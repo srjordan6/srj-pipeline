@@ -235,14 +235,22 @@ func gdelt(db *sql.DB, sourceID int) (fetched, added int, err error) {
 		}
 		url := "https://api.gdeltproject.org/api/v2/doc/doc?query=" + q +
 			"&mode=artlist&maxrecords=100&format=json&timespan=24h"
-		req, _ := http.NewRequest("GET", url, nil)
-		req.Header.Set("User-Agent", "srj-pipeline/1.0 (srjconsultingservices.com)")
-		resp, e := client.Do(req)
-		if e != nil {
-			return fetched, added, e
+		var body []byte
+		var e error
+		for attempt := 1; attempt <= 3; attempt++ {
+			req, _ := http.NewRequest("GET", url, nil)
+			req.Header.Set("User-Agent", "srj-pipeline/1.0 (srjconsultingservices.com)")
+			var resp *http.Response
+			resp, e = client.Do(req)
+			if e == nil {
+				body, e = io.ReadAll(resp.Body)
+				resp.Body.Close()
+			}
+			if e == nil {
+				break
+			}
+			time.Sleep(time.Duration(attempt*10) * time.Second) // transient TLS/egress blips
 		}
-		body, e := io.ReadAll(resp.Body)
-		resp.Body.Close()
 		if e != nil {
 			return fetched, added, e
 		}
