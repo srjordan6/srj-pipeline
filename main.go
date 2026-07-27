@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -231,7 +232,7 @@ func gdelt(db *sql.DB, sourceID int) (fetched, added int, err error) {
 	client := &http.Client{Timeout: 60 * time.Second}
 	for i, q := range queries {
 		if i > 0 {
-			time.Sleep(6 * time.Second)
+			time.Sleep(10 * time.Second)
 		}
 		url := "https://api.gdeltproject.org/api/v2/doc/doc?query=" + q +
 			"&mode=artlist&maxrecords=100&format=json&timespan=24h"
@@ -247,9 +248,16 @@ func gdelt(db *sql.DB, sourceID int) (fetched, added int, err error) {
 				resp.Body.Close()
 			}
 			if e == nil {
+				// GDELT throttling returns HTTP 200 with plain text, not JSON.
+				trimmed := bytes.TrimSpace(body)
+				if len(trimmed) == 0 || trimmed[0] != '{' {
+					e = fmt.Errorf("gdelt non-JSON response (throttled?): %.80s", trimmed)
+				}
+			}
+			if e == nil {
 				break
 			}
-			time.Sleep(time.Duration(attempt*10) * time.Second) // transient TLS/egress blips
+			time.Sleep(time.Duration(attempt*30) * time.Second) // throttle + egress blips
 		}
 		if e != nil {
 			return fetched, added, e
@@ -262,8 +270,8 @@ func gdelt(db *sql.DB, sourceID int) (fetched, added int, err error) {
 				Domain   string `json:"domain"`
 			} `json:"articles"`
 		}
-		if json.Unmarshal(body, &payload) != nil {
-			continue // rate-limit text response; skip this query
+		if e := json.Unmarshal(body, &payload); e != nil {
+			return fetched, added, e
 		}
 		for _, a := range payload.Articles {
 			if a.URL == "" {
