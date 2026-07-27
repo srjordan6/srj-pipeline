@@ -1,10 +1,3 @@
-// srj-pipeline: autonomous data pipeline (Amendment 1 data model).
-// Usage: ./pipeline federal_register
-// Env: DATABASE_URL (Postgres). One daily batch per source.
-//
-// Adapter contract: fetch -> dedupe by (source, external_id, change_hash)
-// -> append to pipeline.documents (corpus) -> log pipeline.runs.
-// Facts (the graph) are asserted by separate verification steps, never here.
 package main
 
 import (
@@ -16,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -27,6 +21,14 @@ func main() {
 		os.Exit(2)
 	}
 	src := os.Args[1]
+	if src == "all" {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt"} {
+			cmd := exec.Command(os.Args[0], s)
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+			cmd.Run() // a failing source must not block the others
+		}
+		return
+	}
 	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "db open:", err)
@@ -50,6 +52,10 @@ func main() {
 	switch src {
 	case "federal_register":
 		fetched, added, runErr = federalRegister(db, sourceID)
+	case "legiscan":
+		fetched, added, runErr = legiscan(db, sourceID)
+	case "gdelt":
+		fetched, added, runErr = gdelt(db, sourceID)
 	default:
 		runErr = fmt.Errorf("no adapter for source %q", src)
 	}
@@ -68,8 +74,6 @@ func main() {
 	}
 }
 
-// federalRegister pulls the newest AI-relevant Federal Register documents.
-// The FR API is public, no key. Primary text (V2-capable evidence).
 func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 	url := "https://www.federalregister.gov/api/v1/documents.json" +
 		"?conditions%5Bterm%5D=%22artificial+intelligence%22" +
@@ -125,6 +129,154 @@ func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 		}
 		if n, _ := res.RowsAffected(); n > 0 {
 			added++
+		}
+	}
+	return fetched, added, nil
+}
+
+
+// insertDoc appends one document to the corpus with change_hash dedupe.
+func insertDoc(db *sql.DB, sourceID int, extID, hash, url, title string, pub any, raw []byte) (bool, error) {
+	res, err := db.Exec(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, published_at, raw)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
+		ON CONFLICT (source_id, external_id, change_hash) DO NOTHING`,
+		sourceID, extID, hash, url, title, pub, raw)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// legiscan pulls state AI bills. LegiScan supplies its own change_hash per
+// bill, which slots directly into the dedupe key. Per the API registration:
+// texts only, all states, one daily batch. Key from LEGISCAN_API_KEY.
+func legiscan(db *sql.DB, sourceID int) (fetched, added int, err error) {
+	key := os.Getenv("LEGISCAN_API_KEY")
+	if key == "" {
+		return 0, 0, fmt.Errorf("LEGISCAN_API_KEY not set")
+	}
+	client := &http.Client{Timeout: 60 * time.Second}
+	for page := 1; page <= 2; page++ {
+		url := fmt.Sprintf("https://api.legiscan.com/?key=%s&op=getSearch&state=ALL&query=%s&page=%d",
+			key, "%22artificial+intelligence%22", page)
+		resp, e := client.Get(url)
+		if e != nil {
+			return fetched, added, e
+		}
+		body, e := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if e != nil {
+			return fetched, added, e
+		}
+		var payload struct {
+			Status       string                     `json:"status"`
+			SearchResult map[string]json.RawMessage `json:"searchresult"`
+		}
+		if e := json.Unmarshal(body, &payload); e != nil {
+			return fetched, added, e
+		}
+		if payload.Status != "OK" {
+			return fetched, added, fmt.Errorf("legiscan status %s", payload.Status)
+		}
+		got := 0
+		for k, v := range payload.SearchResult {
+			if k == "summary" {
+				continue
+			}
+			var b struct {
+				BillID     int    `json:"bill_id"`
+				ChangeHash string `json:"change_hash"`
+				URL        string `json:"url"`
+				State      string `json:"state"`
+				BillNumber string `json:"bill_number"`
+				Title      string `json:"title"`
+				LastAction string `json:"last_action_date"`
+			}
+			if json.Unmarshal(v, &b) != nil || b.BillID == 0 {
+				continue
+			}
+			fetched++
+			got++
+			var pub any
+			if b.LastAction != "" {
+				pub = b.LastAction
+			}
+			ok, e := insertDoc(db, sourceID, fmt.Sprintf("%d", b.BillID), b.ChangeHash,
+				b.URL, b.State+" "+b.BillNumber+": "+b.Title, pub, v)
+			if e != nil {
+				return fetched, added, e
+			}
+			if ok {
+				added++
+			}
+		}
+		if got < 50 {
+			break // last page
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fetched, added, nil
+}
+
+// gdelt pulls the last 24h of global AI-governance news coverage as the
+// DISCOVERY layer. News is never fact evidence (admissible_for_facts=false);
+// it exists to trigger primary-source verification. Courtesy rate: one
+// request per 5 seconds.
+func gdelt(db *sql.DB, sourceID int) (fetched, added int, err error) {
+	queries := []string{
+		"%22artificial%20intelligence%22%20(regulation%20OR%20law%20OR%20governance)",
+		"%22AI%20act%22%20OR%20%22AI%20regulation%22",
+	}
+	client := &http.Client{Timeout: 60 * time.Second}
+	for i, q := range queries {
+		if i > 0 {
+			time.Sleep(6 * time.Second)
+		}
+		url := "https://api.gdeltproject.org/api/v2/doc/doc?query=" + q +
+			"&mode=artlist&maxrecords=100&format=json&timespan=24h"
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("User-Agent", "srj-pipeline/1.0 (srjconsultingservices.com)")
+		resp, e := client.Do(req)
+		if e != nil {
+			return fetched, added, e
+		}
+		body, e := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if e != nil {
+			return fetched, added, e
+		}
+		var payload struct {
+			Articles []struct {
+				URL      string `json:"url"`
+				Title    string `json:"title"`
+				SeenDate string `json:"seendate"`
+				Domain   string `json:"domain"`
+			} `json:"articles"`
+		}
+		if json.Unmarshal(body, &payload) != nil {
+			continue // rate-limit text response; skip this query
+		}
+		for _, a := range payload.Articles {
+			if a.URL == "" {
+				continue
+			}
+			fetched++
+			uh := sha256.Sum256([]byte(a.URL))
+			ch := sha256.Sum256([]byte(a.Title + a.SeenDate))
+			var pub any
+			if len(a.SeenDate) >= 8 {
+				pub = a.SeenDate[:4] + "-" + a.SeenDate[4:6] + "-" + a.SeenDate[6:8]
+			}
+			raw, _ := json.Marshal(a)
+			ok, e := insertDoc(db, sourceID, hex.EncodeToString(uh[:])[:32],
+				hex.EncodeToString(ch[:]), a.URL, a.Title, pub, raw)
+			if e != nil {
+				return fetched, added, e
+			}
+			if ok {
+				added++
+			}
 		}
 	}
 	return fetched, added, nil
