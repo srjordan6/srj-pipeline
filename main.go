@@ -1,9 +1,12 @@
 package main
 
 import (
+	"archive/zip"
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -23,7 +27,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "publish_news"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -37,6 +41,14 @@ func main() {
 	}
 	defer db.Close()
 
+	if src == "publish_news" {
+		if err := publishNews(db); err != nil {
+			fmt.Fprintln(os.Stderr, "publish_news:", err)
+			os.Exit(1)
+		}
+		fmt.Println("publish_news: ok")
+		return
+	}
 	var sourceID int
 	if err := db.QueryRow(`SELECT id FROM pipeline.sources WHERE key=$1`, src).Scan(&sourceID); err != nil {
 		fmt.Fprintln(os.Stderr, "unknown source:", src, err)
@@ -220,80 +232,148 @@ func legiscan(db *sql.DB, sourceID int) (fetched, added int, err error) {
 	return fetched, added, nil
 }
 
-// gdelt pulls the last 24h of global AI-governance news coverage as the
-// DISCOVERY layer. News is never fact evidence (admissible_for_facts=false);
-// it exists to trigger primary-source verification. Courtesy rate: one
-// request per 5 seconds.
+// gdelt pulls the last 24h of global news via GDELT's raw 15-minute GKG
+// files (data.gdeltproject.org, no throttle), filtered to AI relevance.
+// DISCOVERY layer only: news is never fact evidence. Each matched line
+// carries persons/orgs/themes, the seed data for AI-people and AI-orgs.
 func gdelt(db *sql.DB, sourceID int) (fetched, added int, err error) {
-	queries := []string{
-		"%22artificial%20intelligence%22%20(regulation%20OR%20law%20OR%20governance)",
-		"%22AI%20act%22%20OR%20%22AI%20regulation%22",
-	}
-	client := &http.Client{Timeout: 60 * time.Second}
-	for i, q := range queries {
-		if i > 0 {
-			time.Sleep(10 * time.Second)
-		}
-		url := "https://api.gdeltproject.org/api/v2/doc/doc?query=" + q +
-			"&mode=artlist&maxrecords=100&format=json&timespan=24h"
-		var body []byte
-		var e error
-		for attempt := 1; attempt <= 3; attempt++ {
-			req, _ := http.NewRequest("GET", url, nil)
-			req.Header.Set("User-Agent", "srj-pipeline/1.0 (srjconsultingservices.com)")
-			var resp *http.Response
-			resp, e = client.Do(req)
-			if e == nil {
-				body, e = io.ReadAll(resp.Body)
-				resp.Body.Close()
-			}
-			if e == nil {
-				// GDELT throttling returns HTTP 200 with plain text, not JSON.
-				trimmed := bytes.TrimSpace(body)
-				if len(trimmed) == 0 || trimmed[0] != '{' {
-					e = fmt.Errorf("gdelt non-JSON response (throttled?): %.80s", trimmed)
-				}
-			}
-			if e == nil {
-				break
-			}
-			time.Sleep(time.Duration(attempt*30) * time.Second) // throttle + egress blips
-		}
+	client := &http.Client{Timeout: 90 * time.Second}
+	now := time.Now().UTC().Truncate(15 * time.Minute)
+	for i := 96; i >= 1; i-- { // last 24h of 15-min slices
+		ts := now.Add(-time.Duration(i) * 15 * time.Minute).Format("20060102150405")
+		url := "http://data.gdeltproject.org/gdeltv2/" + ts + ".gkg.csv.zip"
+		resp, e := client.Get(url)
 		if e != nil {
-			return fetched, added, e
+			continue // transient slice failure; the day's other 95 carry it
 		}
-		var payload struct {
-			Articles []struct {
-				URL      string `json:"url"`
-				Title    string `json:"title"`
-				SeenDate string `json:"seendate"`
-				Domain   string `json:"domain"`
-			} `json:"articles"`
+		body, e := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if e != nil || resp.StatusCode != 200 {
+			continue
 		}
-		if e := json.Unmarshal(body, &payload); e != nil {
-			return fetched, added, e
+		zr, e := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+		if e != nil || len(zr.File) == 0 {
+			continue
 		}
-		for _, a := range payload.Articles {
-			if a.URL == "" {
+		f, e := zr.File[0].Open()
+		if e != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 1024*1024), 8*1024*1024)
+		for sc.Scan() {
+			line := sc.Text()
+			low := strings.ToLower(line)
+			if !strings.Contains(low, "artificial intelligence") && !strings.Contains(low, "artificialintelligence") {
+				continue
+			}
+			c := strings.Split(line, "\t")
+			if len(c) < 15 {
+				continue
+			}
+			docURL := c[4]
+			if !strings.HasPrefix(docURL, "http") {
 				continue
 			}
 			fetched++
-			uh := sha256.Sum256([]byte(a.URL))
-			ch := sha256.Sum256([]byte(a.Title + a.SeenDate))
-			var pub any
-			if len(a.SeenDate) >= 8 {
-				pub = a.SeenDate[:4] + "-" + a.SeenDate[4:6] + "-" + a.SeenDate[6:8]
+			title := ""
+			if j := strings.Index(line, "<PAGE_TITLE>"); j >= 0 {
+				if k := strings.Index(line[j:], "</PAGE_TITLE>"); k > 12 {
+					title = line[j+12 : j+k]
+				}
 			}
-			raw, _ := json.Marshal(a)
-			ok, e := insertDoc(db, sourceID, hex.EncodeToString(uh[:])[:32],
-				hex.EncodeToString(ch[:]), a.URL, a.Title, pub, raw)
+			meta := map[string]string{"url": docURL, "domain": c[3], "date": c[1],
+				"persons": trunc(c[11], 800), "orgs": trunc(c[13], 800), "themes": trunc(c[7], 800), "title": title}
+			raw, _ := json.Marshal(meta)
+			uh := sha256.Sum256([]byte(docURL))
+			id := hex.EncodeToString(uh[:])[:32]
+			var pub any
+			if len(c[1]) >= 8 {
+				pub = c[1][:4] + "-" + c[1][4:6] + "-" + c[1][6:8]
+			}
+			ok, e := insertDoc(db, sourceID, id, id, docURL, title, pub, raw)
 			if e != nil {
+				f.Close()
 				return fetched, added, e
 			}
 			if ok {
 				added++
 			}
 		}
+		f.Close()
+		time.Sleep(300 * time.Millisecond)
 	}
 	return fetched, added, nil
+}
+
+func trunc(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
+
+// publishNews pushes the latest AI news items into srj-content as
+// news/news.json via the GitHub contents API. The srj-content push fires
+// the site rebuild hook, so the news strip republishes itself daily.
+// Env: GITHUB_TOKEN (fine-grained PAT, contents:write on srj-content).
+func publishNews(db *sql.DB) error {
+	tok := os.Getenv("GITHUB_TOKEN")
+	if tok == "" {
+		return fmt.Errorf("GITHUB_TOKEN not set")
+	}
+	rows, err := db.Query(`SELECT d.title, d.url, d.published_at::date::text, d.raw->>'domain'
+		FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
+		WHERE s.key='gdelt' AND d.title <> '' ORDER BY d.published_at DESC NULLS LAST, d.id DESC LIMIT 60`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type item struct{ Title, URL, Date, Domain string }
+	var items []item
+	for rows.Next() {
+		var it item
+		var date sql.NullString
+		if rows.Scan(&it.Title, &it.URL, &date, &it.Domain) == nil {
+			it.Date = date.String
+			items = append(items, it)
+		}
+	}
+	payload, _ := json.MarshalIndent(map[string]any{"generated": time.Now().UTC().Format(time.RFC3339), "items": items}, "", " ")
+
+	api := "https://api.github.com/repos/srjordan6/srj-content/contents/news/news.json"
+	client := &http.Client{Timeout: 60 * time.Second}
+	gh := func(method, url string, body []byte) (*http.Response, error) {
+		req, _ := http.NewRequest(method, url, bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "srj-pipeline/1.0")
+		return client.Do(req)
+	}
+	sha := ""
+	if resp, e := gh("GET", api, nil); e == nil {
+		var cur struct{ SHA string `json:"sha"` }
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == 200 && json.Unmarshal(b, &cur) == nil {
+			sha = cur.SHA
+		}
+	}
+	put := map[string]any{"message": "pipeline: daily news refresh",
+		"content": base64.StdEncoding.EncodeToString(payload)}
+	if sha != "" {
+		put["sha"] = sha
+	}
+	pb, _ := json.Marshal(put)
+	resp, e := gh("PUT", api, pb)
+	if e != nil {
+		return e
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("github PUT %d: %.200s", resp.StatusCode, b)
+	}
+	return nil
 }
