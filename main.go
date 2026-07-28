@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -28,7 +29,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "publish_news"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "publish_news", "publish_legislation"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -48,6 +49,14 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("publish_news: ok")
+		return
+	}
+	if src == "publish_legislation" {
+		if err := publishLegislation(db); err != nil {
+			fmt.Fprintln(os.Stderr, "publish_legislation:", err)
+			os.Exit(1)
+		}
+		fmt.Println("publish_legislation: ok")
 		return
 	}
 	var sourceID int
@@ -121,6 +130,24 @@ func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 
 	for _, doc := range payload.Results {
 		fetched++
+		title, _ := doc["title"].(string)
+		abstract, _ := doc["abstract"].(string)
+
+		// The API query already carries conditions[term]="artificial
+		// intelligence", but conditions[term] searches the FULL TEXT of a
+		// document. A submarine cable licensing rule that mentions AI once in
+		// its body matches, and so does a fishery council meeting notice. On
+		// 2026-07-28 only 15 of 101 stored documents mentioned AI anywhere, and
+		// the other 86 were noise occupying the corpus.
+		//
+		// Keep the broad query, since recall at the API is free and cheap to
+		// filter, then narrow here: a document earns a row only if AI appears in
+		// its TITLE or ABSTRACT, which is the difference between a rule about AI
+		// and a rule that happens to mention it.
+		if !mentionsAI(title) && !mentionsAI(abstract) {
+			continue
+		}
+
 		raw, _ := json.Marshal(doc)
 		h := sha256.Sum256(raw)
 		hash := hex.EncodeToString(h[:])
@@ -128,7 +155,6 @@ func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 		if extID == "" {
 			continue
 		}
-		title, _ := doc["title"].(string)
 		htmlURL, _ := doc["html_url"].(string)
 		var pub any
 		if p, ok := doc["publication_date"].(string); ok && p != "" {
@@ -147,6 +173,12 @@ func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 	}
 	return fetched, added, nil
 }
+
+// aiTerm matches AI as a subject, not AI as a passing mention. The \b on the
+// bare "AI" is what stops it matching inside "said", "chair", or "maintain".
+var aiTerm = regexp.MustCompile(`(?i)\bartificial intelligence\b|\bmachine learning\b|\bA\.?I\.?\b|\bgenerative ai\b|\balgorithmic\b|\bautomated decision\b`)
+
+func mentionsAI(s string) bool { return s != "" && aiTerm.MatchString(s) }
 
 // insertDoc appends one document to the corpus with change_hash dedupe.
 func insertDoc(db *sql.DB, sourceID int, extID, hash, url, title string, pub any, raw []byte) (bool, error) {
@@ -291,7 +323,15 @@ func gdelt(db *sql.DB, sourceID int) (fetched, added int, err error) {
 			uh := sha256.Sum256([]byte(docURL))
 			id := hex.EncodeToString(uh[:])[:32]
 			var pub any
-			if len(c[1]) >= 8 {
+			// GDELT GKG stamps are YYYYMMDDHHMMSS. The date alone was being
+			// stored, which flattened every story's coverage into a single
+			// undifferentiated day and made an hour-level timeline on the site
+			// impossible without inventing times. Keep the full stamp; the
+			// column is timestamptz and always could have held it.
+			if len(c[1]) >= 14 {
+				pub = c[1][:4] + "-" + c[1][4:6] + "-" + c[1][6:8] + "T" +
+					c[1][8:10] + ":" + c[1][10:12] + ":" + c[1][12:14] + "Z"
+			} else if len(c[1]) >= 8 {
 				pub = c[1][:4] + "-" + c[1][4:6] + "-" + c[1][6:8]
 			}
 			ok, e := insertDoc(db, sourceID, id, id, docURL, title, pub, raw)
@@ -324,7 +364,7 @@ func publishNews(db *sql.DB) error {
 	if tok == "" {
 		return fmt.Errorf("GITHUB_TOKEN not set")
 	}
-	rows, err := db.Query(`SELECT d.title, d.url, d.published_at::date::text, d.raw->>'domain', coalesce(d.raw->>'persons',''), coalesce(d.raw->>'orgs','')
+	rows, err := db.Query(`SELECT d.title, d.url, to_char(d.published_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), d.raw->>'domain', coalesce(d.raw->>'persons',''), coalesce(d.raw->>'orgs','')
 		FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
 		WHERE s.key='gdelt' AND d.title <> '' AND d.fetched_at > now() - interval '36 hours'
 		ORDER BY d.id DESC LIMIT 600`)
@@ -651,6 +691,181 @@ func validateNews(payload []byte) error {
 		if s.DomainCount < 1 || s.ArticleCount < 1 {
 			return fmt.Errorf("%s: DomainCount and ArticleCount must both be at least 1", where)
 		}
+	}
+	return nil
+}
+
+// publishLegislation writes the AI legislation tracker to srj-content.
+//
+// Source is LegiScan, which is the one regulatory adapter whose output is
+// genuinely on topic: on 2026-07-28, 91 of its 100 stored documents were AI
+// bills, against 15 of 101 for the Federal Register. It also carries exactly
+// what a tracker needs and news.json does not: a jurisdiction, a bill number, a
+// plain-language legislative stage, and the date that stage was reached.
+//
+// The AI filter is applied here as well as at fetch time, because the corpus is
+// append-only and already holds rows fetched before the filter existed.
+//
+// Stage is LegiScan's own last_action string, verbatim. It is deliberately not
+// mapped onto a tidy enum like "Committee" or "Passed": the mapping would be a
+// guess dressed as a status, and "Signed by Governor" already says more than
+// any bucket would.
+func publishLegislation(db *sql.DB) error {
+	tok := os.Getenv("GITHUB_TOKEN")
+	if tok == "" {
+		return fmt.Errorf("GITHUB_TOKEN not set")
+	}
+
+	rows, err := db.Query(`
+		SELECT DISTINCT ON (d.raw->>'state', d.raw->>'bill_number')
+		       coalesce(d.raw->>'state',''), coalesce(d.raw->>'bill_number',''),
+		       d.title, d.url, coalesce(d.raw->>'last_action',''),
+		       coalesce(d.raw->>'last_action_date',''), coalesce(d.raw->>'text_url','')
+		FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
+		WHERE s.key='legiscan' AND d.title <> ''
+		ORDER BY d.raw->>'state', d.raw->>'bill_number', d.raw->>'last_action_date' DESC NULLS LAST, d.id DESC`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type bill struct {
+		State, Number, Title, URL, LastAction, LastActionDate, TextURL string
+	}
+	bills := []bill{}
+	for rows.Next() {
+		var b bill
+		if rows.Scan(&b.State, &b.Number, &b.Title, &b.URL, &b.LastAction, &b.LastActionDate, &b.TextURL) != nil {
+			continue
+		}
+		if b.State == "" || b.Number == "" || !mentionsAI(b.Title) {
+			continue
+		}
+		bills = append(bills, b)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Most recently acted first: a tracker is only useful if movement is at
+	// the top. Bills with no recorded action sort last rather than being
+	// dropped, since "introduced, nothing since" is itself a status.
+	sort.SliceStable(bills, func(i, j int) bool {
+		if bills[i].LastActionDate != bills[j].LastActionDate {
+			return bills[i].LastActionDate > bills[j].LastActionDate
+		}
+		if bills[i].State != bills[j].State {
+			return bills[i].State < bills[j].State
+		}
+		return bills[i].Number < bills[j].Number
+	})
+
+	states := map[string]bool{}
+	for _, b := range bills {
+		states[b.State] = true
+	}
+
+	payload, _ := json.MarshalIndent(map[string]any{
+		"generated":     time.Now().UTC().Format(time.RFC3339),
+		"date":          time.Now().UTC().Format("2006-01-02"),
+		"source":        "LegiScan",
+		"jurisdictions": len(states),
+		"count":         len(bills),
+		"bills":         bills,
+	}, "", " ")
+
+	if err := validateLegislation(payload); err != nil {
+		return fmt.Errorf("refusing to publish malformed legislation.json: %w", err)
+	}
+	return putToContent(tok, "legislation/legislation.json",
+		"pipeline: AI legislation tracker refresh", payload)
+}
+
+// validateLegislation is the same gate discipline as validateNews: check the
+// bytes that will ship, refuse rather than publish, and let yesterday's file
+// stand. Every rule maps to something that breaks a rendered row.
+func validateLegislation(payload []byte) error {
+	var doc struct {
+		Generated string             `json:"generated"`
+		Date      string             `json:"date"`
+		Bills     *[]json.RawMessage `json:"bills"`
+	}
+	if err := json.Unmarshal(payload, &doc); err != nil {
+		return fmt.Errorf("payload is not valid JSON: %w", err)
+	}
+	if doc.Generated == "" || doc.Date == "" {
+		return fmt.Errorf("missing generated or date")
+	}
+	if doc.Bills == nil {
+		return fmt.Errorf("bills is null, must be an array")
+	}
+	if len(*doc.Bills) == 0 {
+		return fmt.Errorf("no bills: publishing an empty tracker would blank the page")
+	}
+	seen := map[string]bool{}
+	for i, raw := range *doc.Bills {
+		var b struct {
+			State, Number, Title, URL string
+		}
+		if err := json.Unmarshal(raw, &b); err != nil {
+			return fmt.Errorf("bill %d does not parse: %w", i, err)
+		}
+		key := b.State + " " + b.Number
+		if strings.TrimSpace(b.State) == "" || strings.TrimSpace(b.Number) == "" {
+			return fmt.Errorf("bill %d: missing state or bill number, the row's identity", i)
+		}
+		if seen[key] {
+			return fmt.Errorf("bill %d: duplicate %s, one bill cannot occupy two rows", i, key)
+		}
+		seen[key] = true
+		if strings.TrimSpace(b.Title) == "" {
+			return fmt.Errorf("bill %d (%s): empty title", i, key)
+		}
+		if !strings.HasPrefix(b.URL, "http") {
+			return fmt.Errorf("bill %d (%s): URL is not a link, the row would cite nothing", i, key)
+		}
+	}
+	return nil
+}
+
+// putToContent writes one file to srj-content via the GitHub contents API,
+// reading the current blob SHA first so the write is an update rather than a
+// rejected create. Shared by every publish step.
+func putToContent(tok, path, message string, payload []byte) error {
+	api := "https://api.github.com/repos/srjordan6/srj-content/contents/" + path
+	client := &http.Client{Timeout: 60 * time.Second}
+	gh := func(method, url string, body []byte) (*http.Response, error) {
+		req, _ := http.NewRequest(method, url, bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "srj-pipeline/1.0")
+		return client.Do(req)
+	}
+	sha := ""
+	if resp, e := gh("GET", api, nil); e == nil {
+		var cur struct {
+			SHA string `json:"sha"`
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == 200 && json.Unmarshal(b, &cur) == nil {
+			sha = cur.SHA
+		}
+	}
+	put := map[string]any{"message": message,
+		"content": base64.StdEncoding.EncodeToString(payload)}
+	if sha != "" {
+		put["sha"] = sha
+	}
+	pb, _ := json.Marshal(put)
+	resp, e := gh("PUT", api, pb)
+	if e != nil {
+		return e
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("github PUT %s %d: %.200s", path, resp.StatusCode, b)
 	}
 	return nil
 }
