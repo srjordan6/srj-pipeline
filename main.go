@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -282,8 +283,11 @@ func gdelt(db *sql.DB, sourceID int) (fetched, added int, err error) {
 					title = line[j+12 : j+k]
 				}
 			}
+			// Full raw line retained per retention policy: everything the
+			// pipeline downloads is kept for future LLM development.
 			meta := map[string]string{"url": docURL, "domain": c[3], "date": c[1],
-				"persons": trunc(c[11], 800), "orgs": trunc(c[13], 800), "themes": trunc(c[7], 800), "title": title}
+				"persons": trunc(c[11], 800), "orgs": trunc(c[13], 800), "themes": trunc(c[7], 800), "title": title,
+				"line": line}
 			raw, _ := json.Marshal(meta)
 			uh := sha256.Sum256([]byte(docURL))
 			id := hex.EncodeToString(uh[:])[:32]
@@ -314,33 +318,190 @@ func trunc(s string, n int) string {
 }
 
 
-// publishNews pushes the latest AI news items into srj-content as
-// news/news.json via the GitHub contents API. The srj-content push fires
-// the site rebuild hook, so the news strip republishes itself daily.
-// Env: GITHUB_TOKEN (fine-grained PAT, contents:write on srj-content).
+// publishNews clusters the day's gdelt coverage into top stories and
+// publishes news/news.json to srj-content. Stories rank by breadth of
+// coverage (unique outlets). Same GitHub-commit flow as before.
 func publishNews(db *sql.DB) error {
 	tok := os.Getenv("GITHUB_TOKEN")
 	if tok == "" {
 		return fmt.Errorf("GITHUB_TOKEN not set")
 	}
-	rows, err := db.Query(`SELECT d.title, d.url, d.published_at::date::text, d.raw->>'domain'
+	rows, err := db.Query(`SELECT d.title, d.url, d.published_at::date::text, d.raw->>'domain', coalesce(d.raw->>'persons',''), coalesce(d.raw->>'orgs','')
 		FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
-		WHERE s.key='gdelt' AND d.title <> '' ORDER BY d.published_at DESC NULLS LAST, d.id DESC LIMIT 60`)
+		WHERE s.key='gdelt' AND d.title <> '' AND d.fetched_at > now() - interval '36 hours'
+		ORDER BY d.id DESC LIMIT 600`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	type item struct{ Title, URL, Date, Domain string }
-	var items []item
+	type art struct{ Title, URL, Date, Domain, persons, orgs string }
+	var arts []art
 	for rows.Next() {
-		var it item
-		var date sql.NullString
-		if rows.Scan(&it.Title, &it.URL, &date, &it.Domain) == nil {
-			it.Date = date.String
-			items = append(items, it)
+		var a art
+		var d sql.NullString
+		if rows.Scan(&a.Title, &a.URL, &d, &a.Domain, &a.persons, &a.orgs) == nil {
+			a.Date = d.String
+			arts = append(arts, a)
 		}
 	}
-	payload, _ := json.MarshalIndent(map[string]any{"generated": time.Now().UTC().Format(time.RFC3339), "items": items}, "", " ")
+
+	stop := map[string]bool{"the": true, "a": true, "an": true, "of": true, "to": true, "in": true, "on": true, "for": true, "and": true, "with": true, "as": true, "at": true, "by": true, "is": true, "its": true, "ai": true, "artificial": true, "intelligence": true, "new": true, "how": true, "what": true, "why": true}
+	toks := func(s string) map[string]bool {
+		m := map[string]bool{}
+		w := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !('a' <= r && r <= 'z' || '0' <= r && r <= '9') })
+		for _, x := range w {
+			if len(x) > 2 && !stop[x] {
+				m[x] = true
+			}
+		}
+		return m
+	}
+	sim := func(a, b map[string]bool) float64 {
+		n := 0
+		for k := range a {
+			if b[k] {
+				n++
+			}
+		}
+		d := len(a)
+		if len(b) < d {
+			d = len(b)
+		}
+		if d == 0 {
+			return 0
+		}
+		return float64(n) / float64(d)
+	}
+
+	type cluster struct {
+		arts []art
+		tk   map[string]bool
+	}
+	var cls []*cluster
+	for _, a := range arts {
+		tk := toks(a.Title)
+		if len(tk) < 3 {
+			continue
+		}
+		placed := false
+		for _, c := range cls {
+			if sim(tk, c.tk) >= 0.6 {
+				c.arts = append(c.arts, a)
+				for k := range tk {
+					c.tk[k] = true
+				}
+				placed = true
+				break
+			}
+		}
+		if !placed {
+			cls = append(cls, &cluster{arts: []art{a}, tk: tk})
+		}
+	}
+	domains := func(c *cluster) int {
+		m := map[string]bool{}
+		for _, a := range c.arts {
+			m[a.Domain] = true
+		}
+		return len(m)
+	}
+	sort.Slice(cls, func(i, j int) bool {
+		if domains(cls[i]) != domains(cls[j]) {
+			return domains(cls[i]) > domains(cls[j])
+		}
+		return len(cls[i].arts) > len(cls[j].arts)
+	})
+	if len(cls) > 10 {
+		cls = cls[:10]
+	}
+
+	slugify := func(s string) string {
+		s = strings.ToLower(s)
+		var b strings.Builder
+		dash := false
+		for _, r := range s {
+			if 'a' <= r && r <= 'z' || '0' <= r && r <= '9' {
+				b.WriteRune(r)
+				dash = false
+			} else if !dash && b.Len() > 0 {
+				b.WriteByte('-')
+				dash = true
+			}
+			if b.Len() >= 60 {
+				break
+			}
+		}
+		return strings.Trim(b.String(), "-")
+	}
+	top := func(field func(art) string, n int) func(*cluster) []string {
+		return func(c *cluster) []string {
+			cnt := map[string]int{}
+			for _, a := range c.arts {
+				for _, p := range strings.Split(field(a), ";") {
+					p = strings.TrimSpace(p)
+					if p != "" {
+						cnt[p]++
+					}
+				}
+			}
+			var ks []string
+			for k := range cnt {
+				ks = append(ks, k)
+			}
+			sort.Slice(ks, func(i, j int) bool { return cnt[ks[i]] > cnt[ks[j]] })
+			if len(ks) > n {
+				ks = ks[:n]
+			}
+			return ks
+		}
+	}
+	topPersons := top(func(a art) string { return a.persons }, 6)
+	topOrgs := top(func(a art) string { return a.orgs }, 6)
+
+	type story struct {
+		Slug, Headline           string
+		ArticleCount, DomainCount int
+		Domains                  []string
+		Persons, Orgs            []string
+		Articles                 []map[string]string
+	}
+	var stories []story
+	var big []string
+	seen := map[string]bool{}
+	for _, c := range cls {
+		h := c.arts[0].Title
+		sl := slugify(h)
+		if sl == "" || seen[sl] {
+			continue
+		}
+		seen[sl] = true
+		dm := map[string]bool{}
+		var dl []string
+		var as []map[string]string
+		for _, a := range c.arts {
+			if !dm[a.Domain] {
+				dm[a.Domain] = true
+				dl = append(dl, a.Domain)
+			}
+			if len(as) < 15 {
+				as = append(as, map[string]string{"Title": a.Title, "URL": a.URL, "Domain": a.Domain, "Date": a.Date})
+			}
+		}
+		if len(dl) > 12 {
+			dl = dl[:12]
+		}
+		stories = append(stories, story{Slug: sl, Headline: h, ArticleCount: len(c.arts), DomainCount: len(dm), Domains: dl, Persons: topPersons(c), Orgs: topOrgs(c), Articles: as})
+		if len(big) < 4 {
+			big = append(big, h)
+		}
+	}
+
+	payload, _ := json.MarshalIndent(map[string]any{
+		"generated":   time.Now().UTC().Format(time.RFC3339),
+		"date":        time.Now().UTC().Format("2006-01-02"),
+		"big_picture": big,
+		"stories":     stories,
+	}, "", " ")
 
 	api := "https://api.github.com/repos/srjordan6/srj-content/contents/news/news.json"
 	client := &http.Client{Timeout: 60 * time.Second}
@@ -377,3 +538,4 @@ func publishNews(db *sql.DB) error {
 	}
 	return nil
 }
+
