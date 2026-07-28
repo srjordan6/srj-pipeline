@@ -29,13 +29,26 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "publish_news", "publish_legislation"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "publish_news", "publish_legislation", "publish_leaderboard"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
 		}
 		return
 	}
+
+	// publish_leaderboard needs no database: it is a pure HTTP fetch of a
+	// public leaderboard mirror. Handled before the db open so it still runs
+	// on a host with no DATABASE_URL set.
+	if src == "publish_leaderboard" {
+		if err := publishLeaderboard(); err != nil {
+			fmt.Fprintln(os.Stderr, "publish_leaderboard:", err)
+			os.Exit(1)
+		}
+		fmt.Println("publish_leaderboard: ok")
+		return
+	}
+
 	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "db open:", err)
@@ -823,6 +836,274 @@ func validateLegislation(payload []byte) error {
 		}
 		if !strings.HasPrefix(b.URL, "http") {
 			return fmt.Errorf("bill %d (%s): URL is not a link, the row would cite nothing", i, key)
+		}
+	}
+	return nil
+}
+
+// publishLeaderboard writes the model leaderboard to srj-content.
+//
+// WHY THIS ADAPTER EXISTS, and it is worth stating plainly. The request that
+// prompted it arrived with hand-pasted benchmark figures: "Claude Opus 4.8
+// leads at ~1,580 Elo, followed by GPT-5.5 Pro and Gemini 3.1 Pro." Checked
+// against arena.ai the same day, every clause was wrong. The actual #1 was
+// claude-fable-5 at 1508. Opus 4.8 Thinking sat at #14 on 1484. GPT-5.5 Pro was
+// not on the text board at all. The 1580 figure appears to be the CODE board's
+// range misread as the text board's.
+//
+// The numbers traced back to an SEO content farm, not to arena.ai. That is the
+// whole argument for fetching rather than typing: a leaderboard is the most
+// perishable content on the site, it moves weekly, and a hand-pasted table is
+// wrong within days and then stays wrong. On a site whose competitive position
+// is correction rather than currency, publishing a stale table copied from an
+// aggregator would undo the thing the governance library is for.
+//
+// SOURCE. arena.ai (formerly LMSYS Chatbot Arena) publishes no API; its own
+// mirror repo says so. This reads the daily GitHub snapshot, which carries the
+// upstream fetched_at and source_url in every file, so the provenance chain
+// stays legible: arena.ai is the source, the mirror is the access route, and
+// both are named on the rendered page.
+//
+// TWO UPSTREAM FACTS LEARNED BY RUNNING IT, both of which broke the first
+// version and neither of which is documented in the mirror's schema:
+//
+//  1. Scores arrive as JSON floats (1508.0), not integers, despite the schema
+//     table saying int. Decoding into *int fails the whole board silently.
+//  2. The agent board is RANK-ONLY. All ten entries carry a null score, ci, and
+//     votes. That is a real property of the upstream board, not corruption, so
+//     the gate must allow it while still catching a scored board that has lost
+//     its numbers.
+//
+// The second is handled by requiring internal consistency rather than presence:
+// a board must be all-scored or all-unscored. Half a board losing its scores is
+// a malformation; a board that never had them is a format.
+//
+// WHAT IS DELIBERATELY NOT COLLECTED. MMLU-Pro, SWE-bench Verified, GPQA
+// Diamond, MATH, tokens-per-second, and context-window figures were all in the
+// original paste. None are in this feed, none could be verified against a
+// primary source in the same pass, and the ones that could be checked were
+// wrong. They are omitted rather than carried across on trust. If a verified
+// machine-readable source for any of them is found later, it gets its own
+// adapter and its own gate. An unsourced number on this site is worse than a
+// missing one.
+func publishLeaderboard() error {
+	tok := os.Getenv("GITHUB_TOKEN")
+	if tok == "" {
+		return fmt.Errorf("GITHUB_TOKEN not set")
+	}
+	const mirror = "https://raw.githubusercontent.com/oolong-tea-2026/arena-ai-leaderboards/main/data"
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	get := func(url string) ([]byte, error) {
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("User-Agent", "srj-pipeline/1.0")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return nil, fmt.Errorf("GET %s: %d", url, resp.StatusCode)
+		}
+		return io.ReadAll(resp.Body)
+	}
+
+	// latest.json is the pointer to the newest dated snapshot directory.
+	// Following it rather than constructing today's date means a day the
+	// upstream fetch failed yields yesterday's board, correctly stamped,
+	// instead of a 404 that would blank the page.
+	var ptr struct {
+		Date string `json:"date"`
+		Path string `json:"path"`
+	}
+	b, err := get(mirror + "/latest.json")
+	if err != nil {
+		return fmt.Errorf("latest pointer: %w", err)
+	}
+	if err := json.Unmarshal(b, &ptr); err != nil {
+		return fmt.Errorf("latest pointer parse: %w", err)
+	}
+	if ptr.Path == "" {
+		return fmt.Errorf("latest pointer carries no path")
+	}
+
+	// All numerics are float64 because the upstream emits floats regardless
+	// of what its schema table claims. Rendering formats them.
+	type model struct {
+		Rank    int      `json:"rank"`
+		Model   string   `json:"model"`
+		Vendor  *string  `json:"vendor"`
+		License *string  `json:"license"`
+		Score   *float64 `json:"score"`
+		CI      *float64 `json:"ci"`
+		Votes   *float64 `json:"votes"`
+	}
+	type board struct {
+		Key       string  `json:"key"`
+		Label     string  `json:"label"`
+		Note      string  `json:"note"`
+		Scored    bool    `json:"scored"`
+		SourceURL string  `json:"source_url"`
+		FetchedAt string  `json:"fetched_at"`
+		Count     int     `json:"count"`
+		Models    []model `json:"models"`
+	}
+
+	// Only the boards a Chat & General LLM reader is actually choosing
+	// between. The image, video, and edit boards belong to different
+	// catalog categories and would be noise here.
+	wanted := []struct{ key, label, note string }{
+		{"text", "Overall text and chat",
+			"Head-to-head human preference on general conversation. The closest thing the field has to a general-purpose ranking."},
+		{"code", "Code generation",
+			"The same vote mechanic restricted to coding prompts. Ranks differ sharply from the text board, which is the reason to read both."},
+		{"agent", "Agentic use",
+			"Multi-step tool-using tasks rather than single answers. The board that matters if the model will act rather than reply. Published as an order only, with no ratings."},
+		{"vision", "Vision and multimodal",
+			"Image understanding and mixed text-image prompts."},
+		{"search", "Search-grounded answers",
+			"Models answering with live retrieval, where citation quality matters as much as fluency."},
+	}
+
+	boards := []board{}
+	for _, w := range wanted {
+		raw, err := get(fmt.Sprintf("%s/%s/%s.json", mirror, ptr.Path, w.key))
+		if err != nil {
+			// A single missing board is not fatal. The upstream index
+			// varies by day and a partial page beats no page.
+			fmt.Fprintf(os.Stderr, "leaderboard: skipping %s: %v\n", w.key, err)
+			continue
+		}
+		var f struct {
+			Meta struct {
+				Leaderboard string `json:"leaderboard"`
+				SourceURL   string `json:"source_url"`
+				FetchedAt   string `json:"fetched_at"`
+				ModelCount  int    `json:"model_count"`
+			} `json:"meta"`
+			Models []model `json:"models"`
+		}
+		if err := json.Unmarshal(raw, &f); err != nil {
+			fmt.Fprintf(os.Stderr, "leaderboard: %s does not parse: %v\n", w.key, err)
+			continue
+		}
+		// Top 12 per board. The full boards run past 100 models; a
+		// reference page that reprints all of them is a worse read than
+		// the source, and the source is linked on every board.
+		top := f.Models
+		if len(top) > 12 {
+			top = top[:12]
+		}
+		scored := len(top) > 0
+		for _, m := range top {
+			if m.Score == nil {
+				scored = false
+				break
+			}
+		}
+		boards = append(boards, board{
+			Key: w.key, Label: w.label, Note: w.note, Scored: scored,
+			SourceURL: f.Meta.SourceURL, FetchedAt: f.Meta.FetchedAt,
+			Count: f.Meta.ModelCount, Models: top,
+		})
+	}
+
+	payload, _ := json.MarshalIndent(map[string]any{
+		"generated":   time.Now().UTC().Format(time.RFC3339),
+		"date":        ptr.Date,
+		"source":      "arena.ai (formerly LMSYS Chatbot Arena)",
+		"source_url":  "https://arena.ai/leaderboard/",
+		"access_note": "arena.ai publishes no API. Read via the daily public snapshot mirror at github.com/oolong-tea-2026/arena-ai-leaderboards, which preserves upstream fetched_at and source_url per board.",
+		"method":      "Crowdsourced blind pairwise voting, scored with a Bradley-Terry model and reported as an Elo-style rating with a 95 percent confidence interval. Gaps under roughly 10 points sit inside the noise floor and should not be read as a ranking.",
+		"boards":      boards,
+	}, "", " ")
+
+	if err := validateLeaderboard(payload); err != nil {
+		return fmt.Errorf("refusing to publish malformed leaderboard.json: %w", err)
+	}
+	return putToContent(tok, "leaderboard/leaderboard.json",
+		"pipeline: model leaderboard refresh", payload)
+}
+
+// validateLeaderboard applies the same gate discipline as validateNews and
+// validateLegislation: parse the bytes that will actually ship, refuse rather
+// than publish, and leave yesterday's file standing. Stale beats broken.
+//
+// Every rule maps to something visibly wrong on the rendered page. A board with
+// no models renders an empty table. A missing fetched_at strips the page of the
+// one thing that makes a perishable table trustworthy, which is the date it was
+// true. Ranks that skip or repeat render a table that silently misorders.
+//
+// The scored rule is consistency, not presence, because the agent board is
+// legitimately rank-only upstream. All-scored and all-unscored are both valid;
+// a mix means a scored board lost its numbers mid-fetch.
+func validateLeaderboard(payload []byte) error {
+	var doc struct {
+		Generated string `json:"generated"`
+		Date      string `json:"date"`
+		Source    string `json:"source"`
+		Boards    *[]struct {
+			Key       string `json:"key"`
+			Label     string `json:"label"`
+			Scored    bool   `json:"scored"`
+			FetchedAt string `json:"fetched_at"`
+			SourceURL string `json:"source_url"`
+			Models    *[]struct {
+				Rank  int      `json:"rank"`
+				Model string   `json:"model"`
+				Score *float64 `json:"score"`
+			} `json:"models"`
+		} `json:"boards"`
+	}
+	if err := json.Unmarshal(payload, &doc); err != nil {
+		return fmt.Errorf("payload is not valid JSON: %w", err)
+	}
+	if doc.Generated == "" || doc.Date == "" || doc.Source == "" {
+		return fmt.Errorf("missing generated, date, or source")
+	}
+	if doc.Boards == nil {
+		return fmt.Errorf("boards is null, must be an array")
+	}
+	if len(*doc.Boards) == 0 {
+		return fmt.Errorf("no boards: publishing this would blank the leaderboard section")
+	}
+	seen := map[string]bool{}
+	for i, b := range *doc.Boards {
+		if strings.TrimSpace(b.Key) == "" || strings.TrimSpace(b.Label) == "" {
+			return fmt.Errorf("board %d: missing key or label", i)
+		}
+		if seen[b.Key] {
+			return fmt.Errorf("board %d: duplicate key %q", i, b.Key)
+		}
+		seen[b.Key] = true
+		if strings.TrimSpace(b.FetchedAt) == "" {
+			return fmt.Errorf("board %q: no fetched_at, an undated leaderboard is not a fact", b.Key)
+		}
+		if !strings.HasPrefix(b.SourceURL, "http") {
+			return fmt.Errorf("board %q: source_url is not a link, the table would cite nothing", b.Key)
+		}
+		if b.Models == nil {
+			return fmt.Errorf("board %q: models is null, must be []", b.Key)
+		}
+		if len(*b.Models) == 0 {
+			return fmt.Errorf("board %q: no models, the table would render empty", b.Key)
+		}
+		for j, m := range *b.Models {
+			if strings.TrimSpace(m.Model) == "" {
+				return fmt.Errorf("board %q model %d: empty model name", b.Key, j)
+			}
+			if m.Rank != j+1 {
+				return fmt.Errorf("board %q model %d (%s): rank is %d, ranks must run 1..n without gaps or repeats",
+					b.Key, j, m.Model, m.Rank)
+			}
+			if b.Scored && m.Score == nil {
+				return fmt.Errorf("board %q model %d (%s): board is scored but this row has none, so a scored board has lost its numbers",
+					b.Key, j, m.Model)
+			}
+			if !b.Scored && m.Score != nil {
+				return fmt.Errorf("board %q model %d (%s): board is marked unscored but carries a score",
+					b.Key, j, m.Model)
+			}
 		}
 	}
 	return nil
