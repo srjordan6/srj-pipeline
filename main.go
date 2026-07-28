@@ -148,7 +148,6 @@ func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 	return fetched, added, nil
 }
 
-
 // insertDoc appends one document to the corpus with change_hash dedupe.
 func insertDoc(db *sql.DB, sourceID int, extID, hash, url, title string, pub any, raw []byte) (bool, error) {
 	res, err := db.Exec(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, published_at, raw)
@@ -317,7 +316,6 @@ func trunc(s string, n int) string {
 	return s
 }
 
-
 // publishNews clusters the day's gdelt coverage into top stories and
 // publishes news/news.json to srj-content. Stories rank by breadth of
 // coverage (unique outlets). Same GitHub-commit flow as before.
@@ -444,7 +442,12 @@ func publishNews(db *sql.DB) error {
 					}
 				}
 			}
-			var ks []string
+			// Initialised, not declared nil. A nil slice marshals to JSON null,
+			// not [], and the site prerenders one page per story: on 2026-07-28 a
+			// story with no organizations shipped "Orgs": null, the Astro template
+			// called .slice on it, and that single record failed the entire site
+			// build. Empty must mean empty, everywhere this package emits JSON.
+			ks := []string{}
 			for k := range cnt {
 				ks = append(ks, k)
 			}
@@ -459,14 +462,14 @@ func publishNews(db *sql.DB) error {
 	topOrgs := top(func(a art) string { return a.orgs }, 6)
 
 	type story struct {
-		Slug, Headline           string
+		Slug, Headline            string
 		ArticleCount, DomainCount int
-		Domains                  []string
-		Persons, Orgs            []string
-		Articles                 []map[string]string
+		Domains                   []string
+		Persons, Orgs             []string
+		Articles                  []map[string]string
 	}
 	var stories []story
-	var big []string
+	big := []string{}
 	seen := map[string]bool{}
 	for _, c := range cls {
 		h := c.arts[0].Title
@@ -476,8 +479,8 @@ func publishNews(db *sql.DB) error {
 		}
 		seen[sl] = true
 		dm := map[string]bool{}
-		var dl []string
-		var as []map[string]string
+		dl := []string{}
+		as := []map[string]string{}
 		for _, a := range c.arts {
 			if !dm[a.Domain] {
 				dm[a.Domain] = true
@@ -503,6 +506,25 @@ func publishNews(db *sql.DB) error {
 		"stories":     stories,
 	}, "", " ")
 
+	// THE GATE.
+	//
+	// This publish step commits straight to the default branch of srj-content,
+	// and a push to srj-content is itself the site deploy trigger. There is no
+	// review, no CI, and no staging step in between: whatever this function
+	// writes is on the public site within minutes.
+	//
+	// That is fine while the data is well formed and unacceptable when it is
+	// not, which is not hypothetical. On 2026-07-28 a single malformed story
+	// failed the entire site build and blocked every deploy, including unrelated
+	// ones, until the templates were patched by hand.
+	//
+	// So nothing is published unless it passes. A refusal to publish leaves
+	// yesterday's briefing live, which is a good outcome: slightly stale beats
+	// broken, and the failure is loud in the cron logs rather than silent.
+	if err := validateNews(payload); err != nil {
+		return fmt.Errorf("refusing to publish malformed news.json: %w", err)
+	}
+
 	api := "https://api.github.com/repos/srjordan6/srj-content/contents/news/news.json"
 	client := &http.Client{Timeout: 60 * time.Second}
 	gh := func(method, url string, body []byte) (*http.Response, error) {
@@ -514,7 +536,9 @@ func publishNews(db *sql.DB) error {
 	}
 	sha := ""
 	if resp, e := gh("GET", api, nil); e == nil {
-		var cur struct{ SHA string `json:"sha"` }
+		var cur struct {
+			SHA string `json:"sha"`
+		}
 		b, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == 200 && json.Unmarshal(b, &cur) == nil {
@@ -539,3 +563,94 @@ func publishNews(db *sql.DB) error {
 	return nil
 }
 
+// validateNews is the publish gate. It re-reads the marshalled payload the way
+// the site will read it, and rejects anything the Astro build cannot survive.
+//
+// It parses the bytes rather than inspecting the in-memory structs on purpose.
+// The failure this exists to prevent was a marshalling artefact, a nil slice
+// becoming null, which is invisible from the Go side and only appears once the
+// value has been through encoding/json. Checking the structs would have missed
+// it. Check what actually ships.
+//
+// Every rule here maps to something that breaks a real page:
+//
+//	Slug         the story's URL. Empty means a page at a bad path.
+//	Headline     the h1 and the <title>. Empty means an untitled page.
+//	Articles     the entire body of the story page. Empty means a blank page.
+//	null arrays  the 2026-07-28 build failure, exactly.
+//	duplicates   two stories claiming one URL; the later one silently wins.
+func validateNews(payload []byte) error {
+	var doc struct {
+		Generated  string             `json:"generated"`
+		Date       string             `json:"date"`
+		BigPicture *[]string          `json:"big_picture"`
+		Stories    *[]json.RawMessage `json:"stories"`
+	}
+	if err := json.Unmarshal(payload, &doc); err != nil {
+		return fmt.Errorf("payload is not valid JSON: %w", err)
+	}
+	if doc.Generated == "" || doc.Date == "" {
+		return fmt.Errorf("missing generated or date")
+	}
+	if doc.BigPicture == nil {
+		return fmt.Errorf("big_picture is null, must be an array")
+	}
+	if doc.Stories == nil {
+		return fmt.Errorf("stories is null, must be an array")
+	}
+	if len(*doc.Stories) == 0 {
+		return fmt.Errorf("no stories: publishing an empty briefing would blank the page")
+	}
+
+	// Pointer fields distinguish "absent or null" from "present but empty",
+	// which is the whole point of this check.
+	seen := map[string]bool{}
+	for i, raw := range *doc.Stories {
+		var s struct {
+			Slug         string               `json:"Slug"`
+			Headline     string               `json:"Headline"`
+			ArticleCount int                  `json:"ArticleCount"`
+			DomainCount  int                  `json:"DomainCount"`
+			Domains      *[]string            `json:"Domains"`
+			Persons      *[]string            `json:"Persons"`
+			Orgs         *[]string            `json:"Orgs"`
+			Articles     *[]map[string]string `json:"Articles"`
+		}
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return fmt.Errorf("story %d does not parse: %w", i, err)
+		}
+		where := fmt.Sprintf("story %d (%q)", i, s.Slug)
+		if s.Slug == "" {
+			return fmt.Errorf("%s: empty Slug, would render at a broken URL", where)
+		}
+		if seen[s.Slug] {
+			return fmt.Errorf("%s: duplicate Slug, two stories cannot share one URL", where)
+		}
+		seen[s.Slug] = true
+		if strings.TrimSpace(s.Headline) == "" {
+			return fmt.Errorf("%s: empty Headline, would render an untitled page", where)
+		}
+		for name, arr := range map[string]*[]string{
+			"Domains": s.Domains, "Persons": s.Persons, "Orgs": s.Orgs,
+		} {
+			if arr == nil {
+				return fmt.Errorf("%s: %s is null, must be [] (this is the 2026-07-28 build break)", where, name)
+			}
+		}
+		if s.Articles == nil {
+			return fmt.Errorf("%s: Articles is null, must be []", where)
+		}
+		if len(*s.Articles) == 0 {
+			return fmt.Errorf("%s: no articles, the story page would have no body", where)
+		}
+		for j, a := range *s.Articles {
+			if strings.TrimSpace(a["URL"]) == "" || strings.TrimSpace(a["Title"]) == "" {
+				return fmt.Errorf("%s: article %d missing URL or Title", where, j)
+			}
+		}
+		if s.DomainCount < 1 || s.ArticleCount < 1 {
+			return fmt.Errorf("%s: DomainCount and ArticleCount must both be at least 1", where)
+		}
+	}
+	return nil
+}
