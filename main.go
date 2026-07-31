@@ -1797,6 +1797,13 @@ func archiveNews(db *sql.DB) error {
 		}
 		keyBase := "corpus/news/" + d.ext
 		if err := archivePut(endpoint, token, keyBase+".html", "text/html; charset=utf-8", htmlB); err != nil {
+			// A 403 here is the edge WAF challenging the article body itself
+			// (seen live July 31), which will fail identically every day; mark
+			// the doc failed so it is tried once, not forever. Transient
+			// errors leave the doc eligible for the next run.
+			if strings.Contains(err.Error(), ": 403 ") {
+				db.Exec(`UPDATE pipeline.documents SET fetch_failed_at=now() WHERE id=$1`, d.id)
+			}
 			fmt.Fprintln(os.Stderr, "archive_news:", err)
 			failed++
 			time.Sleep(500 * time.Millisecond)
