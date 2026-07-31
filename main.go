@@ -1559,24 +1559,22 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"OpenAI", "https://openai.com/news/rss.xml"},
 		{"Google DeepMind", "https://deepmind.google/blog/rss.xml"},
 		{"Hugging Face", "https://huggingface.co/blog/feed.xml"},
-		// Research and labs
-		{"Mistral AI", "https://mistral.ai/feed.xml"},
+		// Research and labs. Probed July 31: Aleph Alpha, KAIST, OECD.AI, and
+		// Canada ISED expose no working feed (HTML pages or connection resets)
+		// and move to the phase-2 scraper list.
+		{"Mistral AI", "https://mistral.ai/rss.xml"},
 		{"Stability AI", "https://stability.ai/news?format=rss"},
 		{"AI21 Labs", "https://www.ai21.com/blog/rss.xml"},
-		{"Aleph Alpha", "https://aleph-alpha.com/feed/"},
 		{"The Alan Turing Institute", "https://www.turing.ac.uk/rss.xml"},
 		{"INRIA", "https://inria.fr/en/rss.xml"},
 		{"RIKEN AIP", "https://www.riken.jp/en/feed/"},
-		{"KAIST", "https://news.kaist.ac.kr/rss/newsrss.xml"},
-		{"MBZUAI", "https://mbzuai.ac.ae/feed/"},
+		{"MBZUAI", "https://mbzuai.ac.ae/news/feed/"},
 		{"AI Singapore", "https://aisingapore.org/feed/"},
 		// Policy, regulation, standards
 		{"European Commission AI", "https://digital-strategy.ec.europa.eu/en/rss.xml"},
 		{"UK DSIT", "https://www.gov.uk/government/organisations/department-for-science-innovation-and-technology.atom"},
 		{"UK AI Safety Institute", "https://www.aisi.gov.uk/rss.xml"},
-		{"OECD AI Policy Observatory", "https://oecd.ai/en/feed"},
 		{"UNESCO", "https://www.unesco.org/en/rss.xml"},
-		{"Canada ISED", "https://www.canada.ca/en/innovation-science-economic-development.atom.xml"},
 		{"CIFAR", "https://cifar.ca/feed/"},
 		// Media and industry
 		{"The Register", "https://www.theregister.com/software/ai_ml/headlines.atom"},
