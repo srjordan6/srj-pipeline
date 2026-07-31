@@ -1571,8 +1571,8 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		// Canada ISED expose no working feed (HTML pages or connection resets)
 		// and move to the phase-2 scraper list.
 		{"Mistral AI", "https://mistral.ai/rss.xml"},
-		{"Stability AI", "https://stability.ai/news?format=rss"},
-		{"AI21 Labs", "https://www.ai21.com/blog/rss.xml"},
+		{"Stability AI (coverage)", "https://news.google.com/rss/search?q=%22Stability+AI%22&hl=en-US&gl=US&ceid=US:en"},
+		{"AI21 Labs (coverage)", "https://news.google.com/rss/search?q=%22AI21+Labs%22&hl=en-US&gl=US&ceid=US:en"},
 		{"The Alan Turing Institute", "https://www.turing.ac.uk/rss.xml"},
 		{"INRIA", "https://inria.fr/en/rss.xml"},
 		{"RIKEN AIP", "https://www.riken.jp/en/feed/"},
@@ -1581,8 +1581,8 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		// Policy, regulation, standards
 		{"European Commission AI", "https://digital-strategy.ec.europa.eu/en/rss.xml"},
 		{"UK DSIT", "https://www.gov.uk/government/organisations/department-for-science-innovation-and-technology.atom"},
-		{"UK AI Safety Institute", "https://www.aisi.gov.uk/rss.xml"},
-		{"UNESCO", "https://www.unesco.org/en/rss.xml"},
+		{"UK AI Safety Institute (coverage)", "https://news.google.com/rss/search?q=%22AI+Safety+Institute%22+UK&hl=en-US&gl=US&ceid=US:en"},
+		{"UNESCO (coverage)", "https://news.google.com/rss/search?q=UNESCO+%22artificial+intelligence%22&hl=en-US&gl=US&ceid=US:en"},
 		{"CIFAR", "https://cifar.ca/feed/"},
 		// Media and industry
 		{"The Register", "https://www.theregister.com/software/ai_ml/headlines.atom"},
@@ -1591,7 +1591,7 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"Sifted", "https://sifted.eu/feed"},
 		{"Tech in Asia", "https://www.techinasia.com/rss"},
 		{"KrASIA", "https://kr-asia.com/feed"},
-		{"The Yuan", "https://www.the-yuan.com/rss.xml"},
+		{"The Yuan (coverage)", "https://news.google.com/rss/search?q=%22The+Yuan%22+AI+site:the-yuan.com+OR+%22the-yuan.com%22&hl=en-US&gl=US&ceid=US:en"},
 		{"Computing UK", "https://www.computing.co.uk/feeds/rss"},
 		{"Heise", "https://www.heise.de/rss/heise-atom.xml"},
 		{"L'Usine Digitale", "https://www.usine-digitale.fr/rss"},
