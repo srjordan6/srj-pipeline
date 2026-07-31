@@ -30,7 +30,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -71,6 +71,22 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("publish_legislation: ok")
+		return
+	}
+	if src == "publish_lawsuits" {
+		if err := publishLawsuits(db); err != nil {
+			fmt.Fprintln(os.Stderr, "publish_lawsuits:", err)
+			os.Exit(1)
+		}
+		fmt.Println("publish_lawsuits: ok")
+		return
+	}
+	if src == "publish_intel" {
+		if err := publishIntel(db); err != nil {
+			fmt.Fprintln(os.Stderr, "publish_intel:", err)
+			os.Exit(1)
+		}
+		fmt.Println("publish_intel: ok")
 		return
 	}
 	if src == "intel" {
@@ -1805,4 +1821,93 @@ func anthropicSummarize(headline, text string) (string, error) {
 		return "", fmt.Errorf("empty summary")
 	}
 	return s, nil
+}
+
+// ---- publish_lawsuits: AI Lawsuit Database -> srj-content ------------------
+//
+// Exports every active case in ai_lawsuits, in display order, as one JSON
+// document the Astro build consumes for /ai-governance/ai-lawsuits/. Runs
+// after the intel stage in `all`, so each night's docket refresh reaches the
+// site on its next build. json.RawMessage passes the timeline/claims/tags
+// JSONB and the array columns through verbatim instead of re-modeling them.
+func publishLawsuits(db *sql.DB) error {
+	tok := os.Getenv("GITHUB_TOKEN")
+	if tok == "" {
+		return fmt.Errorf("GITHUB_TOKEN not set")
+	}
+	rows, err := db.Query(`
+		SELECT json_build_object(
+		  'slug', slug, 'case_name', case_name, 'court', court, 'docket', docket,
+		  'judge', judge, 'filed_date', filed_date, 'plaintiffs', plaintiffs,
+		  'defendants', defendants, 'category', category, 'status', status,
+		  'status_badge', status_badge, 'latest_development', latest_development,
+		  'latest_development_date', latest_development_date,
+		  'courtlistener_url', courtlistener_url,
+		  'executive_summary', executive_summary, 'why_it_matters', why_it_matters,
+		  'target_models', target_models, 'disputed_datasets', disputed_datasets,
+		  'materials_at_issue', materials_at_issue,
+		  'plaintiff_counsel', plaintiff_counsel, 'defendant_counsel', defendant_counsel,
+		  'claims', claims, 'timeline', timeline, 'tags', tags,
+		  'related_slugs', related_slugs, 'display_order', display_order,
+		  'verified_date', verified_date)
+		FROM ai_lawsuits WHERE is_active ORDER BY display_order`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var cases []json.RawMessage
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return err
+		}
+		cases = append(cases, json.RawMessage(raw))
+	}
+	if len(cases) == 0 {
+		return fmt.Errorf("ai_lawsuits returned no active cases; refusing to publish an empty database")
+	}
+	out, _ := json.MarshalIndent(map[string]any{
+		"generated": time.Now().UTC().Format(time.RFC3339),
+		"cases":     cases,
+	}, "", "  ")
+	return putToContent(tok, "lawsuits/lawsuits.json",
+		fmt.Sprintf("lawsuits: %d cases %s", len(cases), time.Now().UTC().Format("2006-01-02")), out)
+}
+
+// ---- publish_intel: AI watch feed -> srj-content ---------------------------
+//
+// Publishes the newest non-ignored rows from ai_intel_candidates (new models,
+// tools, terminology, vendor announcements) for the Everything else AI page.
+// Ignored rows never ship; everything else does, newest first, capped so the
+// page and the JSON stay small.
+func publishIntel(db *sql.DB) error {
+	tok := os.Getenv("GITHUB_TOKEN")
+	if tok == "" {
+		return fmt.Errorf("GITHUB_TOKEN not set")
+	}
+	rows, err := db.Query(`
+		SELECT json_build_object(
+		  'kind', kind, 'name', name, 'vendor', vendor, 'url', url,
+		  'summary', summary, 'source', source, 'discovered_at', discovered_at)
+		FROM ai_intel_candidates
+		WHERE status <> 'ignored'
+		ORDER BY discovered_at DESC LIMIT 120`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	items := []json.RawMessage{}
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return err
+		}
+		items = append(items, json.RawMessage(raw))
+	}
+	out, _ := json.MarshalIndent(map[string]any{
+		"generated": time.Now().UTC().Format(time.RFC3339),
+		"items":     items,
+	}, "", "  ")
+	return putToContent(tok, "intel/intel.json",
+		fmt.Sprintf("intel: %d items %s", len(items), time.Now().UTC().Format("2006-01-02")), out)
 }
