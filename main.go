@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,7 +30,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "publish_news", "publish_legislation", "publish_leaderboard"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "publish_news", "publish_legislation", "publish_leaderboard"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -70,6 +71,14 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("publish_legislation: ok")
+		return
+	}
+	if src == "intel" {
+		if err := intelSync(db); err != nil {
+			fmt.Fprintln(os.Stderr, "intel:", err)
+			os.Exit(1)
+		}
+		fmt.Println("intel: ok")
 		return
 	}
 	var sourceID int
@@ -1147,6 +1156,384 @@ func putToContent(tok, path, message string, payload []byte) error {
 	if resp.StatusCode != 200 && resp.StatusCode != 201 {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("github PUT %s %d: %.200s", path, resp.StatusCode, b)
+	}
+	return nil
+}
+
+// ---- intel: AI Lawsuit Database + AI intel sync ----------------------------
+//
+// Keeps the ai_lawsuits table current from CourtListener, fills docket numbers
+// still marked pending, queues newly filed AI lawsuits into
+// ai_lawsuit_candidates, and watches Hugging Face plus vendor feeds for new
+// models and terminology into ai_intel_candidates. Results log to
+// srj_intel_log. COURTLISTENER_TOKEN is required for docket-detail reads
+// (search works anonymously); without it the refresh job logs and moves on.
+
+func clGet(path string, params map[string]string, out any) error {
+	req, err := http.NewRequest("GET", "https://www.courtlistener.com/api/rest/v4"+path, nil)
+	if err != nil {
+		return err
+	}
+	q := req.URL.Query()
+	for k, v := range params {
+		q.Set(k, v)
+	}
+	req.URL.RawQuery = q.Encode()
+	req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
+	if tok := os.Getenv("COURTLISTENER_TOKEN"); tok != "" {
+		req.Header.Set("Authorization", "Token "+tok)
+	}
+	for attempt := 1; attempt <= 3; attempt++ {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode == 429 {
+			resp.Body.Close()
+			time.Sleep(time.Duration(15*attempt) * time.Second)
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("courtlistener %s: %s", path, resp.Status)
+		}
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	return fmt.Errorf("courtlistener rate limited: %s", path)
+}
+
+type clSearch struct {
+	Results []struct {
+		CaseName     string `json:"caseName"`
+		DocketNumber string `json:"docketNumber"`
+		DocketID     int64  `json:"docket_id"`
+		Court        string `json:"court"`
+		DateFiled    string `json:"dateFiled"`
+		Snippet      string `json:"snippet"`
+	} `json:"results"`
+}
+
+var docketIDRe = regexp.MustCompile(`/docket/(\d+)/`)
+
+// intelRefresh updates timeline + latest development for tracked cases whose
+// docket has moved since the stored latest_development_date.
+func intelRefresh(db *sql.DB) (checked, updated int, err error) {
+	rows, err := db.Query(`SELECT id, slug, courtlistener_url, COALESCE(latest_development_date::text,''), COALESCE(timeline::text,'[]')
+		FROM ai_lawsuits WHERE is_active AND courtlistener_url IS NOT NULL`)
+	if err != nil {
+		return 0, 0, err
+	}
+	type caseRow struct {
+		id                 int64
+		slug, clURL, since string
+		timeline           string
+	}
+	var cases []caseRow
+	for rows.Next() {
+		var c caseRow
+		if err := rows.Scan(&c.id, &c.slug, &c.clURL, &c.since, &c.timeline); err != nil {
+			rows.Close()
+			return checked, updated, err
+		}
+		cases = append(cases, c)
+	}
+	rows.Close()
+	for _, c := range cases {
+		m := docketIDRe.FindStringSubmatch(c.clURL)
+		if m == nil {
+			continue
+		}
+		did := m[1]
+		checked++
+		var docket struct {
+			DateLastFiling string `json:"date_last_filing"`
+		}
+		if err := clGet("/dockets/"+did+"/", nil, &docket); err != nil {
+			fmt.Fprintln(os.Stderr, "intel refresh", c.slug, "docket fetch:", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if docket.DateLastFiling == "" || (c.since != "" && docket.DateLastFiling <= c.since) {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		var entries struct {
+			Results []struct {
+				DateFiled   string          `json:"date_filed"`
+				EntryNumber json.RawMessage `json:"entry_number"`
+				Description string          `json:"description"`
+			} `json:"results"`
+		}
+		if err := clGet("/docket-entries/", map[string]string{
+			"docket": did, "order_by": "-date_filed", "page_size": "5",
+		}, &entries); err != nil {
+			fmt.Fprintln(os.Stderr, "intel refresh", c.slug, "entries fetch:", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		var existing []map[string]any
+		json.Unmarshal([]byte(c.timeline), &existing)
+		seen := map[string]bool{}
+		for _, e := range existing {
+			d, _ := e["date"].(string)
+			n, _ := e["doc_no"].(string)
+			seen[d+"|"+n] = true
+		}
+		var fresh []map[string]any
+		for _, en := range entries.Results {
+			desc := strings.TrimSpace(en.Description)
+			docNo := strings.Trim(string(en.EntryNumber), `"null`)
+			if en.DateFiled == "" || desc == "" || seen[en.DateFiled+"|"+docNo] {
+				continue
+			}
+			fresh = append(fresh, map[string]any{
+				"date":   en.DateFiled,
+				"title":  trunc(desc, 300),
+				"doc_no": docNo,
+				"url":    "https://www.courtlistener.com/docket/" + did + "/",
+			})
+		}
+		if len(fresh) > 0 {
+			merged := append(fresh, existing...)
+			sort.Slice(merged, func(i, j int) bool {
+				di, _ := merged[i]["date"].(string)
+				dj, _ := merged[j]["date"].(string)
+				return di > dj
+			})
+			payload, _ := json.Marshal(merged)
+			newest := fresh[0]
+			if _, err := db.Exec(`UPDATE ai_lawsuits SET timeline=$1, latest_development=$2,
+				latest_development_date=$3, updated_at=now() WHERE id=$4`,
+				payload, newest["title"], newest["date"], c.id); err != nil {
+				fmt.Fprintln(os.Stderr, "intel refresh", c.slug, "update:", err)
+				continue
+			}
+			updated++
+			fmt.Printf("intel refresh %s: %d new docket entries through %v\n", c.slug, len(fresh), newest["date"])
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return checked, updated, nil
+}
+
+// intelResolve fills docket numbers still marked pending verification straight
+// from CourtListener search.
+func intelResolve(db *sql.DB) (resolved int, err error) {
+	rows, err := db.Query(`SELECT id, slug, case_name, COALESCE(defendants,'')
+		FROM ai_lawsuits WHERE docket ILIKE '%pending%' AND is_active`)
+	if err != nil {
+		return 0, err
+	}
+	type pend struct {
+		id                         int64
+		slug, caseName, defendants string
+	}
+	var pending []pend
+	for rows.Next() {
+		var p pend
+		if err := rows.Scan(&p.id, &p.slug, &p.caseName, &p.defendants); err != nil {
+			rows.Close()
+			return resolved, err
+		}
+		pending = append(pending, p)
+	}
+	rows.Close()
+	paren := regexp.MustCompile(`\(.*?\)`)
+	for _, p := range pending {
+		q := strings.TrimSpace(paren.ReplaceAllString(p.caseName, ""))
+		var res clSearch
+		if err := clGet("/search/", map[string]string{
+			"type": "r", "q": `"` + q + `"`, "order_by": "score desc",
+		}, &res); err != nil {
+			fmt.Fprintln(os.Stderr, "intel resolve", p.slug, "search:", err)
+			continue
+		}
+		surname := strings.ToLower(strings.TrimSpace(strings.Split(strings.Split(p.defendants, ";")[0], ",")[0]))
+		if i := strings.Index(surname, " "); i > 0 {
+			surname = surname[:i]
+		}
+		for i, h := range res.Results {
+			if i >= 5 {
+				break
+			}
+			if h.DocketNumber == "" || h.DocketID == 0 || surname == "" ||
+				!strings.Contains(strings.ToLower(h.CaseName), surname) {
+				continue
+			}
+			clURL := fmt.Sprintf("https://www.courtlistener.com/docket/%d/", h.DocketID)
+			if _, err := db.Exec(`UPDATE ai_lawsuits SET docket=$1, courtlistener_url=$2, updated_at=now() WHERE id=$3`,
+				h.DocketNumber, clURL, p.id); err == nil {
+				resolved++
+				fmt.Printf("intel resolve %s: docket %s\n", p.slug, h.DocketNumber)
+			}
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return resolved, nil
+}
+
+// intelDiscover queues newly filed AI lawsuits as candidates for review.
+func intelDiscover(db *sql.DB) (added int, err error) {
+	since := time.Now().AddDate(0, 0, -45).Format("2006-01-02")
+	var res clSearch
+	if err := clGet("/search/", map[string]string{
+		"type":        "r",
+		"q":           `("artificial intelligence" OR "generative AI" OR "large language model") AND (copyright OR "training data" OR infringement)`,
+		"filed_after": since,
+		"order_by":    "dateFiled desc",
+	}, &res); err != nil {
+		return 0, err
+	}
+	for i, h := range res.Results {
+		if i >= 25 || h.DocketID == 0 {
+			continue
+		}
+		var tracked bool
+		db.QueryRow(`SELECT EXISTS (SELECT 1 FROM ai_lawsuits WHERE courtlistener_url LIKE $1)`,
+			fmt.Sprintf("%%/docket/%d/%%", h.DocketID)).Scan(&tracked)
+		if tracked {
+			continue
+		}
+		r, err := db.Exec(`INSERT INTO ai_lawsuit_candidates
+			(source, source_id, case_name, court, docket, filed_date, url, snippet)
+			VALUES ('courtlistener', $1, $2, $3, $4, NULLIF($5,'')::date, $6, $7)
+			ON CONFLICT (source_id) DO NOTHING`,
+			fmt.Sprintf("cl-docket-%d", h.DocketID), h.CaseName, h.Court, h.DocketNumber,
+			h.DateFiled, fmt.Sprintf("https://www.courtlistener.com/docket/%d/", h.DocketID),
+			trunc(h.Snippet, 500))
+		if err != nil {
+			continue
+		}
+		if n, _ := r.RowsAffected(); n > 0 {
+			added++
+			fmt.Println("intel discover: queued", h.CaseName, h.DocketNumber)
+		}
+	}
+	return added, nil
+}
+
+// intelAIWatch queues new Hugging Face models and AI vendor news as intel
+// candidates, reusing the pipeline's aiTerm subject filter for the feeds.
+func intelAIWatch(db *sql.DB) (added int, err error) {
+	req, _ := http.NewRequest("GET", "https://huggingface.co/api/models?sort=createdAt&direction=-1&limit=25", nil)
+	req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
+	if resp, herr := http.DefaultClient.Do(req); herr == nil {
+		var models []struct {
+			ID          string `json:"id"`
+			ModelID     string `json:"modelId"`
+			Downloads   int    `json:"downloads"`
+			PipelineTag string `json:"pipeline_tag"`
+		}
+		if derr := json.NewDecoder(resp.Body).Decode(&models); derr == nil {
+			for _, m := range models {
+				mid := m.ModelID
+				if mid == "" {
+					mid = m.ID
+				}
+				if mid == "" || m.Downloads < 50 {
+					continue
+				}
+				name, vendor := mid, ""
+				if i := strings.Index(mid, "/"); i > 0 {
+					vendor, name = mid[:i], mid[i+1:]
+				}
+				r, ierr := db.Exec(`INSERT INTO ai_intel_candidates (kind, name, vendor, url, summary, source, source_id)
+					VALUES ('model', $1, NULLIF($2,''), $3, $4, 'huggingface', $5)
+					ON CONFLICT (source_id) DO NOTHING`,
+					name, vendor, "https://huggingface.co/"+mid,
+					fmt.Sprintf("pipeline: %s, downloads: %d", m.PipelineTag, m.Downloads),
+					"hf-"+mid)
+				if ierr != nil {
+					continue
+				}
+				if n, _ := r.RowsAffected(); n > 0 {
+					added++
+				}
+			}
+		}
+		resp.Body.Close()
+	} else {
+		fmt.Fprintln(os.Stderr, "intel ai_watch huggingface:", herr)
+	}
+	feeds := []struct{ vendor, url string }{
+		{"OpenAI", "https://openai.com/news/rss.xml"},
+		{"Google DeepMind", "https://deepmind.google/blog/rss.xml"},
+		{"Hugging Face", "https://huggingface.co/blog/feed.xml"},
+	}
+	for _, f := range feeds {
+		req, _ := http.NewRequest("GET", f.url, nil)
+		req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
+		resp, ferr := http.DefaultClient.Do(req)
+		if ferr != nil {
+			fmt.Fprintln(os.Stderr, "intel ai_watch feed", f.vendor, ":", ferr)
+			continue
+		}
+		var feed struct {
+			Items []struct {
+				Title string `xml:"title"`
+				Link  string `xml:"link"`
+			} `xml:"channel>item"`
+		}
+		derr := xml.NewDecoder(resp.Body).Decode(&feed)
+		resp.Body.Close()
+		if derr != nil {
+			fmt.Fprintln(os.Stderr, "intel ai_watch feed", f.vendor, "parse:", derr)
+			continue
+		}
+		for _, it := range feed.Items {
+			title, link := strings.TrimSpace(it.Title), strings.TrimSpace(it.Link)
+			if title == "" || link == "" || !mentionsAI(title) {
+				continue
+			}
+			r, ierr := db.Exec(`INSERT INTO ai_intel_candidates (kind, name, vendor, url, source, source_id)
+				VALUES ('vendor-news', $1, $2, $3, 'rss', $4)
+				ON CONFLICT (source_id) DO NOTHING`,
+				trunc(title, 300), f.vendor, link, "rss-"+link)
+			if ierr != nil {
+				continue
+			}
+			if n, _ := r.RowsAffected(); n > 0 {
+				added++
+			}
+		}
+	}
+	return added, nil
+}
+
+// intelSync runs the four intel jobs, each independent, and logs the run.
+func intelSync(db *sql.DB) error {
+	ok := true
+	var details []string
+	checked, updated, err := intelRefresh(db)
+	if err != nil {
+		ok = false
+		details = append(details, "refresh: "+err.Error())
+	}
+	resolved, err := intelResolve(db)
+	if err != nil {
+		ok = false
+		details = append(details, "resolve: "+err.Error())
+	}
+	lawAdded, err := intelDiscover(db)
+	if err != nil {
+		ok = false
+		details = append(details, "discover: "+err.Error())
+	}
+	intelAdded, err := intelAIWatch(db)
+	if err != nil {
+		ok = false
+		details = append(details, "ai_watch: "+err.Error())
+	}
+	detail := sql.NullString{String: strings.Join(details, "; "), Valid: len(details) > 0}
+	db.Exec(`INSERT INTO srj_intel_log (job, ok, dockets_checked, dockets_updated,
+		lawsuit_candidates_added, intel_candidates_added, detail)
+		VALUES ('daily-sync', $1, $2, $3, $4, $5, $6)`,
+		ok, checked, updated, lawAdded, intelAdded, detail)
+	fmt.Printf("intel: checked=%d updated=%d resolved=%d lawsuit_candidates=%d intel_candidates=%d ok=%v\n",
+		checked, updated, resolved, lawAdded, intelAdded, ok)
+	if !ok {
+		return fmt.Errorf("intel jobs failed: %s", strings.Join(details, "; "))
 	}
 	return nil
 }
