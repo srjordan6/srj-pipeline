@@ -14,14 +14,14 @@ Provenance gates what may be trained on:
   third-party   Vendor/news headlines discovered by the watchers. Retrieval
                 only; excluded from training sets by default.
 
-Output keys in the bucket (default srj-training-corpus):
-  YYYY-MM-DD/corpus.jsonl   immutable daily snapshot
-  YYYY-MM-DD/manifest.json  counts, hash, byte size
-  latest/corpus.jsonl       rolling pointer for consumers
-  latest/manifest.json
+Output keys (private srj-uploads bucket, via the Worker's PUT /api/archive,
+bearer-gated by ARCHIVE_TOKEN; no direct R2 credentials needed):
+  corpus/training/YYYY-MM-DD/corpus.jsonl   immutable daily snapshot
+  corpus/training/YYYY-MM-DD/manifest.json  counts, hash, byte size
+  corpus/training/latest/corpus.jsonl       rolling pointer for consumers
+  corpus/training/latest/manifest.json
 
-Required env: DATABASE_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
-Optional env: R2_BUCKET (srj-training-corpus), R2_ACCOUNT_ID.
+Required env: DATABASE_URL, ARCHIVE_TOKEN.
 Every run logs a row to srj_corpus_log, success or failure.
 """
 import hashlib
@@ -32,13 +32,11 @@ import sys
 import tarfile
 from datetime import datetime, timezone
 
-import boto3
 import psycopg2
 import psycopg2.extras
 import requests
 
-R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "2db97ad8218dd8a17d22368d32e41161")
-R2_BUCKET = os.environ.get("R2_BUCKET", "srj-training-corpus")
+ARCHIVE_URL = "https://srjconsultingservices.com/api/archive"
 CONTENT_TARBALL = "https://codeload.github.com/srjordan6/srj-content/tar.gz/refs/heads/main"
 SITE = "https://srjconsultingservices.com"
 
@@ -206,21 +204,17 @@ def main():
                              "third-party records are retrieval-only.",
         }, indent=2).encode()
 
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
-            aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-            region_name="auto",
-        )
-        for prefix in (day, "latest"):
-            s3.put_object(Bucket=R2_BUCKET, Key=f"{prefix}/corpus.jsonl", Body=body,
-                          ContentType="application/x-ndjson")
-            s3.put_object(Bucket=R2_BUCKET, Key=f"{prefix}/manifest.json", Body=manifest,
-                          ContentType="application/json")
+        token = os.environ["ARCHIVE_TOKEN"]
+        headers = {"authorization": f"Bearer {token}"}
+        for prefix in (f"corpus/training/{day}", "corpus/training/latest"):
+            for name, payload, ctype in (("corpus.jsonl", body, "application/x-ndjson"),
+                                          ("manifest.json", manifest, "application/json")):
+                r = requests.put(f"{ARCHIVE_URL}?key={prefix}/{name}", data=payload,
+                                 headers={**headers, "content-type": ctype}, timeout=300)
+                r.raise_for_status()
 
-        log_run(dsn, True, counts, len(body), digest, f"{day}/corpus.jsonl")
-        print(f"corpus export ok: {counts} -> r2://{R2_BUCKET}/{day}/ ({len(body)} bytes)")
+        log_run(dsn, True, counts, len(body), digest, f"corpus/training/{day}/corpus.jsonl")
+        print(f"corpus export ok: {counts} -> srj-uploads:corpus/training/{day}/ ({len(body)} bytes)")
     except Exception as e:
         log_run(dsn, False, detail=str(e)[:500])
         raise
