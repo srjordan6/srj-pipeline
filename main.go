@@ -30,7 +30,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "export_corpus"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -97,6 +97,14 @@ func main() {
 		fmt.Println("intel: ok")
 		return
 	}
+	if src == "export_corpus" {
+		if err := exportCorpus(db); err != nil {
+			fmt.Fprintln(os.Stderr, "export_corpus:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "archive_news" {
 		if err := archiveNews(db); err != nil {
 			fmt.Fprintln(os.Stderr, "archive_news:", err)
