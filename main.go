@@ -1432,8 +1432,30 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 	}, &res); err != nil {
 		return 0, err
 	}
+	// Relevance scoring. "Artificial intelligence" appears in patent and
+	// trademark boilerplate constantly; the first live run queued NASCAR
+	// trademark chaff alongside a real new Anthropic suit. Score on the
+	// signals that separate AI-subject litigation from passing mentions,
+	// and queue only what clears the bar. The score is stored so review
+	// can sort by it.
+	aiParty := regexp.MustCompile(`(?i)openai|anthropic|meta platforms|midjourney|stability ai|suno|uncharted labs|udio|perplexity|x\.?ai|google|alphabet|microsoft|nvidia|hugging face|character\.?ai|deepseek|mistral|runway|eleven ?labs|minimax`)
+	aiSubject := regexp.MustCompile(`(?i)training data|generative|large language|chatbot|machine learning|neural|copyright|infring|scrap(e|ing)|dataset|deepfake|right of publicity|biometric`)
+	patentNoise := regexp.MustCompile(`(?i)patent|'\d{3} patent|licensing, llc|innovations ltd|ip pty|technology licensing`)
 	for i, h := range res.Results {
 		if i >= 25 || h.DocketID == 0 {
+			continue
+		}
+		score := 0
+		if aiParty.MatchString(h.CaseName) {
+			score += 3
+		}
+		if aiSubject.MatchString(h.Snippet) || aiSubject.MatchString(h.CaseName) {
+			score += 2
+		}
+		if patentNoise.MatchString(h.CaseName) {
+			score -= 3
+		}
+		if score < 2 {
 			continue
 		}
 		var tracked bool
@@ -1443,18 +1465,18 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 			continue
 		}
 		r, err := db.Exec(`INSERT INTO ai_lawsuit_candidates
-			(source, source_id, case_name, court, docket, filed_date, url, snippet)
-			VALUES ('courtlistener', $1, $2, $3, $4, NULLIF($5,'')::date, $6, $7)
+			(source, source_id, case_name, court, docket, filed_date, url, snippet, score)
+			VALUES ('courtlistener', $1, $2, $3, $4, NULLIF($5,'')::date, $6, $7, $8)
 			ON CONFLICT (source_id) DO NOTHING`,
 			fmt.Sprintf("cl-docket-%d", h.DocketID), h.CaseName, h.Court, h.DocketNumber,
 			h.DateFiled, fmt.Sprintf("https://www.courtlistener.com/docket/%d/", h.DocketID),
-			trunc(h.Snippet, 500))
+			trunc(h.Snippet, 500), score)
 		if err != nil {
 			continue
 		}
 		if n, _ := r.RowsAffected(); n > 0 {
 			added++
-			fmt.Println("intel discover: queued", h.CaseName, h.DocketNumber)
+			fmt.Printf("intel discover: queued (score %d) %s %s\n", score, h.CaseName, h.DocketNumber)
 		}
 	}
 	return added, nil
