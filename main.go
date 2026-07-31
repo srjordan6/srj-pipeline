@@ -30,7 +30,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "publish_news", "publish_legislation", "publish_leaderboard"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -79,6 +79,14 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("intel: ok")
+		return
+	}
+	if src == "archive_news" {
+		if err := archiveNews(db); err != nil {
+			fmt.Fprintln(os.Stderr, "archive_news:", err)
+			os.Exit(1)
+		}
+		fmt.Println("archive_news: ok")
 		return
 	}
 	var sourceID int
@@ -396,6 +404,25 @@ func publishNews(db *sql.DB) error {
 	defer rows.Close()
 	type art struct{ Title, URL, Date, Domain, persons, orgs string }
 	var arts []art
+	// Per-URL summary and lead text, for the story summary at the top of each
+	// news page. Own-words summaries only; the site never republishes bodies.
+	type docText struct{ summary, text string }
+	docs := map[string]docText{}
+	{
+		drows, derr := db.Query(`SELECT d.url, COALESCE(d.summary,''), COALESCE(substr(d.fulltext,1,12000),'')
+			FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
+			WHERE s.key='gdelt' AND d.fetched_at > now() - interval '36 hours'
+			AND (d.summary IS NOT NULL OR d.fulltext IS NOT NULL)`)
+		if derr == nil {
+			for drows.Next() {
+				var u, sm, tx string
+				if drows.Scan(&u, &sm, &tx) == nil {
+					docs[u] = docText{summary: sm, text: tx}
+				}
+			}
+			drows.Close()
+		}
+	}
 	for rows.Next() {
 		var a art
 		var d sql.NullString
@@ -525,6 +552,8 @@ func publishNews(db *sql.DB) error {
 
 	type story struct {
 		Slug, Headline            string
+		Summary                   string
+		SummaryURL, SummaryDomain string
 		ArticleCount, DomainCount int
 		Domains                   []string
 		Persons, Orgs             []string
@@ -555,7 +584,25 @@ func publishNews(db *sql.DB) error {
 		if len(dl) > 12 {
 			dl = dl[:12]
 		}
-		stories = append(stories, story{Slug: sl, Headline: h, ArticleCount: len(c.arts), DomainCount: len(dm), Domains: dl, Persons: topPersons(c), Orgs: topOrgs(c), Articles: as})
+		summary, sumURL, sumDomain := "", "", ""
+		for _, a := range c.arts {
+			dt, okd := docs[a.URL]
+			if !okd || (dt.summary == "" && dt.text == "") {
+				continue
+			}
+			if dt.summary == "" {
+				s2, serr := anthropicSummarize(h, dt.text)
+				if serr != nil {
+					fmt.Fprintln(os.Stderr, "publish_news summarize:", serr)
+					continue
+				}
+				dt.summary = s2
+				db.Exec(`UPDATE pipeline.documents SET summary=$1 WHERE url=$2`, s2, a.URL)
+			}
+			summary, sumURL, sumDomain = dt.summary, a.URL, a.Domain
+			break
+		}
+		stories = append(stories, story{Slug: sl, Headline: h, Summary: summary, SummaryURL: sumURL, SummaryDomain: sumDomain, ArticleCount: len(c.arts), DomainCount: len(dm), Domains: dl, Persons: topPersons(c), Orgs: topOrgs(c), Articles: as})
 		if len(big) < 4 {
 			big = append(big, h)
 		}
@@ -1536,4 +1583,204 @@ func intelSync(db *sql.DB) error {
 		return fmt.Errorf("intel jobs failed: %s", strings.Join(details, "; "))
 	}
 	return nil
+}
+
+// ---- archive_news: full-text corpus archival + summaries -------------------
+//
+// Everything the news discovery layer finds is downloaded once and kept:
+// article HTML and extracted text go to the PRIVATE R2 bucket (srj-uploads,
+// corpus/ prefix) through the site Worker's /api/archive endpoint, and the
+// extracted text is also held in pipeline.documents.fulltext for summarization
+// and future LLM work. The public site only ever shows own-words summaries.
+//
+// Environment: ARCHIVE_ENDPOINT (https://srjconsultingservices.com/api/archive),
+// ARCHIVE_TOKEN (bearer), ANTHROPIC_API_KEY (summaries; publish_news degrades
+// gracefully without it).
+
+var (
+	scriptRe = regexp.MustCompile(`(?is)<(script|style|noscript|svg|nav|header|footer|form)[^>]*>.*?</\s*(script|style|noscript|svg|nav|header|footer|form)\s*>`)
+	tagRe    = regexp.MustCompile(`(?s)<[^>]*>`)
+	wsRe     = regexp.MustCompile(`[ \t\r\f]+`)
+	nlRe     = regexp.MustCompile(`\n{3,}`)
+)
+
+// htmlToText is a deliberately simple extractor: strip the chrome-bearing
+// elements, drop tags, decode the common entities, collapse whitespace. Good
+// enough for summarization and corpus search; the raw HTML is archived too,
+// so a better extractor can always re-run later.
+func htmlToText(h string) string {
+	h = scriptRe.ReplaceAllString(h, " ")
+	h = strings.ReplaceAll(h, "</p>", "\n\n")
+	h = strings.ReplaceAll(h, "<br>", "\n")
+	h = strings.ReplaceAll(h, "<br/>", "\n")
+	h = tagRe.ReplaceAllString(h, " ")
+	for k, v := range map[string]string{"&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": `"`, "&#39;": "'", "&rsquo;": "'", "&lsquo;": "'", "&ldquo;": `"`, "&rdquo;": `"`, "&nbsp;": " ", "&mdash;": ",", "&ndash;": "-"} {
+		h = strings.ReplaceAll(h, k, v)
+	}
+	h = wsRe.ReplaceAllString(h, " ")
+	lines := strings.Split(h, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSpace(lines[i])
+	}
+	h = strings.Join(lines, "\n")
+	return strings.TrimSpace(nlRe.ReplaceAllString(h, "\n\n"))
+}
+
+// archivePut writes one object through the Worker's bearer-gated endpoint.
+func archivePut(endpoint, token, key, contentType string, body []byte) error {
+	req, err := http.NewRequest("PUT", endpoint+"?key="+key, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+		return fmt.Errorf("archive PUT %s: %d %s", key, resp.StatusCode, b)
+	}
+	return nil
+}
+
+// archiveNews downloads article bodies for recent gdelt documents that have
+// not been archived yet, stores HTML + text in R2, and keeps the text in
+// pipeline.documents.fulltext. Failures mark fetch_failed_at so a dead URL is
+// tried once, not daily forever.
+func archiveNews(db *sql.DB) error {
+	endpoint, token := os.Getenv("ARCHIVE_ENDPOINT"), os.Getenv("ARCHIVE_TOKEN")
+	if endpoint == "" || token == "" {
+		return fmt.Errorf("ARCHIVE_ENDPOINT and ARCHIVE_TOKEN must be set")
+	}
+	rows, err := db.Query(`SELECT d.id, d.external_id, d.url
+		FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
+		WHERE s.key='gdelt' AND d.r2_key IS NULL AND d.fetch_failed_at IS NULL
+		AND d.fetched_at > now() - interval '10 days'
+		ORDER BY d.id DESC LIMIT 80`)
+	if err != nil {
+		return err
+	}
+	type doc struct {
+		id      int64
+		ext, ur string
+	}
+	var todo []doc
+	for rows.Next() {
+		var d doc
+		if rows.Scan(&d.id, &d.ext, &d.ur) == nil {
+			todo = append(todo, d)
+		}
+	}
+	rows.Close()
+	client := &http.Client{Timeout: 25 * time.Second}
+	archived, failed := 0, 0
+	for _, d := range todo {
+		req, rerr := http.NewRequest("GET", d.ur, nil)
+		if rerr != nil {
+			db.Exec(`UPDATE pipeline.documents SET fetch_failed_at=now() WHERE id=$1`, d.id)
+			failed++
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; SRJ-archive/1.0; +https://srjconsultingservices.com)")
+		resp, gerr := client.Do(req)
+		if gerr != nil || resp.StatusCode != 200 {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			db.Exec(`UPDATE pipeline.documents SET fetch_failed_at=now() WHERE id=$1`, d.id)
+			failed++
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		htmlB, rderr := io.ReadAll(io.LimitReader(resp.Body, 3*1024*1024))
+		resp.Body.Close()
+		if rderr != nil || len(htmlB) == 0 {
+			db.Exec(`UPDATE pipeline.documents SET fetch_failed_at=now() WHERE id=$1`, d.id)
+			failed++
+			continue
+		}
+		text := htmlToText(string(htmlB))
+		if len(text) > 200*1024 {
+			text = text[:200*1024]
+		}
+		keyBase := "corpus/news/" + d.ext
+		if err := archivePut(endpoint, token, keyBase+".html", "text/html; charset=utf-8", htmlB); err != nil {
+			fmt.Fprintln(os.Stderr, "archive_news:", err)
+			failed++
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if err := archivePut(endpoint, token, keyBase+".txt", "text/plain; charset=utf-8", []byte(text)); err != nil {
+			fmt.Fprintln(os.Stderr, "archive_news:", err)
+		}
+		if _, err := db.Exec(`UPDATE pipeline.documents SET r2_key=$1, fulltext=$2 WHERE id=$3`,
+			keyBase+".html", text, d.id); err != nil {
+			fmt.Fprintln(os.Stderr, "archive_news db:", err)
+			continue
+		}
+		archived++
+		time.Sleep(400 * time.Millisecond)
+	}
+	fmt.Printf("archive_news: archived=%d failed=%d of %d\n", archived, failed, len(todo))
+	return nil
+}
+
+// anthropicSummarize writes a two-paragraph, own-words news summary. House
+// style: plain English, commas rather than dashes, no reproduced passages.
+func anthropicSummarize(headline, text string) (string, error) {
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		return "", fmt.Errorf("ANTHROPIC_API_KEY not set")
+	}
+	if len(text) < 400 {
+		return "", fmt.Errorf("article text too short to summarize")
+	}
+	prompt := "Summarize this news article in two short paragraphs, 120 to 180 words total, entirely in your own words. " +
+		"State what happened, who is involved, the key numbers, and what happens next if the article says. " +
+		"Plain English. Use commas rather than dashes. Do not quote more than a few words. Do not repeat the headline. " +
+		"Do not add opinions or information that is not in the article. Output only the summary paragraphs.\n\n" +
+		"Headline: " + headline + "\n\nArticle text:\n" + text
+	body, _ := json.Marshal(map[string]any{
+		"model":      "claude-haiku-4-5",
+		"max_tokens": 400,
+		"messages":   []map[string]string{{"role": "user", "content": prompt}},
+	})
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("x-api-key", key)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("content-type", "application/json")
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		return "", fmt.Errorf("anthropic %d: %s", resp.StatusCode, b)
+	}
+	var out struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	for _, c := range out.Content {
+		sb.WriteString(c.Text)
+	}
+	s := strings.TrimSpace(sb.String())
+	if s == "" {
+		return "", fmt.Errorf("empty summary")
+	}
+	return s, nil
 }
