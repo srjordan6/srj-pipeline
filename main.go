@@ -30,7 +30,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "export_corpus"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "arxiv_watch", "export_corpus"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -97,6 +97,14 @@ func main() {
 		fmt.Println("intel: ok")
 		return
 	}
+	if src == "arxiv_watch" {
+		if err := arxivWatch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "arxiv_watch:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "export_corpus" {
 		if err := exportCorpus(db); err != nil {
 			fmt.Fprintln(os.Stderr, "export_corpus:", err)
@@ -1587,6 +1595,23 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"Computing UK", "https://www.computing.co.uk/feeds/rss"},
 		{"Heise", "https://www.heise.de/rss/heise-atom.xml"},
 		{"L'Usine Digitale", "https://www.usine-digitale.fr/rss"},
+		// Phase 2 of the watch-everything directive: sources with no working
+		// feed of their own, watched through Google News RSS coverage
+		// queries. This trades first-party immediacy for zero scraper
+		// maintenance and free English-language handling of the
+		// Chinese-language set; a first-party scraper can replace any of
+		// these later without schema changes.
+		{"BAAI (coverage)", "https://news.google.com/rss/search?q=%22Beijing+Academy+of+Artificial+Intelligence%22&hl=en-US&gl=US&ceid=US:en"},
+		{"Shanghai AI Lab (coverage)", "https://news.google.com/rss/search?q=%22Shanghai+AI+Laboratory%22&hl=en-US&gl=US&ceid=US:en"},
+		{"China CAC (coverage)", "https://news.google.com/rss/search?q=%22Cyberspace+Administration+of+China%22+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"Singapore IMDA (coverage)", "https://news.google.com/rss/search?q=IMDA+Singapore+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"Naver Clova (coverage)", "https://news.google.com/rss/search?q=Naver+HyperCLOVA+OR+%22Naver+AI%22&hl=en-US&gl=US&ceid=US:en"},
+		{"36Kr (coverage)", "https://news.google.com/rss/search?q=36Kr+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"QbitAI (coverage)", "https://news.google.com/rss/search?q=QbitAI+OR+%22%E9%87%8F%E5%AD%90%E4%BD%8D%22&hl=en-US&gl=US&ceid=US:en"},
+		{"Aleph Alpha (coverage)", "https://news.google.com/rss/search?q=%22Aleph+Alpha%22&hl=en-US&gl=US&ceid=US:en"},
+		{"KAIST AI (coverage)", "https://news.google.com/rss/search?q=KAIST+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"OECD AI (coverage)", "https://news.google.com/rss/search?q=%22OECD%22+AI+policy&hl=en-US&gl=US&ceid=US:en"},
+		{"Canada AI policy (coverage)", "https://news.google.com/rss/search?q=Canada+ISED+OR+CIFAR+AI&hl=en-US&gl=US&ceid=US:en"},
 	}
 	for _, f := range feeds {
 		req, _ := http.NewRequest("GET", f.url, nil)
@@ -1970,4 +1995,83 @@ func publishIntel(db *sql.DB) error {
 	}, "", "  ")
 	return putToContent(tok, "intel/intel.json",
 		fmt.Sprintf("intel: %d items %s", len(items), time.Now().UTC().Format("2006-01-02")), out)
+}
+
+// arxivWatch is phase 3 of the watch-everything directive: affiliation
+// tracking on new arXiv preprints. Pulls the newest submissions in cs.AI,
+// cs.CL, and cs.LG from the official arXiv Atom API and keeps only papers
+// whose title or abstract names a tracked institution, so the volume that
+// lands in ai_intel_candidates stays reviewable instead of flooding it with
+// every preprint. arXiv terms permit this use; the API is free and keyless.
+func arxivWatch(db *sql.DB) error {
+	orgs := []string{
+		"Tsinghua", "Peking University", "BAAI", "Beijing Academy",
+		"Shanghai AI Lab", "Chinese Academy of Sciences", "RIKEN", "AIST",
+		"KAIST", "Naver", "MBZUAI", "AI21", "Weizmann", "Hebrew University",
+		"Mistral", "Aleph Alpha", "Stability AI", "Alan Turing Institute",
+		"Max Planck", "INRIA", "ELLIS", "AI Singapore", "DeepMind", "OpenAI",
+		"Anthropic", "Hugging Face", "Zhipu", "Moonshot", "DeepSeek", "Qwen",
+		"Alibaba", "Tencent", "ByteDance", "Huawei", "Baidu",
+	}
+	type entry struct {
+		Title   string `xml:"title"`
+		Summary string `xml:"summary"`
+		ID      string `xml:"id"`
+	}
+	var parsed struct {
+		Entries []entry `xml:"entry"`
+	}
+	added := 0
+	for _, cat := range []string{"cs.AI", "cs.CL", "cs.LG"} {
+		u := "https://export.arxiv.org/api/query?search_query=cat:" + cat +
+			"&sortBy=submittedDate&sortOrder=descending&max_results=40"
+		req, _ := http.NewRequest("GET", u, nil)
+		req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != 200 {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			fmt.Fprintln(os.Stderr, "arxiv_watch", cat, ":", err)
+			continue
+		}
+		parsed.Entries = nil
+		dec := xml.NewDecoder(resp.Body)
+		dec.Strict = false
+		dec.Entity = xml.HTMLEntity
+		derr := dec.Decode(&parsed)
+		resp.Body.Close()
+		if derr != nil {
+			fmt.Fprintln(os.Stderr, "arxiv_watch", cat, "parse:", derr)
+			continue
+		}
+		for _, e := range parsed.Entries {
+			text := e.Title + " " + e.Summary
+			var hit string
+			for _, o := range orgs {
+				if strings.Contains(text, o) {
+					hit = o
+					break
+				}
+			}
+			if hit == "" || e.ID == "" {
+				continue
+			}
+			title := strings.Join(strings.Fields(e.Title), " ")
+			r, ierr := db.Exec(`INSERT INTO ai_intel_candidates (kind, name, vendor, url, source, source_id)
+				VALUES ('paper', $1, $2, $3, 'arxiv', $4)
+				ON CONFLICT (source_id) DO NOTHING`,
+				trunc(title, 300), hit, e.ID, "arxiv-"+e.ID)
+			if ierr != nil {
+				continue
+			}
+			if n, _ := r.RowsAffected(); n > 0 {
+				added++
+			}
+		}
+		time.Sleep(3 * time.Second) // arXiv API courtesy delay
+	}
+	fmt.Printf("arxiv_watch: papers_added=%d ok=true\n", added)
+	return nil
 }
