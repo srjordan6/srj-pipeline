@@ -1604,7 +1604,15 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 				Link  string `xml:"link"`
 			} `xml:"channel>item"`
 		}
-		derr := xml.NewDecoder(resp.Body).Decode(&feed)
+		// RSS in the wild is full of HTML entities (&mdash;) and sloppy
+		// markup that Go's strict XML parser rejects (July 31 run: 7 of the
+		// new feeds failed on entities alone). Lenient mode with the HTML
+		// entity table rescues those; feeds serving actual HTML pages still
+		// fail and need their URLs corrected instead.
+		dec := xml.NewDecoder(resp.Body)
+		dec.Strict = false
+		dec.Entity = xml.HTMLEntity
+		derr := dec.Decode(&feed)
 		resp.Body.Close()
 		if derr != nil {
 			fmt.Fprintln(os.Stderr, "intel ai_watch feed", f.vendor, "parse:", derr)
