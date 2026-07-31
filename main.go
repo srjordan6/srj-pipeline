@@ -1549,10 +1549,46 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 	} else {
 		fmt.Fprintln(os.Stderr, "intel ai_watch huggingface:", herr)
 	}
+	// Phase 1 of the watch-everything directive (Stephen, July 31 2026,
+	// changelog seq 138): every free source with a working RSS/Atom feed.
+	// Feedless sources (BAAI, CAC, IMDA, Naver, 36Kr, QbitAI, Shanghai AI
+	// Lab) are phase 2, scraper-based. Paid APIs (Dealroom, Tracxn) are
+	// excluded on Stephen's instruction. A dead feed logs and is skipped, so
+	// one source rotting never blocks the rest.
 	feeds := []struct{ vendor, url string }{
 		{"OpenAI", "https://openai.com/news/rss.xml"},
 		{"Google DeepMind", "https://deepmind.google/blog/rss.xml"},
 		{"Hugging Face", "https://huggingface.co/blog/feed.xml"},
+		// Research and labs
+		{"Mistral AI", "https://mistral.ai/feed.xml"},
+		{"Stability AI", "https://stability.ai/news?format=rss"},
+		{"AI21 Labs", "https://www.ai21.com/blog/rss.xml"},
+		{"Aleph Alpha", "https://aleph-alpha.com/feed/"},
+		{"The Alan Turing Institute", "https://www.turing.ac.uk/rss.xml"},
+		{"INRIA", "https://inria.fr/en/rss.xml"},
+		{"RIKEN AIP", "https://www.riken.jp/en/feed/"},
+		{"KAIST", "https://news.kaist.ac.kr/rss/newsrss.xml"},
+		{"MBZUAI", "https://mbzuai.ac.ae/feed/"},
+		{"AI Singapore", "https://aisingapore.org/feed/"},
+		// Policy, regulation, standards
+		{"European Commission AI", "https://digital-strategy.ec.europa.eu/en/rss.xml"},
+		{"UK DSIT", "https://www.gov.uk/government/organisations/department-for-science-innovation-and-technology.atom"},
+		{"UK AI Safety Institute", "https://www.aisi.gov.uk/rss.xml"},
+		{"OECD AI Policy Observatory", "https://oecd.ai/en/feed"},
+		{"UNESCO", "https://www.unesco.org/en/rss.xml"},
+		{"Canada ISED", "https://www.canada.ca/en/innovation-science-economic-development.atom.xml"},
+		{"CIFAR", "https://cifar.ca/feed/"},
+		// Media and industry
+		{"The Register", "https://www.theregister.com/software/ai_ml/headlines.atom"},
+		{"Rest of World", "https://restofworld.org/feed/latest/"},
+		{"Synced", "https://syncedreview.com/feed/"},
+		{"Sifted", "https://sifted.eu/feed"},
+		{"Tech in Asia", "https://www.techinasia.com/rss"},
+		{"KrASIA", "https://kr-asia.com/feed"},
+		{"The Yuan", "https://www.the-yuan.com/rss.xml"},
+		{"Computing UK", "https://www.computing.co.uk/feeds/rss"},
+		{"Heise", "https://www.heise.de/rss/heise-atom.xml"},
+		{"L'Usine Digitale", "https://www.usine-digitale.fr/rss"},
 	}
 	for _, f := range feeds {
 		req, _ := http.NewRequest("GET", f.url, nil)
@@ -1763,8 +1799,11 @@ func archiveNews(db *sql.DB) error {
 		if err := archivePut(endpoint, token, keyBase+".txt", "text/plain; charset=utf-8", []byte(text)); err != nil {
 			fmt.Fprintln(os.Stderr, "archive_news:", err)
 		}
+		// Postgres rejects invalid UTF-8 (seen live July 31: "invalid byte
+		// sequence 0xbb" from mis-declared article encodings), so sanitize
+		// before the write; the raw bytes are already preserved in R2.
 		if _, err := db.Exec(`UPDATE pipeline.documents SET r2_key=$1, fulltext=$2 WHERE id=$3`,
-			keyBase+".html", text, d.id); err != nil {
+			keyBase+".html", strings.ToValidUTF8(text, "\uFFFD"), d.id); err != nil {
 			fmt.Fprintln(os.Stderr, "archive_news db:", err)
 			continue
 		}
