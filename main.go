@@ -2167,8 +2167,40 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d ok=true\n",
-		len(index), total, glossary != "", len(cases))
+	// ---- Static pages (about, contact, privacy, terms, disclaimer, disclosure).
+	// Copy lives in site_content under twoai/static/*.json so nothing is typed
+	// into a template; this stage only renders it into the twoai-content repo.
+	sr, err := db.Query(`SELECT path, data::text FROM site_content
+		WHERE path LIKE 'twoai/static/%' ORDER BY path`)
+	if err != nil {
+		return err
+	}
+	statics := 0
+	for sr.Next() {
+		var sp, sd string
+		if err := sr.Scan(&sp, &sd); err != nil {
+			sr.Close()
+			return err
+		}
+		var doc map[string]any
+		if json.Unmarshal([]byte(sd), &doc) != nil {
+			continue
+		}
+		slug, _ := doc["slug"].(string)
+		if slug == "" {
+			slug = strings.TrimSuffix(sp[strings.LastIndex(sp, "/")+1:], ".json")
+		}
+		doc["generated"] = today
+		if err := upsert("static/"+slug+".json", "static", doc); err != nil {
+			sr.Close()
+			return err
+		}
+		statics++
+	}
+	sr.Close()
+
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics)
 	return nil
 }
 
