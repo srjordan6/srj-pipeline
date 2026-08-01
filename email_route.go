@@ -350,7 +350,11 @@ func emailRoute(db *sql.DB) error {
 		return fmt.Errorf("gmail auth (is gmail.modify granted in domain-wide delegation?): %w", err)
 	}
 
-	listRaw, err := erGmail(token, "GET", "/messages?q="+url.QueryEscape("is:unread in:inbox")+"&maxResults=25", nil)
+	// The coordinator's own escalation mail arrives in this same inbox, so
+	// without the exclusions each hourly run would re-triage and re-escalate
+	// its own output: a mail loop. Nothing the coordinator sends is ever its
+	// own input.
+	listRaw, err := erGmail(token, "GET", "/messages?q="+url.QueryEscape(`is:unread in:inbox -subject:"[Coordinator]" -from:`+erMailbox)+"&maxResults=25", nil)
 	if err != nil {
 		return err
 	}
