@@ -147,6 +147,14 @@ func main() {
 		return
 	}
 
+	if src == "email_route" {
+		if err := emailRoute(db); err != nil {
+			fmt.Fprintln(os.Stderr, "email_route:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "export_corpus" {
 		if err := exportCorpus(db); err != nil {
 			fmt.Fprintln(os.Stderr, "export_corpus:", err)
