@@ -30,7 +30,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "arxiv_watch", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "arxiv_watch", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -100,6 +100,14 @@ func main() {
 	if src == "arxiv_watch" {
 		if err := arxivWatch(db); err != nil {
 			fmt.Fprintln(os.Stderr, "arxiv_watch:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "sync_people" {
+		if err := syncPeople(db); err != nil {
+			fmt.Fprintln(os.Stderr, "sync_people:", err)
 			os.Exit(1)
 		}
 		return
@@ -1917,6 +1925,126 @@ func anthropicSummarize(headline, text string) (string, error) {
 	return s, nil
 }
 
+// ---- sync_people: AI Movers and Shakers, SQL -> srj-content ----------------
+//
+// site_people (slug, data jsonb) is the single source of truth for the people
+// directory, per the July 31 directive that ALL content lives in SQL and no
+// content files ever land on a local machine. This stage makes the repo a
+// generated artifact of the table:
+//
+//   1. Ensures the table exists.
+//   2. One-time backfill: any people/{slug}.json already in srj-content that
+//      has no SQL row is imported (ON CONFLICT DO NOTHING, so SQL always
+//      wins afterward). This absorbs the 37 pre-directive profiles without a
+//      manual load and is a no-op on every later run.
+//   3. Exports every SQL row to people/{slug}.json via the GitHub API,
+//      skipping files whose content is already identical, so quiet days
+//      produce zero commits.
+//
+// roster.json is not a person and is left alone in the repo.
+func syncPeople(db *sql.DB) error {
+	tok := os.Getenv("GITHUB_TOKEN")
+	if tok == "" {
+		return fmt.Errorf("GITHUB_TOKEN not set")
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS site_people (
+		slug text PRIMARY KEY, data jsonb NOT NULL,
+		updated_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+		return err
+	}
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	gh := func(method, url string, body []byte) (*http.Response, error) {
+		req, _ := http.NewRequest(method, url, bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "srj-pipeline/1.0")
+		return client.Do(req)
+	}
+
+	// 2. Backfill from the repo listing.
+	resp, err := gh("GET", "https://api.github.com/repos/srjordan6/srj-content/contents/people", nil)
+	if err != nil {
+		return err
+	}
+	var listing []struct {
+		Name        string `json:"name"`
+		DownloadURL string `json:"download_url"`
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode == 200 {
+		_ = json.Unmarshal(b, &listing)
+	}
+	imported := 0
+	for _, f := range listing {
+		if !strings.HasSuffix(f.Name, ".json") || f.Name == "roster.json" {
+			continue
+		}
+		slug := strings.TrimSuffix(f.Name, ".json")
+		var exists bool
+		if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM site_people WHERE slug=$1)`, slug).Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		fr, err := gh("GET", f.DownloadURL, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sync_people: fetch %s: %v\n", f.Name, err)
+			continue
+		}
+		fb, _ := io.ReadAll(fr.Body)
+		fr.Body.Close()
+		if fr.StatusCode != 200 || !json.Valid(fb) {
+			fmt.Fprintf(os.Stderr, "sync_people: skip %s: status %d or invalid JSON\n", f.Name, fr.StatusCode)
+			continue
+		}
+		if _, err := db.Exec(`INSERT INTO site_people (slug, data) VALUES ($1, $2::jsonb)
+			ON CONFLICT (slug) DO NOTHING`, slug, string(fb)); err != nil {
+			return err
+		}
+		imported++
+	}
+
+	// 3. Export SQL -> repo, skipping identical files.
+	rows, err := db.Query(`SELECT slug, jsonb_pretty(data) FROM site_people ORDER BY slug`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	exported, unchanged := 0, 0
+	for rows.Next() {
+		var slug, pretty string
+		if err := rows.Scan(&slug, &pretty); err != nil {
+			return err
+		}
+		payload := []byte(pretty + "\n")
+		path := "people/" + slug + ".json"
+		cur, err := gh("GET", "https://api.github.com/repos/srjordan6/srj-content/contents/"+path, nil)
+		if err == nil {
+			var meta struct {
+				Content string `json:"content"`
+			}
+			cb, _ := io.ReadAll(cur.Body)
+			cur.Body.Close()
+			if cur.StatusCode == 200 && json.Unmarshal(cb, &meta) == nil {
+				if dec, e := base64.StdEncoding.DecodeString(strings.ReplaceAll(meta.Content, "\n", "")); e == nil && bytes.Equal(dec, payload) {
+					unchanged++
+					continue
+				}
+			}
+		}
+		if err := putToContent(tok, path,
+			fmt.Sprintf("people: %s from site_people %s", slug, time.Now().UTC().Format("2006-01-02")), payload); err != nil {
+			return err
+		}
+		exported++
+	}
+	fmt.Printf("sync_people: imported=%d exported=%d unchanged=%d ok=true\n", imported, exported, unchanged)
+	return nil
+}
+
 // ---- deploy_site: rebuild the website so today's data actually ships -------
 //
 // The publish stages write JSON to srj-content, but the website only rebuilds
@@ -1929,9 +2057,28 @@ func anthropicSummarize(headline, text string) (string, error) {
 // A failure here is reported but should never be read as "the data is wrong":
 // the data is published either way, it is the rebuild that did not happen.
 func deploySite() error {
+	// Preferred path: POST the Cloudflare deploy hook directly. Set
+	// CLOUDFLARE_DEPLOY_HOOK on the Render service (same URL srj-site keeps
+	// as a GitHub secret); it needs no GitHub permissions at all.
+	if hook := strings.TrimSpace(os.Getenv("CLOUDFLARE_DEPLOY_HOOK")); hook != "" {
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err := client.Post(hook, "application/json", nil)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		rb, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return fmt.Errorf("deploy hook returned %d: %s", resp.StatusCode, strings.TrimSpace(string(rb)))
+		}
+		return nil
+	}
+	// Fallback: dispatch srj-site's deploy workflow. Requires the PAT to
+	// carry workflow scope; a 403 here means add that scope or set the
+	// CLOUDFLARE_DEPLOY_HOOK env var above.
 	tok := os.Getenv("GITHUB_TOKEN")
 	if tok == "" {
-		return fmt.Errorf("GITHUB_TOKEN not set")
+		return fmt.Errorf("GITHUB_TOKEN not set and CLOUDFLARE_DEPLOY_HOOK not set")
 	}
 	const api = "https://api.github.com/repos/srjordan6/srj-site/actions/workflows/deploy.yml/dispatches"
 	body := []byte(`{"ref":"main"}`)
