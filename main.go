@@ -31,7 +31,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "arxiv_watch", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "twoai_build", "twoai_publish", "arxiv_watch", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -117,6 +117,22 @@ func main() {
 	if src == "sync_content" {
 		if err := syncContent(db); err != nil {
 			fmt.Fprintln(os.Stderr, "sync_content:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_build" {
+		if err := twoaiBuild(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_build:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_publish" {
+		if err := twoaiPublish(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_publish:", err)
 			os.Exit(1)
 		}
 		return
@@ -1977,6 +1993,266 @@ func anthropicSummarize(headline, text string) (string, error) {
 	return s, nil
 }
 
+// ---- twoai: theworldofai.org, SQL -> twoai-content ------------------------
+//
+// The consumer property renders the same database. twoai_pages is a render
+// cache: path is the exact repo path inside twoai-content, data is everything
+// the Astro template needs. Dropping the table and re-running the pipeline
+// must always reproduce it. twoaiBuild fills it from existing tables (bills,
+// glossary, lawsuits); twoaiPublish exports rows whose git blob sha differs,
+// so a quiet day is one tree call and zero commits, same as sync_content.
+var twoaiStates = map[string]string{
+	"AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California",
+	"CO": "Colorado", "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia",
+	"HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa",
+	"KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+	"MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri",
+	"MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+	"NM": "New Mexico", "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio",
+	"OK": "Oklahoma", "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+	"SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont",
+	"VA": "Virginia", "WA": "Washington", "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
+	"DC": "District of Columbia", "PR": "Puerto Rico", "US": "United States Congress",
+}
+
+func twoaiSlug(name string) string {
+	s := strings.ToLower(name)
+	s = strings.ReplaceAll(s, " ", "-")
+	return s
+}
+
+func twoaiBuild(db *sql.DB) error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_pages (
+		path text PRIMARY KEY, kind text NOT NULL, data jsonb NOT NULL,
+		updated_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+		return err
+	}
+	today := time.Now().UTC().Format("2006-01-02")
+
+	// ---- F1: AI laws by state, from the LegiScan corpus. One row per bill
+	// (latest change wins), grouped by the "ST NUM: Title" prefix.
+	rows, err := db.Query(`SELECT DISTINCT ON (external_id) external_id, title, url,
+			COALESCE(to_char(published_at,'YYYY-MM-DD'),'') 
+		FROM pipeline.documents WHERE source_id = 2
+		ORDER BY external_id, id DESC`)
+	if err != nil {
+		return err
+	}
+	type bill struct {
+		Number string `json:"number"`
+		Title  string `json:"title"`
+		URL    string `json:"url"`
+		Date   string `json:"date"`
+	}
+	byState := map[string][]bill{}
+	for rows.Next() {
+		var ext, title, url, date string
+		if err := rows.Scan(&ext, &title, &url, &date); err != nil {
+			rows.Close()
+			return err
+		}
+		parts := strings.SplitN(title, ":", 2)
+		head := strings.Fields(parts[0])
+		if len(head) < 2 {
+			continue
+		}
+		code := strings.ToUpper(head[0])
+		if _, ok := twoaiStates[code]; !ok {
+			continue
+		}
+		b := bill{Number: strings.Join(head[1:], " "), URL: url, Date: date}
+		if len(parts) == 2 {
+			b.Title = strings.TrimSpace(parts[1])
+		}
+		byState[code] = append(byState[code], b)
+	}
+	rows.Close()
+
+	type stateIdx struct {
+		Code  string `json:"code"`
+		Name  string `json:"name"`
+		Slug  string `json:"slug"`
+		Count int    `json:"count"`
+	}
+	var index []stateIdx
+	total := 0
+	upsert := func(path, kind string, v any) error {
+		j, _ := json.Marshal(v)
+		_, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data) VALUES ($1,$2,$3::jsonb)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data, updated_at=now()`,
+			path, kind, string(j))
+		return err
+	}
+	for code, name := range twoaiStates {
+		bills := byState[code]
+		if bills == nil {
+			bills = []bill{}
+		}
+		sort.Slice(bills, func(i, j int) bool { return bills[i].Date > bills[j].Date })
+		total += len(bills)
+		slug := twoaiSlug(name)
+		index = append(index, stateIdx{code, name, slug, len(bills)})
+		if err := upsert("laws/"+slug+".json", "state-law", map[string]any{
+			"code": code, "name": name, "slug": slug, "count": len(bills),
+			"bills": bills, "generated": today,
+		}); err != nil {
+			return err
+		}
+	}
+	sort.Slice(index, func(i, j int) bool { return index[i].Name < index[j].Name })
+	if err := upsert("laws/index.json", "hub", map[string]any{
+		"states": index, "total": total, "generated": today,
+	}); err != nil {
+		return err
+	}
+
+	// ---- F2: glossary, straight from the library already in site_content.
+	var glossary string
+	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='resources/glossary.json'`).Scan(&glossary); err == nil && glossary != "" {
+		var g map[string]any
+		if json.Unmarshal([]byte(glossary), &g) == nil {
+			g["generated"] = today
+			if err := upsert("glossary/glossary.json", "glossary", g); err != nil {
+				return err
+			}
+		}
+	}
+
+	// ---- F3: living lawsuit tracker from ai_lawsuits.
+	lr, err := db.Query(`SELECT COALESCE(slug,''), case_name, court, COALESCE(docket,''),
+			COALESCE(to_char(filed_date,'YYYY-MM-DD'),''), plaintiffs, defendants, category,
+			status, COALESCE(status_badge,''), COALESCE(latest_development,''),
+			COALESCE(to_char(latest_development_date,'YYYY-MM-DD'),''),
+			COALESCE(executive_summary,''), COALESCE(why_it_matters,''), COALESCE(summary,''),
+			COALESCE(claims,'[]'::jsonb)::text, COALESCE(timeline,'[]'::jsonb)::text,
+			COALESCE(courtlistener_url,''), COALESCE(source_url,''), COALESCE(judge,'')
+		FROM ai_lawsuits WHERE is_active IS NOT FALSE AND slug IS NOT NULL
+		ORDER BY display_order, case_name`)
+	if err != nil {
+		return err
+	}
+	var cases []map[string]any
+	for lr.Next() {
+		var slug, name, court, docket, filed, pl, de, cat, status, badge, dev, devDate,
+			exec, why, sum, claims, timeline, clURL, srcURL, judge string
+		if err := lr.Scan(&slug, &name, &court, &docket, &filed, &pl, &de, &cat, &status, &badge,
+			&dev, &devDate, &exec, &why, &sum, &claims, &timeline, &clURL, &srcURL, &judge); err != nil {
+			lr.Close()
+			return err
+		}
+		var cj, tj any
+		json.Unmarshal([]byte(claims), &cj)
+		json.Unmarshal([]byte(timeline), &tj)
+		cases = append(cases, map[string]any{
+			"slug": slug, "case_name": name, "court": court, "docket": docket,
+			"filed_date": filed, "plaintiffs": pl, "defendants": de, "category": cat,
+			"status": status, "status_badge": badge, "latest_development": dev,
+			"latest_development_date": devDate, "executive_summary": exec,
+			"why_it_matters": why, "summary": sum, "claims": cj, "timeline": tj,
+			"courtlistener_url": clURL, "source_url": srcURL, "judge": judge,
+		})
+	}
+	lr.Close()
+	if err := upsert("lawsuits/lawsuits.json", "lawsuits", map[string]any{
+		"cases": cases, "count": len(cases), "generated": today,
+	}); err != nil {
+		return err
+	}
+
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d ok=true\n",
+		len(index), total, glossary != "", len(cases))
+	return nil
+}
+
+// twoaiPublish exports twoai_pages to the twoai-content repo, sha-compared
+// against the tree so unchanged rows cost nothing. Export-only: SQL is the
+// origin here, there is nothing to backfill.
+func twoaiPublish(db *sql.DB) error {
+	tok := os.Getenv("GITHUB_TOKEN")
+	if tok == "" {
+		return fmt.Errorf("GITHUB_TOKEN not set")
+	}
+	client := &http.Client{Timeout: 120 * time.Second}
+	get := func(url string) ([]byte, int, error) {
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "srj-pipeline/1.0")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return b, resp.StatusCode, nil
+	}
+	blobSha := func(b []byte) string {
+		h := sha1.New()
+		fmt.Fprintf(h, "blob %d", len(b))
+		h.Write([]byte{0})
+		h.Write(b)
+		return hex.EncodeToString(h.Sum(nil))
+	}
+	repoSha := map[string]string{}
+	if tb, code, err := get("https://api.github.com/repos/srjordan6/twoai-content/git/trees/main?recursive=1"); err == nil && code == 200 {
+		var tree struct {
+			Tree []struct {
+				Path string `json:"path"`
+				Type string `json:"type"`
+				Sha  string `json:"sha"`
+			} `json:"tree"`
+		}
+		if json.Unmarshal(tb, &tree) == nil {
+			for _, e := range tree.Tree {
+				if e.Type == "blob" {
+					repoSha[e.Path] = e.Sha
+				}
+			}
+		}
+	}
+	rows, err := db.Query(`SELECT path, jsonb_pretty(data) FROM twoai_pages ORDER BY path`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	exported, unchanged := 0, 0
+	for rows.Next() {
+		var path, pretty string
+		if err := rows.Scan(&path, &pretty); err != nil {
+			return err
+		}
+		payload := []byte(pretty + "\n")
+		if repoSha[path] == blobSha(payload) {
+			unchanged++
+			continue
+		}
+		put := map[string]any{
+			"message": fmt.Sprintf("twoai: %s from twoai_pages %s", path, time.Now().UTC().Format("2006-01-02")),
+			"content": base64.StdEncoding.EncodeToString(payload),
+		}
+		if sha := repoSha[path]; sha != "" {
+			put["sha"] = sha
+		}
+		pb, _ := json.Marshal(put)
+		req, _ := http.NewRequest("PUT", "https://api.github.com/repos/srjordan6/twoai-content/contents/"+path, bytes.NewReader(pb))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "srj-pipeline/1.0")
+		pr, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		prb, _ := io.ReadAll(pr.Body)
+		pr.Body.Close()
+		if pr.StatusCode != 200 && pr.StatusCode != 201 {
+			return fmt.Errorf("github PUT %s %d: %.200s", path, pr.StatusCode, prb)
+		}
+		exported++
+	}
+	fmt.Printf("twoai_publish: exported=%d unchanged=%d ok=true\n", exported, unchanged)
+	return nil
+}
+
 // ---- sync_content: every remaining content file, SQL -> srj-content --------
 //
 // Completes the July 31 directive for the whole repo: governance, resources,
@@ -2288,6 +2564,19 @@ func deploySite() error {
 		rb, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode < 200 || resp.StatusCode > 299 {
 			return fmt.Errorf("deploy hook returned %d: %s", resp.StatusCode, strings.TrimSpace(string(rb)))
+		}
+		// theworldofai.org rebuilds on the same trigger when its hook is set.
+		if th := strings.TrimSpace(os.Getenv("TWOAI_DEPLOY_HOOK")); th != "" {
+			tr, terr := client.Post(th, "application/json", nil)
+			if terr != nil {
+				fmt.Fprintln(os.Stderr, "twoai deploy hook:", terr)
+			} else {
+				trb, _ := io.ReadAll(tr.Body)
+				tr.Body.Close()
+				if tr.StatusCode < 200 || tr.StatusCode > 299 {
+					fmt.Fprintf(os.Stderr, "twoai deploy hook returned %d: %s\n", tr.StatusCode, strings.TrimSpace(string(trb)))
+				}
+			}
 		}
 		return nil
 	}
