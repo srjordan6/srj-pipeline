@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"crypto/sha1"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
@@ -30,7 +31,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "arxiv_watch", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "arxiv_watch", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -108,6 +109,14 @@ func main() {
 	if src == "sync_people" {
 		if err := syncPeople(db); err != nil {
 			fmt.Fprintln(os.Stderr, "sync_people:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "sync_content" {
+		if err := syncContent(db); err != nil {
+			fmt.Fprintln(os.Stderr, "sync_content:", err)
 			os.Exit(1)
 		}
 		return
@@ -1923,6 +1932,172 @@ func anthropicSummarize(headline, text string) (string, error) {
 		return "", fmt.Errorf("empty summary")
 	}
 	return s, nil
+}
+
+// ---- sync_content: every remaining content file, SQL -> srj-content --------
+//
+// Completes the July 31 directive for the whole repo: governance, resources,
+// migrated pages, books, and roster all live in site_content (path, data
+// jsonb) in srj-audit-db, and the repo is a generated artifact. Out of scope:
+// .github (CI code, not content), people/{slug}.json (owned by site_people),
+// and the five files the publish stages regenerate daily from their own SQL
+// tables (news, legislation, leaderboard, lawsuits, intel).
+//
+// The tree API supplies every path with its git blob sha, so the export
+// compares shas instead of downloading content; a quiet day costs one tree
+// call and zero commits. The backfill imports any in-scope repo file that has
+// no SQL row yet (ON CONFLICT DO NOTHING), which absorbs the pre-directive
+// library once and is a no-op forever after; SQL wins from then on.
+func syncContent(db *sql.DB) error {
+	tok := os.Getenv("GITHUB_TOKEN")
+	if tok == "" {
+		return fmt.Errorf("GITHUB_TOKEN not set")
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS site_content (
+		path text PRIMARY KEY, data jsonb NOT NULL,
+		updated_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+		return err
+	}
+
+	outOfScope := func(p string) bool {
+		if !strings.HasSuffix(p, ".json") || strings.HasPrefix(p, ".github/") {
+			return true
+		}
+		if strings.HasPrefix(p, "people/") && p != "people/roster.json" {
+			return true
+		}
+		switch p {
+		case "news/news.json", "legislation/legislation.json", "leaderboard/leaderboard.json",
+			"lawsuits/lawsuits.json", "intel/intel.json":
+			return true
+		}
+		return false
+	}
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	get := func(url string) ([]byte, int, error) {
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "srj-pipeline/1.0")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return b, resp.StatusCode, nil
+	}
+	blobSha := func(b []byte) string {
+		h := sha1.New()
+		fmt.Fprintf(h, "blob %d", len(b))
+		h.Write([]byte{0})
+		h.Write(b)
+		return hex.EncodeToString(h.Sum(nil))
+	}
+
+	tb, code, err := get("https://api.github.com/repos/srjordan6/srj-content/git/trees/main?recursive=1")
+	if err != nil {
+		return err
+	}
+	if code != 200 {
+		return fmt.Errorf("trees API returned %d", code)
+	}
+	var tree struct {
+		Tree []struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+			Sha  string `json:"sha"`
+			URL  string `json:"url"`
+		} `json:"tree"`
+	}
+	if err := json.Unmarshal(tb, &tree); err != nil {
+		return err
+	}
+	repoSha := map[string]string{}
+
+	imported := 0
+	for _, e := range tree.Tree {
+		if e.Type != "blob" || outOfScope(e.Path) {
+			continue
+		}
+		repoSha[e.Path] = e.Sha
+		var exists bool
+		if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM site_content WHERE path=$1)`, e.Path).Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		// Blob API handles any size (the contents API caps at 1MB, and
+		// migrated-pages.json is 1.7MB).
+		bb, bc, err := get(e.URL)
+		if err != nil || bc != 200 {
+			fmt.Fprintf(os.Stderr, "sync_content: blob %s: status %d err %v\n", e.Path, bc, err)
+			continue
+		}
+		var blob struct {
+			Content string `json:"content"`
+		}
+		if json.Unmarshal(bb, &blob) != nil {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(blob.Content, "\n", ""))
+		if err != nil || !json.Valid(raw) {
+			fmt.Fprintf(os.Stderr, "sync_content: skip %s: not valid JSON\n", e.Path)
+			continue
+		}
+		if _, err := db.Exec(`INSERT INTO site_content (path, data) VALUES ($1, $2::jsonb)
+			ON CONFLICT (path) DO NOTHING`, e.Path, string(raw)); err != nil {
+			return err
+		}
+		imported++
+	}
+
+	rows, err := db.Query(`SELECT path, jsonb_pretty(data) FROM site_content ORDER BY path`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	exported, unchanged := 0, 0
+	for rows.Next() {
+		var path, pretty string
+		if err := rows.Scan(&path, &pretty); err != nil {
+			return err
+		}
+		payload := []byte(pretty + "\n")
+		if repoSha[path] == blobSha(payload) {
+			unchanged++
+			continue
+		}
+		// PUT directly with the sha from the tree: the contents GET inside
+		// putToContent 403s on files over 1MB (migrated-pages.json is 1.7MB),
+		// which would strip the sha and turn the update into a 422.
+		put := map[string]any{
+			"message": fmt.Sprintf("content: %s from site_content %s", path, time.Now().UTC().Format("2006-01-02")),
+			"content": base64.StdEncoding.EncodeToString(payload),
+		}
+		if sha := repoSha[path]; sha != "" {
+			put["sha"] = sha
+		}
+		pb, _ := json.Marshal(put)
+		req, _ := http.NewRequest("PUT", "https://api.github.com/repos/srjordan6/srj-content/contents/"+path, bytes.NewReader(pb))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "srj-pipeline/1.0")
+		pr, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		prb, _ := io.ReadAll(pr.Body)
+		pr.Body.Close()
+		if pr.StatusCode != 200 && pr.StatusCode != 201 {
+			return fmt.Errorf("github PUT %s %d: %.200s", path, pr.StatusCode, prb)
+		}
+		exported++
+	}
+	fmt.Printf("sync_content: imported=%d exported=%d unchanged=%d ok=true\n", imported, exported, unchanged)
+	return nil
 }
 
 // ---- sync_people: AI Movers and Shakers, SQL -> srj-content ----------------
