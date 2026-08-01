@@ -30,7 +30,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "arxiv_watch", "export_corpus"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "arxiv_watch", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -102,6 +102,15 @@ func main() {
 			fmt.Fprintln(os.Stderr, "arxiv_watch:", err)
 			os.Exit(1)
 		}
+		return
+	}
+
+	if src == "deploy_site" {
+		if err := deploySite(); err != nil {
+			fmt.Fprintln(os.Stderr, "deploy_site:", err)
+			os.Exit(1)
+		}
+		fmt.Println("deploy_site: ok")
 		return
 	}
 
@@ -1906,6 +1915,46 @@ func anthropicSummarize(headline, text string) (string, error) {
 		return "", fmt.Errorf("empty summary")
 	}
 	return s, nil
+}
+
+// ---- deploy_site: rebuild the website so today's data actually ships -------
+//
+// The publish stages write JSON to srj-content, but the website only rebuilds
+// when srj-site itself is pushed, so without this stage a day's lawsuits,
+// vendor news, and roundup sit in the content repo and never reach a visitor.
+// This fires srj-site's existing "Trigger Cloudflare build" workflow through
+// the GitHub API, using the token the pipeline already carries. No new secret,
+// and the workflow already supports workflow_dispatch.
+//
+// A failure here is reported but should never be read as "the data is wrong":
+// the data is published either way, it is the rebuild that did not happen.
+func deploySite() error {
+	tok := os.Getenv("GITHUB_TOKEN")
+	if tok == "" {
+		return fmt.Errorf("GITHUB_TOKEN not set")
+	}
+	const api = "https://api.github.com/repos/srjordan6/srj-site/actions/workflows/deploy.yml/dispatches"
+	body := []byte(`{"ref":"main"}`)
+	req, err := http.NewRequest("POST", api, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "srj-pipeline/1.0")
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	// 204 No Content is the documented success for a workflow dispatch.
+	if resp.StatusCode != 204 && resp.StatusCode != 201 && resp.StatusCode != 200 {
+		return fmt.Errorf("workflow dispatch returned %d: %s", resp.StatusCode, strings.TrimSpace(string(rb)))
+	}
+	return nil
 }
 
 // ---- publish_lawsuits: AI Lawsuit Database -> srj-content ------------------
