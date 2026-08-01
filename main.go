@@ -281,17 +281,24 @@ func insertDoc(db *sql.DB, sourceID int, extID, hash, url, title string, pub any
 	return n > 0, nil
 }
 
-// legiscan pulls state AI bills. LegiScan supplies its own change_hash per
-// bill, which slots directly into the dedupe key. Per the API registration:
-// texts only, all states, one daily batch. Key from LEGISCAN_API_KEY.
+// legiscan pulls state AI bills, completely. getSearchRaw returns the FULL
+// result set for the query (up to 2,000 ids per page with LegiScan's own
+// change_hash), where the old getSearch capped at the top ~100 by relevance
+// and a brand-new bill could in theory sit below the fold for days. Only ids
+// that are new or changed get hydrated through getBill, so a quiet day costs
+// one search call; the hydration budget caps a heavy first pass and carries
+// the remainder to the next run. Relevance below 50 is a passing mention,
+// not an AI bill. Key from LEGISCAN_API_KEY.
 func legiscan(db *sql.DB, sourceID int) (fetched, added int, err error) {
 	key := os.Getenv("LEGISCAN_API_KEY")
 	if key == "" {
 		return 0, 0, fmt.Errorf("LEGISCAN_API_KEY not set")
 	}
 	client := &http.Client{Timeout: 60 * time.Second}
-	for page := 1; page <= 2; page++ {
-		url := fmt.Sprintf("https://api.legiscan.com/?key=%s&op=getSearch&state=ALL&query=%s&page=%d",
+	const hydrateBudget = 300
+	hydrated := 0
+	for page := 1; page <= 3; page++ {
+		url := fmt.Sprintf("https://api.legiscan.com/?key=%s&op=getSearchRaw&state=ALL&query=%s&page=%d",
 			key, "%22artificial+intelligence%22", page)
 		resp, e := client.Get(url)
 		if e != nil {
@@ -303,8 +310,17 @@ func legiscan(db *sql.DB, sourceID int) (fetched, added int, err error) {
 			return fetched, added, e
 		}
 		var payload struct {
-			Status       string                     `json:"status"`
-			SearchResult map[string]json.RawMessage `json:"searchresult"`
+			Status       string `json:"status"`
+			SearchResult struct {
+				Summary struct {
+					PageTotal int `json:"page_total"`
+				} `json:"summary"`
+				Results []struct {
+					Relevance  int    `json:"relevance"`
+					BillID     int    `json:"bill_id"`
+					ChangeHash string `json:"change_hash"`
+				} `json:"results"`
+			} `json:"searchresult"`
 		}
 		if e := json.Unmarshal(body, &payload); e != nil {
 			return fetched, added, e
@@ -312,40 +328,67 @@ func legiscan(db *sql.DB, sourceID int) (fetched, added int, err error) {
 		if payload.Status != "OK" {
 			return fetched, added, fmt.Errorf("legiscan status %s", payload.Status)
 		}
-		got := 0
-		for k, v := range payload.SearchResult {
-			if k == "summary" {
-				continue
-			}
-			var b struct {
-				BillID     int    `json:"bill_id"`
-				ChangeHash string `json:"change_hash"`
-				URL        string `json:"url"`
-				State      string `json:"state"`
-				BillNumber string `json:"bill_number"`
-				Title      string `json:"title"`
-				LastAction string `json:"last_action_date"`
-			}
-			if json.Unmarshal(v, &b) != nil || b.BillID == 0 {
+		for _, r := range payload.SearchResult.Results {
+			if r.BillID == 0 || r.Relevance < 50 {
 				continue
 			}
 			fetched++
-			got++
-			var pub any
-			if b.LastAction != "" {
-				pub = b.LastAction
+			extID := fmt.Sprintf("%d", r.BillID)
+			var exists bool
+			if e := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pipeline.documents
+				WHERE source_id=$1 AND external_id=$2 AND change_hash=$3)`,
+				sourceID, extID, r.ChangeHash).Scan(&exists); e != nil {
+				return fetched, added, e
 			}
-			ok, e := insertDoc(db, sourceID, fmt.Sprintf("%d", b.BillID), b.ChangeHash,
-				b.URL, b.State+" "+b.BillNumber+": "+b.Title, pub, v)
+			if exists {
+				continue
+			}
+			if hydrated >= hydrateBudget {
+				continue // picked up on the next run
+			}
+			bu := fmt.Sprintf("https://api.legiscan.com/?key=%s&op=getBill&id=%d", key, r.BillID)
+			br, e := client.Get(bu)
+			if e != nil {
+				fmt.Fprintln(os.Stderr, "legiscan getBill", r.BillID, ":", e)
+				continue
+			}
+			bb, e := io.ReadAll(br.Body)
+			br.Body.Close()
+			if e != nil {
+				continue
+			}
+			var bp struct {
+				Status string `json:"status"`
+				Bill   struct {
+					BillID     int    `json:"bill_id"`
+					State      string `json:"state"`
+					BillNumber string `json:"bill_number"`
+					Title      string `json:"title"`
+					URL        string `json:"url"`
+					StatusDate string `json:"status_date"`
+				} `json:"bill"`
+			}
+			if json.Unmarshal(bb, &bp) != nil || bp.Status != "OK" || bp.Bill.BillID == 0 {
+				fmt.Fprintln(os.Stderr, "legiscan getBill", r.BillID, ": bad payload")
+				continue
+			}
+			hydrated++
+			var pub any
+			if bp.Bill.StatusDate != "" {
+				pub = bp.Bill.StatusDate
+			}
+			ok, e := insertDoc(db, sourceID, extID, r.ChangeHash, bp.Bill.URL,
+				bp.Bill.State+" "+bp.Bill.BillNumber+": "+bp.Bill.Title, pub, bb)
 			if e != nil {
 				return fetched, added, e
 			}
 			if ok {
 				added++
 			}
+			time.Sleep(500 * time.Millisecond)
 		}
-		if got < 50 {
-			break // last page
+		if page >= payload.SearchResult.Summary.PageTotal {
+			break
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -2396,10 +2439,23 @@ func arxivWatch(db *sql.DB) error {
 	for _, cat := range []string{"cs.AI", "cs.CL", "cs.LG"} {
 		u := "https://export.arxiv.org/api/query?search_query=cat:" + cat +
 			"&sortBy=submittedDate&sortOrder=descending&max_results=40"
-		req, _ := http.NewRequest("GET", u, nil)
-		req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
-		client := &http.Client{Timeout: 30 * time.Second}
-		resp, err := client.Do(req)
+		// arXiv's API is occasionally slow to first byte (Aug 1: cs.AI timed
+		// out at 30s and the whole category skipped for the day). One retry
+		// with a longer timeout keeps a slow response from costing a category.
+		fetch := func(timeout time.Duration) (*http.Response, error) {
+			req, _ := http.NewRequest("GET", u, nil)
+			req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
+			client := &http.Client{Timeout: timeout}
+			return client.Do(req)
+		}
+		resp, err := fetch(30 * time.Second)
+		if err != nil || resp.StatusCode != 200 {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			time.Sleep(5 * time.Second)
+			resp, err = fetch(90 * time.Second)
+		}
 		if err != nil || resp.StatusCode != 200 {
 			if resp != nil {
 				resp.Body.Close()
