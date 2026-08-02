@@ -1805,12 +1805,24 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 		}
 	}
 
+	// Discovery makes 25 API calls across the two passes. When CourtListener
+	// throttles, each one costs about ninety seconds of backoff, which is over
+	// half an hour of a run spent achieving nothing. Stop at the first sign of
+	// it: discovery is a daily sweep, and missing one day costs a candidate
+	// being queued tomorrow instead of today.
+	throttled := false
 	for _, q := range subjects {
+		if throttled {
+			break
+		}
 		var res clSearch
 		if e := clGet("/search/", map[string]string{
 			"type": "r", "q": q, "filed_after": since, "order_by": "dateFiled desc",
 		}, &res); e != nil {
 			fmt.Fprintln(os.Stderr, "intel discover subject:", e)
+			if strings.Contains(e.Error(), "rate limited") {
+				throttled = true
+			}
 			continue
 		}
 		for i, h := range res.Results {
@@ -1828,12 +1840,18 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 	// evidence.
 	dsince := time.Now().AddDate(0, 0, -365).Format("2006-01-02")
 	for _, d := range defendants {
+		if throttled {
+			break
+		}
 		var res clSearch
 		if e := clGet("/search/", map[string]string{
 			"type": "r", "q": fmt.Sprintf(`caseName:("%s")`, d),
 			"filed_after": dsince, "order_by": "dateFiled desc",
 		}, &res); e != nil {
 			fmt.Fprintln(os.Stderr, "intel discover defendant", d, ":", e)
+			if strings.Contains(e.Error(), "rate limited") {
+				throttled = true
+			}
 			continue
 		}
 		for i, h := range res.Results {
@@ -1845,6 +1863,9 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 		time.Sleep(2 * time.Second)
 	}
 
+	if throttled {
+		fmt.Println("intel discover: rate limited, discovery cut short this run")
+	}
 	promoted, perr := intelPromote(db)
 	if perr != nil {
 		return added, perr
