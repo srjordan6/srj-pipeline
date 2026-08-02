@@ -3120,12 +3120,13 @@ func twoaiCompliance(db *sql.DB, today string, upsert func(path, kind string, v 
 // to a domain is the number of pages actually published under it.
 func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
 	type domain struct {
-		Slug   string `json:"slug"`
-		Name   string `json:"name"`
-		Blurb  string `json:"blurb"`
-		Status string `json:"status"`
-		Path   string `json:"path,omitempty"`
-		Pages  int    `json:"pages"`
+		Slug     string   `json:"slug"`
+		Name     string   `json:"name"`
+		Blurb    string   `json:"blurb"`
+		Status   string   `json:"status"`
+		Path     string   `json:"path,omitempty"`
+		Pages    int      `json:"pages"`
+		Sections []domain `json:"sections,omitempty"`
 	}
 	type category struct {
 		Slug    string   `json:"slug"`
@@ -3136,18 +3137,23 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 		Pages   int      `json:"pages"`
 	}
 
+	// Levels 1 to 3: category, domain, section. Sections are what a reader
+	// actually visits, so a domain with sections reports their combined page
+	// count and counts as live when any section is.
 	rows, err := db.Query(`SELECT t.slug, t.name, COALESCE(t.blurb,''), t.status,
 			COALESCE(t.live_path,''), COALESCE(t.parent_slug,''), t.level,
 			(SELECT count(*) FROM twoai_pages p WHERE p.taxonomy_slug = t.slug)
-		FROM twoai_taxonomy t WHERE t.level IN (1,2) ORDER BY t.level, t.sort`)
+		FROM twoai_taxonomy t WHERE t.level IN (1,2,3) ORDER BY t.level, t.sort`)
 	if err != nil {
 		return 0, err
 	}
 	var cats []*category
 	byslug := map[string]*category{}
+	doms := map[string]*domain{}
 	type pending struct {
 		parent string
 		d      domain
+		level  int
 	}
 	var later []pending
 	for rows.Next() {
@@ -3162,18 +3168,41 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 			byslug[slug] = c
 			continue
 		}
-		later = append(later, pending{parent, domain{slug, name, blurb, status, path, pages}})
+		later = append(later, pending{parent, domain{Slug: slug, Name: name, Blurb: blurb,
+			Status: status, Path: path, Pages: pages}, level})
 	}
 	rows.Close()
+	// Domains first, then sections, so a section always finds its parent.
 	for _, p := range later {
+		if p.level != 2 {
+			continue
+		}
 		c := byslug[p.parent]
 		if c == nil {
 			continue
 		}
-		c.Domains = append(c.Domains, p.d)
-		c.Pages += p.d.Pages
-		if p.d.Status == "live" {
-			c.Live++
+		d := p.d
+		c.Domains = append(c.Domains, d)
+		doms[d.Slug] = &c.Domains[len(c.Domains)-1]
+	}
+	for _, p := range later {
+		if p.level != 3 {
+			continue
+		}
+		if d := doms[p.parent]; d != nil {
+			d.Sections = append(d.Sections, p.d)
+			d.Pages += p.d.Pages
+			if p.d.Status == "live" && d.Status != "live" {
+				d.Status = "live"
+			}
+		}
+	}
+	for _, c := range cats {
+		for _, d := range c.Domains {
+			c.Pages += d.Pages
+			if d.Status == "live" {
+				c.Live++
+			}
 		}
 	}
 	if len(cats) == 0 {
