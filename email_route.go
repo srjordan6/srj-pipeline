@@ -438,6 +438,10 @@ func emailRoute(db *sql.DB) error {
 	}
 	fmt.Printf("email_route: routed=%d noise=%d escalated=%d failed=%d of %d unread\n",
 		routed, noise, escalated, failed, len(list.Messages))
+
+	if err := bridgeWatch(db, token); err != nil {
+		fmt.Fprintln(os.Stderr, "bridge_watch:", err)
+	}
 	return nil
 }
 
@@ -448,4 +452,85 @@ func pqArray(ss []string) string {
 		return "{}"
 	}
 	return "{" + strings.Join(ss, ",") + "}"
+}
+
+// ---- bridge watch -------------------------------------------------------
+//
+// Stephen's directive (Aug 1 2026): every project checked every hour whether
+// anyone is using it or not. Claude projects cannot wake themselves, so the
+// hourly check is centralized here: this cron scans every project mailbox and
+// emails Stephen whenever open work is waiting. The email repeats only when
+// the picture changes (new arrivals or acks) or once a day as a re-reminder,
+// so a quiet backlog does not become hourly spam.
+
+func bridgeWatch(db *sql.DB, token string) error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS bridge_watch_state (
+		id int PRIMARY KEY DEFAULT 1, open_ids text NOT NULL DEFAULT '',
+		last_notified timestamptz)`); err != nil {
+		return err
+	}
+	rows, err := db.Query(`SELECT id, to_project, from_project, topic,
+		round(extract(epoch FROM now()-created_at)/3600) AS age_h
+		FROM project_bridge WHERE status='open' ORDER BY to_project, id`)
+	if err != nil {
+		return err
+	}
+	type item struct {
+		id          int
+		from, topic string
+		ageH        int
+	}
+	byProject := map[string][]item{}
+	ids := []string{}
+	for rows.Next() {
+		var it item
+		var proj string
+		if rows.Scan(&it.id, &proj, &it.from, &it.topic, &it.ageH) == nil {
+			byProject[proj] = append(byProject[proj], it)
+			ids = append(ids, fmt.Sprint(it.id))
+		}
+	}
+	rows.Close()
+	fingerprint := strings.Join(ids, ",")
+
+	var prev string
+	var lastNotified sql.NullTime
+	db.QueryRow(`SELECT open_ids, last_notified FROM bridge_watch_state WHERE id=1`).Scan(&prev, &lastNotified)
+
+	if len(ids) == 0 {
+		if prev != "" {
+			db.Exec(`INSERT INTO bridge_watch_state (id, open_ids, last_notified) VALUES (1,'',NULL)
+				ON CONFLICT (id) DO UPDATE SET open_ids='', last_notified=NULL`)
+		}
+		fmt.Println("bridge_watch: all mailboxes clear")
+		return nil
+	}
+
+	changed := fingerprint != prev
+	staleReminder := lastNotified.Valid && time.Since(lastNotified.Time) > 24*time.Hour
+	if !changed && !staleReminder {
+		fmt.Printf("bridge_watch: %d open, unchanged, no notice\n", len(ids))
+		return nil
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Open work is waiting in %d project mailbox(es). Open each project and say \"check the bridge\".\n\n", len(byProject))
+	for proj, items := range byProject {
+		fmt.Fprintf(&b, "%s - %d item(s), oldest %dh:\n", proj, len(items), items[0].ageH)
+		for _, it := range items {
+			t := it.topic
+			if len(t) > 70 {
+				t = t[:70] + "..."
+			}
+			fmt.Fprintf(&b, "  #%d from %s (%dh): %s\n", it.id, it.from, it.ageH, t)
+		}
+		b.WriteString("\n")
+	}
+	if err := erSendEscalation(token, "Bridge mailboxes have open work", b.String()); err != nil {
+		return err
+	}
+	db.Exec(`INSERT INTO bridge_watch_state (id, open_ids, last_notified) VALUES (1,$1,now())
+		ON CONFLICT (id) DO UPDATE SET open_ids=$1, last_notified=now()`, fingerprint)
+	fmt.Printf("bridge_watch: notified, %d open across %d projects\n", len(ids), len(byProject))
+	return nil
 }
