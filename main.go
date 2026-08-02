@@ -2611,6 +2611,11 @@ func twoaiBuild(db *sql.DB) error {
 		toolPages++
 	}
 
+	compliance, err := twoaiCompliance(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
 	ecosystem, err := twoaiEcosystem(db, today, upsert)
 	if err != nil {
 		return err
@@ -2621,8 +2626,8 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance)
 	return nil
 }
 
@@ -3013,6 +3018,93 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 		return 0, err
 	}
 	return len(built), nil
+}
+
+// twoaiCompliance renders the AI governance framework library: ISO 42001, the
+// NIST AI RMF, the EU AI Act, SOC 2, the sector rules, the agency enforcement
+// records, and the rest, 61 explainers held in site_content.
+//
+// THE MIGRATION PROBLEM, AND HOW THIS HANDLES IT. These explainers are already
+// published at srjconsultingservices.com/ai-governance/. Stephen's intent is
+// for theworldofai.org to become the source of all data and for the consulting
+// site to become marketing, so the library belongs here eventually. But two
+// sites under one owner publishing identical text is duplicate content:
+// a search engine picks one and suppresses the other, and today the consulting
+// site has the authority. Publishing these self-canonical right now would risk
+// demoting the very pages that currently rank.
+//
+// So each page carries a canonical URL looked up from twoai_canonicals, which
+// is seeded pointing at the SRJ original. The pages exist here, are linked, and
+// are readable, while the search engine is told which copy is the original.
+// When srj adds the 301 from /ai-governance/ to this site, deleting the row
+// makes the page self-canonical on the next run. No code change, no rebuild of
+// the factory, one DELETE per page or one for the lot.
+//
+// Body HTML is passed through as authored. It is SRJ's own writing, not
+// third-party text, so there is nothing here to paraphrase around.
+func twoaiCompliance(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
+	rows, err := db.Query(`SELECT c.path, c.data::text, COALESCE(k.canonical_url,'')
+		FROM site_content c
+		LEFT JOIN twoai_canonicals k
+		  ON k.path = 'compliance/' || (c.data->>'slug') || '.json'
+		WHERE c.path LIKE 'governance/%'
+		  AND c.path NOT IN ('governance/_meta.json','governance/sources.json','governance/ai-tools.json')
+		ORDER BY c.path`)
+	if err != nil {
+		return 0, err
+	}
+	type entry struct {
+		Slug     string `json:"slug"`
+		Title    string `json:"title"`
+		Subtitle string `json:"subtitle,omitempty"`
+		Short    string `json:"short,omitempty"`
+		Parent   string `json:"parent,omitempty"`
+	}
+	var all []map[string]any
+	for rows.Next() {
+		var p, raw, canon string
+		if rows.Scan(&p, &raw, &canon) != nil {
+			continue
+		}
+		var doc map[string]any
+		if json.Unmarshal([]byte(raw), &doc) != nil {
+			continue
+		}
+		if s, _ := doc["slug"].(string); s == "" {
+			continue
+		}
+		doc["generated"] = today
+		if canon != "" {
+			doc["canonical"] = canon
+		}
+		all = append(all, doc)
+	}
+	rows.Close()
+	if len(all) == 0 {
+		return 0, nil
+	}
+
+	count := 0
+	index := []entry{}
+	for _, doc := range all {
+		slug, _ := doc["slug"].(string)
+		if err := upsert("compliance/"+slug+".json", "compliance", doc); err != nil {
+			return count, err
+		}
+		count++
+		title, _ := doc["title"].(string)
+		sub, _ := doc["subtitle"].(string)
+		short, _ := doc["short"].(string)
+		parent, _ := doc["parent"].(string)
+		index = append(index, entry{slug, title, sub, short, parent})
+	}
+	sort.Slice(index, func(i, j int) bool { return index[i].Title < index[j].Title })
+	if err := upsert("compliance/index.json", "compliance-hub", map[string]any{
+		"frameworks": index, "total": len(index), "generated": today,
+	}); err != nil {
+		return count, err
+	}
+	return count + 1, nil
 }
 
 // twoaiEcosystem renders the site's spine: the AI Ecosystem root and its four
