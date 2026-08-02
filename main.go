@@ -1517,11 +1517,27 @@ type clSearch struct {
 
 var docketIDRe = regexp.MustCompile(`/docket/(\d+)/`)
 
-// intelRefresh updates timeline + latest development for tracked cases whose
-// docket has moved since the stored latest_development_date.
+// intelRefresh checks tracked cases for docket movement.
+//
+// SWEEP BUDGET. This used to walk every active case on every run, which was
+// fine at 13 cases and broke at 39: CourtListener began rate limiting, each
+// blocked fetch cost about 90 seconds of backoff, and the run stopped reaching
+// twoai_build at all. Auto-promotion tripled the case count, so the sweep cost
+// tripled with it, and the stages downstream paid for it.
+//
+// So the sweep is now budgeted and prioritised rather than exhaustive. Cases
+// are ordered by how long it has been since we last saw them move, and only
+// the first N are checked per run. A case that filed something yesterday is
+// checked today; one dormant since 2025 waits its turn. Over a few days every
+// case still gets checked, which is what daily docket monitoring actually
+// requires, without any single run trying to do all of it.
 func intelRefresh(db *sql.DB) (checked, updated int, err error) {
+	// Budget per run. Raise it only if CourtListener stops rate limiting.
+	const sweepLimit = 12
 	rows, err := db.Query(`SELECT id, slug, courtlistener_url, COALESCE(latest_development_date::text,''), COALESCE(timeline::text,'[]')
-		FROM ai_lawsuits WHERE is_active AND courtlistener_url IS NOT NULL`)
+		FROM ai_lawsuits WHERE is_active AND courtlistener_url IS NOT NULL
+		ORDER BY docket_checked_at ASC NULLS FIRST, latest_development_date DESC NULLS LAST
+		LIMIT $1`, sweepLimit)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1547,6 +1563,9 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 		}
 		did := m[1]
 		checked++
+		// Stamp the attempt before the fetch, so a case that rate limits does
+		// not monopolise the front of the queue on the next run.
+		db.Exec(`UPDATE ai_lawsuits SET docket_checked_at = now() WHERE id = $1`, c.id)
 		var docket struct {
 			DateLastFiling string `json:"date_last_filing"`
 		}
