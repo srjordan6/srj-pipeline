@@ -2199,9 +2199,120 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	sr.Close()
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics)
+	// ---- F4 tools directory. Catalog and deep profiles both already live in
+	// site_content; this renders a hub, one page per category, and one page per
+	// profiled tool. Tools with only a catalog row get a listing, not a page:
+	// a page with nothing on it but a name and a link is thin by definition.
+	tools, cats, profiles := twoaiToolData(db)
+	toolPages := 0
+	if len(tools) > 0 {
+		byCat := map[string][]map[string]any{}
+		for _, t := range tools {
+			cn, _ := t["category"].(string)
+			byCat[cn] = append(byCat[cn], t)
+		}
+		catIdx := []map[string]any{}
+		for _, c := range cats {
+			name, _ := c["name"].(string)
+			cslug, _ := c["slug"].(string)
+			list := byCat[name]
+			if len(list) == 0 {
+				continue
+			}
+			sort.Slice(list, func(i, j int) bool {
+				a, _ := list[i]["name"].(string)
+				b, _ := list[j]["name"].(string)
+				return strings.ToLower(a) < strings.ToLower(b)
+			})
+			if err := upsert("tools/cat-"+cslug+".json", "tool-category", map[string]any{
+				"name": name, "slug": cslug, "generated": today, "tools": list,
+			}); err != nil {
+				return err
+			}
+			catIdx = append(catIdx, map[string]any{"name": name, "slug": cslug, "count": len(list)})
+			toolPages++
+		}
+		// Deep profiles, joined to the catalog row for the vendor link.
+		byName := map[string]map[string]any{}
+		for _, t := range tools {
+			n, _ := t["name"].(string)
+			byName[strings.ToLower(n)] = t
+		}
+		profiled := []map[string]any{}
+		for slug, p := range profiles {
+			pm, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			cn, _ := pm["catalog_name"].(string)
+			if cn == "" {
+				cn, _ = pm["name"].(string)
+			}
+			if row := byName[strings.ToLower(cn)]; row != nil {
+				pm["url"] = row["url"]
+				pm["category"] = row["category"]
+			}
+			pm["slug"] = slug
+			pm["generated"] = today
+			if err := upsert("tools/"+slug+".json", "tool", pm); err != nil {
+				return err
+			}
+			nm, _ := pm["name"].(string)
+			tl, _ := pm["tagline"].(string)
+			profiled = append(profiled, map[string]any{"slug": slug, "name": nm, "tagline": tl, "category": pm["category"]})
+			toolPages++
+		}
+		sort.Slice(profiled, func(i, j int) bool {
+			a, _ := profiled[i]["name"].(string)
+			b, _ := profiled[j]["name"].(string)
+			return strings.ToLower(a) < strings.ToLower(b)
+		})
+		sort.Slice(catIdx, func(i, j int) bool {
+			a, _ := catIdx[i]["name"].(string)
+			b, _ := catIdx[j]["name"].(string)
+			return a < b
+		})
+		if err := upsert("tools/index.json", "tool-hub", map[string]any{
+			"generated": today, "total": len(tools), "categories": catIdx,
+			"profiled": profiled, "tools": tools,
+		}); err != nil {
+			return err
+		}
+		toolPages++
+	}
+
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages)
 	return nil
+}
+
+// twoaiToolData reads the AI tool catalog and the deep tool profiles out of
+// site_content. Both are maintained for the SRJ site and are read only here.
+// Any absence is tolerated: a missing row means the tools factory emits
+// nothing rather than half a directory.
+func twoaiToolData(db *sql.DB) (tools []map[string]any, cats []map[string]any, profiles map[string]any) {
+	profiles = map[string]any{}
+	var catalog string
+	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='resources/tools.json'`).Scan(&catalog); err == nil {
+		var c struct {
+			Tools      []map[string]any `json:"tools"`
+			Categories []map[string]any `json:"categories"`
+		}
+		if json.Unmarshal([]byte(catalog), &c) == nil {
+			tools, cats = c.Tools, c.Categories
+		}
+	}
+	var prof string
+	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='resources/tool-profiles.json'`).Scan(&prof); err == nil {
+		var p struct {
+			Profiles map[string]any `json:"profiles"`
+			AsOf     string         `json:"as_of"`
+		}
+		if json.Unmarshal([]byte(prof), &p) == nil && p.Profiles != nil {
+			profiles = p.Profiles
+		}
+	}
+	return tools, cats, profiles
 }
 
 // twoaiPublish exports twoai_pages to the twoai-content repo, sha-compared
