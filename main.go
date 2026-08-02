@@ -1837,6 +1837,23 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 // The timeline fills itself: intelRefresh reads the docket for every active
 // case on the next run, so a promoted case gains its history automatically.
 func intelPromote(db *sql.DB) (int, error) {
+	// Auto-publishing taught a lesson on its first live run. The defendant
+	// sweep scores on the party name, and party names collide: "Cohere" is an
+	// AI lab and also Cohere Health, a prior-authorisation company, and Cohere
+	// Beauty of Omaha. "Suno" is a music model and also a surname, which put a
+	// federal criminal case on the tracker. Nvidia is sued constantly over
+	// patents and securities, none of which is AI-subject litigation. Twenty
+	// candidates auto-published and three of them did not belong.
+	//
+	// So promotion now needs two things the queue score alone cannot give: the
+	// caption must name a defendant we actually track as an AI product or
+	// service company, and it must not match the collision and boilerplate
+	// patterns that produced the bad rows. Anything that fails either test
+	// stays a candidate. A case sitting in the queue costs nothing; a wrong
+	// case on a public tracker costs the credibility the whole site runs on.
+	aiCore := regexp.MustCompile(`(?i)openai|anthropic|midjourney|stability ai|uncharted labs|udio|suno,? inc|suno inc|perplexity ai|character technologies|character\.ai|clearview ai|workday|hirevue|runway ai|eleven ?labs|minimax|hugging face|deepseek|mistral ai|scale ai|x\.ai|meta platforms`)
+	noise := regexp.MustCompile(`(?i)cohere health|cohere beauty|cali-curl|villanueva|monolithic 3d|speednic|edgecomm|array cache|arlington technologies|mobility workx|health discovery|concurrent ventures|in re subpoena|department of war|nvidia|patent|licensing, ?llc|technologies llc`)
+
 	rows, err := db.Query(`SELECT id, case_name, court, COALESCE(docket,''),
 			COALESCE(filed_date::text,''), url, COALESCE(snippet,'')
 		FROM ai_lawsuit_candidates
@@ -1861,6 +1878,9 @@ func intelPromote(db *sql.DB) (int, error) {
 	nonSlug := regexp.MustCompile(`[^a-z0-9]+`)
 	promoted := 0
 	for _, c := range cs {
+		if !aiCore.MatchString(c.name) || noise.MatchString(c.name) {
+			continue
+		}
 		parties := strings.SplitN(c.name, " v. ", 2)
 		plaintiff := strings.TrimSpace(parties[0])
 		defendant := ""
