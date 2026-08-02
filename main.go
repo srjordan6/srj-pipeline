@@ -1545,32 +1545,70 @@ func intelResolve(db *sql.DB) (resolved int, err error) {
 	return resolved, nil
 }
 
-// intelDiscover queues newly filed AI lawsuits as candidates for review.
+// intelDiscover queues newly filed AI lawsuits as candidates for review, then
+// auto-promotes the unambiguous ones into ai_lawsuits so the tracker stays
+// current without a human in the loop.
+//
+// Two searches run, because they fail in opposite directions. The SUBJECT
+// search finds AI litigation against defendants nobody has heard of yet, but a
+// broad topical query returns thousands of rows where "machine learning" or
+// "discrimination" appear in unrelated boilerplate: a live check on 2026-08-02
+// returned 2,925 hits, most of them pharmaceutical product-liability suits. The
+// DEFENDANT search is the opposite, precise and shallow: caseName against the
+// known AI defendants returns almost pure signal (Anthropic 39 dockets, Workday
+// 19, Clearview 9, Character Technologies 8, Stability AI 6).
+//
+// The claim vocabulary also widened past copyright. Copyright and training data
+// were the first wave, but the categories now growing fastest are chatbot
+// wrongful death and product liability, AI hiring discrimination, right of
+// publicity and deepfakes, biometric privacy, and AI-washing securities fraud.
+// A tracker that only watched copyright would have shown a shrinking field while
+// the actual field expanded.
 func intelDiscover(db *sql.DB) (added int, err error) {
 	since := time.Now().AddDate(0, 0, -45).Format("2006-01-02")
-	var res clSearch
-	if err := clGet("/search/", map[string]string{
-		"type":        "r",
-		"q":           `("artificial intelligence" OR "generative AI" OR "large language model") AND (copyright OR "training data" OR infringement)`,
-		"filed_after": since,
-		"order_by":    "dateFiled desc",
-	}, &res); err != nil {
-		return 0, err
+
+	// Defendants worth watching by name. Precision comes from the party, so
+	// these need no topical qualifier at all.
+	defendants := []string{
+		"OpenAI", "Anthropic", "Midjourney", "Stability AI", "Uncharted Labs",
+		"Suno", "Perplexity", "Character Technologies", "Clearview AI",
+		"Workday", "HireVue", "Minimax", "Runway AI", "ElevenLabs",
+		"Nvidia", "Hugging Face", "Scale AI", "Cohere", "Mistral AI",
 	}
+
+	// Subject queries, one per claim family rather than one giant OR, so a
+	// noisy family cannot swamp the others in a single ranked result set.
+	subjects := []string{
+		`("artificial intelligence" OR "generative AI" OR "large language model") AND (copyright OR "training data" OR infringement)`,
+		`(chatbot OR "companion AI" OR "AI companion") AND ("wrongful death" OR suicide OR "product liability" OR "failure to warn")`,
+		`("artificial intelligence" OR algorithm OR "automated decision") AND ("employment discrimination" OR "disparate impact" OR "hiring discrimination" OR ADEA OR "Title VII")`,
+		`(deepfake OR "digital replica" OR "voice clone" OR "AI-generated likeness") AND ("right of publicity" OR defamation OR Lanham)`,
+		`("facial recognition" OR biometric OR "face template") AND (BIPA OR "biometric privacy" OR "Illinois Biometric")`,
+		`("artificial intelligence" OR "AI-powered") AND ("securities fraud" OR "materially false" OR "misled investors" OR "AI washing")`,
+	}
+
 	// Relevance scoring. "Artificial intelligence" appears in patent and
 	// trademark boilerplate constantly; the first live run queued NASCAR
 	// trademark chaff alongside a real new Anthropic suit. Score on the
 	// signals that separate AI-subject litigation from passing mentions,
 	// and queue only what clears the bar. The score is stored so review
 	// can sort by it.
-	aiParty := regexp.MustCompile(`(?i)openai|anthropic|meta platforms|midjourney|stability ai|suno|uncharted labs|udio|perplexity|x\.?ai|google|alphabet|microsoft|nvidia|hugging face|character\.?ai|deepseek|mistral|runway|eleven ?labs|minimax`)
-	aiSubject := regexp.MustCompile(`(?i)training data|generative|large language|chatbot|machine learning|neural|copyright|infring|scrap(e|ing)|dataset|deepfake|right of publicity|biometric`)
+	aiParty := regexp.MustCompile(`(?i)openai|anthropic|meta platforms|midjourney|stability ai|suno|uncharted labs|udio|perplexity|x\.?ai|google|alphabet|microsoft|nvidia|hugging face|character\.?ai|character technologies|deepseek|mistral|runway|eleven ?labs|minimax|clearview|workday|hirevue|scale ai|cohere`)
+	aiSubject := regexp.MustCompile(`(?i)training data|generative|large language|chatbot|machine learning|neural|copyright|infring|scrap(e|ing)|dataset|deepfake|right of publicity|biometric|wrongful death|product liability|disparate impact|securities fraud|ai washing|facial recognition|automated decision`)
 	patentNoise := regexp.MustCompile(`(?i)patent|'\d{3} patent|licensing, llc|innovations ltd|ip pty|technology licensing`)
-	for i, h := range res.Results {
-		if i >= 25 || h.DocketID == 0 {
-			continue
+
+	queue := func(h struct {
+		CaseName     string `json:"caseName"`
+		DocketNumber string `json:"docketNumber"`
+		DocketID     int64  `json:"docket_id"`
+		Court        string `json:"court"`
+		DateFiled    string `json:"dateFiled"`
+		Snippet      string `json:"snippet"`
+	}, base int) {
+		if h.DocketID == 0 {
+			return
 		}
-		score := 0
+		score := base
 		if aiParty.MatchString(h.CaseName) {
 			score += 3
 		}
@@ -1581,30 +1619,172 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 			score -= 3
 		}
 		if score < 2 {
-			continue
+			return
 		}
 		var tracked bool
 		db.QueryRow(`SELECT EXISTS (SELECT 1 FROM ai_lawsuits WHERE courtlistener_url LIKE $1)`,
 			fmt.Sprintf("%%/docket/%d/%%", h.DocketID)).Scan(&tracked)
 		if tracked {
-			continue
+			return
 		}
-		r, err := db.Exec(`INSERT INTO ai_lawsuit_candidates
+		r, e := db.Exec(`INSERT INTO ai_lawsuit_candidates
 			(source, source_id, case_name, court, docket, filed_date, url, snippet, score)
 			VALUES ('courtlistener', $1, $2, $3, $4, NULLIF($5,'')::date, $6, $7, $8)
 			ON CONFLICT (source_id) DO NOTHING`,
 			fmt.Sprintf("cl-docket-%d", h.DocketID), h.CaseName, h.Court, h.DocketNumber,
 			h.DateFiled, fmt.Sprintf("https://www.courtlistener.com/docket/%d/", h.DocketID),
 			trunc(h.Snippet, 500), score)
-		if err != nil {
-			continue
+		if e != nil {
+			return
 		}
 		if n, _ := r.RowsAffected(); n > 0 {
 			added++
 			fmt.Printf("intel discover: queued (score %d) %s %s\n", score, h.CaseName, h.DocketNumber)
 		}
 	}
+
+	for _, q := range subjects {
+		var res clSearch
+		if e := clGet("/search/", map[string]string{
+			"type": "r", "q": q, "filed_after": since, "order_by": "dateFiled desc",
+		}, &res); e != nil {
+			fmt.Fprintln(os.Stderr, "intel discover subject:", e)
+			continue
+		}
+		for i, h := range res.Results {
+			if i >= 25 {
+				break
+			}
+			queue(h, 0)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	// Defendant sweep runs on a longer window: a suit against a known AI
+	// company is worth tracking whenever it was filed, not only in the last
+	// 45 days. The base score of 3 reflects that the party alone is the
+	// evidence.
+	dsince := time.Now().AddDate(0, 0, -365).Format("2006-01-02")
+	for _, d := range defendants {
+		var res clSearch
+		if e := clGet("/search/", map[string]string{
+			"type": "r", "q": fmt.Sprintf(`caseName:("%s")`, d),
+			"filed_after": dsince, "order_by": "dateFiled desc",
+		}, &res); e != nil {
+			fmt.Fprintln(os.Stderr, "intel discover defendant", d, ":", e)
+			continue
+		}
+		for i, h := range res.Results {
+			if i >= 20 {
+				break
+			}
+			queue(h, 3)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	promoted, perr := intelPromote(db)
+	if perr != nil {
+		return added, perr
+	}
+	if promoted > 0 {
+		fmt.Printf("intel discover: promoted %d candidates to the tracker\n", promoted)
+	}
 	return added, nil
+}
+
+// intelPromote publishes high-confidence candidates into ai_lawsuits so a newly
+// filed case appears on the tracker without waiting on a human.
+//
+// Only the verified fields carry over: case name, court, docket number, filing
+// date, the parties as they appear in the caption, and the CourtListener link.
+// Nothing interpretive is generated here. executive_summary, why_it_matters,
+// and claims stay empty until a person writes them, because a machine-written
+// characterisation of somebody's lawsuit is exactly the kind of confident
+// invention this platform exists not to publish. The page renders what it has
+// and says less where it has nothing.
+//
+// The timeline fills itself: intelRefresh reads the docket for every active
+// case on the next run, so a promoted case gains its history automatically.
+func intelPromote(db *sql.DB) (int, error) {
+	rows, err := db.Query(`SELECT id, case_name, court, COALESCE(docket,''),
+			COALESCE(filed_date::text,''), url, COALESCE(snippet,'')
+		FROM ai_lawsuit_candidates
+		WHERE status='new' AND score >= 5
+		ORDER BY filed_date DESC NULLS LAST LIMIT 20`)
+	if err != nil {
+		return 0, err
+	}
+	type cand struct {
+		id                                       int64
+		name, court, docket, filed, url, snippet string
+	}
+	var cs []cand
+	for rows.Next() {
+		var c cand
+		if rows.Scan(&c.id, &c.name, &c.court, &c.docket, &c.filed, &c.url, &c.snippet) == nil {
+			cs = append(cs, c)
+		}
+	}
+	rows.Close()
+
+	nonSlug := regexp.MustCompile(`[^a-z0-9]+`)
+	promoted := 0
+	for _, c := range cs {
+		parties := strings.SplitN(c.name, " v. ", 2)
+		plaintiff := strings.TrimSpace(parties[0])
+		defendant := ""
+		if len(parties) == 2 {
+			defendant = strings.TrimSpace(parties[1])
+		}
+		short := func(s string) string {
+			f := strings.Fields(nonSlug.ReplaceAllString(strings.ToLower(s), " "))
+			if len(f) > 2 {
+				f = f[:2]
+			}
+			return strings.Join(f, "-")
+		}
+		slug := strings.Trim(short(plaintiff)+"-v-"+short(defendant), "-")
+		if slug == "" || slug == "-v-" {
+			continue
+		}
+		// Slug collisions are real: two Concord actions against Anthropic
+		// already share a caption. Suffix rather than overwrite.
+		base := slug
+		for n := 2; n < 10; n++ {
+			var taken bool
+			db.QueryRow(`SELECT EXISTS(SELECT 1 FROM ai_lawsuits WHERE slug=$1)`, slug).Scan(&taken)
+			if !taken {
+				break
+			}
+			slug = fmt.Sprintf("%s-%d", base, n)
+		}
+		var filed any
+		if c.filed != "" {
+			filed = c.filed
+		}
+		var summary any
+		if c.snippet != "" {
+			summary = c.snippet
+		}
+		if _, err := db.Exec(`INSERT INTO ai_lawsuits
+			(slug, case_name, court, docket, filed_date, plaintiffs, defendants, category,
+			 status, status_badge, courtlistener_url, source_url, is_active, display_order,
+			 verified_date, summary)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,'copyright',
+			 'Filed; docket monitoring active, no development recorded yet by this tracker',
+			 'Active Litigation',$8,$8,true,
+			 (SELECT COALESCE(MAX(display_order),0)+10 FROM ai_lawsuits),
+			 current_date,$9)
+			ON CONFLICT (slug) DO NOTHING`,
+			slug, c.name, c.court, c.docket, filed, plaintiff, defendant, c.url, summary); err != nil {
+			fmt.Fprintln(os.Stderr, "intel promote", slug, ":", err)
+			continue
+		}
+		db.Exec(`UPDATE ai_lawsuit_candidates SET status='promoted' WHERE id=$1`, c.id)
+		promoted++
+	}
+	return promoted, nil
 }
 
 // intelAIWatch queues new Hugging Face models and AI vendor news as intel
