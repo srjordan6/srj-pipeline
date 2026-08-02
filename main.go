@@ -31,7 +31,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "twoai_build", "twoai_publish", "arxiv_watch", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "twoai_build", "twoai_publish", "arxiv_watch", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -191,6 +191,8 @@ func main() {
 		fetched, added, runErr = legiscan(db, sourceID)
 	case "gdelt":
 		fetched, added, runErr = gdelt(db, sourceID)
+	case "govinfo":
+		fetched, added, runErr = govinfo(db, sourceID)
 	default:
 		runErr = fmt.Errorf("no adapter for source %q", src)
 	}
@@ -283,6 +285,134 @@ func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 			added++
 		}
 	}
+	return fetched, added, nil
+}
+
+// govinfo pulls federal court opinions that mention AI from the U.S.
+// Government Publishing Office's official USCOURTS collection.
+//
+// WHY THIS EXISTS ALONGSIDE COURTLISTENER. CourtListener gives us dockets:
+// who sued whom, and what was filed when. It does not give us the court's own
+// words. govinfo publishes the opinion PDFs and their metadata as an official
+// government record, free, with a documented API. Rulings are where AI law
+// actually gets made, so a tracker that only watches filings watches the least
+// interesting half.
+//
+// The search is a FULL TEXT phrase match, which means most hits mention AI in
+// passing rather than being about it: a live check on 2026-08-02 returned 1,168
+// opinions, including insurance and social-security appeals whose text happens
+// to contain the phrase. Everything is kept in the corpus regardless, because
+// the corpus is a research asset and filtering it destroys recall we cannot get
+// back. Only opinions whose CAPTION names a known AI party are promoted into
+// the lawsuit candidate queue, where the existing scoring applies. That single
+// live check surfaced DOE v. X.AI Corp., which the docket sweep had not.
+//
+// Key from GOVINFO_API_KEY, free from api.data.gov. Without it the stage says
+// so and returns cleanly rather than failing the run.
+func govinfo(db *sql.DB, sourceID int) (fetched, added int, err error) {
+	key := os.Getenv("GOVINFO_API_KEY")
+	if key == "" {
+		return 0, 0, fmt.Errorf("GOVINFO_API_KEY not set")
+	}
+	since := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
+	body, _ := json.Marshal(map[string]any{
+		"query":      `collection:USCOURTS "artificial intelligence" publishdate:range(` + since + `,)`,
+		"pageSize":   100,
+		"offsetMark": "*",
+		"sorts":      []map[string]string{{"field": "publishdate", "sortOrder": "DESC"}},
+	})
+	req, err := http.NewRequest("POST", "https://api.govinfo.gov/search", bytes.NewReader(body))
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("X-Api-Key", key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "srj-pipeline/1.0 (srjconsultingservices.com)")
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		return 0, 0, fmt.Errorf("govinfo search %d: %s", resp.StatusCode, b)
+	}
+	var payload struct {
+		Count   int `json:"count"`
+		Results []struct {
+			Title            string         `json:"title"`
+			PackageID        string         `json:"packageId"`
+			GranuleID        string         `json:"granuleId"`
+			DateIssued       string         `json:"dateIssued"`
+			GovernmentAuthor []string       `json:"governmentAuthor"`
+			Download         map[string]any `json:"download"`
+			ResultLink       string         `json:"resultLink"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return 0, 0, err
+	}
+
+	// A caption naming an AI company is the signal that an opinion is about AI
+	// rather than merely mentioning it.
+	aiParty := regexp.MustCompile(`(?i)openai|anthropic|midjourney|stability ai|uncharted labs|udio|suno|perplexity|x\.?ai|character\.?ai|character technologies|clearview|workday|hirevue|scale ai|cohere|mistral|eleven ?labs|minimax|hugging face|deepseek`)
+	queued := 0
+	for _, r := range payload.Results {
+		if r.PackageID == "" || r.Title == "" {
+			continue
+		}
+		fetched++
+		court := ""
+		if len(r.GovernmentAuthor) > 0 {
+			court = r.GovernmentAuthor[len(r.GovernmentAuthor)-1]
+		}
+		link := r.ResultLink
+		if link == "" {
+			link = "https://www.govinfo.gov/app/details/" + r.PackageID
+		}
+		meta := map[string]any{
+			"title": r.Title, "packageId": r.PackageID, "granuleId": r.GranuleID,
+			"dateIssued": r.DateIssued, "court": court, "download": r.Download,
+			"collection": "USCOURTS",
+		}
+		raw, _ := json.Marshal(meta)
+		h := sha256.Sum256(raw)
+		extID := r.PackageID
+		if r.GranuleID != "" {
+			extID = r.PackageID + "/" + r.GranuleID
+		}
+		var pub any
+		if r.DateIssued != "" {
+			pub = r.DateIssued
+		}
+		ok, e := insertDoc(db, sourceID, extID, hex.EncodeToString(h[:]), link, r.Title, pub, raw)
+		if e != nil {
+			return fetched, added, e
+		}
+		if ok {
+			added++
+		}
+		// Promote to the lawsuit candidate queue only when the caption names
+		// an AI party. Score 4 keeps these below the auto-publish threshold of
+		// 5, since an opinion tells us a case exists but not that it belongs on
+		// a tracker of AI litigation.
+		if !aiParty.MatchString(r.Title) {
+			continue
+		}
+		res, e := db.Exec(`INSERT INTO ai_lawsuit_candidates
+			(source, source_id, case_name, court, docket, filed_date, url, snippet, score)
+			VALUES ('govinfo', $1, $2, $3, '', NULLIF($4,'')::date, $5, $6, 4)
+			ON CONFLICT (source_id) DO NOTHING`,
+			"govinfo-"+extID, r.Title, court, r.DateIssued, link,
+			"Federal court opinion published by GPO in the USCOURTS collection.")
+		if e == nil {
+			if n, _ := res.RowsAffected(); n > 0 {
+				queued++
+			}
+		}
+	}
+	fmt.Printf("govinfo: matched=%d stored=%d queued_candidates=%d\n", payload.Count, added, queued)
 	return fetched, added, nil
 }
 
@@ -2788,7 +2918,7 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 			"jurisdiction_count": len(jur), "unthemed_bills": unthemed,
 		}
 
-		if err := upsert("week/"+w.Slug+".json", "week", map[string]any{
+		data := map[string]any{
 			"slug": w.Slug, "label": w.Label, "start": w.Start, "end": w.End,
 			"bills": w.Bills, "federal": w.Federal, "courts": w.Courts,
 			"analysis": analysis,
@@ -2797,7 +2927,15 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 				"total": len(w.Bills) + len(w.Federal) + len(w.Courts),
 			},
 			"generated": today,
-		}); err != nil {
+		}
+		if recap, model, rerr := twoaiWeekRecap(db, w.Label, w.Start, w.End, analysis,
+			len(w.Bills), len(w.Federal), len(w.Courts)); rerr != nil {
+			fmt.Fprintln(os.Stderr, "twoai week recap", w.Slug, ":", rerr)
+		} else if recap != "" {
+			data["recap"] = recap
+			data["recap_model"] = model
+		}
+		if err := upsert("week/"+w.Slug+".json", "week", data); err != nil {
 			return 0, err
 		}
 		topTheme := ""
@@ -2850,6 +2988,113 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 		return 0, err
 	}
 	return len(built), nil
+}
+
+// twoaiWeekRecap writes the short prose recap that sits at the top of a weekly
+// digest page. Claude Sonnet writes it, and three deliberate constraints keep
+// it honest.
+//
+// FIRST, it is given ONLY the computed analysis: theme counts, jurisdiction
+// counts, agency counts, and the three totals. It never sees the bill titles or
+// the case captions. A model that cannot see the underlying items cannot invent
+// a claim about one, and every number in the prose is a number the page already
+// prints in a table directly below it, so the two can never disagree.
+//
+// SECOND, it is cached against a fingerprint of that analysis. A closed week
+// never changes, so its recap is written once and then read from
+// twoai_week_recaps forever. Only a week whose counts actually moved is
+// rewritten. Without this the stage would spend tokens nightly producing a
+// slightly different paragraph about identical facts, and the page would
+// visibly churn for no reader benefit.
+//
+// THIRD, a failure is not fatal. No API key, a timeout, or a refusal returns an
+// empty string, the page renders without the recap, and the tables carry it.
+// The prose is a convenience on top of the record, never the record itself.
+const twoaiRecapModel = "claude-sonnet-5"
+
+func twoaiWeekRecap(db *sql.DB, label, start, end string, analysis map[string]any,
+	bills, federal, courts int) (string, string, error) {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_week_recaps (
+		slug text PRIMARY KEY, fingerprint text NOT NULL, recap text NOT NULL,
+		model text NOT NULL, created_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+		return "", "", err
+	}
+	facts, _ := json.Marshal(map[string]any{
+		"week": label, "start": start, "end": end,
+		"bill_movements": bills, "federal_documents": federal, "case_updates": courts,
+		"analysis": analysis,
+	})
+	fp := fmt.Sprintf("%x", sha256.Sum256(facts))
+	slug := start
+
+	var cachedFP, cached, cachedModel string
+	db.QueryRow(`SELECT fingerprint, recap, model FROM twoai_week_recaps WHERE slug=$1`, slug).
+		Scan(&cachedFP, &cached, &cachedModel)
+	if cachedFP == fp && cached != "" {
+		return cached, cachedModel, nil
+	}
+
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		return "", "", nil // silent, not an error: the tables stand alone
+	}
+	prompt := "You are writing the opening recap for a weekly record of United States AI policy " +
+		"and litigation. Below is the ONLY information you have: computed counts from a database. " +
+		"You cannot see the individual bills or cases, and you must not invent any.\n\n" +
+		"Write two short paragraphs, 90 to 140 words total. Say what the week was about, using the " +
+		"theme and jurisdiction counts to describe the shape of the activity. Name a theme only if it " +
+		"appears in the data. Use the exact numbers given. If the totals are small, say the week was " +
+		"quiet; do not inflate it. Plain English, commas rather than dashes, no bullet points, no " +
+		"headline, no opinions about whether any law is good or bad, and no predictions. Do not claim " +
+		"a bill passed: a bill movement means its record changed status. Output only the paragraphs.\n\n" +
+		"Data:\n" + string(facts)
+
+	body, _ := json.Marshal(map[string]any{
+		"model":      twoaiRecapModel,
+		"max_tokens": 500,
+		"messages":   []map[string]string{{"role": "user", "content": prompt}},
+	})
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("x-api-key", key)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("content-type", "application/json")
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		return "", "", fmt.Errorf("anthropic %d: %s", resp.StatusCode, b)
+	}
+	var out struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", "", err
+	}
+	var sb strings.Builder
+	for _, c := range out.Content {
+		sb.WriteString(c.Text)
+	}
+	recap := strings.TrimSpace(sb.String())
+	if recap == "" {
+		return "", "", fmt.Errorf("empty recap")
+	}
+	if _, err := db.Exec(`INSERT INTO twoai_week_recaps (slug, fingerprint, recap, model)
+		VALUES ($1,$2,$3,$4)
+		ON CONFLICT (slug) DO UPDATE SET fingerprint=EXCLUDED.fingerprint,
+			recap=EXCLUDED.recap, model=EXCLUDED.model, created_at=now()`,
+		slug, fp, recap, twoaiRecapModel); err != nil {
+		return recap, twoaiRecapModel, nil
+	}
+	return recap, twoaiRecapModel, nil
 }
 
 // twoaiPublish exports twoai_pages to the twoai-content repo, sha-compared
