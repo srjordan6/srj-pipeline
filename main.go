@@ -2611,13 +2611,18 @@ func twoaiBuild(db *sql.DB) error {
 		toolPages++
 	}
 
+	ecosystem, err := twoaiEcosystem(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
 	weeks, err := twoaiWeeks(db, today, upsert)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem)
 	return nil
 }
 
@@ -3008,6 +3013,102 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 		return 0, err
 	}
 	return len(built), nil
+}
+
+// twoaiEcosystem renders the site's spine: the AI Ecosystem root and its four
+// categories, each listing the domains beneath it.
+//
+// The taxonomy lives in twoai_taxonomy rather than in a template, so the map a
+// reader sees is the same map the build works from. That matters most for the
+// parts that do NOT exist yet: a domain marked planned renders as planned,
+// with no link, instead of quietly vanishing from the page. A site that only
+// shows what it has finished is a site whose coverage nobody can assess.
+//
+// Page counts are computed from twoai_pages.taxonomy_slug, so the number next
+// to a domain is the number of pages actually published under it.
+func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
+	type domain struct {
+		Slug   string `json:"slug"`
+		Name   string `json:"name"`
+		Blurb  string `json:"blurb"`
+		Status string `json:"status"`
+		Path   string `json:"path,omitempty"`
+		Pages  int    `json:"pages"`
+	}
+	type category struct {
+		Slug    string   `json:"slug"`
+		Name    string   `json:"name"`
+		Blurb   string   `json:"blurb"`
+		Domains []domain `json:"domains"`
+		Live    int      `json:"live"`
+		Pages   int      `json:"pages"`
+	}
+
+	rows, err := db.Query(`SELECT t.slug, t.name, COALESCE(t.blurb,''), t.status,
+			COALESCE(t.live_path,''), COALESCE(t.parent_slug,''), t.level,
+			(SELECT count(*) FROM twoai_pages p WHERE p.taxonomy_slug = t.slug)
+		FROM twoai_taxonomy t WHERE t.level IN (1,2) ORDER BY t.level, t.sort`)
+	if err != nil {
+		return 0, err
+	}
+	var cats []*category
+	byslug := map[string]*category{}
+	type pending struct {
+		parent string
+		d      domain
+	}
+	var later []pending
+	for rows.Next() {
+		var slug, name, blurb, status, path, parent string
+		var level, pages int
+		if rows.Scan(&slug, &name, &blurb, &status, &path, &parent, &level, &pages) != nil {
+			continue
+		}
+		if level == 1 {
+			c := &category{Slug: slug, Name: name, Blurb: blurb}
+			cats = append(cats, c)
+			byslug[slug] = c
+			continue
+		}
+		later = append(later, pending{parent, domain{slug, name, blurb, status, path, pages}})
+	}
+	rows.Close()
+	for _, p := range later {
+		c := byslug[p.parent]
+		if c == nil {
+			continue
+		}
+		c.Domains = append(c.Domains, p.d)
+		c.Pages += p.d.Pages
+		if p.d.Status == "live" {
+			c.Live++
+		}
+	}
+	if len(cats) == 0 {
+		return 0, nil
+	}
+
+	count := 0
+	summary := []map[string]any{}
+	for _, c := range cats {
+		if err := upsert("ecosystem/"+c.Slug+".json", "ecosystem-category", map[string]any{
+			"slug": c.Slug, "name": c.Name, "blurb": c.Blurb, "domains": c.Domains,
+			"live": c.Live, "total": len(c.Domains), "pages": c.Pages, "generated": today,
+		}); err != nil {
+			return count, err
+		}
+		count++
+		summary = append(summary, map[string]any{
+			"slug": c.Slug, "name": c.Name, "blurb": c.Blurb,
+			"live": c.Live, "total": len(c.Domains), "pages": c.Pages,
+		})
+	}
+	if err := upsert("ecosystem/index.json", "ecosystem-hub", map[string]any{
+		"categories": summary, "generated": today,
+	}); err != nil {
+		return count, err
+	}
+	return count + 1, nil
 }
 
 // twoaiWeekRecap writes the short prose recap that sits at the top of a weekly
