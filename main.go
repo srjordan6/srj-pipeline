@@ -1556,6 +1556,7 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 		cases = append(cases, c)
 	}
 	rows.Close()
+	rateLimited := 0
 	for _, c := range cases {
 		m := docketIDRe.FindStringSubmatch(c.clURL)
 		if m == nil {
@@ -1571,6 +1572,18 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 		}
 		if err := clGet("/dockets/"+did+"/", nil, &docket); err != nil {
 			fmt.Fprintln(os.Stderr, "intel refresh", c.slug, "docket fetch:", err)
+			// Give up the sweep once CourtListener is clearly throttling us.
+			// Each blocked fetch costs about ninety seconds of backoff, so
+			// pushing on turns one throttled API into an hour-long run and
+			// starves every stage downstream. The remaining cases keep their
+			// place in the queue and are checked on the next run.
+			if strings.Contains(err.Error(), "rate limited") {
+				rateLimited++
+				if rateLimited >= 2 {
+					fmt.Fprintln(os.Stderr, "intel refresh: rate limited, ending sweep early")
+					break
+				}
+			}
 			time.Sleep(2 * time.Second)
 			continue
 		}
