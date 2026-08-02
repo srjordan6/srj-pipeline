@@ -2320,6 +2320,61 @@ func twoaiToolData(db *sql.DB) (tools []map[string]any, cats []map[string]any, p
 	return tools, cats, profiles
 }
 
+// twoaiThemes classifies a bill or docket title into the recurring subjects of
+// AI legislation. The point is not taxonomy for its own sake: a reader looking
+// at forty bill rows cannot see a pattern, and the pattern is the story. What
+// the categories are, and the keywords that mark them, are the same ones the
+// bills use about themselves, so a bill lands in a bucket because of its own
+// words rather than an editorial judgement about it.
+//
+// A bill can match more than one theme, and does not have to match any. An
+// unmatched bill still appears in the table; it just does not contribute to
+// the thematic summary, which is better than forcing it into a bucket that
+// would misdescribe it.
+var twoaiThemeRules = []struct {
+	Name, Blurb string
+	Re          *regexp.Regexp
+}{
+	{"Deepfakes and likeness", "Synthetic images, voices, and video of real people, and who owns a likeness once a machine can copy it.",
+		regexp.MustCompile(`(?i)deepfake|synthetic media|digital replica|likeness|voice clon|impersonat|nonconsensual|sexually explicit`)},
+	{"Elections", "AI-generated political content, disclosure on campaign material, and interference with voting.",
+		regexp.MustCompile(`(?i)election|campaign|ballot|candidate|political advertis`)},
+	{"Children and minors", "Companion chatbots, age verification, school use, and protections for people under eighteen.",
+		regexp.MustCompile(`(?i)\bminor|child|kids|student|school|age verification|companion chatbot`)},
+	{"Health care", "Clinical decision support, utilization review, mental health chatbots, and AI in diagnosis or coverage decisions.",
+		regexp.MustCompile(`(?i)health|medical|clinical|patient|mental health|insur(er|ance) (review|decision)|prior authorization|therapist`)},
+	{"Employment and hiring", "Automated screening of applicants, workplace surveillance, and decisions about pay or promotion.",
+		regexp.MustCompile(`(?i)employ|hiring|applicant|worker|workplace|labor|resume|personnel decision`)},
+	{"Government use", "How agencies themselves buy, deploy, and account for AI, including inventories and procurement rules.",
+		regexp.MustCompile(`(?i)state agenc|government use|procurement|public sector|inventory of|task force|advisory (council|committee)|study committee`)},
+	{"Transparency and disclosure", "Labeling AI-generated output, telling people when they are talking to a machine, and impact assessments.",
+		regexp.MustCompile(`(?i)disclos|transparen|label|watermark|notice to consumers|impact assessment|audit`)},
+	{"Consumer protection and discrimination", "Algorithmic decisions that affect credit, housing, insurance pricing, or that produce unlawful bias.",
+		regexp.MustCompile(`(?i)discriminat|algorithmic (pricing|bias)|consumer protection|credit|housing|unfair|deceptive`)},
+	{"Privacy and data", "Biometrics, training data, and what may be collected or fed into a model.",
+		regexp.MustCompile(`(?i)privacy|biometric|personal (data|information)|training data|facial recognition|surveillance`)},
+	{"Criminal law", "New offenses, penalties, and evidence rules for conduct carried out with AI.",
+		regexp.MustCompile(`(?i)criminal|penalt|offense|felony|misdemeanor|fraud|prosecut`)},
+	{"Safety and frontier models", "Obligations aimed at the most capable systems, including testing, incident reporting, and catastrophic risk.",
+		regexp.MustCompile(`(?i)frontier|catastrophic|safety (standard|protocol)|critical infrastructure|foundation model|general.purpose`)},
+	{"Infrastructure and energy", "Data centers, the power they draw, and the local cost of hosting them.",
+		regexp.MustCompile(`(?i)data cent(er|re)|energy|electric|grid|water use|utility`)},
+	{"Workforce and education", "Training people to use AI, apprenticeships, curriculum, and public literacy programs.",
+		regexp.MustCompile(`(?i)workforce|apprentice|curriculum|literacy|training program|community college|scholarship`)},
+	{"Intellectual property", "Copyright, authorship, and the use of protected work to build models.",
+		regexp.MustCompile(`(?i)copyright|intellectual property|authorship|royalt|licens(e|ing) of works`)},
+}
+
+func twoaiClassify(text string) []string {
+	var out []string
+	for _, r := range twoaiThemeRules {
+		if r.Re.MatchString(text) {
+			out = append(out, r.Name)
+		}
+	}
+	return out
+}
+
 // twoaiWeeks builds the weekly digest, one page per ISO week, from our own
 // verified tables rather than from a news feed.
 //
@@ -2334,18 +2389,28 @@ func twoaiToolData(db *sql.DB) (tools []map[string]any, cats []map[string]any, p
 // until then the honest weekly is legislative movement, federal action, and
 // docket movement, all of which we verify ourselves.
 //
+// Each item carries the explanatory text we already hold and can stand behind:
+// LegiScan's own bill description, the Federal Register's abstract, which is a
+// government-written summary in the public domain, and the why_it_matters
+// paragraph from ai_lawsuits. Nothing on the page is written about an item we
+// have not read. On top of that the stage computes a thematic breakdown, so a
+// reader sees what the week was ABOUT rather than thirty unrelated rows.
+//
 // Quiet weeks are published as quiet, not padded. A week with two bills and
 // nothing else says so, because a tracker that always claims a busy week is a
 // tracker nobody can use to tell busy from quiet.
 func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
 	type weekItem struct {
-		State  string `json:"state,omitempty"`
-		Number string `json:"number,omitempty"`
-		Title  string `json:"title"`
-		URL    string `json:"url"`
-		Date   string `json:"date"`
-		Note   string `json:"note,omitempty"`
-		Slug   string `json:"slug,omitempty"`
+		State  string   `json:"state,omitempty"`
+		Number string   `json:"number,omitempty"`
+		Title  string   `json:"title"`
+		URL    string   `json:"url"`
+		Date   string   `json:"date"`
+		Note   string   `json:"note,omitempty"`
+		Slug   string   `json:"slug,omitempty"`
+		Detail string   `json:"detail,omitempty"`
+		Agency string   `json:"agency,omitempty"`
+		Themes []string `json:"themes,omitempty"`
 	}
 
 	// Monday of the current ISO week, in UTC, then walk back eight weeks.
@@ -2374,7 +2439,8 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 		w.Courts = []weekItem{}
 
 		br, err := db.Query(`SELECT DISTINCT ON (d.external_id) d.title, d.url,
-				COALESCE(to_char(d.published_at,'YYYY-MM-DD'),'')
+				COALESCE(to_char(d.published_at,'YYYY-MM-DD'),''),
+				COALESCE(d.raw->'bill'->>'description','')
 			FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
 			WHERE s.key='legiscan' AND d.published_at >= $1 AND d.published_at < $2
 			ORDER BY d.external_id, d.id DESC`, start, end)
@@ -2382,8 +2448,8 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 			return 0, err
 		}
 		for br.Next() {
-			var title, url, date string
-			if br.Scan(&title, &url, &date) != nil {
+			var title, url, date, descr string
+			if br.Scan(&title, &url, &date, &descr) != nil {
 				continue
 			}
 			parts := strings.SplitN(title, ":", 2)
@@ -2400,13 +2466,27 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 			if len(parts) == 2 {
 				item.Title = strings.TrimSpace(parts[1])
 			}
+			// LegiScan's description repeats the title on most bills. Carry it
+			// only when it actually adds something, so the page does not print
+			// the same sentence twice under a heading that promises more.
+			if d := strings.TrimSpace(descr); d != "" && !strings.EqualFold(d, item.Title) {
+				item.Detail = d
+			}
+			item.Themes = twoaiClassify(item.Title + " " + item.Detail)
 			item.Slug = twoaiSlug(name)
 			w.Bills = append(w.Bills, item)
 		}
 		br.Close()
 
+		// The Federal Register corpus predates the mentionsAI filter, so it
+		// still holds pre-filter rows: a Caribbean fishery council meeting is
+		// in there because its full text says "artificial intelligence" once.
+		// Filter again on read, or the weekly reports fishery meetings as AI
+		// policy. The abstract is a government-written summary and public
+		// domain, so it can be shown in full.
 		fr, err := db.Query(`SELECT d.title, d.url, COALESCE(to_char(d.published_at,'YYYY-MM-DD'),''),
-				COALESCE(d.raw->>'type','')
+				COALESCE(d.raw->>'type',''), COALESCE(d.raw->>'abstract',''),
+				COALESCE(d.raw->'agencies'->0->>'name','')
 			FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
 			WHERE s.key='federal_register' AND d.published_at >= $1 AND d.published_at < $2
 			ORDER BY d.published_at DESC`, start, end)
@@ -2415,14 +2495,20 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 		}
 		for fr.Next() {
 			var it weekItem
-			if fr.Scan(&it.Title, &it.URL, &it.Date, &it.Note) == nil && it.Title != "" {
-				w.Federal = append(w.Federal, it)
+			if fr.Scan(&it.Title, &it.URL, &it.Date, &it.Note, &it.Detail, &it.Agency) != nil {
+				continue
 			}
+			if it.Title == "" || (!mentionsAI(it.Title) && !mentionsAI(it.Detail)) {
+				continue
+			}
+			it.Themes = twoaiClassify(it.Title + " " + it.Detail)
+			w.Federal = append(w.Federal, it)
 		}
 		fr.Close()
 
 		cr, err := db.Query(`SELECT COALESCE(slug,''), case_name, COALESCE(court,''),
-				COALESCE(latest_development,''), to_char(latest_development_date,'YYYY-MM-DD')
+				COALESCE(latest_development,''), to_char(latest_development_date,'YYYY-MM-DD'),
+				COALESCE(NULLIF(why_it_matters,''), COALESCE(executive_summary,'')), COALESCE(category,'')
 			FROM ai_lawsuits
 			WHERE is_active IS NOT FALSE AND latest_development_date >= $1 AND latest_development_date < $2
 			ORDER BY latest_development_date DESC`, start, end)
@@ -2431,9 +2517,10 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 		}
 		for cr.Next() {
 			var it weekItem
-			var court string
-			if cr.Scan(&it.Slug, &it.Title, &court, &it.Note, &it.Date) == nil && it.Title != "" {
+			var court, category string
+			if cr.Scan(&it.Slug, &it.Title, &court, &it.Note, &it.Date, &it.Detail, &category) == nil && it.Title != "" {
 				it.State = court
+				it.Agency = category
 				it.URL = "/ai-lawsuits/" + it.Slug + "/"
 				w.Courts = append(w.Courts, it)
 			}
@@ -2450,10 +2537,81 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 	}
 
 	idx := []map[string]any{}
+	themeTotals := map[string]int{}
 	for _, w := range built {
+		// Thematic and jurisdictional breakdown for this week. Counts come from
+		// the items themselves, so the summary sentence on the page can never
+		// drift from the table below it.
+		themeCount := map[string]int{}
+		themeEg := map[string]string{}
+		jur := map[string]int{}
+		agency := map[string]int{}
+		unthemed := 0
+		for _, b := range w.Bills {
+			jur[b.State]++
+			if len(b.Themes) == 0 {
+				unthemed++
+			}
+			for _, t := range b.Themes {
+				themeCount[t]++
+				themeTotals[t]++
+				if themeEg[t] == "" {
+					themeEg[t] = b.State + " " + b.Number
+				}
+			}
+		}
+		for _, f := range w.Federal {
+			if f.Agency != "" {
+				agency[f.Agency]++
+			}
+			for _, t := range f.Themes {
+				themeCount[t]++
+				themeTotals[t]++
+			}
+		}
+		rank := func(m map[string]int) []map[string]any {
+			ks := []string{}
+			for k := range m {
+				ks = append(ks, k)
+			}
+			sort.Slice(ks, func(i, j int) bool {
+				if m[ks[i]] != m[ks[j]] {
+					return m[ks[i]] > m[ks[j]]
+				}
+				return ks[i] < ks[j]
+			})
+			out := []map[string]any{}
+			for _, k := range ks {
+				row := map[string]any{"name": k, "count": m[k]}
+				if eg := themeEg[k]; eg != "" {
+					row["example"] = eg
+				}
+				for _, tr := range twoaiThemeRules {
+					if tr.Name == k {
+						row["blurb"] = tr.Blurb
+					}
+				}
+				out = append(out, row)
+			}
+			return out
+		}
+		themes := rank(themeCount)
+		if len(themes) > 8 {
+			themes = themes[:8]
+		}
+		jurs := rank(jur)
+		if len(jurs) > 8 {
+			jurs = jurs[:8]
+		}
+		analysis := map[string]any{
+			"themes": themes, "jurisdictions": jurs, "agencies": rank(agency),
+			"jurisdiction_count": len(jur), "unthemed_bills": unthemed,
+		}
+
 		if err := upsert("week/"+w.Slug+".json", "week", map[string]any{
 			"slug": w.Slug, "label": w.Label, "start": w.Start, "end": w.End,
 			"bills": w.Bills, "federal": w.Federal, "courts": w.Courts,
+			"analysis": analysis,
 			"counts": map[string]int{
 				"bills": len(w.Bills), "federal": len(w.Federal), "courts": len(w.Courts),
 				"total": len(w.Bills) + len(w.Federal) + len(w.Courts),
@@ -2462,17 +2620,52 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 		}); err != nil {
 			return 0, err
 		}
+		topTheme := ""
+		if len(themes) > 0 {
+			topTheme, _ = themes[0]["name"].(string)
+		}
 		idx = append(idx, map[string]any{
 			"slug": w.Slug, "label": w.Label, "start": w.Start, "end": w.End,
 			"bills": len(w.Bills), "federal": len(w.Federal), "courts": len(w.Courts),
 			"total": len(w.Bills) + len(w.Federal) + len(w.Courts),
+			"jurisdictions": len(jur), "top_theme": topTheme,
 		})
 	}
 	if len(idx) == 0 {
 		return 0, nil
 	}
+	// Archive-wide totals, so the hub can say what the whole period was about
+	// rather than only listing weeks.
+	tks := []string{}
+	for k := range themeTotals {
+		tks = append(tks, k)
+	}
+	sort.Slice(tks, func(i, j int) bool {
+		if themeTotals[tks[i]] != themeTotals[tks[j]] {
+			return themeTotals[tks[i]] > themeTotals[tks[j]]
+		}
+		return tks[i] < tks[j]
+	})
+	overall := []map[string]any{}
+	for _, k := range tks {
+		row := map[string]any{"name": k, "count": themeTotals[k]}
+		for _, tr := range twoaiThemeRules {
+			if tr.Name == k {
+				row["blurb"] = tr.Blurb
+			}
+		}
+		overall = append(overall, row)
+		if len(overall) >= 10 {
+			break
+		}
+	}
+	grand := 0
+	for _, w := range idx {
+		grand += w["total"].(int)
+	}
 	if err := upsert("week/index.json", "week-hub", map[string]any{
 		"weeks": idx, "latest": idx[0]["slug"], "generated": today,
+		"themes": overall, "total_items": grand,
 	}); err != nil {
 		return 0, err
 	}
