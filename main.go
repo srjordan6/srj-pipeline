@@ -2281,8 +2281,13 @@ func twoaiBuild(db *sql.DB) error {
 		toolPages++
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages)
+	weeks, err := twoaiWeeks(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks)
 	return nil
 }
 
@@ -2313,6 +2318,165 @@ func twoaiToolData(db *sql.DB) (tools []map[string]any, cats []map[string]any, p
 		}
 	}
 	return tools, cats, profiles
+}
+
+// twoaiWeeks builds the weekly digest, one page per ISO week, from our own
+// verified tables rather than from a news feed.
+//
+// This is deliberately NOT built on ai_intel_candidates. That table is
+// headline-only: summary is null on every row, every URL is an opaque
+// news.google.com redirect rather than a publisher link, and the vendor field
+// is frequently wrong because coverage queries attribute a story to whichever
+// search found it. A page assembled from that would be a wall of other
+// people's headlines, which is both worthless to a reader and the exact shape
+// of content ad networks reject. When the intel pipeline resolves real
+// publisher URLs and writes summaries, a daily news factory becomes possible;
+// until then the honest weekly is legislative movement, federal action, and
+// docket movement, all of which we verify ourselves.
+//
+// Quiet weeks are published as quiet, not padded. A week with two bills and
+// nothing else says so, because a tracker that always claims a busy week is a
+// tracker nobody can use to tell busy from quiet.
+func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
+	type weekItem struct {
+		State  string `json:"state,omitempty"`
+		Number string `json:"number,omitempty"`
+		Title  string `json:"title"`
+		URL    string `json:"url"`
+		Date   string `json:"date"`
+		Note   string `json:"note,omitempty"`
+		Slug   string `json:"slug,omitempty"`
+	}
+
+	// Monday of the current ISO week, in UTC, then walk back eight weeks.
+	now := time.Now().UTC()
+	offset := (int(now.Weekday()) + 6) % 7 // Monday = 0
+	thisMonday := time.Date(now.Year(), now.Month(), now.Day()-offset, 0, 0, 0, 0, time.UTC)
+
+	type wk struct {
+		Slug, Label, Start, End string
+		Bills, Federal, Courts  []weekItem
+	}
+	var built []wk
+
+	for back := 0; back < 8; back++ {
+		start := thisMonday.AddDate(0, 0, -7*back)
+		end := start.AddDate(0, 0, 7)
+		iso, isoWeek := start.ISOWeek()
+		w := wk{
+			Slug:  fmt.Sprintf("%d-w%02d", iso, isoWeek),
+			Label: fmt.Sprintf("Week %d, %d", isoWeek, iso),
+			Start: start.Format("2006-01-02"),
+			End:   end.AddDate(0, 0, -1).Format("2006-01-02"),
+		}
+		w.Bills = []weekItem{}
+		w.Federal = []weekItem{}
+		w.Courts = []weekItem{}
+
+		br, err := db.Query(`SELECT DISTINCT ON (d.external_id) d.title, d.url,
+				COALESCE(to_char(d.published_at,'YYYY-MM-DD'),'')
+			FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
+			WHERE s.key='legiscan' AND d.published_at >= $1 AND d.published_at < $2
+			ORDER BY d.external_id, d.id DESC`, start, end)
+		if err != nil {
+			return 0, err
+		}
+		for br.Next() {
+			var title, url, date string
+			if br.Scan(&title, &url, &date) != nil {
+				continue
+			}
+			parts := strings.SplitN(title, ":", 2)
+			head := strings.Fields(parts[0])
+			if len(head) < 2 {
+				continue
+			}
+			code := strings.ToUpper(head[0])
+			name, ok := twoaiStates[code]
+			if !ok {
+				continue
+			}
+			item := weekItem{State: name, Number: strings.Join(head[1:], " "), URL: url, Date: date}
+			if len(parts) == 2 {
+				item.Title = strings.TrimSpace(parts[1])
+			}
+			item.Slug = twoaiSlug(name)
+			w.Bills = append(w.Bills, item)
+		}
+		br.Close()
+
+		fr, err := db.Query(`SELECT d.title, d.url, COALESCE(to_char(d.published_at,'YYYY-MM-DD'),''),
+				COALESCE(d.raw->>'type','')
+			FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
+			WHERE s.key='federal_register' AND d.published_at >= $1 AND d.published_at < $2
+			ORDER BY d.published_at DESC`, start, end)
+		if err != nil {
+			return 0, err
+		}
+		for fr.Next() {
+			var it weekItem
+			if fr.Scan(&it.Title, &it.URL, &it.Date, &it.Note) == nil && it.Title != "" {
+				w.Federal = append(w.Federal, it)
+			}
+		}
+		fr.Close()
+
+		cr, err := db.Query(`SELECT COALESCE(slug,''), case_name, COALESCE(court,''),
+				COALESCE(latest_development,''), to_char(latest_development_date,'YYYY-MM-DD')
+			FROM ai_lawsuits
+			WHERE is_active IS NOT FALSE AND latest_development_date >= $1 AND latest_development_date < $2
+			ORDER BY latest_development_date DESC`, start, end)
+		if err != nil {
+			return 0, err
+		}
+		for cr.Next() {
+			var it weekItem
+			var court string
+			if cr.Scan(&it.Slug, &it.Title, &court, &it.Note, &it.Date) == nil && it.Title != "" {
+				it.State = court
+				it.URL = "/ai-lawsuits/" + it.Slug + "/"
+				w.Courts = append(w.Courts, it)
+			}
+		}
+		cr.Close()
+
+		// An empty archive week is a page with nothing on it. The current week
+		// always publishes, because "nothing yet this week" is a real answer;
+		// older empty weeks are skipped rather than shipped hollow.
+		if back > 0 && len(w.Bills)+len(w.Federal)+len(w.Courts) == 0 {
+			continue
+		}
+		built = append(built, w)
+	}
+
+	idx := []map[string]any{}
+	for _, w := range built {
+		if err := upsert("week/"+w.Slug+".json", "week", map[string]any{
+			"slug": w.Slug, "label": w.Label, "start": w.Start, "end": w.End,
+			"bills": w.Bills, "federal": w.Federal, "courts": w.Courts,
+			"counts": map[string]int{
+				"bills": len(w.Bills), "federal": len(w.Federal), "courts": len(w.Courts),
+				"total": len(w.Bills) + len(w.Federal) + len(w.Courts),
+			},
+			"generated": today,
+		}); err != nil {
+			return 0, err
+		}
+		idx = append(idx, map[string]any{
+			"slug": w.Slug, "label": w.Label, "start": w.Start, "end": w.End,
+			"bills": len(w.Bills), "federal": len(w.Federal), "courts": len(w.Courts),
+			"total": len(w.Bills) + len(w.Federal) + len(w.Courts),
+		})
+	}
+	if len(idx) == 0 {
+		return 0, nil
+	}
+	if err := upsert("week/index.json", "week-hub", map[string]any{
+		"weeks": idx, "latest": idx[0]["slug"], "generated": today,
+	}); err != nil {
+		return 0, err
+	}
+	return len(built), nil
 }
 
 // twoaiPublish exports twoai_pages to the twoai-content repo, sha-compared
