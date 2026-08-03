@@ -3184,9 +3184,55 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 			"uid": c.UID, "name": c.Name, "products": len(c.Products),
 			"cases": len(c.Cases), "mcp": len(c.MCP), "has_page": c.Pages,
 		}
+		// A sentence built from what we actually hold, so the directory reads as
+		// prose rather than as a row of counts. Naming the products is the honest
+		// description of a company we know only through its tools: we have not
+		// researched these organisations and will not summarise them as though we
+		// had.
+		names := []string{}
+		cats := map[string]bool{}
+		for _, p := range c.Products {
+			if p.Name != "" {
+				names = append(names, p.Name)
+			}
+			if p.Category != "" {
+				cats[p.Category] = true
+			}
+			if entry["url"] == nil && p.URL != "" {
+				entry["url"] = p.URL
+			}
+		}
+		shown := names
+		if len(shown) > 4 {
+			shown = shown[:4]
+		}
+		var b strings.Builder
+		switch {
+		case len(names) == 1:
+			b.WriteString("Publishes " + names[0])
+			if n := strings.TrimSpace(c.Products[0].Note); n != "" {
+				b.WriteString(", " + strings.ToLower(n[:1]) + n[1:])
+			}
+			b.WriteString(".")
+		case len(names) > 1:
+			b.WriteString(fmt.Sprintf("Publishes %d tools we track, including %s",
+				len(names), strings.Join(shown, ", ")))
+			if len(cats) > 1 {
+				b.WriteString(fmt.Sprintf(", across %d categories", len(cats)))
+			}
+			b.WriteString(".")
+		}
+		if len(c.Cases) > 0 {
+			b.WriteString(fmt.Sprintf(" Named as a defendant in %d lawsuit%s we track.",
+				len(c.Cases), map[bool]string{true: "", false: "s"}[len(c.Cases) == 1]))
+		}
+		if len(c.MCP) > 0 {
+			b.WriteString(fmt.Sprintf(" Publishes %d server%s to the MCP registry.",
+				len(c.MCP), map[bool]string{true: "", false: "s"}[len(c.MCP) == 1]))
+		}
+		entry["summary"] = b.String()
 		if !c.Pages && len(c.Products) == 1 {
 			entry["product"] = c.Products[0].Name
-			entry["url"] = c.Products[0].URL
 			entry["note"] = c.Products[0].Note
 		}
 		index = append(index, entry)
