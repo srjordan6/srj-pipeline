@@ -2787,6 +2787,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	companies, err := twoaiCompanies(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
 	people, err := twoaiPeople(db, today, upsert)
 	if err != nil {
 		return err
@@ -2807,8 +2812,8 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies)
 	return nil
 }
 
@@ -2981,6 +2986,160 @@ func r2Put(endpoint, bucket, keyID, secret, key, contentType string, body []byte
 func twoaiUID(key string) string {
 	h := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(h[:])[:8]
+}
+
+// twoaiCompanies builds the AI company directory from the vendors already in
+// the tools catalog, cross-referenced against the lawsuit tracker and the MCP
+// registry.
+//
+// WHY MOST VENDORS DO NOT GET A PAGE. The catalog names 261 vendors, but 229
+// of them publish exactly one tool we track. A company page for those would
+// repeat the tool page with a different heading, which is duplicate content
+// against our own site and adds nothing a reader could not already see. So a
+// vendor earns a page when it has two or more tools, is a defendant in a case
+// we track, or publishes an MCP server. Everyone else stays a row on the hub
+// with a link to their tool.
+//
+// WHAT MAKES THE PAGE WORTH HAVING. Not the vendor name, which is a fact we
+// already had, but the join: what this company ships, whether anyone is suing
+// it, and whether it has published to the MCP registry. Three separate sources
+// answering one question about one organisation is the thing a directory of
+// tools cannot do.
+func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
+	var catalog string
+	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='resources/tools.json'`).Scan(&catalog); err != nil {
+		return 0, nil
+	}
+	var cat struct {
+		Tools []struct {
+			Name     string `json:"name"`
+			Vendor   string `json:"vendor"`
+			Note     string `json:"note"`
+			URL      string `json:"url"`
+			Category string `json:"category"`
+		} `json:"tools"`
+	}
+	if json.Unmarshal([]byte(catalog), &cat) != nil || len(cat.Tools) == 0 {
+		return 0, nil
+	}
+
+	// Deep profiles tell us which tools have their own page to link to.
+	profiled := map[string]string{}
+	var prof string
+	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='resources/tool-profiles.json'`).Scan(&prof); err == nil {
+		var p struct {
+			Profiles map[string]map[string]any `json:"profiles"`
+		}
+		if json.Unmarshal([]byte(prof), &p) == nil {
+			for slug, v := range p.Profiles {
+				if n, _ := v["name"].(string); n != "" {
+					profiled[strings.ToLower(n)] = slug
+				}
+			}
+		}
+	}
+
+	type product struct {
+		Name      string `json:"name"`
+		Note      string `json:"note,omitempty"`
+		URL       string `json:"url,omitempty"`
+		Category  string `json:"category,omitempty"`
+		Profile   string `json:"profile,omitempty"`
+	}
+	type company struct {
+		UID       string    `json:"uid"`
+		Name      string    `json:"name"`
+		Products  []product `json:"products"`
+		Cases     []map[string]string `json:"cases,omitempty"`
+		MCP       []map[string]string `json:"mcp,omitempty"`
+		Pages     bool      `json:"has_page"`
+	}
+
+	order := []string{}
+	by := map[string]*company{}
+	for _, t := range cat.Tools {
+		v := strings.TrimSpace(t.Vendor)
+		if v == "" {
+			continue
+		}
+		c := by[v]
+		if c == nil {
+			c = &company{UID: twoaiUID("company:" + strings.ToLower(v)), Name: v}
+			by[v] = c
+			order = append(order, v)
+		}
+		c.Products = append(c.Products, product{
+			Name: t.Name, Note: t.Note, URL: t.URL, Category: t.Category,
+			Profile: profiled[strings.ToLower(t.Name)],
+		})
+	}
+
+	// Litigation and MCP presence, matched on the company name appearing in the
+	// defendants field or the server publisher. Deliberately conservative: a
+	// short vendor name could match loosely, so require a word boundary.
+	for _, v := range order {
+		c := by[v]
+		if len(v) < 3 {
+			continue
+		}
+		pattern := "(^|[^a-z])" + strings.ToLower(regexp.QuoteMeta(v)) + "([^a-z]|$)"
+		lr, err := db.Query(`SELECT slug, case_name, COALESCE(court,'') FROM ai_lawsuits
+			WHERE is_active AND lower(COALESCE(defendants,'')) ~ $1 ORDER BY filed_date DESC LIMIT 12`, pattern)
+		if err == nil {
+			for lr.Next() {
+				var slug, name, court string
+				if lr.Scan(&slug, &name, &court) == nil {
+					c.Cases = append(c.Cases, map[string]string{"slug": slug, "name": name, "court": court})
+				}
+			}
+			lr.Close()
+		}
+		mr, err := db.Query(`SELECT slug, name, COALESCE(description,'') FROM twoai_mcp_servers
+			WHERE status='active' AND lower(name) LIKE $1 ORDER BY name LIMIT 12`,
+			"%"+strings.ToLower(strings.ReplaceAll(v, " ", ""))+"%")
+		if err == nil {
+			for mr.Next() {
+				var slug, name, desc string
+				if mr.Scan(&slug, &name, &desc) == nil {
+					c.MCP = append(c.MCP, map[string]string{"slug": slug, "name": name, "description": desc})
+				}
+			}
+			mr.Close()
+		}
+	}
+
+	count := 0
+	index := []map[string]any{}
+	sort.Strings(order)
+	for _, v := range order {
+		c := by[v]
+		c.Pages = len(c.Products) > 1 || len(c.Cases) > 0 || len(c.MCP) > 0
+		if c.Pages {
+			if err := upsert("companies/"+c.UID+".json", "company", map[string]any{
+				"company": c, "generated": today,
+			}); err != nil {
+				return count, err
+			}
+			count++
+		}
+		entry := map[string]any{
+			"uid": c.UID, "name": c.Name, "products": len(c.Products),
+			"cases": len(c.Cases), "mcp": len(c.MCP), "has_page": c.Pages,
+		}
+		if !c.Pages && len(c.Products) == 1 {
+			entry["product"] = c.Products[0].Name
+			entry["url"] = c.Products[0].URL
+			entry["note"] = c.Products[0].Note
+		}
+		index = append(index, entry)
+	}
+	if err := upsert("companies/index.json", "company-hub", map[string]any{
+		"uid": twoaiUID("section:ai-companies-directory"), "companies": index,
+		"total": len(index), "profiled": count, "generated": today,
+	}); err != nil {
+		return count, err
+	}
+	return count + 1, nil
 }
 
 // twoaiPeople renders the AI people directory from site_people, the same 47
@@ -3300,6 +3459,8 @@ func twoaiTaxonomyFor(kind string) any {
 		return "mcp-servers"
 	case "person", "person-hub":
 		return "ai-people-directory"
+	case "company", "company-hub":
+		return "ai-companies-directory"
 	case "week", "week-hub":
 		return "this-week-in-ai"
 	}
