@@ -34,6 +34,19 @@ func main() {
 		os.Exit(2)
 	}
 	src := os.Args[1]
+	// Fast path for theworldofai.org. `pipeline all` takes twenty to thirty
+	// minutes because it re-ingests every source, so a change to the taxonomy or
+	// a page template used to mean waiting for a full run to see it. This runs
+	// only the stages that turn existing SQL into a published site, which takes
+	// about a minute. Nothing here fetches from an external source.
+	if src == "twoai" {
+		for _, s := range []string{"twoai_build", "twoai_publish_r2", "twoai_publish", "deploy_site"} {
+			cmd := exec.Command(os.Args[0], s)
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+			cmd.Run()
+		}
+		return
+	}
 	if src == "all" {
 		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
