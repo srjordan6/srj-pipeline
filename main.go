@@ -2694,6 +2694,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	people, err := twoaiPeople(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
 	mcp, err := twoaiMCP(db, today, upsert)
 	if err != nil {
 		return err
@@ -2709,9 +2714,89 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people)
 	return nil
+}
+
+// twoaiUID returns the short alphanumeric identifier a page is published under.
+//
+// Stephen's instruction 2026-08-03: everything already published keeps its URL,
+// and every NEW section addresses its pages by identifier below the category
+// level rather than by slug. The identifier is the first eight hex characters
+// of a SHA-256 of a stable key, so it is deterministic, collision-resistant at
+// this scale, and survives a person or company being renamed, which is the
+// whole point of addressing by identifier rather than by name.
+func twoaiUID(key string) string {
+	h := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(h[:])[:8]
+}
+
+// twoaiPeople renders the AI people directory from site_people, the same 47
+// profiles behind srjconsultingservices.com/ai-resources/ai-people/.
+//
+// These carry real substance: a hook, a quote, fields, a timeline, achievements,
+// and sources, three to four kilobytes each. That is why this is a page factory
+// rather than a directory listing. Profiles without sources are still rendered,
+// but the page says which claims are unsourced rather than presenting everything
+// with equal confidence.
+func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
+	rows, err := db.Query(`SELECT slug, data::text FROM site_people ORDER BY slug`)
+	if err != nil {
+		return 0, err
+	}
+	type idx struct {
+		UID     string `json:"uid"`
+		Name    string `json:"name"`
+		Moniker string `json:"moniker,omitempty"`
+		Hook    string `json:"hook,omitempty"`
+		Fields  []any  `json:"fields,omitempty"`
+	}
+	var list []idx
+	var docs []map[string]any
+	for rows.Next() {
+		var slug, raw string
+		if rows.Scan(&slug, &raw) != nil {
+			continue
+		}
+		var d map[string]any
+		if json.Unmarshal([]byte(raw), &d) != nil {
+			continue
+		}
+		name, _ := d["name"].(string)
+		if name == "" {
+			continue
+		}
+		uid := twoaiUID("person:" + slug)
+		d["uid"] = uid
+		d["generated"] = today
+		docs = append(docs, d)
+		mon, _ := d["moniker"].(string)
+		hook, _ := d["hook"].(string)
+		fields, _ := d["fields"].([]any)
+		list = append(list, idx{uid, name, mon, hook, fields})
+	}
+	rows.Close()
+	if len(docs) == 0 {
+		return 0, nil
+	}
+
+	count := 0
+	for _, d := range docs {
+		uid, _ := d["uid"].(string)
+		if err := upsert("people/"+uid+".json", "person", d); err != nil {
+			return count, err
+		}
+		count++
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	if err := upsert("people/index.json", "person-hub", map[string]any{
+		"uid": twoaiUID("section:ai-people-directory"), "people": list,
+		"total": len(list), "generated": today,
+	}); err != nil {
+		return count, err
+	}
+	return count + 1, nil
 }
 
 // twoaiMCP renders the Model Context Protocol server tracker from the mirror
@@ -2962,6 +3047,8 @@ func twoaiTaxonomyFor(kind string) any {
 		return "ai-tools-catalog"
 	case "mcp-server", "mcp-hub":
 		return "mcp-servers"
+	case "person", "person-hub":
+		return "ai-people-directory"
 	case "week", "week-hub":
 		return "this-week-in-ai"
 	}
