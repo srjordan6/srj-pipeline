@@ -3284,13 +3284,86 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 	count := 0
 	index := []map[string]any{}
 	sort.Strings(order)
+
+	// Load company profiles once. Every field is optional: nothing is embedded
+	// unless twoai_company_profiles has a row for that uid, so a directory
+	// entry with no profile still renders exactly as before.
+	profiles := map[string]map[string]any{}
+	if pr, err := db.Query(`SELECT uid, COALESCE(org_type,''), for_profit, founded,
+			COALESCE(headquarters,''), COALESCE(website,''), COALESCE(ticker,''),
+			COALESCE(cik,''), last_revenue_usd, last_revenue_end::text,
+			COALESCE(last_revenue_form,''), verified_on::text
+		FROM twoai_company_profiles`); err == nil {
+		for pr.Next() {
+			var uid, orgType, hq, website, ticker, cik, revForm string
+			var forProfit sql.NullBool
+			var founded sql.NullInt32
+			var revUsd sql.NullInt64
+			var revEnd, verified sql.NullString
+			if pr.Scan(&uid, &orgType, &forProfit, &founded, &hq, &website, &ticker,
+				&cik, &revUsd, &revEnd, &revForm, &verified) != nil {
+				continue
+			}
+			p := map[string]any{}
+			if orgType != "" {
+				p["org_type"] = orgType
+			}
+			if forProfit.Valid {
+				p["for_profit"] = forProfit.Bool
+			}
+			if founded.Valid {
+				p["founded"] = founded.Int32
+			}
+			if hq != "" {
+				p["headquarters"] = hq
+			}
+			if website != "" {
+				p["website"] = website
+			}
+			if ticker != "" {
+				p["ticker"] = ticker
+			}
+			if cik != "" {
+				p["cik"] = cik
+			}
+			if revUsd.Valid {
+				p["last_revenue_usd"] = revUsd.Int64
+			}
+			if revEnd.Valid {
+				p["last_revenue_end"] = revEnd.String
+			}
+			if revForm != "" {
+				p["last_revenue_form"] = revForm
+			}
+			if verified.Valid {
+				p["verified_on"] = verified.String
+			}
+			profiles[uid] = p
+		}
+		pr.Close()
+	}
+
 	for _, v := range order {
 		c := by[v]
 		c.Pages = len(c.Products) > 1 || len(c.Cases) > 0 || len(c.MCP) > 0
 		if c.Pages {
-			if err := upsert("companies/"+c.UID+".json", "company", map[string]any{
-				"company": c, "generated": today,
-			}); err != nil {
+			payload := map[string]any{"company": c, "generated": today}
+			if p, ok := profiles[c.UID]; ok && len(p) > 0 {
+				// Embed the profile map alongside the aggregated tools/cases/mcp
+				// so a single fetch of companies/{uid}.json carries every field
+				// the template renders. Nothing is duplicated: the profile map
+				// only holds fields that are not otherwise on `company`.
+				enriched := map[string]any{}
+				enriched["uid"] = c.UID
+				enriched["name"] = c.Name
+				enriched["products"] = c.Products
+				enriched["cases"] = c.Cases
+				enriched["mcp"] = c.MCP
+				enriched["has_page"] = c.Pages
+				enriched["profile"] = p
+				payload["company"] = enriched
+			}
+			if err := upsert("companies/"+c.UID+".json", "company", payload); err != nil {
 				return count, err
 			}
 			count++
