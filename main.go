@@ -2812,6 +2812,164 @@ func twoaiBuild(db *sql.DB) error {
 	return nil
 }
 
+// twoaiPublishR2 writes the whole content set to R2 as one compressed bundle.
+//
+// WHY THIS EXISTS. twoai_publish PUTs every changed page to GitHub through the
+// contents API, one HTTP call per file. That was fine at 200 files. The MCP
+// registry made it 1,616 and the stage took about twenty minutes, which is a
+// scaling wall rather than a slow day: another registry-sized factory would
+// exceed the cron window outright.
+//
+// The design is srj's and it is better than overwriting one fixed key. Every
+// run writes an immutable bundle under a content hash, then updates one small
+// manifest that names it. Publishing is therefore atomic, because the manifest
+// flips only after the bundle is fully uploaded, and rollback is editing one
+// tiny object. A reader that fetches the manifest can never see a half-written
+// bundle.
+//
+// Credentials are R2 S3-compatible and scoped to this bucket alone. They are
+// checked by name and never printed: the stage reports which are missing so a
+// misconfiguration is obvious from the log without leaking anything.
+func twoaiPublishR2(db *sql.DB) error {
+	keyID := os.Getenv("R2_ACCESS_KEY_ID")
+	secret := os.Getenv("R2_SECRET_ACCESS_KEY")
+	endpoint := strings.TrimRight(os.Getenv("R2_S3_ENDPOINT"), "/")
+	bucket := os.Getenv("R2_BUCKET")
+	if bucket == "" {
+		bucket = "twoai-content"
+	}
+	var missing []string
+	if keyID == "" {
+		missing = append(missing, "R2_ACCESS_KEY_ID")
+	}
+	if secret == "" {
+		missing = append(missing, "R2_SECRET_ACCESS_KEY")
+	}
+	if endpoint == "" {
+		missing = append(missing, "R2_S3_ENDPOINT")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("not configured, missing: %s", strings.Join(missing, ", "))
+	}
+
+	rows, err := db.Query(`SELECT path, data::text FROM twoai_pages ORDER BY path`)
+	if err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	files := 0
+	for rows.Next() {
+		var p, d string
+		if rows.Scan(&p, &d) != nil {
+			continue
+		}
+		if err := tw.WriteHeader(&tar.Header{
+			Name: p, Mode: 0o644, Size: int64(len(d)), ModTime: time.Now(),
+		}); err != nil {
+			rows.Close()
+			return err
+		}
+		if _, err := tw.Write([]byte(d)); err != nil {
+			rows.Close()
+			return err
+		}
+		files++
+	}
+	rows.Close()
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	if err := gz.Close(); err != nil {
+		return err
+	}
+	if files == 0 {
+		return fmt.Errorf("no pages to publish")
+	}
+
+	body := buf.Bytes()
+	sum := sha256.Sum256(body)
+	hash := hex.EncodeToString(sum[:])
+	bundleKey := "bundles/" + hash[:16] + ".tar.gz"
+
+	if err := r2Put(endpoint, bucket, keyID, secret, bundleKey, "application/gzip", body); err != nil {
+		return err
+	}
+	manifest, _ := json.Marshal(map[string]any{
+		"bundle": bundleKey, "sha256": hash, "files": files,
+		"bytes": len(body), "generated": time.Now().UTC().Format(time.RFC3339),
+	})
+	if err := r2Put(endpoint, bucket, keyID, secret, "manifest.json", "application/json", manifest); err != nil {
+		return err
+	}
+	fmt.Printf("twoai_publish_r2: files=%d bytes=%d bundle=%s ok=true\n", files, len(body), bundleKey)
+	return nil
+}
+
+// r2Put signs and sends one object with AWS Signature Version 4, which is what
+// R2's S3-compatible API expects. Written out rather than pulling in the AWS
+// SDK: this is the only S3 call the pipeline makes, and a single dependency-free
+// function is easier to audit than a vendored SDK.
+func r2Put(endpoint, bucket, keyID, secret, key, contentType string, body []byte) error {
+	u, err := url.Parse(endpoint + "/" + bucket + "/" + key)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	dateStamp := now.Format("20060102")
+	sum := sha256.Sum256(body)
+	payloadHash := hex.EncodeToString(sum[:])
+
+	canonicalHeaders := fmt.Sprintf("content-type:%s\nhost:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n",
+		contentType, u.Host, payloadHash, amzDate)
+	signedHeaders := "content-type;host;x-amz-content-sha256;x-amz-date"
+	canonicalRequest := strings.Join([]string{
+		"PUT", u.EscapedPath(), "", canonicalHeaders, signedHeaders, payloadHash,
+	}, "\n")
+	crHash := sha256.Sum256([]byte(canonicalRequest))
+
+	scope := dateStamp + "/auto/s3/aws4_request"
+	stringToSign := strings.Join([]string{
+		"AWS4-HMAC-SHA256", amzDate, scope, hex.EncodeToString(crHash[:]),
+	}, "\n")
+
+	mac := func(k, d []byte) []byte {
+		h := hmac.New(sha256.New, k)
+		h.Write(d)
+		return h.Sum(nil)
+	}
+	kDate := mac([]byte("AWS4"+secret), []byte(dateStamp))
+	kRegion := mac(kDate, []byte("auto"))
+	kService := mac(kRegion, []byte("s3"))
+	kSigning := mac(kService, []byte("aws4_request"))
+	signature := hex.EncodeToString(mac(kSigning, []byte(stringToSign)))
+
+	req, err := http.NewRequest("PUT", u.String(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	req.Header.Set("X-Amz-Date", amzDate)
+	req.Header.Set("Authorization", fmt.Sprintf(
+		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		keyID, scope, signedHeaders, signature))
+
+	client := &http.Client{Timeout: 180 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		return fmt.Errorf("r2 PUT %s: %d %s", key, resp.StatusCode, b)
+	}
+	return nil
+}
+
 // twoaiUID returns the short alphanumeric identifier a page is published under.
 //
 // Stephen's instruction 2026-08-03: everything already published keeps its URL,
