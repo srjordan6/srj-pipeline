@@ -1,9 +1,12 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
+	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
 	"database/sql"
@@ -32,7 +35,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "twoai_build", "twoai_publish", "arxiv_watch", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -97,6 +100,13 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("intel: ok")
+		return
+	}
+	if src == "twoai_publish_r2" {
+		if err := twoaiPublishR2(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_publish_r2:", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if src == "mcp_registry" {
