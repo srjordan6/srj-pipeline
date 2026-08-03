@@ -2469,9 +2469,11 @@ func twoaiBuild(db *sql.DB) error {
 	total := 0
 	upsert := func(path, kind string, v any) error {
 		j, _ := json.Marshal(v)
-		_, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data) VALUES ($1,$2,$3::jsonb)
-			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data, updated_at=now()`,
-			path, kind, string(j))
+		_, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug)
+			VALUES ($1,$2,$3::jsonb,$4)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, updated_at=now()`,
+			path, kind, string(j), twoaiTaxonomyFor(kind))
 		return err
 	}
 	for code, name := range twoaiStates {
@@ -2681,6 +2683,35 @@ func twoaiBuild(db *sql.DB) error {
 
 	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d ok=true\n",
 		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance)
+	return nil
+}
+
+// twoaiTaxonomyFor places a page in the AI Ecosystem tree at write time.
+//
+// Assigning this by hand in SQL after each new factory shipped did not hold:
+// 74 pages, including all 61 compliance pages, ended up outside the tree, so
+// their category reported fewer pages than it had and the coverage numbers on
+// the site understated it. A page now gets its node from the same call that
+// writes it, which is the only version of this that cannot drift.
+//
+// A kind with no entry returns empty, which stores NULL: chrome like the
+// ecosystem hub and the legal pages genuinely sit outside the tree rather than
+// belonging to a category, and pretending otherwise would inflate the counts.
+func twoaiTaxonomyFor(kind string) any {
+	switch kind {
+	case "state-law", "hub":
+		return "state-ai-laws"
+	case "compliance", "compliance-hub":
+		return "governance-frameworks"
+	case "lawsuits":
+		return "ai-lawsuit-tracker"
+	case "glossary":
+		return "ai-glossary"
+	case "tool", "tool-category", "tool-hub":
+		return "ai-tools-catalog"
+	case "week", "week-hub":
+		return "this-week-in-ai"
+	}
 	return nil
 }
 
