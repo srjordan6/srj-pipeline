@@ -1942,11 +1942,27 @@ func intelPromote(db *sql.DB) (int, error) {
 		if !aiCore.MatchString(c.name) || noise.MatchString(c.name) {
 			continue
 		}
+		// Two guards the defendant-name test cannot give, found by srj's audit
+		// of the jump to 92 cases. A bankruptcy docket names Workday because it
+		// is a creditor or a vendor of the debtor, not because anyone sued it
+		// over AI, and that is a different collision class from the Cohere and
+		// Suno name clashes. A caption with no " v. " separator is a docket
+		// entity record rather than a suit: one row reached the tracker whose
+		// entire case name was the bare string WORKDAY INC.
+		if strings.Contains(strings.ToLower(c.court), "bankr") {
+			continue
+		}
+		if !strings.Contains(c.name, " v. ") {
+			continue
+		}
 		parties := strings.SplitN(c.name, " v. ", 2)
 		plaintiff := strings.TrimSpace(parties[0])
 		defendant := ""
 		if len(parties) == 2 {
 			defendant = strings.TrimSpace(parties[1])
+		}
+		if defendant == "" {
+			continue
 		}
 		short := func(s string) string {
 			f := strings.Fields(nonSlug.ReplaceAllString(strings.ToLower(s), " "))
