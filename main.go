@@ -2507,6 +2507,15 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	// A bundle row renders many URLs from one file: the glossary is 523 pages
+	// in a single JSON, the tracker is one page per case plus the hub. Counting
+	// rows therefore undercounts the site badly, which is why AI Litigation
+	// reported 1 while publishing 92 cases. url_count records what a row
+	// actually becomes on the site so the coverage numbers mean something.
+	setURLs := func(path string, n int) {
+		db.Exec(`UPDATE twoai_pages SET url_count=$1 WHERE path=$2`, n, path)
+	}
+
 	// ---- F2: glossary, straight from the library already in site_content.
 	var glossary string
 	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='resources/glossary.json'`).Scan(&glossary); err == nil && glossary != "" {
@@ -2516,6 +2525,11 @@ func twoaiBuild(db *sql.DB) error {
 			if err := upsert("glossary/glossary.json", "glossary", g); err != nil {
 				return err
 			}
+			terms := 0
+			if t, ok := g["terms"].([]any); ok {
+				terms = len(t)
+			}
+			setURLs("glossary/glossary.json", terms+1)
 		}
 	}
 
@@ -2559,6 +2573,7 @@ func twoaiBuild(db *sql.DB) error {
 	}); err != nil {
 		return err
 	}
+	setURLs("lawsuits/lawsuits.json", len(cases)+1)
 
 	// ---- Static pages (about, contact, privacy, terms, disclaimer, disclosure).
 	// Copy lives in site_content under twoai/static/*.json so nothing is typed
@@ -3464,7 +3479,7 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 	// count and counts as live when any section is.
 	rows, err := db.Query(`SELECT t.slug, t.name, COALESCE(t.blurb,''), t.status,
 			COALESCE(t.live_path,''), COALESCE(t.parent_slug,''), t.level,
-			(SELECT count(*) FROM twoai_pages p WHERE p.taxonomy_slug = t.slug)
+			(SELECT COALESCE(sum(p.url_count),0) FROM twoai_pages p WHERE p.taxonomy_slug = t.slug)
 		FROM twoai_taxonomy t WHERE t.level IN (1,2,3) ORDER BY t.level, t.sort`)
 	if err != nil {
 		return 0, err
