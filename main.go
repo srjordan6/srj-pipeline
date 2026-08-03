@@ -3040,19 +3040,19 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 	}
 
 	type product struct {
-		Name      string `json:"name"`
-		Note      string `json:"note,omitempty"`
-		URL       string `json:"url,omitempty"`
-		Category  string `json:"category,omitempty"`
-		Profile   string `json:"profile,omitempty"`
+		Name     string `json:"name"`
+		Note     string `json:"note,omitempty"`
+		URL      string `json:"url,omitempty"`
+		Category string `json:"category,omitempty"`
+		Profile  string `json:"profile,omitempty"`
 	}
 	type company struct {
-		UID       string    `json:"uid"`
-		Name      string    `json:"name"`
-		Products  []product `json:"products"`
-		Cases     []map[string]string `json:"cases,omitempty"`
-		MCP       []map[string]string `json:"mcp,omitempty"`
-		Pages     bool      `json:"has_page"`
+		UID      string              `json:"uid"`
+		Name     string              `json:"name"`
+		Products []product           `json:"products"`
+		Cases    []map[string]string `json:"cases,omitempty"`
+		MCP      []map[string]string `json:"mcp,omitempty"`
+		Pages    bool                `json:"has_page"`
 	}
 
 	order := []string{}
