@@ -3214,11 +3214,14 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		return 0, err
 	}
 	type idx struct {
-		UID     string `json:"uid"`
-		Name    string `json:"name"`
-		Moniker string `json:"moniker,omitempty"`
-		Hook    string `json:"hook,omitempty"`
-		Fields  []any  `json:"fields,omitempty"`
+		UID      string `json:"uid,omitempty"`
+		Name     string `json:"name"`
+		Moniker  string `json:"moniker,omitempty"`
+		Hook     string `json:"hook,omitempty"`
+		Fields   []any  `json:"fields,omitempty"`
+		Org      string `json:"org,omitempty"`
+		Title    string `json:"title,omitempty"`
+		Profiled bool   `json:"profiled"`
 	}
 	var list []idx
 	var docs []map[string]any
@@ -3242,9 +3245,43 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		mon, _ := d["moniker"].(string)
 		hook, _ := d["hook"].(string)
 		fields, _ := d["fields"].([]any)
-		list = append(list, idx{uid, name, mon, hook, fields})
+		list = append(list, idx{UID: uid, Name: name, Moniker: mon, Hook: hook, Fields: fields, Profiled: true})
 	}
 	rows.Close()
+
+	// The roster is the people we TRACK; site_people is the subset we have
+	// written up. srjconsultingservices.com publishes 65 while only 47 carry a
+	// full profile, and a directory that silently showed 47 would be a quieter
+	// but worse answer than one that says which 18 are tracked and unwritten.
+	// Roster-only entries get a row with their organisation and title and no
+	// page, because a name and a job title is not a profile.
+	seen := map[string]bool{}
+	for _, e := range list {
+		seen[strings.ToLower(strings.TrimSpace(e.Name))] = true
+	}
+	tracked := 0
+	var roster string
+	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='people/roster.json'`).Scan(&roster); err == nil {
+		var r struct {
+			People []struct {
+				Name  string `json:"name"`
+				Org   string `json:"org"`
+				Title string `json:"title"`
+			} `json:"people"`
+			Source map[string]string `json:"source"`
+		}
+		if json.Unmarshal([]byte(roster), &r) == nil {
+			for _, p := range r.People {
+				n := strings.TrimSpace(p.Name)
+				if n == "" || seen[strings.ToLower(n)] {
+					continue
+				}
+				seen[strings.ToLower(n)] = true
+				list = append(list, idx{Name: n, Org: p.Org, Title: p.Title})
+				tracked++
+			}
+		}
+	}
 	if len(docs) == 0 {
 		return 0, nil
 	}
@@ -3260,7 +3297,8 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	if err := upsert("people/index.json", "person-hub", map[string]any{
 		"uid": twoaiUID("section:ai-people-directory"), "people": list,
-		"total": len(list), "generated": today,
+		"total": len(list), "profiled": count, "tracked_only": tracked,
+		"generated": today,
 	}); err != nil {
 		return count, err
 	}
