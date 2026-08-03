@@ -3182,12 +3182,12 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 		Sections []domain `json:"sections,omitempty"`
 	}
 	type category struct {
-		Slug    string   `json:"slug"`
-		Name    string   `json:"name"`
-		Blurb   string   `json:"blurb"`
-		Domains []domain `json:"domains"`
-		Live    int      `json:"live"`
-		Pages   int      `json:"pages"`
+		Slug    string    `json:"slug"`
+		Name    string    `json:"name"`
+		Blurb   string    `json:"blurb"`
+		Domains []*domain `json:"domains"`
+		Live    int       `json:"live"`
+		Pages   int       `json:"pages"`
 	}
 
 	// Levels 1 to 3: category, domain, section. Sections are what a reader
@@ -3235,8 +3235,13 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 			continue
 		}
 		d := p.d
-		c.Domains = append(c.Domains, d)
-		doms[d.Slug] = &c.Domains[len(c.Domains)-1]
+		// Store pointers, not values. Appending to a slice can reallocate its
+		// backing array, which silently invalidates any pointer taken into it
+		// earlier: that is exactly how every section was attached to a copy
+		// that then vanished, leaving live domains reporting zero pages and
+		// linking nowhere.
+		c.Domains = append(c.Domains, &d)
+		doms[d.Slug] = &d
 	}
 	for _, p := range later {
 		if p.level != 3 {
