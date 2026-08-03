@@ -2800,6 +2800,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	research, err := twoaiResearch(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
 	companies, err := twoaiCompanies(db, today, upsert)
 	if err != nil {
 		return err
@@ -2825,8 +2830,8 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research)
 	return nil
 }
 
@@ -2999,6 +3004,116 @@ func r2Put(endpoint, bucket, keyID, secret, key, contentType string, body []byte
 func twoaiUID(key string) string {
 	h := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(h[:])[:8]
+}
+
+// twoaiResearch renders the AI research library from twoai_research_papers,
+// which is seeded through the Consensus academic index.
+//
+// WHAT IS AND IS NOT PUBLISHED. Bibliographic metadata and our own one-line
+// note, never the abstract. An abstract is the publisher's copyrighted text and
+// republishing hundreds of them would be reproduction at scale, which is not
+// something a site with a lawsuit tracker gets to do casually. Every paper
+// links out so the reader gets the abstract from the source.
+//
+// STALENESS IS STATED. Consensus is an MCP connector inside a Claude session,
+// not an API this pipeline can call, so unlike LegiScan or CourtListener this
+// table cannot refresh itself on the daily run; it is topped up by a scheduled
+// Cowork task. A section that silently goes stale is worse than one that says
+// when it was last added to, so the pages publish the most recent added_on date
+// rather than implying a currency they have not earned.
+func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
+	rows, err := db.Query(`SELECT uid, title, COALESCE(authors,''), COALESCE(year,0),
+			COALESCE(journal,''), COALESCE(citations,0), url, topic, COALESCE(our_note,''),
+			COALESCE(added_on::text,'')
+		FROM twoai_research_papers ORDER BY citations DESC NULLS LAST, year DESC`)
+	if err != nil {
+		return 0, nil
+	}
+	type paper struct {
+		UID       string `json:"uid"`
+		Title     string `json:"title"`
+		Authors   string `json:"authors,omitempty"`
+		Year      int    `json:"year,omitempty"`
+		Journal   string `json:"journal,omitempty"`
+		Citations int    `json:"citations"`
+		URL       string `json:"url"`
+		Topic     string `json:"topic"`
+		Note      string `json:"note,omitempty"`
+		Added     string `json:"added,omitempty"`
+	}
+	var all []paper
+	latest := ""
+	for rows.Next() {
+		var p paper
+		if rows.Scan(&p.UID, &p.Title, &p.Authors, &p.Year, &p.Journal, &p.Citations,
+			&p.URL, &p.Topic, &p.Note, &p.Added) != nil {
+			continue
+		}
+		if p.Added > latest {
+			latest = p.Added
+		}
+		all = append(all, p)
+	}
+	rows.Close()
+	if len(all) == 0 {
+		return 0, nil
+	}
+
+	label := map[string]string{
+		"capabilities-and-limits": "Capabilities and Limits",
+		"reasoning":               "Reasoning",
+		"architectures":           "Architectures",
+		"surveys":                 "Surveys of the Field",
+		"evaluation":              "Evaluation and Benchmarks",
+		"security":                "Security and Privacy",
+		"governance":              "Governance and Policy",
+		"eu-ai-act":               "The EU AI Act",
+		"bias-and-fairness":       "Bias and Fairness",
+		"applications":            "Applications by Sector",
+		"methodology":             "Research Methodology",
+		"healthcare-regulation":   "Healthcare Regulation",
+	}
+
+	byTopic := map[string][]paper{}
+	order := []string{}
+	for _, p := range all {
+		if _, ok := byTopic[p.Topic]; !ok {
+			order = append(order, p.Topic)
+		}
+		byTopic[p.Topic] = append(byTopic[p.Topic], p)
+	}
+	sort.Slice(order, func(i, j int) bool { return len(byTopic[order[i]]) > len(byTopic[order[j]]) })
+
+	count := 0
+	topics := []map[string]any{}
+	for _, t := range order {
+		name := label[t]
+		if name == "" {
+			name = strings.ReplaceAll(t, "-", " ")
+		}
+		uid := twoaiUID("research-topic:" + t)
+		if err := upsert("research/"+uid+".json", "research-topic", map[string]any{
+			"uid": uid, "topic": t, "name": name, "papers": byTopic[t],
+			"total": len(byTopic[t]), "generated": today, "last_added": latest,
+		}); err != nil {
+			return count, err
+		}
+		count++
+		topics = append(topics, map[string]any{
+			"uid": uid, "topic": t, "name": name, "count": len(byTopic[t]),
+		})
+	}
+	top := all
+	if len(top) > 12 {
+		top = top[:12]
+	}
+	if err := upsert("research/index.json", "research-hub", map[string]any{
+		"uid": twoaiUID("section:research-library"), "topics": topics,
+		"most_cited": top, "total": len(all), "generated": today, "last_added": latest,
+	}); err != nil {
+		return count, err
+	}
+	return count + 1, nil
 }
 
 // twoaiEntity registers a named thing in twoai_entities and returns the
@@ -3603,6 +3718,8 @@ func twoaiTaxonomyFor(kind string) any {
 		return "ai-people-directory"
 	case "company", "company-hub":
 		return "ai-companies-directory"
+	case "research-topic", "research-hub":
+		return "research-library"
 	case "week", "week-hub":
 		return "this-week-in-ai"
 	}
