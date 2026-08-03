@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -31,7 +32,7 @@ func main() {
 	}
 	src := os.Args[1]
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "twoai_build", "twoai_publish", "arxiv_watch", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "twoai_build", "twoai_publish", "arxiv_watch", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -96,6 +97,13 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("intel: ok")
+		return
+	}
+	if src == "mcp_registry" {
+		if err := mcpRegistry(db); err != nil {
+			fmt.Fprintln(os.Stderr, "mcp_registry:", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if src == "arxiv_watch" {
@@ -2671,6 +2679,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	mcp, err := twoaiMCP(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
 	ecosystem, err := twoaiEcosystem(db, today, upsert)
 	if err != nil {
 		return err
@@ -2681,8 +2694,231 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp)
+	return nil
+}
+
+// twoaiMCP renders the Model Context Protocol server tracker from the mirror
+// of the official registry.
+//
+// Every field on these pages comes from what the server's own publisher put in
+// the registry. We do not describe what a server does beyond its own
+// description, do not rate them, and do not claim any of them work: nobody has
+// installed 300 servers to check. The page says what was published, by whom,
+// when, and how to reach it, which is the useful and defensible thing.
+//
+// A server needs a description to get its own page. An entry that is a bare
+// name and a version number is a directory row, not a page worth indexing.
+func twoaiMCP(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
+	rows, err := db.Query(`SELECT name, slug, COALESCE(title,''), COALESCE(description,''),
+			COALESCE(version,''), COALESCE(repository::text,''), COALESCE(website_url,''),
+			COALESCE(remotes::text,''), COALESCE(packages::text,''),
+			COALESCE(to_char(published_at,'YYYY-MM-DD'),''),
+			COALESCE(to_char(registry_updated_at,'YYYY-MM-DD'),'')
+		FROM twoai_mcp_servers WHERE status='active' ORDER BY name`)
+	if err != nil {
+		return 0, err
+	}
+	type srv struct {
+		Name      string `json:"name"`
+		Slug      string `json:"slug"`
+		Title     string `json:"title,omitempty"`
+		Desc      string `json:"description,omitempty"`
+		Version   string `json:"version,omitempty"`
+		Website   string `json:"website,omitempty"`
+		RepoURL   string `json:"repo_url,omitempty"`
+		Transport string `json:"transport,omitempty"`
+		Vendor    string `json:"vendor,omitempty"`
+		Published string `json:"published,omitempty"`
+		Updated   string `json:"updated,omitempty"`
+	}
+	var all []srv
+	for rows.Next() {
+		var s srv
+		var repoRaw, remotesRaw, packagesRaw string
+		if rows.Scan(&s.Name, &s.Slug, &s.Title, &s.Desc, &s.Version, &repoRaw,
+			&s.Website, &remotesRaw, &packagesRaw, &s.Published, &s.Updated) != nil {
+			continue
+		}
+		if repoRaw != "" {
+			var r struct {
+				URL string `json:"url"`
+			}
+			if json.Unmarshal([]byte(repoRaw), &r) == nil {
+				s.RepoURL = r.URL
+			}
+		}
+		// How you actually reach it: a hosted endpoint, or something you run.
+		switch {
+		case remotesRaw != "" && remotesRaw != "null":
+			s.Transport = "remote"
+		case packagesRaw != "" && packagesRaw != "null":
+			s.Transport = "local package"
+		}
+		// The registry namespaces names by reverse domain, so the leading
+		// segments identify the publisher.
+		if i := strings.Index(s.Name, "/"); i > 0 {
+			parts := strings.Split(s.Name[:i], ".")
+			for l, r := 0, len(parts)-1; l < r; l, r = l+1, r-1 {
+				parts[l], parts[r] = parts[r], parts[l]
+			}
+			s.Vendor = strings.Join(parts, ".")
+		}
+		all = append(all, s)
+	}
+	rows.Close()
+	if len(all) == 0 {
+		return 0, nil
+	}
+
+	count := 0
+	for _, s := range all {
+		if s.Desc == "" {
+			continue
+		}
+		if err := upsert("mcp/"+s.Slug+".json", "mcp-server", map[string]any{
+			"server": s, "generated": today,
+		}); err != nil {
+			return count, err
+		}
+		count++
+	}
+	remote, local := 0, 0
+	for _, s := range all {
+		switch s.Transport {
+		case "remote":
+			remote++
+		case "local package":
+			local++
+		}
+	}
+	if err := upsert("mcp/index.json", "mcp-hub", map[string]any{
+		"servers": all, "total": len(all), "profiled": count,
+		"remote": remote, "local": local, "generated": today,
+	}); err != nil {
+		return count, err
+	}
+	return count + 1, nil
+}
+
+// mcpRegistry mirrors the official Model Context Protocol registry.
+//
+// SOURCE CHOICE. The obvious approach, searching GitHub for topic:mcp-server,
+// is wrong: a live check returned 2,458 repositories led by n8n, gemini-cli,
+// and a web-scraping framework, none of which is an MCP server. They tag the
+// topic because they support MCP. The official registry at
+// registry.modelcontextprotocol.io is the authoritative list of servers that
+// have actually published themselves, which is a fact about the world rather
+// than a guess from a keyword.
+//
+// Only entries the registry marks isLatest AND active are stored. The API
+// returns every historical version of every server, so without that filter a
+// server appears once per release and the count is nonsense.
+func mcpRegistry(db *sql.DB) error {
+	slugRe := regexp.MustCompile(`[^a-z0-9]+`)
+	client := &http.Client{Timeout: 45 * time.Second}
+	cursor := ""
+	stored, pages := 0, 0
+
+	for pages < 40 {
+		u := "https://registry.modelcontextprotocol.io/v0/servers?limit=100"
+		if cursor != "" {
+			u += "&cursor=" + url.QueryEscape(cursor)
+		}
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", "srj-pipeline/1.0 (theworldofai.org)")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != 200 {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+			resp.Body.Close()
+			return fmt.Errorf("mcp registry %d: %s", resp.StatusCode, b)
+		}
+		var payload struct {
+			Servers []struct {
+				Server struct {
+					Name        string          `json:"name"`
+					Title       string          `json:"title"`
+					Description string          `json:"description"`
+					Version     string          `json:"version"`
+					WebsiteURL  string          `json:"websiteUrl"`
+					Repository  json.RawMessage `json:"repository"`
+					Remotes     json.RawMessage `json:"remotes"`
+					Packages    json.RawMessage `json:"packages"`
+				} `json:"server"`
+				Meta struct {
+					Official struct {
+						Status      string `json:"status"`
+						IsLatest    bool   `json:"isLatest"`
+						PublishedAt string `json:"publishedAt"`
+						UpdatedAt   string `json:"updatedAt"`
+					} `json:"io.modelcontextprotocol.registry/official"`
+				} `json:"_meta"`
+			} `json:"servers"`
+			Metadata struct {
+				NextCursor string `json:"nextCursor"`
+			} `json:"metadata"`
+		}
+		dec := json.NewDecoder(resp.Body)
+		if err := dec.Decode(&payload); err != nil {
+			resp.Body.Close()
+			return err
+		}
+		resp.Body.Close()
+		pages++
+
+		for _, row := range payload.Servers {
+			o := row.Meta.Official
+			s := row.Server
+			if !o.IsLatest || o.Status != "active" || s.Name == "" {
+				continue
+			}
+			slug := strings.Trim(slugRe.ReplaceAllString(strings.ToLower(s.Name), "-"), "-")
+			if slug == "" {
+				continue
+			}
+			js := func(r json.RawMessage) any {
+				if len(r) == 0 {
+					return nil
+				}
+				return string(r)
+			}
+			var pub, upd any
+			if o.PublishedAt != "" {
+				pub = o.PublishedAt
+			}
+			if o.UpdatedAt != "" {
+				upd = o.UpdatedAt
+			}
+			if _, err := db.Exec(`INSERT INTO twoai_mcp_servers
+				(name, slug, title, description, version, repository, website_url,
+				 remotes, packages, status, published_at, registry_updated_at, fetched_at)
+				VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8::jsonb,$9::jsonb,$10,$11,$12,now())
+				ON CONFLICT (name) DO UPDATE SET slug=EXCLUDED.slug, title=EXCLUDED.title,
+					description=EXCLUDED.description, version=EXCLUDED.version,
+					repository=EXCLUDED.repository, website_url=EXCLUDED.website_url,
+					remotes=EXCLUDED.remotes, packages=EXCLUDED.packages,
+					status=EXCLUDED.status, published_at=EXCLUDED.published_at,
+					registry_updated_at=EXCLUDED.registry_updated_at, fetched_at=now()`,
+				s.Name, slug, s.Title, s.Description, s.Version, js(s.Repository),
+				s.WebsiteURL, js(s.Remotes), js(s.Packages), o.Status, pub, upd); err != nil {
+				return err
+			}
+			stored++
+		}
+		cursor = payload.Metadata.NextCursor
+		if cursor == "" {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	fmt.Printf("mcp_registry: pages=%d active_servers=%d ok=true\n", pages, stored)
 	return nil
 }
 
@@ -2709,6 +2945,8 @@ func twoaiTaxonomyFor(kind string) any {
 		return "ai-glossary"
 	case "tool", "tool-category", "tool-hub":
 		return "ai-tools-catalog"
+	case "mcp-server", "mcp-hub":
+		return "mcp-servers"
 	case "week", "week-hub":
 		return "this-week-in-ai"
 	}
