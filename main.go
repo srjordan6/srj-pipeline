@@ -155,6 +155,54 @@ func main() {
 		return
 	}
 
+	// Backfill for rows stored before the resolver landed: 1,213 of them hold
+	// an opaque Google News redirect. Own subcommand, never part of `all`, so
+	// a Google-side change can stall this and nothing else.
+	if src == "resolve_gnews" {
+		rows, err := db.Query(`SELECT id, url, vendor FROM ai_intel_candidates
+			WHERE url LIKE '%news.google.com/rss/articles%' ORDER BY id DESC`)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "resolve_gnews:", err)
+			os.Exit(1)
+		}
+		type row struct {
+			id          int
+			url, vendor string
+		}
+		var todo []row
+		for rows.Next() {
+			var r row
+			var v sql.NullString
+			if rows.Scan(&r.id, &r.url, &v) == nil {
+				r.vendor = v.String
+				todo = append(todo, r)
+			}
+		}
+		rows.Close()
+		fixed, missed := 0, 0
+		for i, r := range todo {
+			real := resolveGoogleNews(r.url)
+			if real == r.url {
+				missed++
+			} else {
+				vendor := r.vendor
+				if strings.Contains(vendor, "(coverage)") {
+					if pub := publisherFromURL(real); pub != "" {
+						vendor = pub
+					}
+				}
+				db.Exec(`UPDATE ai_intel_candidates SET url=$1, vendor=$2 WHERE id=$3`, real, vendor, r.id)
+				fixed++
+			}
+			time.Sleep(700 * time.Millisecond)
+			if (i+1)%50 == 0 {
+				fmt.Printf("resolve_gnews: %d/%d fixed=%d missed=%d\n", i+1, len(todo), fixed, missed)
+			}
+		}
+		fmt.Printf("resolve_gnews: done fixed=%d missed=%d of %d\n", fixed, missed, len(todo))
+		return
+	}
+
 	if src == "email_route" {
 		if err := emailRoute(db); err != nil {
 			fmt.Fprintln(os.Stderr, "email_route:", err)
@@ -2146,10 +2194,29 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 			if title == "" || link == "" || !mentionsAI(title) {
 				continue
 			}
+			// Google News coverage-proxy feeds hand us an opaque redirect
+			// rather than the publisher link, and label the item with the
+			// SEARCH QUERY that found it, which is how a Cohere story ended
+			// up filed under "Aleph Alpha (coverage)". Resolve the real URL
+			// and, for proxy feeds only, name the publisher instead of the
+			// query. First-party vendor feeds keep their own label.
+			vendorLabel := f.vendor
+			sourceID := "rss-" + link
+			if isGoogleNewsURL(link) {
+				if real := resolveGoogleNews(link); real != link {
+					link = real
+					if strings.Contains(f.vendor, "(coverage)") {
+						if pub := publisherFromURL(real); pub != "" {
+							vendorLabel = pub
+						}
+					}
+				}
+				time.Sleep(700 * time.Millisecond)
+			}
 			r, ierr := db.Exec(`INSERT INTO ai_intel_candidates (kind, name, vendor, url, source, source_id)
 				VALUES ('vendor-news', $1, $2, $3, 'rss', $4)
 				ON CONFLICT (source_id) DO NOTHING`,
-				trunc(title, 300), f.vendor, link, "rss-"+link)
+				trunc(title, 300), vendorLabel, link, sourceID)
 			if ierr != nil {
 				continue
 			}
