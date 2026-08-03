@@ -2988,6 +2988,51 @@ func twoaiUID(key string) string {
 	return hex.EncodeToString(h[:])[:8]
 }
 
+// twoaiEntity registers a named thing in twoai_entities and returns the
+// identifier every part of the site should use for it.
+//
+// THE PROBLEM IT SOLVES. The same company shows up in four places already: as a
+// vendor in the tools catalog, as a defendant in the lawsuit tracker, as a
+// publisher in the MCP registry, and soon as the maker of a model. Each source
+// spells it differently, so "OpenAI", "OpenAI, Inc." and "OpenAI Global, LLC"
+// are three strings for one organisation. Joining on the display name means
+// the cross-references silently disagree.
+//
+// So the identifier is derived from a NORMALIZED name, lowercased with legal
+// suffixes and punctuation stripped, and the mapping is stored. Any factory
+// that calls this with any spelling gets the same uid back, which is what makes
+// a company page able to say what a company ships, who is suing it, and what it
+// has published to MCP, and be sure all three refer to the same entity. The
+// original spelling is kept as an alias so the trail from source to identifier
+// stays visible rather than being lost in a hash.
+var entitySuffixRe = regexp.MustCompile(`(?i)[ ,]+(inc|incorporated|llc|l\.l\.c|ltd|limited|corp|corporation|co|company|plc|gmbh|sa|s\.a|ag|pbc|lp|llp|holdings|labs|technologies|technology)\.?$`)
+var entityPunctRe = regexp.MustCompile(`[^a-z0-9]+`)
+
+func twoaiEntityID(db *sql.DB, kind, name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	for {
+		stripped := entitySuffixRe.ReplaceAllString(n, "")
+		if stripped == n {
+			break
+		}
+		n = stripped
+	}
+	n = strings.Trim(entityPunctRe.ReplaceAllString(n, "-"), "-")
+	if n == "" {
+		n = strings.Trim(entityPunctRe.ReplaceAllString(strings.ToLower(name), "-"), "-")
+	}
+	uid := twoaiUID(kind + ":" + n)
+	if db != nil {
+		db.Exec(`INSERT INTO twoai_entities (uid, kind, name, normalized, aliases)
+			VALUES ($1,$2,$3,$4, jsonb_build_array($3::text))
+			ON CONFLICT (uid) DO UPDATE SET last_seen = now(),
+				aliases = CASE WHEN twoai_entities.aliases ? $3 THEN twoai_entities.aliases
+					ELSE twoai_entities.aliases || jsonb_build_array($3::text) END`,
+			uid, kind, strings.TrimSpace(name), n)
+	}
+	return uid
+}
+
 // twoaiCompanies builds the AI company directory from the vendors already in
 // the tools catalog, cross-referenced against the lawsuit tracker and the MCP
 // registry.
@@ -3064,7 +3109,7 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 		}
 		c := by[v]
 		if c == nil {
-			c = &company{UID: twoaiUID("company:" + strings.ToLower(v)), Name: v}
+			c = &company{UID: twoaiEntityID(db, "company", v), Name: v}
 			by[v] = c
 			order = append(order, v)
 		}
@@ -3177,7 +3222,7 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		if name == "" {
 			continue
 		}
-		uid := twoaiUID("person:" + slug)
+		uid := twoaiEntityID(db, "person", name)
 		d["uid"] = uid
 		d["generated"] = today
 		docs = append(docs, d)
