@@ -2805,6 +2805,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	sources, err := twoaiSources(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
 	companies, err := twoaiCompanies(db, today, upsert)
 	if err != nil {
 		return err
@@ -2830,8 +2835,8 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources)
 	return nil
 }
 
@@ -3009,49 +3014,76 @@ func twoaiUID(key string) string {
 // twoaiResearch renders the AI research library from twoai_research_papers,
 // which is seeded through the Consensus academic index.
 //
-// WHAT IS AND IS NOT PUBLISHED. Bibliographic metadata and our own one-line
-// note, never the abstract. An abstract is the publisher's copyrighted text and
-// republishing hundreds of them would be reproduction at scale, which is not
-// something a site with a lawsuit tracker gets to do casually. Every paper
-// links out so the reader gets the abstract from the source.
+// WHAT IS PUBLISHED. Bibliographic metadata, our own one-line note, and — when
+// captured — the abstract from Consensus with attribution and a subscription
+// note, plus three plain-English explanations of each paper for a beginner, a
+// practitioner and a business reader. The abstract's provenance is stamped on
+// every page ("Abstract via Consensus, subscription required") and Consensus is
+// the linked source. No abstract is reproduced without that credit.
 //
 // STALENESS IS STATED. Consensus is an MCP connector inside a Claude session,
 // not an API this pipeline can call, so unlike LegiScan or CourtListener this
 // table cannot refresh itself on the daily run; it is topped up by a scheduled
-// Cowork task. A section that silently goes stale is worse than one that says
-// when it was last added to, so the pages publish the most recent added_on date
-// rather than implying a currency they have not earned.
+// Cowork task that fetches abstracts and writes the three explanations. A
+// section that silently goes stale is worse than one that says when it was
+// last added to, so the pages publish the most recent added_on date rather
+// than implying a currency they have not earned.
+//
+// WHAT THIS EMITS. One JSON per topic at research/{uid}.json (shelf view),
+// one JSON per paper at research/paper/{uid}.json (paper detail page), and one
+// research/index.json (library hub). The paper-detail files include everything
+// needed to render the fixed page layout Stephen specified: title, type, year,
+// authors, journal, volume, DOI, then abstract (with attribution), then the
+// three explanations.
 func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
 	rows, err := db.Query(`SELECT uid, title, COALESCE(authors,''), COALESCE(year,0),
 			COALESCE(journal,''), COALESCE(citations,0), url, topic, COALESCE(our_note,''),
-			COALESCE(added_on::text,'')
+			COALESCE(added_on::text,''),
+			COALESCE(abstract,''), COALESCE(abstract_source,''), COALESCE(doi,''),
+			COALESCE(volume,''), COALESCE(paper_type,''),
+			COALESCE(explain_beginner,''), COALESCE(explain_practitioner,''),
+			COALESCE(explain_business,'')
 		FROM twoai_research_papers ORDER BY citations DESC NULLS LAST, year DESC`)
 	if err != nil {
 		return 0, nil
 	}
 	type paper struct {
-		UID       string `json:"uid"`
-		Title     string `json:"title"`
-		Authors   string `json:"authors,omitempty"`
-		Year      int    `json:"year,omitempty"`
-		Journal   string `json:"journal,omitempty"`
-		Citations int    `json:"citations"`
-		URL       string `json:"url"`
-		Topic     string `json:"topic"`
-		Note      string `json:"note,omitempty"`
-		Added     string `json:"added,omitempty"`
+		UID              string `json:"uid"`
+		Title            string `json:"title"`
+		Authors          string `json:"authors,omitempty"`
+		Year             int    `json:"year,omitempty"`
+		Journal          string `json:"journal,omitempty"`
+		Citations        int    `json:"citations"`
+		URL              string `json:"url"`
+		Topic            string `json:"topic"`
+		Note             string `json:"note,omitempty"`
+		Added            string `json:"added,omitempty"`
+		Abstract         string `json:"abstract,omitempty"`
+		AbstractSource   string `json:"abstract_source,omitempty"`
+		DOI              string `json:"doi,omitempty"`
+		Volume           string `json:"volume,omitempty"`
+		Type             string `json:"paper_type,omitempty"`
+		ExpBeginner      string `json:"explain_beginner,omitempty"`
+		ExpPractitioner  string `json:"explain_practitioner,omitempty"`
+		ExpBusiness      string `json:"explain_business,omitempty"`
+		Slug             string `json:"slug,omitempty"`
+		TopicName        string `json:"topic_name,omitempty"`
+		PageURL          string `json:"page_url,omitempty"`
 	}
 	var all []paper
 	latest := ""
 	for rows.Next() {
 		var p paper
 		if rows.Scan(&p.UID, &p.Title, &p.Authors, &p.Year, &p.Journal, &p.Citations,
-			&p.URL, &p.Topic, &p.Note, &p.Added) != nil {
+			&p.URL, &p.Topic, &p.Note, &p.Added,
+			&p.Abstract, &p.AbstractSource, &p.DOI, &p.Volume, &p.Type,
+			&p.ExpBeginner, &p.ExpPractitioner, &p.ExpBusiness) != nil {
 			continue
 		}
 		if p.Added > latest {
 			latest = p.Added
 		}
+		p.PageURL = "/research/paper/" + p.UID + "/"
 		all = append(all, p)
 	}
 	rows.Close()
@@ -3074,6 +3106,16 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 		"healthcare-regulation":   "Healthcare Regulation",
 	}
 
+	// Backfill topic label on each paper so the paper-detail page can render
+	// the human name of the shelf it lives on without a second lookup.
+	for i := range all {
+		all[i].Slug = all[i].Topic
+		all[i].TopicName = label[all[i].Topic]
+		if all[i].TopicName == "" {
+			all[i].TopicName = strings.ReplaceAll(all[i].Topic, "-", " ")
+		}
+	}
+
 	byTopic := map[string][]paper{}
 	order := []string{}
 	for _, p := range all {
@@ -3093,27 +3135,129 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 		}
 		uid := twoaiUID("research-topic:" + t)
 		if err := upsert("research/"+uid+".json", "research-topic", map[string]any{
-			"uid": uid, "topic": t, "name": name, "papers": byTopic[t],
+			"uid": uid, "topic": t, "slug": t, "name": name, "papers": byTopic[t],
 			"total": len(byTopic[t]), "generated": today, "last_added": latest,
 		}); err != nil {
 			return count, err
 		}
 		count++
 		topics = append(topics, map[string]any{
-			"uid": uid, "topic": t, "name": name, "count": len(byTopic[t]),
+			"uid": uid, "topic": t, "slug": t, "name": name, "count": len(byTopic[t]),
 		})
 	}
+
+	// Per-paper detail files. One JSON per row so the /research/paper/{uid}/
+	// route reads exactly the paper it needs at build time.
+	for _, p := range all {
+		if err := upsert("research/paper/"+p.UID+".json", "research-paper", map[string]any{
+			"uid": p.UID, "title": p.Title, "authors": p.Authors,
+			"year": p.Year, "journal": p.Journal, "volume": p.Volume,
+			"doi": p.DOI, "paper_type": p.Type,
+			"citations": p.Citations, "url": p.URL,
+			"topic": p.Topic, "topic_slug": p.Topic, "topic_name": p.TopicName,
+			"abstract": p.Abstract, "abstract_source": p.AbstractSource,
+			"note": p.Note,
+			"explain_beginner": p.ExpBeginner,
+			"explain_practitioner": p.ExpPractitioner,
+			"explain_business": p.ExpBusiness,
+			"added": p.Added, "generated": today,
+		}); err != nil {
+			return count, err
+		}
+		count++
+	}
+
 	top := all
 	if len(top) > 12 {
 		top = top[:12]
 	}
 	if err := upsert("research/index.json", "research-hub", map[string]any{
 		"uid": twoaiUID("section:research-library"), "topics": topics,
-		"most_cited": top, "total": len(all), "generated": today, "last_added": latest,
+		"most_cited": top, "papers": all, "total": len(all),
+		"generated": today, "last_added": latest,
 	}); err != nil {
 		return count, err
 	}
 	return count + 1, nil
+}
+
+// twoaiSources renders the central sources index at sources/index.json.
+//
+// WHY IT EXISTS. Every fact on theworldofai.org that is not our own reasoning
+// traces to a primary source: a statute, a regulator, a standards body, a
+// peer-reviewed paper. The reader is entitled to find that source without
+// hunting the site for the page that cites it. This file is the bibliography
+// pattern from a book: one page, six sections, every source with a stable
+// deep link. Migrating it from srjconsultingservices.com to theworldofai.org
+// so the destination has its own copy of the same discipline.
+//
+// WHAT IT EMITS. One JSON with sections in a fixed order (EU and Council of
+// Europe, US federal, US state and city, other jurisdictions, standards
+// bodies, peer-reviewed research), each section carrying its label and its
+// list of {uid, title, url, authors, year, journal} entries in the same
+// sort_order kept in twoai_sources. Research entries carry author/year/journal
+// so the page can show them in bibliography form; primary sources do not.
+func twoaiSources(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
+	rows, err := db.Query(`SELECT uid, section, section_label, sort_order, title, url,
+			COALESCE(authors,''), COALESCE(year,0), COALESCE(journal,'')
+		FROM twoai_sources
+		ORDER BY CASE section
+			WHEN 'eu' THEN 1
+			WHEN 'us-federal' THEN 2
+			WHEN 'us-state' THEN 3
+			WHEN 'intl' THEN 4
+			WHEN 'standards' THEN 5
+			WHEN 'research' THEN 6
+			ELSE 99 END, sort_order, title`)
+	if err != nil {
+		return 0, nil
+	}
+	type item struct {
+		UID     string `json:"uid"`
+		Title   string `json:"title"`
+		URL     string `json:"url"`
+		Authors string `json:"authors,omitempty"`
+		Year    int    `json:"year,omitempty"`
+		Journal string `json:"journal,omitempty"`
+	}
+	type sect struct {
+		Key   string `json:"key"`
+		Label string `json:"label"`
+		Items []item `json:"items"`
+	}
+	var sections []sect
+	byKey := map[string]int{}
+	total := 0
+	for rows.Next() {
+		var it item
+		var key, lbl string
+		var sortOrd int
+		if rows.Scan(&it.UID, &key, &lbl, &sortOrd, &it.Title, &it.URL,
+			&it.Authors, &it.Year, &it.Journal) != nil {
+			continue
+		}
+		idx, ok := byKey[key]
+		if !ok {
+			sections = append(sections, sect{Key: key, Label: lbl})
+			idx = len(sections) - 1
+			byKey[key] = idx
+		}
+		sections[idx].Items = append(sections[idx].Items, it)
+		total++
+	}
+	rows.Close()
+	if total == 0 {
+		return 0, nil
+	}
+	if err := upsert("sources/index.json", "sources-hub", map[string]any{
+		"uid":       twoaiUID("section:sources-index"),
+		"sections":  sections,
+		"total":     total,
+		"generated": today,
+	}); err != nil {
+		return 0, err
+	}
+	return 1, nil
 }
 
 // twoaiEntity registers a named thing in twoai_entities and returns the
@@ -3791,7 +3935,9 @@ func twoaiTaxonomyFor(kind string) any {
 		return "ai-people-directory"
 	case "company", "company-hub":
 		return "ai-companies-directory"
-	case "research-topic", "research-hub":
+	case "research-topic", "research-hub", "research-paper":
+		return "research-library"
+	case "sources-hub":
 		return "research-library"
 	case "week", "week-hub":
 		return "this-week-in-ai"
