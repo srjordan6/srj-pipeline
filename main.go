@@ -3133,8 +3133,15 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 		if name == "" {
 			name = strings.ReplaceAll(t, "-", " ")
 		}
+		// Emit at research/{slug}.json only. The earlier hash-uid path
+		// (research/{uid}.json) created a duplicate that collided in the
+		// site's [topic].astro route on the same slug, letting the
+		// alphabetically-first hash-named file win and its papers, which
+		// pre-dated the uid backfill, rendered /research/paper/undefined/
+		// on every link. The uid is still included in the payload so the
+		// hub template can key on it.
 		uid := twoaiUID("research-topic:" + t)
-		if err := upsert("research/"+uid+".json", "research-topic", map[string]any{
+		if err := upsert("research/"+t+".json", "research-topic", map[string]any{
 			"uid": uid, "topic": t, "slug": t, "name": name, "papers": byTopic[t],
 			"total": len(byTopic[t]), "generated": today, "last_added": latest,
 		}); err != nil {
