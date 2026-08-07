@@ -10,8 +10,9 @@ import (
 	"time"
 )
 
-// Remote book covers. Volume V launched after the WordPress cutover, so its
-// cover was never in the R2 archive the earlier volumes load from. Rather
+// Remote binary assets: book covers and executive briefing PDFs. Volume V
+// launched after the WordPress cutover, so its assets were never in the R2
+// archive the earlier volumes load from. Rather
 // than embedding image bytes in source, each cover is fetched from a staging
 // URL, verified against a pinned SHA-256, and then carried by the favicons
 // stage through putToRepo into srj-site public/covers/ like any other
@@ -28,6 +29,11 @@ var coverSources = []struct {
 		repoPath: "covers/the-ai-it-security-audit-cover.jpg",
 		url:      "https://x0.at/MI7j.jpg",
 		sha256:   "97a5008b1cf98faf815aabf374884d236a88c3bd17ef28c0a6b78abf8d70fe63",
+	},
+	{
+		repoPath: "briefings/AI_IT_Security_Audit_Executive_Briefing.pdf",
+		url:      "https://x0.at/rc5K.pdf",
+		sha256:   "6b25e9553eccdc69aadf167c6ee2826a7e0b62c8d970f63f11b100c93bf14a16",
 	},
 }
 
