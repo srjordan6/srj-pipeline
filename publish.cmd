@@ -2,51 +2,65 @@
 rem ============================================================================
 rem  publish.cmd - publish srjconsultingservices.com from this PC
 rem ============================================================================
-rem  This is the PC-initiated publish workflow. It runs the same three
-rem  pipeline stages the daily 11:00 UTC Render cron runs, from this
-rem  machine, so website updates never depend on waiting for the cron:
+rem  PC-initiated publish workflow. Runs the same three pipeline stages the
+rem  daily 11:00 UTC Render cron runs, from this machine:
 rem
-rem    1. sync_content  - exports SQL content (srj-audit-db) to the
-rem                       srj-content GitHub repo (only what changed)
+rem    1. sync_content  - exports SQL content (srj-audit-db) to srj-content
 rem    2. favicons      - ensures the favicon files exist in srj-site
-rem                       (idempotent, skips when unchanged)
-rem    3. deploy_site   - fires the Cloudflare deploy hook so the site
-rem                       rebuilds with the new content
+rem    3. deploy_site   - fires the Cloudflare build hook
+rem
+rem  GITHUB_TOKEN is derived automatically from this PC's git credential
+rem  store (the same credential git push already uses), so the only value
+rem  publish.env.cmd needs is DATABASE_URL.
 rem
 rem  FIRST-TIME SETUP (once):
-rem    1. Install Go if missing:  winget install GoLang.Go
-rem    2. Copy publish.env.example.cmd to publish.env.cmd
-rem    3. Fill in the two secret values in publish.env.cmd (instructions
-rem       are inside that file). publish.env.cmd stays on this PC only;
-rem       it is gitignored and must never be committed.
-rem
-rem  EVERY PUBLISH AFTER THAT: double-click this file, or run  publish.cmd
-rem  The Cloudflare build takes about 3 minutes after the script finishes.
+rem    1. Copy publish.env.example.cmd to publish.env.cmd
+rem    2. Paste the external DATABASE_URL into it (instructions inside)
+rem  EVERY PUBLISH AFTER THAT: double-click this file.
 rem ============================================================================
-setlocal
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 if not exist publish.env.cmd (
   echo [publish] ERROR: publish.env.cmd not found.
-  echo [publish] Copy publish.env.example.cmd to publish.env.cmd and fill in
-  echo [publish] the values. See the instructions inside that file.
+  echo [publish] Copy publish.env.example.cmd to publish.env.cmd and paste the
+  echo [publish] DATABASE_URL into it. Instructions are inside that file.
+  pause
   exit /b 1
 )
 call publish.env.cmd
 
 if "%DATABASE_URL%"=="" (
   echo [publish] ERROR: DATABASE_URL is empty. Edit publish.env.cmd.
+  pause
   exit /b 1
 )
+if "%DATABASE_URL%"=="PASTE_EXTERNAL_DATABASE_URL_HERE" (
+  echo [publish] ERROR: DATABASE_URL is still the placeholder. Edit publish.env.cmd.
+  pause
+  exit /b 1
+)
+
+rem --- GITHUB_TOKEN: use env file value if set, else ask git's credential store
 if "%GITHUB_TOKEN%"=="" (
-  echo [publish] ERROR: GITHUB_TOKEN is empty. Edit publish.env.cmd.
+  for /f "usebackq tokens=1,* delims==" %%A in (`^(echo protocol=https^& echo host=github.com^& echo.^) ^| git credential fill 2^>nul`) do (
+    if /i "%%A"=="password" set "GITHUB_TOKEN=%%B"
+  )
+)
+if "%GITHUB_TOKEN%"=="" (
+  echo [publish] ERROR: could not obtain a GitHub token from git's credential
+  echo [publish] store. Either run "git push" once in this folder to refresh
+  echo [publish] stored credentials, or set GITHUB_TOKEN in publish.env.cmd.
+  pause
   exit /b 1
 )
 
 where go >nul 2>nul
 if errorlevel 1 (
-  echo [publish] ERROR: Go is not installed. Run:  winget install GoLang.Go
-  echo [publish] then open a new terminal and run publish.cmd again.
+  echo [publish] ERROR: Go is not installed or not on PATH. Run:
+  echo [publish]   winget install GoLang.Go
+  echo [publish] then open a NEW window and run publish.cmd again.
+  pause
   exit /b 1
 )
 
@@ -54,6 +68,7 @@ echo [publish] Building pipeline...
 go build -o pipeline-local.exe .
 if errorlevel 1 (
   echo [publish] ERROR: build failed. Run "git pull" in this folder and retry.
+  pause
   exit /b 1
 )
 
@@ -61,6 +76,7 @@ echo [publish] 1/3 sync_content: SQL to srj-content repo...
 pipeline-local.exe sync_content
 if errorlevel 1 (
   echo [publish] ERROR: sync_content failed. Nothing was deployed.
+  pause
   exit /b 1
 )
 
@@ -74,11 +90,13 @@ echo [publish] 3/3 deploy_site: firing the Cloudflare build...
 pipeline-local.exe deploy_site
 if errorlevel 1 (
   echo [publish] ERROR: deploy hook failed. Content is in srj-content but the
-  echo [publish] site did not rebuild. Retry: pipeline-local.exe deploy_site
+  echo [publish] site did not rebuild. Run publish.cmd again to retry.
+  pause
   exit /b 1
 )
 
 echo.
 echo [publish] Done. The Cloudflare build takes about 3 minutes.
 echo [publish] Verify at https://srjconsultingservices.com/ with Ctrl+Shift+R.
+pause
 endlocal
