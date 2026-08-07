@@ -235,16 +235,8 @@ func main() {
 	}
 
 	if src == "email_route" {
-		routeErr := emailRoute(db)
-		if routeErr != nil {
-			fmt.Fprintln(os.Stderr, "email_route:", routeErr)
-		}
-		// The hourly coordinator doubles as the publish heartbeat: SQL and
-		// favicon changes go live within the hour instead of waiting for the
-		// daily 11:00 UTC run. Runs after routing so email never waits on it,
-		// and a routing failure still exits non-zero for Render alerting.
-		hourlyCatchUp(db)
-		if routeErr != nil {
+		if err := emailRoute(db); err != nil {
+			fmt.Fprintln(os.Stderr, "email_route:", err)
 			os.Exit(1)
 		}
 		return
