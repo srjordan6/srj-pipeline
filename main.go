@@ -48,7 +48,7 @@ func main() {
 		return
 	}
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -181,6 +181,14 @@ func main() {
 	// Backfill for rows stored before the resolver landed: 1,213 of them hold
 	// an opaque Google News redirect. Own subcommand, never part of `all`, so
 	// a Google-side change can stall this and nothing else.
+	if src == "favicons" {
+		if err := runFavicons(); err != nil {
+			fmt.Fprintln(os.Stderr, "favicons:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "resolve_gnews" {
 		rows, err := db.Query(`SELECT id, url, vendor FROM ai_intel_candidates
 			WHERE url LIKE '%news.google.com/rss/articles%' ORDER BY id DESC`)
@@ -1503,7 +1511,23 @@ func validateLeaderboard(payload []byte) error {
 // reading the current blob SHA first so the write is an update rather than a
 // rejected create. Shared by every publish step.
 func putToContent(tok, path, message string, payload []byte) error {
-	api := "https://api.github.com/repos/srjordan6/srj-content/contents/" + path
+	return putToRepoTok(tok, "srjordan6/srj-content", path, message, payload)
+}
+
+// putToRepo is putToContent for any srjordan6 repo, reading GITHUB_TOKEN
+// itself. Added for the favicons stage, which writes binary assets into
+// srj-site public/ because no other connector in the toolchain can carry
+// binary content to that repo.
+func putToRepo(repo, path, message string, payload []byte) error {
+	tok := os.Getenv("GITHUB_TOKEN")
+	if tok == "" {
+		return fmt.Errorf("GITHUB_TOKEN not set")
+	}
+	return putToRepoTok(tok, repo, path, message, payload)
+}
+
+func putToRepoTok(tok, repo, path, message string, payload []byte) error {
+	api := "https://api.github.com/repos/" + repo + "/contents/" + path
 	client := &http.Client{Timeout: 60 * time.Second}
 	gh := func(method, url string, body []byte) (*http.Response, error) {
 		req, _ := http.NewRequest(method, url, bytes.NewReader(body))
@@ -1521,6 +1545,16 @@ func putToContent(tok, path, message string, payload []byte) error {
 		resp.Body.Close()
 		if resp.StatusCode == 200 && json.Unmarshal(b, &cur) == nil {
 			sha = cur.SHA
+			// Skip the write when the stored blob already matches: git blob
+			// SHA1 is sha1("blob " + len + NUL + content). Keeps daily
+			// re-runs of asset stages write-free.
+			h := sha1.New()
+			fmt.Fprintf(h, "blob %d", len(payload))
+			h.Write([]byte{0})
+			h.Write(payload)
+			if fmt.Sprintf("%x", h.Sum(nil)) == sha {
+				return nil
+			}
 		}
 	}
 	put := map[string]any{"message": message,
