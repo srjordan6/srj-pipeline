@@ -1,0 +1,6 @@
+# Local publish secrets: stays on this PC, never committed.
+publish.env.cmd
+
+# Local build artifacts
+pipeline-local.exe
+pipeline
