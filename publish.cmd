@@ -43,9 +43,15 @@ if "%DATABASE_URL%"=="PASTE_EXTERNAL_DATABASE_URL_HERE" (
 
 rem --- GITHUB_TOKEN: use env file value if set, else ask git's credential store
 if "%GITHUB_TOKEN%"=="" (
-  for /f "usebackq tokens=1,* delims==" %%A in (`^(echo protocol=https^& echo host=github.com^& echo.^) ^| git credential fill 2^>nul`) do (
+  > "%TEMP%\srj_cred_req.txt" (
+    echo protocol=https
+    echo host=github.com
+    echo.
+  )
+  for /f "usebackq tokens=1,* delims==" %%A in (`git credential fill ^< "%TEMP%\srj_cred_req.txt" 2^>nul`) do (
     if /i "%%A"=="password" set "GITHUB_TOKEN=%%B"
   )
+  del "%TEMP%\srj_cred_req.txt" >nul 2>nul
 )
 if "%GITHUB_TOKEN%"=="" (
   echo [publish] ERROR: could not obtain a GitHub token from git's credential
