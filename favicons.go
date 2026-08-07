@@ -164,6 +164,7 @@ var faviconFiles = map[string]string{
 }
 
 func runFavicons() error {
+	loadRemoteCovers()
 	for name, b64 := range faviconFiles {
 		data, err := base64.StdEncoding.DecodeString(b64)
 		if err != nil {
