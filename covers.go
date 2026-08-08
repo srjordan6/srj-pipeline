@@ -37,8 +37,8 @@ var coverSources = []struct {
 	},
 	{
 		repoPath: "images/insights/ai-governance-update-aug-2026.png",
-		url:      "https://x0.at/SdIJ.png",
-		sha256:   "52ba94710b254d167e84cf43e783859d287c002db7933b0ca04736bbcde5bc6b",
+		url:      "https://x0.at/uNzz.png",
+		sha256:   "8e3021564978593ff2d350df86c833f5caee22c1f6c69bc6447feefdbea7065b",
 	},
 }
 
