@@ -35,6 +35,11 @@ var coverSources = []struct {
 		url:      "https://x0.at/rc5K.pdf",
 		sha256:   "6b25e9553eccdc69aadf167c6ee2826a7e0b62c8d970f63f11b100c93bf14a16",
 	},
+	{
+		repoPath: "images/insights/ai-governance-update-aug-2026.png",
+		url:      "https://x0.at/SdIJ.png",
+		sha256:   "52ba94710b254d167e84cf43e783859d287c002db7933b0ca04736bbcde5bc6b",
+	},
 }
 
 // loadRemoteCovers downloads each cover, verifies its hash, and merges it
