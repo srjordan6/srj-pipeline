@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1604,8 +1605,23 @@ func clGet(path string, params map[string]string, out any) error {
 			return err
 		}
 		if resp.StatusCode == 429 {
+			// CourtListener sends Retry-After telling us exactly how long
+			// its quota window has left. The old fixed 15/30/45s ladder
+			// ignored it and burned all three attempts inside a window
+			// that had longer to run, which is why the Aug 8 run lost four
+			// docket refreshes while two succeeded. Honor the header when
+			// present, capped so a long window cannot stall the whole run.
+			wait := time.Duration(15*attempt) * time.Second
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if secs, perr := strconv.Atoi(strings.TrimSpace(ra)); perr == nil && secs > 0 {
+					wait = time.Duration(secs) * time.Second
+					if wait > 90*time.Second {
+						wait = 90 * time.Second
+					}
+				}
+			}
 			resp.Body.Close()
-			time.Sleep(time.Duration(15*attempt) * time.Second)
+			time.Sleep(wait)
 			continue
 		}
 		defer resp.Body.Close()
@@ -2226,6 +2242,14 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 			fmt.Fprintln(os.Stderr, "intel ai_watch feed", f.vendor, ":", ferr)
 			continue
 		}
+		// Buffered rather than streamed so a parse failure can be retried
+		// against the same bytes by the regex fallback below.
+		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		resp.Body.Close()
+		if rerr != nil {
+			fmt.Fprintln(os.Stderr, "intel ai_watch feed", f.vendor, "read:", rerr)
+			continue
+		}
 		var feed struct {
 			Items []struct {
 				Title string `xml:"title"`
@@ -2237,14 +2261,37 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		// new feeds failed on entities alone). Lenient mode with the HTML
 		// entity table rescues those; feeds serving actual HTML pages still
 		// fail and need their URLs corrected instead.
-		dec := xml.NewDecoder(resp.Body)
+		dec := xml.NewDecoder(bytes.NewReader(body))
 		dec.Strict = false
 		dec.Entity = xml.HTMLEntity
 		derr := dec.Decode(&feed)
-		resp.Body.Close()
 		if derr != nil {
-			fmt.Fprintln(os.Stderr, "intel ai_watch feed", f.vendor, "parse:", derr)
-			continue
+			// Lenient mode still rejects genuinely malformed markup, e.g.
+			// Sifted's stray attribute on line 91 (Aug 8 run). Rather than
+			// lose the whole feed to one bad element, fall back to pulling
+			// item titles and links out of the raw bytes. Same data, no
+			// parser. A feed serving an HTML page matches nothing here and
+			// still reports as a failure, which is the signal we want.
+			items := itemRe.FindAllSubmatch(body, -1)
+			recovered := 0
+			for _, m := range items {
+				t := titleRe.FindSubmatch(m[1])
+				l := linkRe.FindSubmatch(m[1])
+				if t == nil || l == nil {
+					continue
+				}
+				feed.Items = append(feed.Items, struct {
+					Title string `xml:"title"`
+					Link  string `xml:"link"`
+				}{Title: stripCDATA(string(t[1])), Link: stripCDATA(string(l[1]))})
+				recovered++
+			}
+			if recovered == 0 {
+				fmt.Fprintln(os.Stderr, "intel ai_watch feed", f.vendor, "parse:", derr)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "intel ai_watch feed %s parse: %v (recovered %d items without the parser)\n",
+				f.vendor, derr, recovered)
 		}
 		for _, it := range feed.Items {
 			title, link := strings.TrimSpace(it.Title), strings.TrimSpace(it.Link)
@@ -5199,6 +5246,22 @@ func publishLawsuits(db *sql.DB) error {
 
 // ---- publish_intel: AI watch feed -> srj-content ---------------------------
 //
+// Fallback extractors for feeds whose XML will not parse. Deliberately
+// simple: find each item element, then the first title and link inside it.
+var (
+	itemRe  = regexp.MustCompile(`(?is)<item[^>]*>(.*?)</item>`)
+	titleRe = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	linkRe  = regexp.MustCompile(`(?is)<link[^>]*>(.*?)</link>`)
+)
+
+// stripCDATA unwraps the CDATA sections RSS titles often arrive in.
+func stripCDATA(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "<![CDATA[")
+	s = strings.TrimSuffix(s, "]]>")
+	return strings.TrimSpace(s)
+}
+
 // Publishes the newest non-ignored rows from ai_intel_candidates (new models,
 // tools, terminology, vendor announcements) for the Everything else AI page.
 // Ignored rows never ship; everything else does, newest first, capped so the
