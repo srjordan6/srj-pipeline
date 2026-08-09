@@ -5208,13 +5208,28 @@ func publishIntel(db *sql.DB) error {
 	if tok == "" {
 		return fmt.Errorf("GITHUB_TOKEN not set")
 	}
+	// Newest 25 per vendor rather than the newest 120 overall. The flat
+	// limit made the published vendor set a rolling window: a vendor that
+	// stopped producing news fell out of the newest 120, its
+	// /ai-resources/ai-vendor-news/{vendor}/ page stopped generating, and
+	// the URL began returning 404 to anyone (Google included) who had
+	// already crawled it. Google Search Console surfaced 22 such 404s on
+	// 2026-08-07. Partitioning by vendor keeps every vendor page alive
+	// permanently, which is what a stable URL requires, while capping the
+	// payload: 161 vendors and 745 rows at ~200KB, versus 1,963 rows if
+	// the whole table were published.
 	rows, err := db.Query(`
 		SELECT json_build_object(
 		  'kind', kind, 'name', name, 'vendor', vendor, 'url', url,
 		  'summary', summary, 'source', source, 'discovered_at', discovered_at)
-		FROM ai_intel_candidates
-		WHERE status <> 'ignored'
-		ORDER BY discovered_at DESC LIMIT 120`)
+		FROM (
+		  SELECT *, row_number() OVER (
+		    PARTITION BY vendor ORDER BY discovered_at DESC) AS rn
+		  FROM ai_intel_candidates
+		  WHERE status <> 'ignored'
+		) ranked
+		WHERE rn <= 25
+		ORDER BY discovered_at DESC`)
 	if err != nil {
 		return err
 	}
