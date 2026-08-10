@@ -2926,6 +2926,30 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	// Staleness tripwire for benchmark results. The result snapshots in
+	// twoai_benchmarks.results are hand-curated from named evaluators, not
+	// scraped: the source leaderboards are JS-rendered and re-baseline
+	// without notice, so an automated scrape would either break silently or
+	// publish wrong numbers silently, and the second failure mode is worse.
+	// The trade is that a human (or a session) must refresh them, and this
+	// warning is what makes that debt visible: it fires in the cron log when
+	// any result set has gone unreviewed past its review interval, keyed on
+	// updated_at so no text-date parsing of as_of is involved.
+	var staleBench int
+	var oldestBench sql.NullString
+	if err := db.QueryRow(`SELECT count(*),
+			min(slug || ' (' || to_char(updated_at, 'YYYY-MM-DD') || ')')
+		FROM twoai_benchmarks
+		WHERE results IS NOT NULL
+		  AND updated_at < now() - (coalesce(review_interval_days, 90) || ' days')::interval`,
+	).Scan(&staleBench, &oldestBench); err != nil {
+		return err
+	}
+	if staleBench > 0 {
+		fmt.Fprintf(os.Stderr, "twoai_build: WARNING %d benchmark result set(s) past review interval, oldest %s - refresh twoai_benchmarks.results\n",
+			staleBench, oldestBench.String)
+	}
+
 	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d ok=true\n",
 		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers)
 	return nil
