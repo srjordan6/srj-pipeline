@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 func main() {
@@ -2916,8 +2916,13 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources)
+	vendorNews, err := twoaiVendorNews(db, upsert)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews)
 	return nil
 }
 
@@ -4029,6 +4034,8 @@ func twoaiTaxonomyFor(kind string) any {
 		return "research-library"
 	case "week", "week-hub":
 		return "this-week-in-ai"
+	case "vendor-news":
+		return "vendor-news"
 	}
 	return nil
 }
@@ -4117,18 +4124,134 @@ func twoaiClassify(text string) []string {
 	return out
 }
 
+// twoaiVendorNews builds news/vendor.json: the AI Vendor News page at
+// /ai-news/vendor/, which is what the organisations building and governing AI
+// said themselves.
+//
+// WHY THE SOURCE LIST IS EXPLICIT. ai_intel_candidates mixes two very
+// different things under one kind: posts from a vendor's own feed, where the
+// vendor column is the organisation ('OpenAI', 'Google DeepMind'), and press
+// articles discovered by RSS, where the vendor column is whatever domain
+// published them ('miragenews.com'). Only the first belongs here. A domain
+// test alone would let any aggregator that happens to lack a dot in its name
+// through, so the allowed sources are named. Adding a vendor is a deliberate
+// edit to this list, which is the right friction for a page whose whole claim
+// is that these are primary sources.
+//
+// Press coverage of the field is the Daily News briefing's job. The two pages
+// answer different questions and must not blur: what is being reported, versus
+// what the builders announced.
+//
+// Dates are when the intel watch surfaced each post, not when the vendor
+// published it, because that is what the table stores. The page says so. A
+// newly added feed backfills its archive on first sweep, so its items all
+// carry that sweep's date and would otherwise look like a burst of same-day
+// announcements that never happened.
+func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (int, error) {
+	// Display names for feeds whose vendor column holds a hostname. Anything
+	// not listed renders as stored.
+	display := map[string]string{
+		"stability.ai": "Stability AI",
+		"aisi.gov.uk":  "UK AI Security Institute",
+	}
+	allowed := []string{
+		"OpenAI", "Google DeepMind", "Hugging Face", "Mistral AI",
+		"European Commission AI", "CIFAR", "AI Singapore",
+		"stability.ai", "aisi.gov.uk",
+	}
+	const windowDays = 30
+	const perVendor = 25
+
+	rows, err := db.Query(`SELECT DISTINCT ON (url) vendor, name, url,
+			to_char(discovered_at at time zone 'UTC','YYYY-MM-DD')
+		FROM ai_intel_candidates
+		WHERE url IS NOT NULL AND url <> '' AND url NOT LIKE '%news.google%'
+		  AND discovered_at > now() - ($1 || ' days')::interval
+		  AND vendor = ANY($2)
+		ORDER BY url, discovered_at DESC`, windowDays, pq.Array(allowed))
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type item struct {
+		Title string `json:"title"`
+		URL   string `json:"url"`
+		Date  string `json:"date"`
+	}
+	byVendor := map[string][]item{}
+	for rows.Next() {
+		var vendor, name, url, date string
+		if err := rows.Scan(&vendor, &name, &url, &date); err != nil {
+			return 0, err
+		}
+		if d, ok := display[vendor]; ok {
+			vendor = d
+		}
+		byVendor[vendor] = append(byVendor[vendor], item{Title: name, URL: url, Date: date})
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	type vendorBlock struct {
+		Vendor string `json:"vendor"`
+		Total  int    `json:"total"`
+		Items  []item `json:"items"`
+	}
+	// Initialised, not nil: a nil slice marshals to JSON null, and the Astro
+	// template maps over these arrays at prerender time. Empty must mean empty.
+	blocks := []vendorBlock{}
+	for vendor, items := range byVendor {
+		sort.Slice(items, func(i, j int) bool { return items[i].Date > items[j].Date })
+		total := len(items)
+		if len(items) > perVendor {
+			items = items[:perVendor]
+		}
+		blocks = append(blocks, vendorBlock{Vendor: vendor, Total: total, Items: items})
+	}
+	sort.Slice(blocks, func(i, j int) bool {
+		if blocks[i].Total != blocks[j].Total {
+			return blocks[i].Total > blocks[j].Total
+		}
+		return blocks[i].Vendor < blocks[j].Vendor
+	})
+
+	// A run that finds nothing leaves the last good page alone. An empty sweep
+	// is far more likely to be a feed outage than a day on which nine labs all
+	// published nothing, and a page that empties itself on a transient failure
+	// is worse than one that is a day stale and says so.
+	if len(blocks) == 0 {
+		fmt.Fprintln(os.Stderr, "twoai_build: vendor news found no items, keeping the existing page")
+		return 0, nil
+	}
+
+	now := time.Now().UTC()
+	if err := upsert("news/vendor.json", "vendor-news", map[string]any{
+		"generated":   now.Format(time.RFC3339),
+		"date":        now.Format("2006-01-02"),
+		"window_days": windowDays,
+		"vendors":     blocks,
+	}); err != nil {
+		return 0, err
+	}
+	return len(blocks), nil
+}
+
 // twoaiWeeks builds the weekly digest, one page per ISO week, from our own
 // verified tables rather than from a news feed.
 //
-// This is deliberately NOT built on ai_intel_candidates. That table is
-// headline-only: summary is null on every row, every URL is an opaque
-// news.google.com redirect rather than a publisher link, and the vendor field
-// is frequently wrong because coverage queries attribute a story to whichever
-// search found it. A page assembled from that would be a wall of other
-// people's headlines, which is both worthless to a reader and the exact shape
-// of content ad networks reject. When the intel pipeline resolves real
-// publisher URLs and writes summaries, a daily news factory becomes possible;
-// until then the honest weekly is legislative movement, federal action, and
+// This is deliberately NOT built on ai_intel_candidates for the press-coverage
+// half of that table. Those rows are headline-only: summary is null, the URL
+// is frequently an opaque news.google.com redirect rather than a publisher
+// link, and the vendor field is whichever domain a coverage query surfaced. A
+// page assembled from that would be a wall of other people's headlines, which
+// is both worthless to a reader and the exact shape of content ad networks
+// reject. The vendor-feed half of the same table IS usable, has real publisher
+// URLs, and is what twoaiVendorNews above renders; the daily press briefing is
+// published separately by publish_news from clustered, summarised GDELT.
+//
+// So the honest weekly here is legislative movement, federal action, and
 // docket movement, all of which we verify ourselves.
 //
 // Each item carries the explanatory text we already hold and can stand behind:
