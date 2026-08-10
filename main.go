@@ -49,7 +49,7 @@ func main() {
 		return
 	}
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -133,6 +133,14 @@ func main() {
 	if src == "arxiv_watch" {
 		if err := arxivWatch(db); err != nil {
 			fmt.Fprintln(os.Stderr, "arxiv_watch:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "bench_results" {
+		if err := benchResults(db); err != nil {
+			fmt.Fprintln(os.Stderr, "bench_results:", err)
 			os.Exit(1)
 		}
 		return
@@ -4332,6 +4340,275 @@ func twoaiResearchWatch(db *sql.DB, upsert func(path, kind string, v any) error)
 		return 0, err
 	}
 	return len(papers), nil
+}
+
+// benchResults auto-refreshes the benchmark result snapshots in
+// twoai_benchmarks.results from STRUCTURED sources the projects publish
+// themselves, then mirrors any changed results into the twoai_pages rows the
+// site renders. It never scrapes rendered HTML: every adapter reads a JSON or
+// CSV artifact (or an authenticated API) with a stable shape, validates what
+// it parsed, and on any failure keeps the last good snapshot and warns, so
+// the failure mode is a visibly dated page rather than a silently wrong one.
+// The staleness tripwire in twoai_build is the backstop: an adapter that
+// fails for 90 days surfaces in the cron log.
+//
+// Adapter status:
+//   swe-bench  LIVE.    Official leaderboards.json from the swe-bench site
+//                       repo (the data behind swebench.com), Verified board.
+//   hle, gpqa  GATED.   Artificial Analysis API; activates when AA_API_KEY
+//                       is set on the cron service (free key from
+//                       artificialanalysis.ai). Until then the curated
+//                       snapshot stands. The parse is defensive because the
+//                       response shape could not be verified without a key;
+//                       first keyed run confirms via the log.
+//   lmarena    GATED.   The public HF mirror (lmarena-ai/arena-leaderboard)
+//                       froze at leaderboard_table_20250804.csv, so a
+//                       30-day recency gate rejects it; if the mirror
+//                       revives, the stage logs that fresh data exists and
+//                       still leaves the curated snapshot for a manual look
+//                       first, because the CSV schema of a revived mirror is
+//                       unverified by definition.
+// Everything else (saturation statements, configuration-shaped notes) is
+// stable prose with nothing to fetch.
+func benchResults(db *sql.DB) error {
+	updated := 0
+
+	if res, err := benchFetchSweBenchVerified(); err != nil {
+		fmt.Fprintf(os.Stderr, "bench_results: swe-bench: %v (keeping last snapshot)\n", err)
+	} else if err := benchStore(db, "swe-bench", res); err != nil {
+		return err
+	} else {
+		updated++
+	}
+
+	if key := os.Getenv("AA_API_KEY"); key == "" {
+		fmt.Fprintln(os.Stderr, "bench_results: AA_API_KEY not set, hle and gpqa stay on the curated snapshot (free key: artificialanalysis.ai)")
+	} else {
+		for slug, cfg := range map[string]struct{ evalKeys []string; metric, srcURL string }{
+			"hle":  {[]string{"humanitys_last_exam", "hle"}, "Accuracy, Artificial Analysis protocol", "https://artificialanalysis.ai/evaluations/humanitys-last-exam"},
+			"gpqa": {[]string{"gpqa_diamond", "gpqa"}, "Accuracy on the 198-question Diamond subset", "https://artificialanalysis.ai/evaluations/gpqa-diamond"},
+		} {
+			if res, err := benchFetchArtificialAnalysis(key, cfg.evalKeys, cfg.metric, cfg.srcURL); err != nil {
+				fmt.Fprintf(os.Stderr, "bench_results: %s via Artificial Analysis: %v (keeping last snapshot)\n", slug, err)
+			} else if err := benchStore(db, slug, res); err != nil {
+				return err
+			} else {
+				updated++
+			}
+		}
+	}
+
+	benchCheckLMArenaMirror()
+
+	// Mirror changed results into the page rows the site renders. Guarded on
+	// IS DISTINCT FROM so untouched pages keep their updated_at.
+	if _, err := db.Exec(`UPDATE twoai_pages p
+		SET data = p.data || jsonb_build_object('results', b.results), updated_at = now()
+		FROM twoai_benchmarks b
+		WHERE p.path = 'benchmarks/' || b.slug || '.json'
+		  AND b.results IS NOT NULL
+		  AND p.data->'results' IS DISTINCT FROM b.results`); err != nil {
+		return err
+	}
+
+	fmt.Printf("bench_results: updated=%d ok=true\n", updated)
+	return nil
+}
+
+// benchStore writes one benchmark's refreshed results and bumps updated_at,
+// which is what keeps the twoai_build staleness tripwire quiet for adapters
+// that are succeeding and lets it fire for ones that have been failing.
+func benchStore(db *sql.DB, slug string, results map[string]any) error {
+	buf, err := json.Marshal(results)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`UPDATE twoai_benchmarks SET results = $1::jsonb, updated_at = now() WHERE slug = $2`, string(buf), slug)
+	return err
+}
+
+// benchFetchSweBenchVerified reads the official SWE-bench leaderboard data:
+// data/leaderboards.json in the swe-bench.github.io repo (master branch),
+// which is the artifact the JS site renders. Entries are agent+model
+// combinations with a resolved percentage and a submission date, which is
+// editorially better than model-only vendor numbers because the scaffold is
+// explicit in the row name. Validation: the Verified board must exist, carry
+// at least 20 entries (it had 180 on 2026-08-10, so fewer than 20 means the
+// shape changed), and every kept score must sit in (0,100].
+func benchFetchSweBenchVerified() (map[string]any, error) {
+	client := &http.Client{Timeout: 90 * time.Second}
+	req, _ := http.NewRequest("GET", "https://raw.githubusercontent.com/swe-bench/swe-bench.github.io/master/data/leaderboards.json", nil)
+	req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (theworldofai.org)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var doc struct {
+		Leaderboards []struct {
+			Name    string `json:"name"`
+			Results []struct {
+				Name     string  `json:"name"`
+				Resolved float64 `json:"resolved"`
+				Date     string  `json:"date"`
+			} `json:"results"`
+		} `json:"leaderboards"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		return nil, err
+	}
+	for _, lb := range doc.Leaderboards {
+		if lb.Name != "Verified" {
+			continue
+		}
+		type row struct {
+			name     string
+			resolved float64
+			date     string
+		}
+		var rows []row
+		for _, r := range lb.Results {
+			if r.Name != "" && r.Resolved > 0 && r.Resolved <= 100 {
+				rows = append(rows, row{r.Name, r.Resolved, r.Date})
+			}
+		}
+		if len(rows) < 20 {
+			return nil, fmt.Errorf("verified board has %d valid entries, expected 20+, shape may have changed", len(rows))
+		}
+		sort.Slice(rows, func(i, j int) bool { return rows[i].resolved > rows[j].resolved })
+		out := []map[string]any{}
+		for _, r := range rows[:5] {
+			detail := ""
+			if r.date != "" {
+				detail = "submitted " + r.date
+			}
+			out = append(out, map[string]any{
+				"system": r.name,
+				"score":  fmt.Sprintf("%.1f%%", r.resolved),
+				"detail": detail,
+			})
+		}
+		return map[string]any{
+			"as_of":      time.Now().UTC().Format("2006-01-02"),
+			"source":     "SWE-bench official leaderboard (auto-refreshed daily from the published data file)",
+			"source_url": "https://www.swebench.com/",
+			"metric":     "% of 500 SWE-bench Verified issues resolved, official submissions",
+			"note":       "Rows are agent-plus-model combinations as officially submitted, so the scaffold is part of the result. Vendor-reported model-only numbers are often higher than official submissions because harnesses differ; the official board is the comparable set.",
+			"rows":       out,
+		}, nil
+	}
+	return nil, fmt.Errorf("no Verified board in leaderboards.json")
+}
+
+// benchFetchArtificialAnalysis pulls one evaluation column from the
+// Artificial Analysis models API and returns the top three models on it.
+// EXPERIMENTAL until the first keyed run: the response shape was documented
+// but could not be verified without a key, so the parse is defensive (finds
+// the model array under "data", reads evaluations as a loose map, requires
+// at least three parseable scores in (0,100]) and any surprise fails closed.
+func benchFetchArtificialAnalysis(key string, evalKeys []string, metric, srcURL string) (map[string]any, error) {
+	client := &http.Client{Timeout: 60 * time.Second}
+	req, _ := http.NewRequest("GET", "https://artificialanalysis.ai/api/v2/data/llms/models", nil)
+	req.Header.Set("x-api-key", key)
+	req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (theworldofai.org)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var doc struct {
+		Data []struct {
+			Name        string             `json:"name"`
+			Evaluations map[string]float64 `json:"evaluations"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		return nil, err
+	}
+	type row struct {
+		name  string
+		score float64
+	}
+	var rows []row
+	for _, m := range doc.Data {
+		for _, k := range evalKeys {
+			if v, ok := m.Evaluations[k]; ok && m.Name != "" {
+				if v > 0 && v <= 1 { // some APIs report fractions
+					v *= 100
+				}
+				if v > 0 && v <= 100 {
+					rows = append(rows, row{m.Name, v})
+				}
+				break
+			}
+		}
+	}
+	if len(rows) < 3 {
+		return nil, fmt.Errorf("parsed %d scores for %v, expected 3+, response shape differs from the assumption", len(rows), evalKeys)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].score > rows[j].score })
+	out := []map[string]any{}
+	for _, r := range rows[:3] {
+		out = append(out, map[string]any{"system": r.name, "score": fmt.Sprintf("%.1f%%", r.score)})
+	}
+	return map[string]any{
+		"as_of":      time.Now().UTC().Format("2006-01-02"),
+		"source":     "Artificial Analysis API (auto-refreshed daily)",
+		"source_url": srcURL,
+		"metric":     metric,
+		"note":       "Independent evaluation under one consistent protocol. Numbers from other evaluators differ because protocols differ; compare within one evaluator, not across.",
+		"rows":       out,
+	}, nil
+}
+
+// benchCheckLMArenaMirror watches the public Hugging Face mirror of the
+// Arena leaderboard, which froze at leaderboard_table_20250804.csv. It never
+// writes results: if the mirror revives, the CSV schema is by definition
+// unverified, so the stage only logs that fresh data exists and a manual
+// look is warranted. Silence in the log means the mirror is still frozen.
+func benchCheckLMArenaMirror() {
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, _ := http.NewRequest("GET", "https://huggingface.co/api/spaces/lmarena-ai/arena-leaderboard", nil)
+	req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (theworldofai.org)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return // a watch endpoint failing is not worth a warning
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return
+	}
+	var doc struct {
+		Siblings []struct {
+			Rfilename string `json:"rfilename"`
+		} `json:"siblings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		return
+	}
+	latest := ""
+	for _, s := range doc.Siblings {
+		f := s.Rfilename
+		if strings.HasPrefix(f, "leaderboard_table_") && strings.HasSuffix(f, ".csv") && f > latest {
+			latest = f
+		}
+	}
+	if latest == "" {
+		return
+	}
+	d, err := time.Parse("20060102", strings.TrimSuffix(strings.TrimPrefix(latest, "leaderboard_table_"), ".csv"))
+	if err != nil {
+		return
+	}
+	if time.Since(d) < 30*24*time.Hour {
+		fmt.Fprintf(os.Stderr, "bench_results: LMArena HF mirror has fresh data (%s), review it and refresh the lmarena snapshot\n", latest)
+	}
 }
 
 // twoaiWeeks builds the weekly digest, one page per ISO week, from our own
