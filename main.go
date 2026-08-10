@@ -2921,8 +2921,13 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews)
+	watchPapers, err := twoaiResearchWatch(db, upsert)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers)
 	return nil
 }
 
@@ -4036,6 +4041,8 @@ func twoaiTaxonomyFor(kind string) any {
 		return "this-week-in-ai"
 	case "vendor-news":
 		return "vendor-news"
+	case "research-watch":
+		return "research-library"
 	}
 	return nil
 }
@@ -4236,6 +4243,71 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 		return 0, err
 	}
 	return len(blocks), nil
+}
+
+// twoaiResearchWatch builds research/watch.json: the arXiv Watch page at
+// /research/watch/, rendering the preprints arxiv_watch has filed in
+// ai_intel_candidates (source='arxiv').
+//
+// The template labels each paper's vendor value as "mentions {name}", never
+// as authorship: arXiv's API exposes no affiliations, so arxiv_watch matches
+// names in the title and abstract, and a paper matched on a model family is
+// usually a paper studying that model. This stage only renders what the watch
+// stored; the honesty constraint lives in the wording, which the template
+// owns. Rows marked ignored in review are excluded, which is the operator's
+// lever for pruning noise without deleting the record.
+//
+// Same defensive posture as twoaiVendorNews: an empty sweep leaves the last
+// good page in place, since arXiv API outages are routine (Aug 1) and a page
+// that empties itself on a transient failure is worse than one a day stale.
+func twoaiResearchWatch(db *sql.DB, upsert func(path, kind string, v any) error) (int, error) {
+	const windowDays = 30
+	rows, err := db.Query(`SELECT name, vendor,
+			replace(url, 'http://arxiv.org', 'https://arxiv.org'),
+			to_char(discovered_at at time zone 'UTC','YYYY-MM-DD')
+		FROM ai_intel_candidates
+		WHERE source = 'arxiv' AND status <> 'ignored'
+		  AND discovered_at > now() - ($1 || ' days')::interval
+		ORDER BY discovered_at DESC, id DESC`, windowDays)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type paper struct {
+		Title    string `json:"title"`
+		Match    string `json:"match"`
+		URL      string `json:"url"`
+		Surfaced string `json:"surfaced"`
+	}
+	// Initialised, not nil: nil marshals to JSON null and the template maps
+	// over this array at prerender time.
+	papers := []paper{}
+	for rows.Next() {
+		var p paper
+		if err := rows.Scan(&p.Title, &p.Match, &p.URL, &p.Surfaced); err != nil {
+			return 0, err
+		}
+		papers = append(papers, p)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(papers) == 0 {
+		fmt.Fprintln(os.Stderr, "twoai_build: arxiv watch found no papers, keeping the existing page")
+		return 0, nil
+	}
+
+	now := time.Now().UTC()
+	if err := upsert("research/watch.json", "research-watch", map[string]any{
+		"generated":   now.Format(time.RFC3339),
+		"date":        now.Format("2006-01-02"),
+		"window_days": windowDays,
+		"papers":      papers,
+	}); err != nil {
+		return 0, err
+	}
+	return len(papers), nil
 }
 
 // twoaiWeeks builds the weekly digest, one page per ISO week, from our own
