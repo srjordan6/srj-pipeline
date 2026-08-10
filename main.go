@@ -5516,6 +5516,15 @@ func arxivWatch(db *sql.DB) error {
 				ON CONFLICT (source_id) DO NOTHING`,
 				trunc(title, 300), hit, e.ID, "arxiv-"+e.ID)
 			if ierr != nil {
+				// Say what failed. The original silent continue hid a CHECK
+				// constraint that rejected kind='paper' outright: every insert
+				// failed identically from the day this stage shipped, the log
+				// printed papers_added=0 ok=true, and nothing distinguished
+				// "no papers matched" from "every insert bounced" until
+				// someone asked where the papers were (2026-08-10). One line
+				// per failed insert makes that class of failure loud on day
+				// one; the constraint now includes 'paper'.
+				fmt.Fprintln(os.Stderr, "arxiv_watch insert:", ierr)
 				continue
 			}
 			if n, _ := r.RowsAffected(); n > 0 {
