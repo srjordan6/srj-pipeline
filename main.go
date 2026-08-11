@@ -50,7 +50,7 @@ func main() {
 		return
 	}
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -174,6 +174,14 @@ func main() {
 	if src == "twoai_build" {
 		if err := twoaiBuild(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_build:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_jobs" {
+		if err := twoaiJobsFetch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_jobs:", err)
 			os.Exit(1)
 		}
 		return
@@ -2948,6 +2956,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	jobListings, err := twoaiJobs(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
 	// Staleness tripwire for benchmark results. The result snapshots in
 	// twoai_benchmarks.results are hand-curated from named evaluators, not
 	// scraped: the source leaderboards are JS-rendered and re-baseline
@@ -2999,8 +3012,8 @@ func twoaiBuild(db *sql.DB) error {
 			staleTimeline, oldestTimeline.String)
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings)
 	return nil
 }
 
@@ -4137,6 +4150,8 @@ func twoaiTaxonomyFor(kind string) any {
 		return "vendor-news"
 	case "research-watch":
 		return "research-library"
+	case "jobs-hub":
+		return "jobs-listings"
 	}
 	return nil
 }
