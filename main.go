@@ -3804,12 +3804,33 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 	}
 
 	count := 0
+	keep := make([]string, 0, len(docs))
 	for _, d := range docs {
 		uid, _ := d["uid"].(string)
 		if err := upsert("people/"+uid+".json", "person", d); err != nil {
 			return count, err
 		}
+		keep = append(keep, "people/"+uid+".json")
 		count++
+	}
+
+	// Reap person rows that this run did not write.
+	//
+	// The uid is derived from the name, so changing how a name is normalized
+	// changes the uid, and upsert-by-path then writes the profile to a NEW row
+	// while the old one sits there forever still rendering a page. That is not
+	// hypothetical: Tim O'Reilly published under two uids for a week, because an
+	// earlier rule dropped the apostrophe (tim-oreilly) where the entity
+	// normalizer turns it into a hyphen (tim-o-reilly). Two URLs, identical
+	// content, competing with each other, in the one section whose entire
+	// purpose is that an entity has exactly one identifier.
+	//
+	// Deleting what this run did not write is the only version of this that
+	// stays correct when the rule changes again. It is guarded by len(docs) > 0
+	// above, so a run that read nothing deletes nothing.
+	if _, err := db.Exec(`DELETE FROM twoai_pages
+		WHERE kind = 'person' AND NOT (path = ANY($1))`, pq.Array(keep)); err != nil {
+		return count, err
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	if err := upsert("people/index.json", "person-hub", map[string]any{
