@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
 	"database/sql"
@@ -4180,12 +4181,32 @@ func twoaiClassify(text string) []string {
 // Press coverage of the field is the Daily News briefing's job. The two pages
 // answer different questions and must not blur: what is being reported, versus
 // what the builders announced.
-//
-// Dates are when the intel watch surfaced each post, not when the vendor
-// published it, because that is what the table stores. The page says so. A
-// newly added feed backfills its archive on first sweep, so its items all
-// carry that sweep's date and would otherwise look like a burst of same-day
-// announcements that never happened.
+
+// twoaiPostSlug builds the permanent slug for a vendor announcement page:
+// the sanitized title plus the first 6 hex chars of the URL's md5, matching
+// the SQL expression that emitted the launch snapshot so the same post never
+// gets two different URLs. Slugs are permanent once published, per the
+// standing URL rule, which is why the disambiguator hashes the URL (stable)
+// rather than anything that could be re-edited.
+func twoaiPostSlug(name, url string) string {
+	s := strings.ToLower(name)
+	s = regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if len(s) > 60 {
+		s = s[:60]
+	}
+	return s + "-" + fmt.Sprintf("%x", md5.Sum([]byte(url)))[:6]
+}
+
+// twoaiVendorNews builds news/vendor.json for /ai-news/vendor/. Items carry
+// the date the intel watch surfaced them, not the date the vendor published
+// it, because that is what the table stores. The page says so. A newly added
+// feed backfills its archive on first sweep, so its items all carry that
+// sweep's date and would otherwise look like a burst of same-day
+// announcements that never happened. Each item also carries the vendor's own
+// published description (summary, when the row has one) and a permanent
+// slug, because every post gets its own on-site page telling the reader why
+// the outbound link is worth clicking before they leave the site.
 func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (int, error) {
 	// Display names for feeds whose vendor column holds a hostname. Anything
 	// not listed renders as stored.
@@ -4202,7 +4223,8 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 	const perVendor = 25
 
 	rows, err := db.Query(`SELECT DISTINCT ON (url) vendor, name, url,
-			to_char(discovered_at at time zone 'UTC','YYYY-MM-DD')
+			to_char(discovered_at at time zone 'UTC','YYYY-MM-DD'),
+			CASE WHEN length(trim(coalesce(summary,''))) >= 40 THEN summary ELSE '' END
 		FROM ai_intel_candidates
 		WHERE url IS NOT NULL AND url <> '' AND url NOT LIKE '%news.google%'
 		  AND discovered_at > now() - ($1 || ' days')::interval
@@ -4214,20 +4236,25 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 	defer rows.Close()
 
 	type item struct {
-		Title string `json:"title"`
-		URL   string `json:"url"`
-		Date  string `json:"date"`
+		Title   string `json:"title"`
+		URL     string `json:"url"`
+		Date    string `json:"date"`
+		Summary string `json:"summary,omitempty"`
+		Slug    string `json:"slug"`
 	}
 	byVendor := map[string][]item{}
 	for rows.Next() {
-		var vendor, name, url, date string
-		if err := rows.Scan(&vendor, &name, &url, &date); err != nil {
+		var vendor, name, url, date, summary string
+		if err := rows.Scan(&vendor, &name, &url, &date, &summary); err != nil {
 			return 0, err
 		}
 		if d, ok := display[vendor]; ok {
 			vendor = d
 		}
-		byVendor[vendor] = append(byVendor[vendor], item{Title: name, URL: url, Date: date})
+		byVendor[vendor] = append(byVendor[vendor], item{
+			Title: name, URL: url, Date: date, Summary: summary,
+			Slug: twoaiPostSlug(name, url),
+		})
 	}
 	if err := rows.Err(); err != nil {
 		return 0, err
