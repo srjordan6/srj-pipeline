@@ -2938,6 +2938,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	timeline, err := twoaiTimeline(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
 	watchPapers, err := twoaiResearchWatch(db, upsert)
 	if err != nil {
 		return err
@@ -2967,8 +2972,8 @@ func twoaiBuild(db *sql.DB) error {
 			staleBench, oldestBench.String)
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline)
 	return nil
 }
 
@@ -4929,6 +4934,155 @@ func benchCheckLMArenaMirror() {
 // Quiet weeks are published as quiet, not padded. A week with two bills and
 // nothing else says so, because a tracker that always claims a busy week is a
 // tracker nobody can use to tell busy from quiet.
+
+// twoaiTimeline renders the AI Historical Timeline at /ai-news/timeline/.
+//
+// HOW IT STAYS CURRENT, AND WHY IT IS BUILT THIS WAY. A timeline is the page
+// type most likely to rot: the 1943 entry is settled forever, while the last
+// two years change under you. So the two halves are kept current by different
+// means, because they fail in different ways.
+//
+// The historical spine is curated rows in twoai_timeline, each carrying its
+// primary source and the date it was last reviewed. It does not refresh,
+// because there is nothing to refresh: what changes about 1956 is our
+// understanding, not the facts, and that is a job for a person. The review
+// date is rendered so a stale entry is visible rather than merely old.
+//
+// The current era updates itself from records we already verify daily. The
+// tempting version of this reads the news feed and promotes whatever looks
+// big, which is fabrication with extra steps: a press release is not a
+// milestone, and no rule over prose can tell the difference. Instead the
+// significance judgment is made once, deliberately, by flagging a case as
+// timeline_milestone, and the pipeline then carries that case's live docket
+// status and development date onto the timeline every day. The editorial
+// decision is a human's and is made once; the facts underneath it stay fresh
+// on their own. Unflagging a case removes its entry on the next run.
+//
+// Rows carry origin so the two kinds never blur: curated entries say a person
+// wrote them, auto entries link to the case page and the court record.
+func twoaiTimeline(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
+	// Sync the flagged lawsuits into the timeline. Written every run so a
+	// docket development reaches the timeline the same day it reaches the case
+	// page, and deleted when a case is unflagged so the two cannot disagree.
+	if _, err := db.Exec(`DELETE FROM twoai_timeline
+		WHERE origin = 'auto-lawsuit'
+		  AND origin_ref NOT IN (SELECT slug FROM ai_lawsuits WHERE timeline_milestone)`); err != nil {
+		return 0, err
+	}
+	if _, err := db.Exec(`INSERT INTO twoai_timeline
+			(id, year, date_text, title, detail, category, era, source_name, source_url, origin, origin_ref, reviewed_on, updated_at)
+		SELECT 'case-' || slug,
+			EXTRACT(YEAR FROM filed_date)::int,
+			to_char(filed_date, 'FMMonth YYYY'),
+			case_name,
+			coalesce(why_it_matters, executive_summary, summary, '') ||
+				case when status is not null and status <> ''
+					then ' Status as of ' || to_char(coalesce(latest_development_date, current_date), 'FMMonth DD, YYYY') || ': ' || status || '.'
+					else '' end,
+			'litigation',
+			CASE
+				WHEN EXTRACT(YEAR FROM filed_date) < 1956 THEN 'Origins (1943-1955)'
+				WHEN EXTRACT(YEAR FROM filed_date) < 1974 THEN 'Symbolic era (1956-1973)'
+				WHEN EXTRACT(YEAR FROM filed_date) < 1993 THEN 'AI winters and expert systems (1974-1992)'
+				WHEN EXTRACT(YEAR FROM filed_date) < 2012 THEN 'Statistical turn (1993-2011)'
+				WHEN EXTRACT(YEAR FROM filed_date) < 2017 THEN 'Deep learning era (2012-2016)'
+				WHEN EXTRACT(YEAR FROM filed_date) < 2022 THEN 'Transformer era (2017-2021)'
+				ELSE 'Assistant era (2022-present)'
+			END,
+			coalesce(court, 'Court record'),
+			coalesce(courtlistener_url, source_url),
+			'auto-lawsuit', slug, current_date, now()
+		FROM ai_lawsuits
+		WHERE timeline_milestone AND filed_date IS NOT NULL
+		ON CONFLICT (id) DO UPDATE SET
+			title = EXCLUDED.title, detail = EXCLUDED.detail,
+			source_url = EXCLUDED.source_url, source_name = EXCLUDED.source_name,
+			date_text = EXCLUDED.date_text, year = EXCLUDED.year,
+			reviewed_on = EXCLUDED.reviewed_on, updated_at = now()`); err != nil {
+		return 0, err
+	}
+
+	type entry struct {
+		ID         string `json:"id"`
+		Year       int    `json:"year"`
+		Date       string `json:"date,omitempty"`
+		Title      string `json:"title"`
+		Detail     string `json:"detail"`
+		Category   string `json:"category"`
+		Era        string `json:"era"`
+		SourceName string `json:"source_name,omitempty"`
+		SourceURL  string `json:"source_url,omitempty"`
+		Origin     string `json:"origin"`
+		CaseSlug   string `json:"case_slug,omitempty"`
+		Reviewed   string `json:"reviewed_on,omitempty"`
+	}
+	rows, err := db.Query(`SELECT id, year, coalesce(date_text,''), title, detail, category, era,
+			coalesce(source_name,''), coalesce(source_url,''), origin,
+			coalesce(origin_ref,''), coalesce(to_char(reviewed_on,'YYYY-MM-DD'),'')
+		FROM twoai_timeline ORDER BY year, coalesce(sort_key, date_text, title)`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	var all []entry
+	eraOrder := []string{}
+	seenEra := map[string]bool{}
+	for rows.Next() {
+		var e entry
+		if err := rows.Scan(&e.ID, &e.Year, &e.Date, &e.Title, &e.Detail, &e.Category, &e.Era,
+			&e.SourceName, &e.SourceURL, &e.Origin, &e.CaseSlug, &e.Reviewed); err != nil {
+			return 0, err
+		}
+		if e.Origin != "auto-lawsuit" {
+			e.CaseSlug = ""
+		}
+		all = append(all, e)
+		if !seenEra[e.Era] {
+			seenEra[e.Era] = true
+			eraOrder = append(eraOrder, e.Era)
+		}
+	}
+	if len(all) == 0 {
+		return 0, nil
+	}
+
+	// Group by era in first-appearance order, which is chronological because
+	// the query is ordered by year.
+	type eraBlock struct {
+		Era     string  `json:"era"`
+		Entries []entry `json:"entries"`
+	}
+	blocks := make([]eraBlock, 0, len(eraOrder))
+	for _, name := range eraOrder {
+		b := eraBlock{Era: name}
+		for _, e := range all {
+			if e.Era == name {
+				b.Entries = append(b.Entries, e)
+			}
+		}
+		blocks = append(blocks, b)
+	}
+
+	auto := 0
+	for _, e := range all {
+		if e.Origin == "auto-lawsuit" {
+			auto++
+		}
+	}
+
+	if err := upsert("timeline/index.json", "timeline", map[string]any{
+		"uid": twoaiUID("section:historical-timeline"),
+		"eras": blocks, "total": len(all), "auto": auto,
+		"curated": len(all) - auto,
+		"first_year": all[0].Year, "last_year": all[len(all)-1].Year,
+		"generated": today,
+	}); err != nil {
+		return 0, err
+	}
+	return len(all), nil
+}
+
 func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
 	type weekItem struct {
 		State  string   `json:"state,omitempty"`
