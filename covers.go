@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -45,9 +46,25 @@ var coverSources = []struct {
 // loadRemoteCovers downloads each cover, verifies its hash, and merges it
 // into faviconFiles so runFavicons pushes it with the rest. Never fails the
 // stage: a dead link or bad byte just means this run skips that cover.
+//
+// An asset already in the repo is skipped without fetching. putToRepo
+// already made the push write-free once the blob matched, but the download
+// still ran every time, and runFavicons is called by the daily `all` pass
+// AND by hourlyCatchUp, so this was pulling several megabytes an hour from
+// the staging host to produce nothing. Existence is a sufficient test
+// because the only way a file reaches the repo is through this function,
+// which verifies the pinned SHA-256 first.
+//
+// The practical effect is that each cover retires its own staging URL after
+// the first successful run. That matters because the staging host is
+// ephemeral: when a link eventually expires, a retired asset says nothing
+// rather than warning every hour about a file that is already published.
 func loadRemoteCovers() {
 	client := &http.Client{Timeout: 60 * time.Second}
 	for _, c := range coverSources {
+		if repoHasFile("srjordan6/srj-site", "public/"+c.repoPath) {
+			continue
+		}
 		resp, err := client.Get(c.url)
 		if err != nil {
 			fmt.Println("covers: fetch failed, skipping", c.repoPath, err)
@@ -67,4 +84,30 @@ func loadRemoteCovers() {
 		faviconFiles[c.repoPath] = base64.StdEncoding.EncodeToString(data)
 		fmt.Println("covers: verified", c.repoPath, len(data), "bytes")
 	}
+}
+
+// repoHasFile reports whether a path exists in the repo. Any error, including
+// a missing token, answers false: the caller then falls back to fetching and
+// pushing, which is the behaviour this function is an optimisation over, so a
+// failed check costs bandwidth rather than correctness.
+func repoHasFile(repo, path string) bool {
+	tok := os.Getenv("GITHUB_TOKEN")
+	if tok == "" {
+		return false
+	}
+	req, err := http.NewRequest("GET",
+		"https://api.github.com/repos/"+repo+"/contents/"+path, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "srj-pipeline/1.0")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return false
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
