@@ -2972,6 +2972,33 @@ func twoaiBuild(db *sql.DB) error {
 			staleBench, oldestBench.String)
 	}
 
+	// The same debt check for the timeline's curated entries, for the same
+	// reason and with one difference: these are keyed on reviewed_on, the date
+	// a person last checked the entry, not updated_at, which any incidental
+	// write would reset and so would quietly launder a stale entry as fresh.
+	//
+	// Intervals vary by how fast the ground moves under an entry rather than
+	// being one number for the page. A 1943 paper is not going to change and
+	// gets three years; a governance entry describes a regime with phased
+	// obligations and gets one, because that is the entry most likely to be
+	// quietly wrong. Auto-synced cases are excluded: they are rewritten from
+	// the docket every run, so a review date on them would measure nothing.
+	var staleTimeline int
+	var oldestTimeline sql.NullString
+	if err := db.QueryRow(`SELECT count(*),
+			min(id || ' (' || to_char(reviewed_on, 'YYYY-MM-DD') || ')')
+		FROM twoai_timeline
+		WHERE origin <> 'auto-lawsuit'
+		  AND (reviewed_on IS NULL
+		       OR reviewed_on < current_date - (coalesce(review_interval_days, 1095) || ' days')::interval)`,
+	).Scan(&staleTimeline, &oldestTimeline); err != nil {
+		return err
+	}
+	if staleTimeline > 0 {
+		fmt.Fprintf(os.Stderr, "twoai_build: WARNING %d timeline entr(ies) past review interval, oldest %s - re-verify the source and bump twoai_timeline.reviewed_on\n",
+			staleTimeline, oldestTimeline.String)
+	}
+
 	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d ok=true\n",
 		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline)
 	return nil
