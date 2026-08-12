@@ -4298,6 +4298,31 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 	const windowDays = 30
 	const perVendor = 25
 
+	// Every post page that has ever been published stays published: the URL
+	// permanence rule applies to a permalink whether it fell off the page
+	// because its source row aged out or because a newer post pushed it past
+	// perVendor. The second is what actually bit us. On 2026-08-11 the sitemap
+	// carried 48 /ai-news/vendor/ permalinks that were gone the next day, not
+	// because the candidates expired (all 395 were still inside the window)
+	// but because busier vendors pushed them out of their own top 25, and the
+	// route builds its paths from the same capped list the hub renders.
+	//
+	// So the cap now governs display only. Posts are written through to
+	// twoai_vendor_posts on first sight and every row is emitted in `archive`,
+	// which is what the route builds from. first_published is set once and
+	// never rewritten, so a permalink's identity does not drift.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_vendor_posts (
+		slug text PRIMARY KEY,
+		vendor text NOT NULL,
+		title text NOT NULL,
+		url text NOT NULL,
+		summary text NOT NULL DEFAULT '',
+		posted_on date,
+		first_published timestamptz NOT NULL DEFAULT now(),
+		last_seen timestamptz NOT NULL DEFAULT now())`); err != nil {
+		return 0, err
+	}
+
 	rows, err := db.Query(`SELECT DISTINCT ON (url) vendor, name, url,
 			to_char(discovered_at at time zone 'UTC','YYYY-MM-DD'),
 			CASE WHEN length(trim(coalesce(summary,''))) >= 40 THEN summary ELSE '' END
@@ -4336,6 +4361,28 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 		return 0, err
 	}
 
+	// Write through before rendering. A post seen once is kept even when the
+	// candidate row behind it is later pruned, which is the other way a
+	// permalink can go missing.
+	for vendor, items := range byVendor {
+		for _, it := range items {
+			if it.Slug == "" {
+				continue
+			}
+			if _, err := db.Exec(`INSERT INTO twoai_vendor_posts
+				(slug, vendor, title, url, summary, posted_on)
+				VALUES ($1,$2,$3,$4,$5,$6::date)
+				ON CONFLICT (slug) DO UPDATE SET
+					vendor=EXCLUDED.vendor, title=EXCLUDED.title, url=EXCLUDED.url,
+					summary=CASE WHEN EXCLUDED.summary <> '' THEN EXCLUDED.summary
+					             ELSE twoai_vendor_posts.summary END,
+					last_seen=now()`,
+				it.Slug, vendor, it.Title, it.URL, it.Summary, it.Date); err != nil {
+				fmt.Fprintln(os.Stderr, "twoai_build: vendor post upsert:", err)
+			}
+		}
+	}
+
 	type vendorBlock struct {
 		Vendor string `json:"vendor"`
 		Total  int    `json:"total"`
@@ -4368,15 +4415,40 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 		return 0, nil
 	}
 
+	// The archive is every post page that exists, capped by nothing. The hub
+	// renders `vendors`; the permalink route builds from this.
+	arows, err := db.Query(`SELECT slug, vendor, title, url, summary,
+			COALESCE(to_char(posted_on,'YYYY-MM-DD'),'')
+		FROM twoai_vendor_posts ORDER BY posted_on DESC NULLS LAST, slug`)
+	if err != nil {
+		return 0, err
+	}
+	type archived struct {
+		item
+		Vendor string `json:"vendor"`
+	}
+	archiveOut := []archived{}
+	for arows.Next() {
+		var a archived
+		if err := arows.Scan(&a.Slug, &a.Vendor, &a.Title, &a.URL, &a.Summary, &a.Date); err != nil {
+			arows.Close()
+			return 0, err
+		}
+		archiveOut = append(archiveOut, a)
+	}
+	arows.Close()
+
 	now := time.Now().UTC()
 	if err := upsert("news/vendor.json", "vendor-news", map[string]any{
 		"generated":   now.Format(time.RFC3339),
 		"date":        now.Format("2006-01-02"),
 		"window_days": windowDays,
 		"vendors":     blocks,
+		"archive":     archiveOut,
 	}); err != nil {
 		return 0, err
 	}
+	fmt.Printf("twoai_build: vendor news vendors=%d archive=%d ok=true\n", len(blocks), len(archiveOut))
 	return len(blocks), nil
 }
 
@@ -4548,13 +4620,49 @@ func urlRegistry(db *sql.DB) error {
 		}
 	}
 
+	if _, err := tx.Exec(`ALTER TABLE twoai_url_registry
+		ADD COLUMN IF NOT EXISTS resolution text,
+		ADD COLUMN IF NOT EXISTS resolution_note text,
+		ADD COLUMN IF NOT EXISTS resolved_at timestamptz`); err != nil {
+		return err
+	}
+
 	// Rows the sitemap no longer lists. These are not deleted, because a URL
 	// that stopped being published is the single most useful thing this table
 	// can tell us: it was probably indexed, it is probably now a 404, and it
 	// probably needs a redirect. Deleting it would destroy the evidence.
-	var gone int
+	//
+	// A count alone was not enough. It sat at 77 for a day, rose to 81, and
+	// nothing happened, because a warning with no state behind it is a warning
+	// nobody can be behind on. Each vanished URL now carries a resolution:
+	// 'redirected' when a rule was added, 'restored' when the page came back at
+	// its own URL, 'intentional' when the URL was never meant to be public and
+	// leaving it 404 is correct. Anything still unresolved after 48 hours is
+	// named individually, the same tiered-tripwire discipline the timeline
+	// entries use.
+	var gone, unresolved int
 	if err := tx.QueryRow(`SELECT count(*) FROM twoai_url_registry
 		WHERE last_seen_at < now() - interval '1 hour'`).Scan(&gone); err != nil {
+		return err
+	}
+	var overdue []string
+	orows, err := tx.Query(`SELECT url FROM twoai_url_registry
+		WHERE last_seen_at < now() - interval '48 hours' AND resolution IS NULL
+		ORDER BY last_seen_at, url`)
+	if err != nil {
+		return err
+	}
+	for orows.Next() {
+		var u string
+		if err := orows.Scan(&u); err != nil {
+			orows.Close()
+			return err
+		}
+		overdue = append(overdue, u)
+	}
+	orows.Close()
+	if err := tx.QueryRow(`SELECT count(*) FROM twoai_url_registry
+		WHERE last_seen_at < now() - interval '1 hour' AND resolution IS NULL`).Scan(&unresolved); err != nil {
 		return err
 	}
 
@@ -4562,10 +4670,18 @@ func urlRegistry(db *sql.DB) error {
 		return err
 	}
 
-	fmt.Printf("url_registry: live=%d gone=%d\n", len(urls), gone)
-	if gone > 0 {
-		fmt.Fprintf(os.Stderr, "url_registry: %d url(s) in the registry are no longer in the sitemap; "+
-			"query twoai_url_registry WHERE last_seen_at < now() - interval '1 day' and redirect any that were indexed\n", gone)
+	fmt.Printf("url_registry: live=%d gone=%d unresolved=%d\n", len(urls), gone, unresolved)
+	if len(overdue) > 0 {
+		fmt.Fprintf(os.Stderr, "url_registry: %d url(s) have been out of the sitemap for over 48 hours "+
+			"with no resolution recorded. Redirect or restore each, then set resolution "+
+			"('redirected' | 'restored' | 'intentional') on the row:\n", len(overdue))
+		for i, u := range overdue {
+			if i == 25 {
+				fmt.Fprintf(os.Stderr, "  ... and %d more\n", len(overdue)-25)
+				break
+			}
+			fmt.Fprintln(os.Stderr, "  "+u)
+		}
 	}
 	return nil
 }
