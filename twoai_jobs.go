@@ -35,7 +35,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -219,6 +221,161 @@ func twoaiJobSlug(s string) string {
 	return strings.Trim(b.String(), "-")
 }
 
+// twoaiSalaryRE pulls a numeric range out of the free-text salary strings the
+// feeds supply: "$125,776–$187,093/yr", "$110k - $165.3k", "$120 - $170 /hour".
+// Each source writes it differently and none of them writes it as numbers.
+var twoaiSalaryRE = regexp.MustCompile(`\$\s*([0-9,]+(?:\.[0-9]+)?)\s*(k?)\s*[-–—to]+\s*\$?\s*([0-9,]+(?:\.[0-9]+)?)\s*(k?)`)
+var twoaiSalarySingleRE = regexp.MustCompile(`\$\s*([0-9,]+(?:\.[0-9]+)?)\s*(k?)`)
+
+// twoaiParseSalary returns min, max, and the period. A figure below 15,000 a
+// year is not a salary, it is an hourly rate the feed forgot to label or a
+// stipend, so it is rejected rather than dragging a median down.
+func twoaiParseSalary(s string) (float64, float64, string) {
+	if s == "" {
+		return 0, 0, ""
+	}
+	l := strings.ToLower(s)
+	period := "year"
+	switch {
+	case strings.Contains(l, "hour"), strings.Contains(l, "/hr"):
+		period = "hour"
+	case strings.Contains(l, "month"):
+		period = "month"
+	case strings.Contains(l, "week"):
+		period = "week"
+	}
+	num := func(v, k string) float64 {
+		f, err := strconv.ParseFloat(strings.ReplaceAll(v, ",", ""), 64)
+		if err != nil {
+			return 0
+		}
+		if k == "k" {
+			f *= 1000
+		}
+		return f
+	}
+	if m := twoaiSalaryRE.FindStringSubmatch(l); m != nil {
+		lo, hi := num(m[1], m[2]), num(m[3], m[4])
+		if lo > hi {
+			lo, hi = hi, lo
+		}
+		if period == "year" && hi > 0 && hi < 15000 {
+			return 0, 0, ""
+		}
+		return lo, hi, period
+	}
+	if m := twoaiSalarySingleRE.FindStringSubmatch(l); m != nil {
+		v := num(m[1], m[2])
+		if period == "year" && v > 0 && v < 15000 {
+			return 0, 0, ""
+		}
+		return v, v, period
+	}
+	return 0, 0, ""
+}
+
+// twoaiSeniority reads the level out of the title. Titles are the only place
+// this is stated consistently across ten different feeds.
+func twoaiSeniority(title string) string {
+	t := " " + strings.ToLower(title) + " "
+	t = strings.NewReplacer("/", " ", ",", " ", "-", " ", "(", " ", ")", " ", ".", " ").Replace(t)
+	has := func(w ...string) bool {
+		for _, x := range w {
+			if strings.Contains(t, " "+x+" ") {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has("intern", "internship", "co op"):
+		return "Intern"
+	case has("chief", "ciso", "cto", "cio", "cso"):
+		return "Executive"
+	case has("vp", "svp", "evp") || strings.Contains(t, "vice president"):
+		return "Vice President"
+	case has("director") || strings.Contains(t, "head of"):
+		return "Director"
+	case has("manager", "mgr", "supervisor", "supervisory"):
+		return "Manager"
+	case has("principal", "distinguished", "fellow"):
+		return "Principal"
+	case has("staff"):
+		return "Staff"
+	case has("lead"):
+		return "Lead"
+	case has("sr", "senior", "snr"):
+		return "Senior"
+	case has("jr", "junior", "associate", "entry", "graduate") || strings.Contains(t, "new grad"):
+		return "Junior"
+	}
+	return "Mid-level"
+}
+
+// twoaiSkillVocab is the vocabulary counted against posting text. A fixed list
+// rather than open extraction, because open extraction on somebody else's
+// prose produces noise and, worse, starts storing their words. Only the
+// matched skill names are kept; the posting text itself is never stored.
+var twoaiSkillVocab = map[string][]string{
+	"Python": {"python"}, "Go": {"golang"}, "Rust": {"rust"}, "Java": {"java"},
+	"JavaScript": {"javascript"}, "TypeScript": {"typescript"}, "C++": {"c++"},
+	"SQL": {"sql"}, "Scala": {"scala"}, "Bash": {"bash", "shell scripting"},
+	"PyTorch": {"pytorch"}, "TensorFlow": {"tensorflow"}, "JAX": {"jax"},
+	"Hugging Face": {"hugging face", "huggingface"}, "LangChain": {"langchain"},
+	"CUDA": {"cuda"}, "Triton": {"triton"}, "Ray": {"ray "},
+	"Large Language Models": {"large language model", "llm"},
+	"Retrieval-Augmented Generation": {"retrieval augmented", "rag "},
+	"Fine-tuning": {"fine tuning", "fine-tuning"},
+	"Reinforcement Learning": {"reinforcement learning", "rlhf"},
+	"Computer Vision": {"computer vision"}, "NLP": {"natural language processing", " nlp"},
+	"Diffusion Models": {"diffusion model"}, "Transformers": {"transformer"},
+	"Model Evaluation": {"model evaluation", "evals", "benchmarking"},
+	"Prompt Engineering": {"prompt engineering"},
+	"MLOps": {"mlops"}, "Kubernetes": {"kubernetes", "k8s"}, "Docker": {"docker"},
+	"Terraform": {"terraform"}, "AWS": {"aws", "amazon web services"},
+	"Azure": {"azure"}, "GCP": {"gcp", "google cloud"},
+	"CI/CD": {"ci/cd", "continuous integration"}, "Spark": {"spark"},
+	"Airflow": {"airflow"}, "dbt": {"dbt"}, "Snowflake": {"snowflake"},
+	"Databricks": {"databricks"}, "Kafka": {"kafka"},
+	"Distributed Systems": {"distributed system"}, "GPU Infrastructure": {"gpu cluster", "gpu infrastructure"},
+	"Threat Modeling": {"threat model"}, "Incident Response": {"incident response"},
+	"SIEM": {"siem", "splunk"}, "EDR": {"edr", "endpoint detection"},
+	"Penetration Testing": {"penetration testing", "pentest"},
+	"Threat Hunting": {"threat hunting"}, "Malware Analysis": {"malware analysis"},
+	"Reverse Engineering": {"reverse engineering"}, "Cryptography": {"cryptograph"},
+	"Zero Trust": {"zero trust"}, "IAM": {"identity and access", " iam "},
+	"Okta": {"okta"}, "SSO": {"single sign on", " sso "},
+	"Vulnerability Management": {"vulnerability management"},
+	"SOC 2": {"soc 2"}, "ISO 27001": {"iso 27001"}, "FedRAMP": {"fedramp"},
+	"NIST": {"nist"}, "GDPR": {"gdpr"}, "HIPAA": {"hipaa"},
+	"Security Clearance": {"security clearance", "ts/sci"},
+	"AI Governance": {"ai governance", "responsible ai"},
+	"Red Teaming": {"red team"}, "Detection Engineering": {"detection engineering"},
+	"Cloud Security": {"cloud security"}, "Application Security": {"application security", "appsec"},
+}
+
+// twoaiExtractSkills counts vocabulary hits in a posting's text and returns
+// the skill NAMES only. The text is read and discarded: it belongs to the
+// employer, and what we keep is the fact that a skill was asked for.
+func twoaiExtractSkills(text string) []string {
+	if text == "" {
+		return nil
+	}
+	l := " " + strings.ToLower(twoaiTagStrip.ReplaceAllString(text, " ")) + " "
+	l = strings.Join(strings.Fields(l), " ")
+	var out []string
+	for name, needles := range twoaiSkillVocab {
+		for _, n := range needles {
+			if strings.Contains(l, n) {
+				out = append(out, name)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func twoaiJobsFetch(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_jobs (
 		id bigserial PRIMARY KEY,
@@ -238,7 +395,12 @@ func twoaiJobsFetch(db *sql.DB) error {
 		return err
 	}
 	if _, err := db.Exec(`ALTER TABLE twoai_jobs
-		ADD COLUMN IF NOT EXISTS job_category text NOT NULL DEFAULT ''`); err != nil {
+		ADD COLUMN IF NOT EXISTS job_category text NOT NULL DEFAULT '',
+		ADD COLUMN IF NOT EXISTS salary_min numeric,
+		ADD COLUMN IF NOT EXISTS salary_max numeric,
+		ADD COLUMN IF NOT EXISTS salary_period text,
+		ADD COLUMN IF NOT EXISTS seniority text,
+		ADD COLUMN IF NOT EXISTS skills jsonb NOT NULL DEFAULT '[]'::jsonb`); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_jobs_market (
@@ -248,7 +410,8 @@ func twoaiJobsFetch(db *sql.DB) error {
 	}
 
 	saved, skipped := 0, 0
-	save := func(source, extID, title, company, location string, remote bool, salary, link, posted string) {
+	// desc is the posting text, used to count skill mentions and then dropped.
+	save := func(source, extID, title, company, location string, remote bool, salary, link, posted, desc string) {
 		title = strings.TrimSpace(title)
 		if title == "" || link == "" || extID == "" {
 			return
@@ -266,17 +429,31 @@ func twoaiJobsFetch(db *sql.DB) error {
 				}
 			}
 		}
+		salMin, salMax, salPeriod := twoaiParseSalary(salary)
+		skills := twoaiExtractSkills(desc)
+		skillsJSON, _ := json.Marshal(skills)
+		var sMin, sMax, sPeriod any
+		if salMin > 0 {
+			sMin, sMax, sPeriod = salMin, salMax, salPeriod
+		}
 		if _, err := db.Exec(`INSERT INTO twoai_jobs
-			(source, external_id, title, company, location, remote, salary, category, url, posted_on, job_category)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::date,$11)
+			(source, external_id, title, company, location, remote, salary, category, url, posted_on,
+			 job_category, salary_min, salary_max, salary_period, seniority, skills)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::date,$11,$12,$13,$14,$15,$16::jsonb)
 			ON CONFLICT (source, external_id) DO UPDATE SET
 				title=EXCLUDED.title, company=EXCLUDED.company, location=EXCLUDED.location,
 				remote=EXCLUDED.remote, salary=EXCLUDED.salary, category=EXCLUDED.category,
 				url=EXCLUDED.url, posted_on=COALESCE(EXCLUDED.posted_on, twoai_jobs.posted_on),
-				job_category=EXCLUDED.job_category, last_seen=now()`,
+				job_category=EXCLUDED.job_category, salary_min=EXCLUDED.salary_min,
+				salary_max=EXCLUDED.salary_max, salary_period=EXCLUDED.salary_period,
+				seniority=EXCLUDED.seniority,
+				skills=CASE WHEN jsonb_array_length(EXCLUDED.skills) > 0
+				            THEN EXCLUDED.skills ELSE twoai_jobs.skills END,
+				last_seen=now()`,
 			source, extID, strings.TrimSpace(title), strings.TrimSpace(company),
 			strings.TrimSpace(location), remote, strings.TrimSpace(salary), cat, link, postedOn,
-			twoaiJobFunction(title, cat)); err != nil {
+			twoaiJobFunction(title, cat), sMin, sMax, sPeriod, twoaiSeniority(title),
+			string(skillsJSON)); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_jobs: upsert:", err)
 			return
 		}
@@ -297,7 +474,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 		"sentinellabs": "SentinelOne",
 	}
 	for slug, name := range greenhouse {
-		b, err := twoaiJobsGet("https://boards-api.greenhouse.io/v1/boards/"+slug+"/jobs", nil)
+		b, err := twoaiJobsGet("https://boards-api.greenhouse.io/v1/boards/"+slug+"/jobs?content=true", nil)
 		if err != nil {
 			warn("greenhouse/"+slug, err)
 			continue
@@ -311,6 +488,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 					Name string `json:"name"`
 				} `json:"location"`
 				FirstPublished string `json:"first_published"`
+				Content        string `json:"content"`
 			} `json:"jobs"`
 		}
 		if err := json.Unmarshal(b, &d); err != nil {
@@ -320,7 +498,8 @@ func twoaiJobsFetch(db *sql.DB) error {
 		for _, j := range d.Jobs {
 			loc := j.Location.Name
 			save("greenhouse", slug+":"+j.ID.String(), j.Title, name, loc,
-				strings.Contains(strings.ToLower(loc), "remote"), "", j.URL, j.FirstPublished)
+				strings.Contains(strings.ToLower(loc), "remote"), "", j.URL, j.FirstPublished,
+				j.Content)
 		}
 	}
 
@@ -343,6 +522,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 				IsListed    bool   `json:"isListed"`
 				JobURL      string `json:"jobUrl"`
 				PublishedAt string `json:"publishedAt"`
+				DescPlain   string `json:"descriptionPlain"`
 			} `json:"jobs"`
 		}
 		if err := json.Unmarshal(b, &d); err != nil {
@@ -353,7 +533,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 			if !j.IsListed {
 				continue
 			}
-			save("ashby", slug+":"+j.ID, j.Title, name, j.Location, j.IsRemote, "", j.JobURL, j.PublishedAt)
+			save("ashby", slug+":"+j.ID, j.Title, name, j.Location, j.IsRemote, "", j.JobURL, j.PublishedAt, j.DescPlain)
 		}
 	}
 
@@ -373,6 +553,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 				Location string `json:"location"`
 			} `json:"categories"`
 			WorkplaceType string `json:"workplaceType"`
+			DescPlain     string `json:"descriptionPlain"`
 		}
 		if err := json.Unmarshal(b, &d); err != nil {
 			warn("lever/"+slug, err)
@@ -384,7 +565,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 				posted = time.UnixMilli(j.CreatedAt).UTC().Format("2006-01-02")
 			}
 			save("lever", slug+":"+j.ID, j.Text, name, j.Categories.Location,
-				j.WorkplaceType == "remote", "", j.HostedURL, posted)
+				j.WorkplaceType == "remote", "", j.HostedURL, posted, j.DescPlain)
 		}
 	}
 
@@ -404,6 +585,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 				URL      string      `json:"url"`
 				Salary   string      `json:"salary"`
 				PubDate  string      `json:"publication_date"`
+				Desc     string      `json:"description"`
 			} `json:"jobs"`
 		}
 		if err := json.Unmarshal(b, &d); err != nil {
@@ -411,7 +593,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 			continue
 		}
 		for _, j := range d.Jobs {
-			save("remotive", j.ID.String(), j.Title, j.Company, j.Loc, true, j.Salary, j.URL, j.PubDate)
+			save("remotive", j.ID.String(), j.Title, j.Company, j.Loc, true, j.Salary, j.URL, j.PubDate, j.Desc)
 		}
 	}
 
@@ -427,12 +609,13 @@ func twoaiJobsFetch(db *sql.DB) error {
 			Location string      `json:"location"`
 			URL      string      `json:"url"`
 			Date     string      `json:"date"`
+			Desc     string      `json:"description"`
 		}
 		if err := json.Unmarshal(b, &d); err != nil {
 			warn("remoteok", err)
 		} else {
 			for _, j := range d {
-				save("remoteok", j.ID.String(), j.Position, j.Company, j.Location, true, "", j.URL, j.Date)
+				save("remoteok", j.ID.String(), j.Position, j.Company, j.Location, true, "", j.URL, j.Date, j.Desc)
 			}
 		}
 	}
@@ -443,13 +626,14 @@ func twoaiJobsFetch(db *sql.DB) error {
 	} else {
 		var d struct {
 			Data []struct {
-				Slug      string `json:"slug"`
-				Title     string `json:"title"`
-				Company   string `json:"company_name"`
-				Location  string `json:"location"`
-				Remote    bool   `json:"remote"`
-				URL       string `json:"url"`
-				CreatedAt int64  `json:"created_at"`
+				Slug        string `json:"slug"`
+				Title       string `json:"title"`
+				Company     string `json:"company_name"`
+				Location    string `json:"location"`
+				Remote      bool   `json:"remote"`
+				URL         string `json:"url"`
+				CreatedAt   int64  `json:"created_at"`
+				Description string `json:"description"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(b, &d); err != nil {
@@ -460,7 +644,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 				if j.CreatedAt > 0 {
 					posted = time.Unix(j.CreatedAt, 0).UTC().Format("2006-01-02")
 				}
-				save("arbeitnow", j.Slug, j.Title, j.Company, j.Location, j.Remote, "", j.URL, posted)
+				save("arbeitnow", j.Slug, j.Title, j.Company, j.Location, j.Remote, "", j.URL, posted, j.Description)
 			}
 		}
 	}
@@ -486,7 +670,8 @@ func twoaiJobsFetch(db *sql.DB) error {
 				Locations []struct {
 					Name string `json:"name"`
 				} `json:"locations"`
-				Refs struct {
+				Contents string `json:"contents"`
+				Refs     struct {
 					LandingPage string `json:"landing_page"`
 				} `json:"refs"`
 			} `json:"results"`
@@ -505,7 +690,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 				}
 			}
 			save("themuse", j.ID.String(), j.Name, j.Company.Name, strings.Join(locs, "; "),
-				remote, "", j.Refs.LandingPage, j.PubDate)
+				remote, "", j.Refs.LandingPage, j.PubDate, j.Contents)
 		}
 		if len(d.Results) == 0 {
 			break
@@ -544,7 +729,8 @@ func twoaiJobsFetch(db *sql.DB) error {
 								Max      string `json:"MaximumRange"`
 								Interval string `json:"RateIntervalCode"`
 							} `json:"PositionRemuneration"`
-							PubStart string `json:"PublicationStartDate"`
+							PubStart  string `json:"PublicationStartDate"`
+							JobSummry string `json:"QualificationSummary"`
 						} `json:"MatchedObjectDescriptor"`
 					} `json:"SearchResultItems"`
 				} `json:"SearchResult"`
@@ -570,7 +756,8 @@ func twoaiJobsFetch(db *sql.DB) error {
 					}
 				}
 				save("usajobs", j.PositionID, j.PositionTitle, j.OrgName, loc,
-					strings.Contains(strings.ToLower(loc), "remote"), sal, j.PositionURI, j.PubStart)
+					strings.Contains(strings.ToLower(loc), "remote"), sal, j.PositionURI, j.PubStart,
+					j.JobSummry)
 			}
 		}
 	}
@@ -593,6 +780,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 					Title   string  `json:"title"`
 					Created string  `json:"created"`
 					URL     string  `json:"redirect_url"`
+					Desc    string  `json:"description"`
 					SalMin  float64 `json:"salary_min"`
 					SalMax  float64 `json:"salary_max"`
 					Company struct {
@@ -612,7 +800,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 				if j.SalMin > 0 {
 					sal = fmt.Sprintf("$%.0f–$%.0f/yr", j.SalMin, j.SalMax)
 				}
-				save("adzuna", j.ID, j.Title, j.Company.Name, j.Location.Name, false, sal, j.URL, j.Created)
+				save("adzuna", j.ID, j.Title, j.Company.Name, j.Location.Name, false, sal, j.URL, j.Created, j.Desc)
 			}
 		}
 	}
@@ -645,6 +833,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 					Link     string      `json:"link"`
 					Salary   string      `json:"salary"`
 					Updated  string      `json:"updated"`
+					Snippet  string      `json:"snippet"`
 				} `json:"jobs"`
 			}
 			if err := json.Unmarshal(b, &d); err != nil {
@@ -652,7 +841,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 				continue
 			}
 			for _, j := range d.Jobs {
-				save("jooble", j.ID.String(), j.Title, j.Company, j.Location, false, j.Salary, j.Link, j.Updated)
+				save("jooble", j.ID.String(), j.Title, j.Company, j.Location, false, j.Salary, j.Link, j.Updated, j.Snippet)
 			}
 		}
 	}
@@ -803,6 +992,97 @@ func twoaiJobs(db *sql.DB, today string, upsert func(path, kind string, v any) e
 		return groups[i].Name < groups[k].Name
 	})
 
+	// SALARY DATA. Aggregated from the listings whose employer states a figure,
+	// which is the number the page leads with: a median computed from half the
+	// market is worth publishing only if the reader knows it is half. Hourly and
+	// other periods are excluded rather than annualised, because a guess at
+	// hours-per-year is a number nobody stated.
+	type payRow struct {
+		Group     string  `json:"group"`
+		Count     int     `json:"count"`
+		Disclosed int     `json:"disclosed"`
+		P25       float64 `json:"p25,omitempty"`
+		Median    float64 `json:"median,omitempty"`
+		P75       float64 `json:"p75,omitempty"`
+	}
+	payBy := func(col string) []payRow {
+		q := `SELECT COALESCE(NULLIF(` + col + `,''),'Unstated') AS g, count(*),
+				count(*) FILTER (WHERE salary_period='year' AND salary_min > 15000),
+				COALESCE(percentile_cont(0.25) WITHIN GROUP (ORDER BY (salary_min+salary_max)/2)
+					FILTER (WHERE salary_period='year' AND salary_min > 15000), 0),
+				COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY (salary_min+salary_max)/2)
+					FILTER (WHERE salary_period='year' AND salary_min > 15000), 0),
+				COALESCE(percentile_cont(0.75) WITHIN GROUP (ORDER BY (salary_min+salary_max)/2)
+					FILTER (WHERE salary_period='year' AND salary_min > 15000), 0)
+			FROM twoai_jobs WHERE last_seen > now() - ($1||' days')::interval
+			GROUP BY g HAVING count(*) FILTER (WHERE salary_period='year' AND salary_min > 15000) >= 5
+			ORDER BY 5 DESC`
+		rs, err := db.Query(q, twoaiJobsFreshDays)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_build: salary by "+col+":", err)
+			return nil
+		}
+		defer rs.Close()
+		var out []payRow
+		for rs.Next() {
+			var r payRow
+			if rs.Scan(&r.Group, &r.Count, &r.Disclosed, &r.P25, &r.Median, &r.P75) == nil {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+	var payTotal, payDisclosed int
+	var payMedian float64
+	db.QueryRow(`SELECT count(*),
+			count(*) FILTER (WHERE salary_period='year' AND salary_min > 15000),
+			COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY (salary_min+salary_max)/2)
+				FILTER (WHERE salary_period='year' AND salary_min > 15000), 0)
+		FROM twoai_jobs WHERE last_seen > now() - ($1||' days')::interval`,
+		twoaiJobsFreshDays).Scan(&payTotal, &payDisclosed, &payMedian)
+	salary := map[string]any{
+		"listings": payTotal, "disclosed": payDisclosed, "median": payMedian,
+		"by_discipline": payBy("job_category"), "by_level": payBy("seniority"),
+		"note": "Annual figures only, from listings where the employer stated a range. " +
+			"Hourly and other periods are excluded rather than annualised.",
+	}
+
+	// SKILLS IN DEMAND. Counted from posting text against a fixed vocabulary;
+	// the text itself is never stored. A skill's share is of the postings we
+	// could read, not of all postings, because feeds that supply no description
+	// would otherwise look like employers who want nothing.
+	type skillRow struct {
+		Skill string  `json:"skill"`
+		Count int     `json:"count"`
+		Share float64 `json:"share"`
+	}
+	var withText int
+	db.QueryRow(`SELECT count(*) FROM twoai_jobs
+		WHERE last_seen > now() - ($1||' days')::interval AND jsonb_array_length(skills) > 0`,
+		twoaiJobsFreshDays).Scan(&withText)
+	var skillRows []skillRow
+	if srs, err := db.Query(`SELECT s.value::text, count(*) FROM twoai_jobs j,
+			jsonb_array_elements(j.skills) s
+		WHERE j.last_seen > now() - ($1||' days')::interval
+		GROUP BY 1 ORDER BY 2 DESC LIMIT 40`, twoaiJobsFreshDays); err == nil {
+		for srs.Next() {
+			var r skillRow
+			if srs.Scan(&r.Skill, &r.Count) == nil {
+				r.Skill = strings.Trim(r.Skill, `"`)
+				if withText > 0 {
+					r.Share = float64(r.Count) * 100 / float64(withText)
+				}
+				skillRows = append(skillRows, r)
+			}
+		}
+		srs.Close()
+	}
+	skillsBlock := map[string]any{
+		"postings_read": withText, "skills": skillRows,
+		"note": "Counted from the text of postings we can read, against a fixed vocabulary. " +
+			"Share is of those postings, not of every listing.",
+	}
+
 	market := map[string]any{}
 	mrows, err := db.Query(`SELECT key, data::text FROM twoai_jobs_market`)
 	if err == nil {
@@ -846,6 +1126,8 @@ func twoaiJobs(db *sql.DB, today string, upsert func(path, kind string, v any) e
 		},
 		"by_source": bySource,
 		"functions": byFunction,
+		"salary":    salary,
+		"skills":    skillsBlock,
 		"groups":    groups,
 		"jobs":      jobs,
 		"market":    market,
