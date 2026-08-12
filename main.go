@@ -4158,7 +4158,12 @@ func twoaiTaxonomyFor(kind string) any {
 	case "jobs-hub":
 		return "jobs-listings"
 	case "news-archive":
-		return "daily-news"
+		// The node is headline-news, not daily-news. A duplicate daily-news
+		// node was removed when AI News was restructured, and guessing the
+		// slug here cost a build: twoai_pages has a foreign key on
+		// taxonomy_slug, so an unknown slug aborts twoaiBuild partway
+		// through rather than degrading quietly.
+		return "headline-news"
 	}
 	return nil
 }
