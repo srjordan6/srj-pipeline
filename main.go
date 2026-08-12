@@ -50,7 +50,7 @@ func main() {
 		return
 	}
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_onet", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -190,6 +190,14 @@ func main() {
 	if src == "twoai_vendor_feeds" {
 		if err := twoaiVendorFeeds(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_vendor_feeds:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_onet" {
+		if err := twoaiOnet(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_onet:", err)
 			os.Exit(1)
 		}
 		return
@@ -2974,6 +2982,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	skillPages, err := twoaiSkills(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
 	// Staleness tripwire for benchmark results. The result snapshots in
 	// twoai_benchmarks.results are hand-curated from named evaluators, not
 	// scraped: the source leaderboards are JS-rendered and re-baseline
@@ -3025,8 +3038,8 @@ func twoaiBuild(db *sql.DB) error {
 			staleTimeline, oldestTimeline.String)
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d skills=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive, skillPages)
 	return nil
 }
 
@@ -4285,6 +4298,11 @@ func twoaiTaxonomyFor(kind string) any {
 		return "research-library"
 	case "jobs-hub":
 		return "jobs-listings"
+	case "skills-hub", "onet-occupation":
+		// skills-graph, checked against twoai_taxonomy rather than guessed.
+		// The last time a slug here was written from memory the foreign key
+		// took the build down mid-run.
+		return "skills-graph"
 	case "news-archive":
 		// The node is headline-news, not daily-news. A duplicate daily-news
 		// node was removed when AI News was restructured, and guessing the
