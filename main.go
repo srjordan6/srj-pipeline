@@ -2961,6 +2961,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	newsArchive, err := twoaiNewsArchive(db, upsert)
+	if err != nil {
+		return err
+	}
+
 	// Staleness tripwire for benchmark results. The result snapshots in
 	// twoai_benchmarks.results are hand-curated from named evaluators, not
 	// scraped: the source leaderboards are JS-rendered and re-baseline
@@ -3012,8 +3017,8 @@ func twoaiBuild(db *sql.DB) error {
 			staleTimeline, oldestTimeline.String)
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive)
 	return nil
 }
 
@@ -4152,6 +4157,8 @@ func twoaiTaxonomyFor(kind string) any {
 		return "research-library"
 	case "jobs-hub":
 		return "jobs-listings"
+	case "news-archive":
+		return "daily-news"
 	}
 	return nil
 }
