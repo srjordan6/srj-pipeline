@@ -3446,14 +3446,134 @@ func twoaiSources(db *sql.DB, today string, upsert func(path, kind string, v any
 	if total == 0 {
 		return 0, nil
 	}
+
+	// The curated list above is the citation apparatus: the laws, standards,
+	// and papers the written pages cite. It is not the whole answer to "what
+	// are your sources", because it says nothing about the feeds and APIs the
+	// site actually runs on. Those are enumerated from twoai_data_sources, in
+	// SQL for the same reason the vendor feeds are: a source list hardcoded in
+	// Go is a source list that stops matching reality.
+	//
+	// Each row can name a table to count, so the page carries a live figure
+	// rather than a claim. count_where is a fragment written by us in this
+	// table, never user input, and the query is built only from those two
+	// fields.
+	type feedSrc struct {
+		Key       string `json:"key"`
+		Name      string `json:"name"`
+		URL       string `json:"url"`
+		Category  string `json:"category"`
+		Publisher string `json:"publisher,omitempty"`
+		WhatWeUse string `json:"what_we_use,omitempty"`
+		Terms     string `json:"terms,omitempty"`
+		Records   int    `json:"records,omitempty"`
+	}
+	var feeds []feedSrc
+	frows, ferr := db.Query(`SELECT key, name, url, category, publisher, what_we_use, terms_note,
+			COALESCE(count_table,''), COALESCE(count_where,'')
+		FROM twoai_data_sources WHERE active ORDER BY sort_order, name`)
+	if ferr == nil {
+		for frows.Next() {
+			var f feedSrc
+			var tbl, where string
+			if frows.Scan(&f.Key, &f.Name, &f.URL, &f.Category, &f.Publisher,
+				&f.WhatWeUse, &f.Terms, &tbl, &where) != nil {
+				continue
+			}
+			if tbl != "" {
+				q := "SELECT count(*) FROM " + tbl
+				if where != "" {
+					q += " WHERE " + where
+				}
+				// A source whose table has gone is worth knowing about, but not
+				// worth failing the build over: the row still lists correctly
+				// without a count.
+				if err := db.QueryRow(q).Scan(&f.Records); err != nil {
+					fmt.Fprintf(os.Stderr, "twoai_build: sources count for %s: %v\n", f.Key, err)
+				}
+			}
+			feeds = append(feeds, f)
+		}
+		frows.Close()
+	}
+
+	// Vendor feeds are listed individually rather than as one line, because
+	// "27 company blogs" is not a source list, it is a summary of one.
+	type vfeed struct {
+		Vendor    string `json:"vendor"`
+		URL       string `json:"url"`
+		EntityUID string `json:"entity_uid,omitempty"`
+		Healthy   bool   `json:"healthy"`
+	}
+	var vfeeds []vfeed
+	vrows, verr := db.Query(`SELECT vendor, feed_url, COALESCE(entity_uid,''), last_ok IS NOT NULL
+		FROM twoai_vendor_feeds WHERE active ORDER BY vendor`)
+	if verr == nil {
+		for vrows.Next() {
+			var v vfeed
+			if vrows.Scan(&v.Vendor, &v.URL, &v.EntityUID, &v.Healthy) == nil {
+				vfeeds = append(vfeeds, v)
+			}
+		}
+		vrows.Close()
+	}
+
+	// Our own titles. These are the one place on this site where linking to
+	// srjconsultingservices.com is right: a reader asking what we publish is
+	// being pointed at a product, not being handed our own site as evidence
+	// for a claim about AI.
+	type book struct {
+		Number    int    `json:"number"`
+		Title     string `json:"title"`
+		Subtitle  string `json:"subtitle,omitempty"`
+		Pillar    string `json:"pillar,omitempty"`
+		Status    string `json:"status"`
+		Published string `json:"published,omitempty"`
+		AmazonURL string `json:"amazon_url,omitempty"`
+		Pages     int    `json:"pages,omitempty"`
+	}
+	var books []book
+	var booksRaw string
+	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='books/books.json'`).Scan(&booksRaw); err == nil {
+		var doc struct {
+			Books []struct {
+				Number      json.Number `json:"book_number"`
+				Title       string      `json:"title"`
+				Subtitle    string      `json:"subtitle"`
+				Pillar      string      `json:"pillar"`
+				Status      string      `json:"status"`
+				PublishedOn string      `json:"published_on"`
+				AmazonURL   string      `json:"amazon_url"`
+				Pages       json.Number `json:"pages"`
+			} `json:"books"`
+		}
+		if json.Unmarshal([]byte(booksRaw), &doc) == nil {
+			for _, b := range doc.Books {
+				n, _ := b.Number.Int64()
+				p, _ := b.Pages.Int64()
+				books = append(books, book{
+					Number: int(n), Title: b.Title, Subtitle: b.Subtitle, Pillar: b.Pillar,
+					Status: b.Status, Published: b.PublishedOn, AmazonURL: b.AmazonURL,
+					Pages: int(p),
+				})
+			}
+			sort.Slice(books, func(i, j int) bool { return books[i].Number < books[j].Number })
+		}
+	}
+
 	if err := upsert("sources/index.json", "sources-hub", map[string]any{
-		"uid":       twoaiUID("section:sources-index"),
-		"sections":  sections,
-		"total":     total,
-		"generated": today,
+		"uid":          twoaiUID("section:sources-index"),
+		"sections":     sections,
+		"total":        total,
+		"data_sources": feeds,
+		"vendor_feeds": vfeeds,
+		"books":        books,
+		"generated":    today,
 	}); err != nil {
 		return 0, err
 	}
+	fmt.Printf("twoai_build: sources citations=%d data_sources=%d vendor_feeds=%d books=%d ok=true\n",
+		total, len(feeds), len(vfeeds), len(books))
 	return 1, nil
 }
 
