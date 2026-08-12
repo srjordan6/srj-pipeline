@@ -39,20 +39,46 @@ import (
 // failures is about a week of the daily cron.
 const twoaiFeedMaxFailures = 6
 
+// twoaiFeedLink covers both feed dialects in one field. RSS puts the URL in
+// the element's text; Atom puts it in an href attribute and can carry several
+// links with different rel values. Declaring those as two Go fields with the
+// same `xml:"link"` tag is not a parse failure, it is a STRUCT failure:
+// encoding/xml rejects the type itself, so every feed died at once with
+// "field Link conflicts with field LinkAttr" and the stage reported 27 of 27
+// failed on its first real run.
+type twoaiFeedLink struct {
+	Value string `xml:",chardata"`
+	Href  string `xml:"href,attr"`
+	Rel   string `xml:"rel,attr"`
+	Type  string `xml:"type,attr"`
+}
+
 type twoaiFeedItem struct {
-	Title       string `xml:"title"`
-	Link        string `xml:"link"`
-	Description string `xml:"description"`
-	PubDate     string `xml:"pubDate"`
-	Published   string `xml:"published"`
-	Updated     string `xml:"updated"`
-	Date        string `xml:"date"`
-	Summary     string `xml:"summary"`
-	Content     string `xml:"encoded"`
-	LinkAttr    []struct {
-		Href string `xml:"href,attr"`
-		Rel  string `xml:"rel,attr"`
-	} `xml:"link"`
+	Title       string          `xml:"title"`
+	Links       []twoaiFeedLink `xml:"link"`
+	Description string          `xml:"description"`
+	PubDate     string          `xml:"pubDate"`
+	Published   string          `xml:"published"`
+	Updated     string          `xml:"updated"`
+	Date        string          `xml:"date"`
+	Summary     string          `xml:"summary"`
+	Content     string          `xml:"encoded"`
+}
+
+// URL picks the item's canonical link: the RSS text node if there is one,
+// otherwise the Atom alternate href.
+func (it twoaiFeedItem) URL() string {
+	for _, l := range it.Links {
+		if v := strings.TrimSpace(l.Value); v != "" {
+			return v
+		}
+	}
+	for _, l := range it.Links {
+		if (l.Rel == "" || l.Rel == "alternate") && strings.TrimSpace(l.Href) != "" {
+			return strings.TrimSpace(l.Href)
+		}
+	}
+	return ""
 }
 
 type twoaiFeedDoc struct {
@@ -183,15 +209,7 @@ func twoaiVendorFeeds(db *sql.DB) error {
 		}
 		n := 0
 		for _, it := range items {
-			link := strings.TrimSpace(it.Link)
-			if link == "" {
-				for _, la := range it.LinkAttr {
-					if la.Rel == "" || la.Rel == "alternate" {
-						link = strings.TrimSpace(la.Href)
-						break
-					}
-				}
-			}
+			link := it.URL()
 			title := strings.TrimSpace(html.UnescapeString(twoaiTagStrip.ReplaceAllString(it.Title, "")))
 			if title == "" || link == "" || strings.Contains(link, "news.google.") {
 				continue

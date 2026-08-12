@@ -140,18 +140,22 @@ func corpusRecord(id, rtype, prov, source string, d map[string]any) map[string]a
 		"content_hash": hex.EncodeToString(h[:])[:16], "raw": d,
 	}
 
-	// Provenance is per field, not per record. "trainable" is what a training
-	// set may read; "cite_only" is what a retrieval index may read and must
-	// attribute. Owned and public-record material is trainable whole; a
-	// third-party record contributes its facts and withholds its prose.
+	// Provenance is per field, not per record. Owned and public-record material
+	// is trainable whole, so it carries a scope marker and nothing is copied:
+	// emitting a `trainable` clone of `raw` for every record grew the corpus
+	// 51% on its first run (14.7 MB to 22.3 MB) to say something one string
+	// already says. Only a third-party record is actually split, because only
+	// there do the two halves differ.
 	switch prov {
 	case "third-party":
 		factual, expressive := corpusSplit(d)
+		rec["trainable_scope"] = "fields"
 		rec["trainable"] = factual
 		rec["cite_only"] = expressive
 		rec["attribution_required"] = true
 	default:
-		rec["trainable"] = d
+		// The whole of `raw` may be trained on.
+		rec["trainable_scope"] = "record"
 		rec["attribution_required"] = false
 	}
 	return rec
@@ -338,12 +342,13 @@ func exportCorpus(db *sql.DB) error {
 	manifest, _ := json.MarshalIndent(map[string]any{
 		"generated": time.Now().UTC().Format(time.RFC3339),
 		"records":   counts, "bytes": len(body), "sha256": digest,
-		"training_note": "Every record carries a `trainable` object, which is what a training set may read. " +
-			"Owned and public-record records are trainable whole. A third-party record is split: its facts " +
-			"(URL, date, domain, outlet counts, named entities) are in `trainable` because facts are not " +
-			"copyrightable, while the publisher's own words (headline, summary, article text) are in " +
-			"`cite_only` and are for retrieval with attribution, never for training. Attribution does not " +
-			"make `cite_only` trainable; it addresses plagiarism, not copyright.",
+		"training_note": "Read trainable_scope on every record. 'record' means the whole of `raw` may be " +
+			"trained on: the record is owned or public-record material. 'fields' means the record is " +
+			"third-party and split: its facts (URL, date, domain, outlet counts, named entities) are in " +
+			"`trainable` because facts are not copyrightable, while the publisher's own words (headline, " +
+			"summary, article text) are in `cite_only` and are for retrieval with attribution, never for " +
+			"training. Attribution does not make `cite_only` trainable; it addresses plagiarism, not " +
+			"copyright.",
 	}, "", "  ")
 
 	for _, prefix := range []string{"corpus/training/" + day, "corpus/training/latest"} {
@@ -355,8 +360,8 @@ func exportCorpus(db *sql.DB) error {
 		}
 	}
 	corpusLog(db, true, counts, len(body), digest, "corpus/training/"+day+"/corpus.jsonl", "")
-	fmt.Printf("export_corpus: ok total=%d owned=%d public=%d thirdparty=%d trainable=%d cite_only=%d bytes=%d -> corpus/training/%s/\n",
+	fmt.Printf("export_corpus: ok total=%d owned=%d public=%d thirdparty=%d cite_only=%d bytes=%d -> corpus/training/%s/\n",
 		counts["total"], counts["owned"], counts["public-record"], counts["third-party"],
-		counts["total"], counts["third-party"], len(body), day)
+		counts["third-party"], len(body), day)
 	return nil
 }

@@ -19,12 +19,18 @@ package main
 // Redistribution as a dataset is not permitted, so the skills graph is never
 // added to /api/ as a bulk download the way the site's own data is.
 //
-// Environment: ONET_USERNAME and ONET_PASSWORD, HTTP Basic. Absent, the stage
-// skips with a note and leaves the existing graph alone; it never fails a run.
+// Environment: ONET_API_KEY. Absent, the stage skips with a note and leaves
+// the existing graph alone; it never fails a run.
+//
+// AUTH, THE HARD WAY. The first attempt used HTTP Basic against
+// services.onetcenter.org/ws and every request came back 401. That is the
+// version 1.9 shape. Version 2.0 moved to api-v2.onetcenter.org with an
+// X-API-Key header, which is what O*NET's own published client does. Reading
+// the reference manual was not enough, because its example URLs still show the
+// old host; the client library is the thing that tells the truth.
 
 import (
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,7 +66,7 @@ var twoaiOnetSeed = []string{
 	"11-3021.00", // Computer and Information Systems Managers
 }
 
-const twoaiOnetBase = "https://services.onetcenter.org/ws"
+const twoaiOnetBase = "https://api-v2.onetcenter.org"
 
 // twoaiOnetStaleDays is when the graph is re-fetched in full. O*NET publishes
 // on a roughly annual cycle, so a daily refetch would be 18 requests a day of
@@ -78,12 +84,12 @@ type onetElement struct {
 	} `json:"score"`
 }
 
-func twoaiOnetGet(path string, auth string, out any) error {
+func twoaiOnetGet(path string, key string, out any) error {
 	req, err := http.NewRequest("GET", twoaiOnetBase+path, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Basic "+auth)
+	req.Header.Set("X-API-Key", key)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "theworldofai.org (stephen@srjconsultingservices.com)")
 	resp, err := twoaiJobsClient.Do(req)
@@ -99,12 +105,11 @@ func twoaiOnetGet(path string, auth string, out any) error {
 }
 
 func twoaiOnet(db *sql.DB) error {
-	user, pass := os.Getenv("ONET_USERNAME"), os.Getenv("ONET_PASSWORD")
-	if user == "" || pass == "" {
-		fmt.Fprintln(os.Stderr, "twoai_onet: ONET_USERNAME/ONET_PASSWORD unset, skipping (existing graph kept)")
+	auth := os.Getenv("ONET_API_KEY")
+	if auth == "" {
+		fmt.Fprintln(os.Stderr, "twoai_onet: ONET_API_KEY unset, skipping (existing graph kept)")
 		return nil
 	}
-	auth := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_onet_occupations (
 		soc_code text PRIMARY KEY,
