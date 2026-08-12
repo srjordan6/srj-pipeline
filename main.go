@@ -3985,7 +3985,16 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 					continue
 				}
 				seen[strings.ToLower(n)] = true
-				list = append(list, idx{Name: n, Org: p.Org, Title: p.Title})
+				// A name with an organisation and a title is enough to publish:
+				// three verified facts about a real person, sourced. It is not
+				// enough to pretend it is a profile, so the page says what it is
+				// and what it is missing rather than padding to look finished.
+				uid := twoaiEntityID(db, "person", n)
+				list = append(list, idx{UID: uid, Name: n, Org: p.Org, Title: p.Title})
+				docs = append(docs, map[string]any{
+					"uid": uid, "name": n, "org": p.Org, "title": p.Title,
+					"tracked_only": true, "generated": today,
+				})
 				tracked++
 			}
 		}
@@ -4026,7 +4035,7 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	if err := upsert("people/index.json", "person-hub", map[string]any{
 		"uid": twoaiUID("section:ai-people-directory"), "people": list,
-		"total": len(list), "profiled": count, "tracked_only": tracked,
+		"total": len(list), "profiled": count - tracked, "tracked_only": tracked,
 		"generated": today,
 	}); err != nil {
 		return count, err
