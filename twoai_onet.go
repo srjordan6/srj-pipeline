@@ -68,20 +68,48 @@ var twoaiOnetSeed = []string{
 
 const twoaiOnetBase = "https://api-v2.onetcenter.org"
 
+// SHAPES, THE SAME HARD WAY. The second attempt authenticated fine and still
+// got 15 of 18 wrong, because I guessed the field names. bright_outlook is an
+// ARRAY of categories, not an object; skills carry `importance` and not a
+// `score` object; tasks use `title` and not `name`; job zone is its own
+// endpoint; wages live under `salary` as annual_median and friends. The three
+// that did come through were simply the occupations with no bright_outlook
+// field to trip over, and each stored exactly ten of everything, which was the
+// tell: `display=long` is not a parameter here. Paging is `start` and `end`.
+//
+// Every struct below now comes from the published OpenAPI description at
+// services.onetcenter.org/reference/openapi.json, which states each field
+// outright. Guessing twice was one time too many.
+
+// twoaiOnetPageEnd is the page ceiling for descriptor reports. The API
+// defaults to 10 and caps at 2000; 200 covers every descriptor set O*NET
+// publishes for an occupation with room to spare.
+const twoaiOnetPageEnd = 200
+
 // twoaiOnetStaleDays is when the graph is re-fetched in full. O*NET publishes
 // on a roughly annual cycle, so a daily refetch would be 18 requests a day of
 // pure noise against somebody else's free service. reviewed_on drives it.
 const twoaiOnetStaleDays = 30
 
+// onetElement is a descriptor row from a details report. `importance` is the
+// standardised 0-100 rating and is absent when O*NET has no numeric rating,
+// so it is a json.Number rather than an int.
 type onetElement struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Score       struct {
-		Scale     string      `json:"scale"`
-		Important bool        `json:"important"`
-		Value     json.Number `json:"value"`
-	} `json:"score"`
+	ID          string      `json:"id"`
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Importance  json.Number `json:"importance"`
+}
+
+func (e onetElement) Score() float64 {
+	if e.Importance == "" {
+		return 0
+	}
+	f, err := e.Importance.Float64()
+	if err != nil {
+		return 0
+	}
+	return f
 }
 
 func twoaiOnetGet(path string, key string, out any) error {
@@ -141,10 +169,10 @@ func twoaiOnet(db *sql.DB) error {
 			Code          string `json:"code"`
 			Title         string `json:"title"`
 			Description   string `json:"description"`
-			BrightOutlook struct {
-				Category []string `json:"category"`
+			BrightOutlook []struct {
+				Code  string `json:"code"`
+				Title string `json:"title"`
 			} `json:"bright_outlook"`
-			JobZone json.Number `json:"job_zone"`
 		}
 		if err := twoaiOnetGet("/online/occupations/"+soc+"/", auth, &summary); err != nil {
 			fmt.Fprintf(os.Stderr, "twoai_onet: %s summary: %v\n", soc, err)
@@ -157,33 +185,53 @@ func twoaiOnet(db *sql.DB) error {
 			continue
 		}
 
-		// Descriptor reports. display=long returns the full set rather than
-		// the top ten, which matters for a graph: the shared skill that links
-		// two occupations is often not either one's headline skill.
+		// Descriptor reports page at 10 by default. `end` raises that; there is
+		// no display parameter, which is why every occupation previously stored
+		// exactly ten skills.
 		get := func(kind string) []onetElement {
 			var doc struct {
+				Total   int           `json:"total"`
 				Element []onetElement `json:"element"`
 			}
-			if err := twoaiOnetGet("/online/occupations/"+soc+"/details/"+kind+"?display=long", auth, &doc); err != nil {
+			if err := twoaiOnetGet(fmt.Sprintf("/online/occupations/%s/details/%s?start=1&end=%d",
+				soc, kind, twoaiOnetPageEnd), auth, &doc); err != nil {
 				fmt.Fprintf(os.Stderr, "twoai_onet: %s %s: %v\n", soc, kind, err)
 				return nil
+			}
+			if doc.Total > len(doc.Element) {
+				fmt.Fprintf(os.Stderr, "twoai_onet: %s %s truncated at %d of %d\n",
+					soc, kind, len(doc.Element), doc.Total)
 			}
 			return doc.Element
 		}
 		skills := get("skills")
 		knowledge := get("knowledge")
 
+		// Tasks label their text `title`, not `name`.
 		var taskDoc struct {
 			Task []struct {
-				ID    json.Number `json:"id"`
-				Name  string      `json:"name"`
-				Score struct {
-					Value json.Number `json:"value"`
-				} `json:"score"`
+				ID         string      `json:"id"`
+				Title      string      `json:"title"`
+				Importance json.Number `json:"importance"`
+				Category   string      `json:"category"`
 			} `json:"task"`
 		}
-		if err := twoaiOnetGet("/online/occupations/"+soc+"/details/tasks?display=long", auth, &taskDoc); err != nil {
+		if err := twoaiOnetGet(fmt.Sprintf("/online/occupations/%s/details/tasks?start=1&end=%d",
+			soc, twoaiOnetPageEnd), auth, &taskDoc); err != nil {
 			fmt.Fprintf(os.Stderr, "twoai_onet: %s tasks: %v\n", soc, err)
+		}
+		// The page renders tasks under a `name`, so normalise here rather than
+		// teaching the template about O*NET's field names.
+		tasksOut := make([]map[string]any, 0, len(taskDoc.Task))
+		for _, t := range taskDoc.Task {
+			if t.Title == "" {
+				continue
+			}
+			m := map[string]any{"id": t.ID, "name": t.Title}
+			if t.Category != "" {
+				m["category"] = t.Category
+			}
+			tasksOut = append(tasksOut, m)
 		}
 
 		var relDoc struct {
@@ -192,23 +240,33 @@ func twoaiOnet(db *sql.DB) error {
 				Title string `json:"title"`
 			} `json:"occupation"`
 		}
-		if err := twoaiOnetGet("/online/occupations/"+soc+"/details/related_occupations", auth, &relDoc); err != nil {
+		if err := twoaiOnetGet(fmt.Sprintf("/online/occupations/%s/details/related_occupations?start=1&end=%d",
+			soc, twoaiOnetPageEnd), auth, &relDoc); err != nil {
 			fmt.Fprintf(os.Stderr, "twoai_onet: %s related: %v\n", soc, err)
 		}
 
-		// Wages come from the My Next Move career report, which carries the
-		// national median. A missing figure stays null rather than being
-		// filled from anywhere else.
+		// Job zone is its own endpoint, not a field on the summary.
+		var zoneDoc struct {
+			Code      json.Number `json:"code"`
+			Title     string      `json:"title"`
+			Education string      `json:"education"`
+		}
+		if err := twoaiOnetGet("/online/occupations/"+soc+"/details/job_zone", auth, &zoneDoc); err != nil {
+			fmt.Fprintf(os.Stderr, "twoai_onet: %s job_zone: %v\n", soc, err)
+		}
+
+		// Wages: the My Next Move career report, under `salary`. A missing
+		// figure stays null rather than being filled from anywhere else.
 		var outlook struct {
-			Wages struct {
-				Median   json.Number `json:"median"`
-				Pct10    json.Number `json:"percentile_10"`
-				Pct90    json.Number `json:"percentile_90"`
-				SoCTitle string      `json:"soc_title"`
+			Salary struct {
+				Annual10 json.Number `json:"annual_10th_percentile"`
+				AnnualMe json.Number `json:"annual_median"`
+				Annual90 json.Number `json:"annual_90th_percentile"`
 			} `json:"salary"`
-			BrightOutlook struct {
+			Outlook struct {
+				Category    string `json:"category"`
 				Description string `json:"description"`
-			} `json:"bright_outlook"`
+			} `json:"outlook"`
 		}
 		if err := twoaiOnetGet("/mnm/careers/"+soc+"/job_outlook", auth, &outlook); err != nil {
 			fmt.Fprintf(os.Stderr, "twoai_onet: %s outlook: %v\n", soc, err)
@@ -226,9 +284,9 @@ func twoaiOnet(db *sql.DB) error {
 
 		skillsJSON, _ := json.Marshal(skills)
 		knowJSON, _ := json.Marshal(knowledge)
-		taskJSON, _ := json.Marshal(taskDoc.Task)
+		taskJSON, _ := json.Marshal(tasksOut)
 		relJSON, _ := json.Marshal(relDoc.Occupation)
-		jz, _ := summary.JobZone.Int64()
+		jz, _ := zoneDoc.Code.Int64()
 		var jobZone any
 		if jz > 0 {
 			jobZone = jz
@@ -245,10 +303,10 @@ func twoaiOnet(db *sql.DB) error {
 				related=EXCLUDED.related, wage_median=EXCLUDED.wage_median,
 				wage_p10=EXCLUDED.wage_p10, wage_p90=EXCLUDED.wage_p90,
 				fetched_at=now(), reviewed_on=current_date`,
-			soc, summary.Title, summary.Description, len(summary.BrightOutlook.Category) > 0,
+			soc, summary.Title, summary.Description, len(summary.BrightOutlook) > 0,
 			jobZone, string(skillsJSON), string(knowJSON), string(taskJSON), string(relJSON),
-			numOrNil(outlook.Wages.Median), numOrNil(outlook.Wages.Pct10),
-			numOrNil(outlook.Wages.Pct90)); err != nil {
+			numOrNil(outlook.Salary.AnnualMe), numOrNil(outlook.Salary.Annual10),
+			numOrNil(outlook.Salary.Annual90)); err != nil {
 			fmt.Fprintf(os.Stderr, "twoai_onet: %s upsert: %v\n", soc, err)
 			failed++
 			continue
@@ -324,8 +382,7 @@ func twoaiSkills(db *sql.DB, today string, upsert func(path, kind string, v any)
 		conv := func(in []onetElement) []elem {
 			out := []elem{}
 			for _, e := range in {
-				f, _ := e.Score.Value.Float64()
-				out = append(out, elem{ID: e.ID, Name: e.Name, Desc: e.Description, Score: f})
+				out = append(out, elem{ID: e.ID, Name: e.Name, Desc: e.Description, Score: e.Score()})
 			}
 			return out
 		}
