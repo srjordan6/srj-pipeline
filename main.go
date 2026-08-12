@@ -3967,6 +3967,48 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 	for _, e := range list {
 		seen[strings.ToLower(strings.TrimSpace(e.Name))] = true
 	}
+	// Exact-name matching is not enough to tell whether the roster is naming
+	// somebody we have already profiled. The roster carries "Ravi Ummadisetti"
+	// and site_people carries "Ravi Chandu Ummadisetti" — one person, two
+	// pages, in the section whose entire point is that an entity has exactly
+	// one identifier.
+	//
+	// The test is deliberately tight rather than fuzzy: the shorter name's
+	// words must all appear in the longer one, AND first and last must match.
+	// A dropped middle name matches; two different people who happen to share
+	// a first and last name do not, because their other words differ. Loose
+	// matching here would merge strangers, which is a worse failure than a
+	// duplicate.
+	nameWords := func(s string) []string {
+		return strings.Fields(strings.ToLower(strings.TrimSpace(s)))
+	}
+	sameHuman := func(a, b string) bool {
+		aw, bw := nameWords(a), nameWords(b)
+		if len(aw) < 2 || len(bw) < 2 {
+			return false
+		}
+		if aw[0] != bw[0] || aw[len(aw)-1] != bw[len(bw)-1] {
+			return false
+		}
+		short, long := aw, bw
+		if len(short) > len(long) {
+			short, long = long, short
+		}
+		inLong := map[string]bool{}
+		for _, w := range long {
+			inLong[w] = true
+		}
+		for _, w := range short {
+			if !inLong[w] {
+				return false
+			}
+		}
+		return true
+	}
+	profiledNames := make([]string, 0, len(list))
+	for _, e := range list {
+		profiledNames = append(profiledNames, e.Name)
+	}
 	tracked := 0
 	var roster string
 	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='people/roster.json'`).Scan(&roster); err == nil {
@@ -3982,6 +4024,17 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 			for _, p := range r.People {
 				n := strings.TrimSpace(p.Name)
 				if n == "" || seen[strings.ToLower(n)] {
+					continue
+				}
+				dup := false
+				for _, pn := range profiledNames {
+					if sameHuman(n, pn) {
+						fmt.Fprintf(os.Stderr, "twoai_build: roster %q is the profiled %q, skipping the duplicate\n", n, pn)
+						dup = true
+						break
+					}
+				}
+				if dup {
 					continue
 				}
 				seen[strings.ToLower(n)] = true
