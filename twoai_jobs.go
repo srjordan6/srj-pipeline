@@ -101,6 +101,124 @@ func twoaiJobCategory(title string) string {
 	return ""
 }
 
+// twoaiJobFunction places a listing in a specific discipline, which is the
+// difference between a job board and a useful one. "1,600 AI and security
+// jobs" is a number; "48 Detection Engineering roles" is something a reader
+// can act on.
+//
+// Ordered most specific first and returns on the first match, because the
+// titles overlap heavily: "AI Security Engineer" is AI Security, not Security
+// Engineering, and "MLOps Engineer" is Machine Learning Operations rather than
+// the generic Machine Learning Engineering it also matches. Anything that
+// matches nothing lands in a named bucket rather than being dropped, so the
+// gap is visible and the classifier can be improved against it.
+func twoaiJobFunction(title, category string) string {
+	t := " " + strings.ToLower(title) + " "
+	t = strings.NewReplacer("/", " ", ",", " ", "-", " ", "(", " ", ")", " ", "&", " ").Replace(t)
+	has := func(words ...string) bool {
+		for _, w := range words {
+			if strings.Contains(t, w) {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch {
+	// Cross-cutting first: these sit in both worlds and belong in neither
+	// parent bucket.
+	case category == "ai-security":
+		return "AI Security"
+
+	// Security disciplines, most specific first.
+	case has("penetration test", "pentest", "red team", "offensive security", "exploit develop"):
+		return "Offensive Security"
+	case has("detection engineer", "detection and response", "threat hunt", " soc ", "security operations", "incident response", "blue team", "purple team"):
+		return "Detection and Incident Response"
+	case has("threat intel", "threat research", "malware", "reverse engineer", "adversary"):
+		return "Threat Intelligence and Malware Research"
+	case has("appsec", "application security", "product security", "devsecops", "secure code", "software security"):
+		return "Application and Product Security"
+	case has("cloud security", "infrastructure security", "platform security", "container security", "kubernetes security"):
+		return "Cloud and Infrastructure Security"
+	case has("identity", " iam ", " sso ", "access management", "okta", "directory service"):
+		return "Identity and Access Management"
+	case has("grc", "compliance", "audit", "security risk", "soc 2", "iso 27001", "fedramp", "third party risk", "vendor risk"):
+		return "Security Governance, Risk, and Compliance"
+	case has("privacy", "data protection", " gdpr", " ccpa"):
+		return "Privacy and Data Protection"
+	case has("cryptograph", "encryption", " pki ", "key management"):
+		return "Cryptography"
+	case has("forensic", "e discovery"):
+		return "Digital Forensics"
+	case has("vulnerab", "patch management", "attack surface"):
+		return "Vulnerability Management"
+	case has("physical security", "insider threat", "personnel security"):
+		return "Physical and Insider Threat"
+	case has(" ciso", "head of security", "director of security", "security manager", "vp security", "security lead"):
+		return "Security Leadership"
+	case has("security architect", "zero trust", "network security", "security engineer", "security analyst", "cyber", "infosec", "security"):
+		return "Security Engineering"
+
+	// AI disciplines, most specific first.
+	case has("mlops", "ml platform", "ml infrastructure", "machine learning infrastructure", "model serving", "inference infra", "training infra", "ai infrastructure", "ml systems"):
+		return "Machine Learning Operations and Infrastructure"
+	case has("computer vision", "image recognition", "perception", "3d reconstruction"):
+		return "Computer Vision"
+	case has(" nlp ", "natural language", "speech", "conversational ai", "voice"):
+		return "Natural Language and Speech"
+	case has("robotic", "autonomous vehicle", "self driving", "embodied", "motion planning", "slam"):
+		return "Robotics and Autonomy"
+	case has("research scientist", "research engineer", "reinforcement learning", "foundation model", "pretraining", "post training", "frontier", "scaling"):
+		return "AI Research"
+	case has("ai safety", "alignment", "red teaming", "responsible ai", "ai ethic", "model evaluation", "evals", "trust and safety"):
+		return "AI Safety and Alignment"
+	case has("ai policy", "ai governance", "ai regulation", "public policy", "ai assurance"):
+		return "AI Policy and Governance"
+	case has("data scientist", "data science", "quantitative", "statistic", "experimentation", "analytics"):
+		return "Data Science and Analytics"
+	case has("data engineer", "analytics engineer", "data platform", "data warehouse", "etl", "pipeline engineer"):
+		return "Data Engineering"
+	case has("prompt engineer", "ai tutor", "annotat", "data label", "rater", "human data", "content specialist"):
+		return "AI Training Data and Annotation"
+	case has("product manager", "product lead", "program manager", "product owner", "technical program"):
+		return "AI Product and Program Management"
+	case has("solutions architect", "solutions engineer", "forward deployed", "applied ai", "customer engineer", "field engineer", "implementation"):
+		return "Applied AI and Solutions Engineering"
+	case has("account executive", "sales", "business development", "partnership", "go to market", " gtm ", "marketing", "growth"):
+		return "AI Sales, Marketing, and Partnerships"
+	case has("developer advocate", "developer relations", "technical writer", "documentation", "educator", "curriculum", "instructor"):
+		return "Developer Relations and Education"
+	case has("recruiter", "talent", "people operations", "chief of staff", "operations manager", "finance", "legal counsel", "counsel"):
+		return "AI Company Operations"
+	case has("machine learning engineer", "ml engineer", "ai engineer", "deep learning", " llm", "genai", "generative", "neural", "machine learning", "artificial intelligence", " ai ", " ml "):
+		return "Machine Learning Engineering"
+	}
+	if category == "security" {
+		return "Security Engineering"
+	}
+	return "Other AI Roles"
+}
+
+// twoaiJobSlug turns a discipline name into the anchor the page links to.
+func twoaiJobSlug(s string) string {
+	var b strings.Builder
+	last := '-'
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			last = r
+		default:
+			if last != '-' {
+				b.WriteRune('-')
+				last = '-'
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
 func twoaiJobsFetch(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_jobs (
 		id bigserial PRIMARY KEY,
@@ -117,6 +235,10 @@ func twoaiJobsFetch(db *sql.DB) error {
 		first_seen timestamptz NOT NULL DEFAULT now(),
 		last_seen timestamptz NOT NULL DEFAULT now(),
 		UNIQUE (source, external_id))`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`ALTER TABLE twoai_jobs
+		ADD COLUMN IF NOT EXISTS job_category text NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_jobs_market (
@@ -145,15 +267,16 @@ func twoaiJobsFetch(db *sql.DB) error {
 			}
 		}
 		if _, err := db.Exec(`INSERT INTO twoai_jobs
-			(source, external_id, title, company, location, remote, salary, category, url, posted_on)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::date)
+			(source, external_id, title, company, location, remote, salary, category, url, posted_on, job_category)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::date,$11)
 			ON CONFLICT (source, external_id) DO UPDATE SET
 				title=EXCLUDED.title, company=EXCLUDED.company, location=EXCLUDED.location,
 				remote=EXCLUDED.remote, salary=EXCLUDED.salary, category=EXCLUDED.category,
 				url=EXCLUDED.url, posted_on=COALESCE(EXCLUDED.posted_on, twoai_jobs.posted_on),
-				last_seen=now()`,
+				job_category=EXCLUDED.job_category, last_seen=now()`,
 			source, extID, strings.TrimSpace(title), strings.TrimSpace(company),
-			strings.TrimSpace(location), remote, strings.TrimSpace(salary), cat, link, postedOn); err != nil {
+			strings.TrimSpace(location), remote, strings.TrimSpace(salary), cat, link, postedOn,
+			twoaiJobFunction(title, cat)); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_jobs: upsert:", err)
 			return
 		}
@@ -619,31 +742,66 @@ func twoaiJobs(db *sql.DB, today string, upsert func(path, kind string, v any) e
 		URL      string `json:"url"`
 		Posted   string `json:"posted,omitempty"`
 		Source   string `json:"source"`
+		Function string `json:"function"`
 	}
 	rows, err := db.Query(`SELECT title, company, location, remote, salary, category, url,
-			COALESCE(to_char(posted_on,'YYYY-MM-DD'),''), source
+			COALESCE(to_char(posted_on,'YYYY-MM-DD'),''), source,
+			CASE WHEN job_category = '' THEN 'Other AI Roles' ELSE job_category END
 		FROM twoai_jobs
 		WHERE last_seen > now() - ($1||' days')::interval
-		ORDER BY posted_on DESC NULLS LAST, last_seen DESC
-		LIMIT 800`, twoaiJobsFreshDays)
+		ORDER BY 10, lower(title), lower(company)`, twoaiJobsFreshDays)
 	if err != nil {
 		return 0, err
 	}
 	jobs := []job{}
 	counts := map[string]int{}
 	bySource := map[string]int{}
+	byFunction := map[string]int{}
 	for rows.Next() {
 		var j job
 		if err := rows.Scan(&j.Title, &j.Company, &j.Location, &j.Remote, &j.Salary,
-			&j.Category, &j.URL, &j.Posted, &j.Source); err != nil {
+			&j.Category, &j.URL, &j.Posted, &j.Source, &j.Function); err != nil {
 			rows.Close()
 			return 0, err
 		}
 		jobs = append(jobs, j)
 		counts[j.Category]++
 		bySource[j.Source]++
+		byFunction[j.Function]++
 	}
 	rows.Close()
+
+	// Grouped by discipline, and both the groups and the roles inside them in
+	// alphabetical order. Date order suits a news page; a job board is scanned
+	// for one's own field, and scanning wants a predictable position rather
+	// than a fresh one. "Other AI Roles" sorts to the end regardless of its
+	// letter, because a catch-all sitting between two real disciplines reads
+	// as one.
+	type group struct {
+		Name  string `json:"name"`
+		Slug  string `json:"slug"`
+		Count int    `json:"count"`
+		Jobs  []job  `json:"jobs"`
+	}
+	groupIndex := map[string]*group{}
+	groups := []*group{}
+	for _, j := range jobs {
+		g, ok := groupIndex[j.Function]
+		if !ok {
+			g = &group{Name: j.Function, Slug: twoaiJobSlug(j.Function)}
+			groupIndex[j.Function] = g
+			groups = append(groups, g)
+		}
+		g.Jobs = append(g.Jobs, j)
+		g.Count++
+	}
+	sort.Slice(groups, func(i, k int) bool {
+		oi, ok := groups[i].Name == "Other AI Roles", groups[k].Name == "Other AI Roles"
+		if oi != ok {
+			return ok
+		}
+		return groups[i].Name < groups[k].Name
+	})
 
 	market := map[string]any{}
 	mrows, err := db.Query(`SELECT key, data::text FROM twoai_jobs_market`)
@@ -687,6 +845,8 @@ func twoaiJobs(db *sql.DB, today string, upsert func(path, kind string, v any) e
 			"ai": counts["ai"], "security": counts["security"], "ai_security": counts["ai-security"],
 		},
 		"by_source": bySource,
+		"functions": byFunction,
+		"groups":    groups,
 		"jobs":      jobs,
 		"market":    market,
 		"sources":   sources,
