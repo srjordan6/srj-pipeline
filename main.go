@@ -50,7 +50,7 @@ func main() {
 		return
 	}
 	if src == "all" {
-		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -182,6 +182,14 @@ func main() {
 	if src == "twoai_jobs" {
 		if err := twoaiJobsFetch(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_jobs:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_vendor_feeds" {
+		if err := twoaiVendorFeeds(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_vendor_feeds:", err)
 			os.Exit(1)
 		}
 		return
@@ -4418,31 +4426,43 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 		return blocks[i].Vendor < blocks[j].Vendor
 	})
 
-	// A run that finds nothing leaves the last good page alone. An empty sweep
-	// is far more likely to be a feed outage than a day on which nine labs all
-	// published nothing, and a page that empties itself on a transient failure
-	// is worse than one that is a day stale and says so.
+	// A run that finds nothing in the intel path leaves the vendor blocks
+	// alone, but the page no longer depends on them: `latest` below is built
+	// from twoai_vendor_posts, which the feed stage fills directly.
 	if len(blocks) == 0 {
-		fmt.Fprintln(os.Stderr, "twoai_build: vendor news found no items, keeping the existing page")
-		return 0, nil
+		fmt.Fprintln(os.Stderr, "twoai_build: vendor news intel sweep found no items, using the archive alone")
 	}
 
-	// The archive is every post page that exists, capped by nothing. The hub
-	// renders `vendors`; the permalink route builds from this.
-	arows, err := db.Query(`SELECT slug, vendor, title, url, summary,
-			COALESCE(to_char(posted_on,'YYYY-MM-DD'),'')
-		FROM twoai_vendor_posts ORDER BY posted_on DESC NULLS LAST, slug`)
+	// The archive is every post page that exists, capped by nothing. It drives
+	// the permalink route, and `latest` below is the date-ordered slice of it
+	// the hub renders.
+	//
+	// entity_uid is the cross-reference: /companies/ and /ai-news/vendor/ were
+	// two lists of the same organisations with no link between them, so a
+	// reader landing on an OpenAI announcement had no way to reach the OpenAI
+	// profile and vice versa. Posts carry the uid of the company or tool that
+	// published them, and the template turns it into a link.
+	arows, err := db.Query(`SELECT p.slug, p.vendor, p.title, p.url, p.summary,
+			COALESCE(to_char(p.posted_on,'YYYY-MM-DD'),''),
+			COALESCE(p.entity_uid, f.entity_uid, ''),
+			COALESCE(p.entity_kind, f.entity_kind, '')
+		FROM twoai_vendor_posts p
+		LEFT JOIN twoai_vendor_feeds f ON lower(f.vendor) = lower(p.vendor)
+		ORDER BY p.posted_on DESC NULLS LAST, p.slug`)
 	if err != nil {
 		return 0, err
 	}
 	type archived struct {
 		item
-		Vendor string `json:"vendor"`
+		Vendor     string `json:"vendor"`
+		EntityUID  string `json:"entity_uid,omitempty"`
+		EntityKind string `json:"entity_kind,omitempty"`
 	}
 	archiveOut := []archived{}
 	for arows.Next() {
 		var a archived
-		if err := arows.Scan(&a.Slug, &a.Vendor, &a.Title, &a.URL, &a.Summary, &a.Date); err != nil {
+		if err := arows.Scan(&a.Slug, &a.Vendor, &a.Title, &a.URL, &a.Summary, &a.Date,
+			&a.EntityUID, &a.EntityKind); err != nil {
 			arows.Close()
 			return 0, err
 		}
@@ -4450,17 +4470,41 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 	}
 	arows.Close()
 
+	// The hub used to group by vendor and cap each at 25, which meant it read
+	// as a directory of sources rather than a news page: a post from this
+	// morning sat below a month-old one because its vendor sorted higher.
+	// `latest` is the same posts in the order a reader wants them.
+	const latestCap = 250
+	latest := archiveOut
+	if len(latest) > latestCap {
+		latest = latest[:latestCap]
+	}
+
+	// Coverage is stated rather than implied. 27 of the 62 companies publish a
+	// discoverable first-party feed; the rest are not covered, and a reader
+	// should be able to see that instead of assuming silence means no news.
+	var feedCount, feedOK int
+	db.QueryRow(`SELECT count(*), count(*) FILTER (WHERE last_ok IS NOT NULL)
+		FROM twoai_vendor_feeds WHERE active`).Scan(&feedCount, &feedOK)
+	var companyCount int
+	db.QueryRow(`SELECT count(*) FROM twoai_pages WHERE kind='company'`).Scan(&companyCount)
+
 	now := time.Now().UTC()
 	if err := upsert("news/vendor.json", "vendor-news", map[string]any{
 		"generated":   now.Format(time.RFC3339),
 		"date":        now.Format("2006-01-02"),
 		"window_days": windowDays,
 		"vendors":     blocks,
+		"latest":      latest,
 		"archive":     archiveOut,
+		"coverage": map[string]int{
+			"feeds": feedCount, "feeds_healthy": feedOK, "companies": companyCount,
+		},
 	}); err != nil {
 		return 0, err
 	}
-	fmt.Printf("twoai_build: vendor news vendors=%d archive=%d ok=true\n", len(blocks), len(archiveOut))
+	fmt.Printf("twoai_build: vendor news vendors=%d latest=%d archive=%d feeds=%d/%d ok=true\n",
+		len(blocks), len(latest), len(archiveOut), feedOK, feedCount)
 	return len(blocks), nil
 }
 

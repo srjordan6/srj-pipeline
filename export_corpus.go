@@ -90,6 +90,36 @@ func corpusTitle(d map[string]any) any {
 	return nil
 }
 
+// corpusThirdPartyFields are the fields on a third-party record that carry
+// somebody else's expression: the words a publisher wrote. Everything else on
+// such a record is fact — a URL, a date, a domain, an outlet count, a named
+// entity — and facts are not copyrightable, so excluding a whole record
+// because part of it is a headline threw away far more than the law requires.
+//
+// Attribution does not change this. Citing a source addresses plagiarism, not
+// copyright, and the cases this site tracks are the reason to be careful:
+// third-party expression stays retrieval-only and is quoted with a citation,
+// never trained on.
+var corpusThirdPartyFields = map[string]bool{
+	"title": true, "name": true, "headline": true, "summary": true,
+	"description": true, "excerpt": true, "body": true, "content": true,
+	"abstract": true, "snippet": true, "text": true, "articles": true,
+}
+
+// corpusSplit divides a third-party record into the part that may be trained
+// on and the part that may only be retrieved and cited.
+func corpusSplit(d map[string]any) (factual, expressive map[string]any) {
+	factual, expressive = map[string]any{}, map[string]any{}
+	for k, v := range d {
+		if corpusThirdPartyFields[strings.ToLower(k)] {
+			expressive[k] = v
+		} else {
+			factual[k] = v
+		}
+	}
+	return
+}
+
 func corpusRecord(id, rtype, prov, source string, d map[string]any) map[string]any {
 	text := corpusText(d)
 	h := sha256.Sum256([]byte(text))
@@ -104,11 +134,27 @@ func corpusRecord(id, rtype, prov, source string, d map[string]any) map[string]a
 	if url == nil {
 		url = d["canonical_url"]
 	}
-	return map[string]any{
+	rec := map[string]any{
 		"id": id, "type": rtype, "title": corpusTitle(d), "text": text,
 		"url": url, "source": source, "provenance": prov, "created": created,
 		"content_hash": hex.EncodeToString(h[:])[:16], "raw": d,
 	}
+
+	// Provenance is per field, not per record. "trainable" is what a training
+	// set may read; "cite_only" is what a retrieval index may read and must
+	// attribute. Owned and public-record material is trainable whole; a
+	// third-party record contributes its facts and withholds its prose.
+	switch prov {
+	case "third-party":
+		factual, expressive := corpusSplit(d)
+		rec["trainable"] = factual
+		rec["cite_only"] = expressive
+		rec["attribution_required"] = true
+	default:
+		rec["trainable"] = d
+		rec["attribution_required"] = false
+	}
+	return rec
 }
 
 func corpusDBRecords(db *sql.DB) ([]map[string]any, error) {
@@ -292,7 +338,12 @@ func exportCorpus(db *sql.DB) error {
 	manifest, _ := json.MarshalIndent(map[string]any{
 		"generated": time.Now().UTC().Format(time.RFC3339),
 		"records":   counts, "bytes": len(body), "sha256": digest,
-		"training_note": "Train on provenance in {owned, public-record} only; third-party records are retrieval-only.",
+		"training_note": "Every record carries a `trainable` object, which is what a training set may read. " +
+			"Owned and public-record records are trainable whole. A third-party record is split: its facts " +
+			"(URL, date, domain, outlet counts, named entities) are in `trainable` because facts are not " +
+			"copyrightable, while the publisher's own words (headline, summary, article text) are in " +
+			"`cite_only` and are for retrieval with attribution, never for training. Attribution does not " +
+			"make `cite_only` trainable; it addresses plagiarism, not copyright.",
 	}, "", "  ")
 
 	for _, prefix := range []string{"corpus/training/" + day, "corpus/training/latest"} {
@@ -304,7 +355,8 @@ func exportCorpus(db *sql.DB) error {
 		}
 	}
 	corpusLog(db, true, counts, len(body), digest, "corpus/training/"+day+"/corpus.jsonl", "")
-	fmt.Printf("export_corpus: ok total=%d owned=%d public=%d thirdparty=%d bytes=%d -> corpus/training/%s/\n",
-		counts["total"], counts["owned"], counts["public-record"], counts["third-party"], len(body), day)
+	fmt.Printf("export_corpus: ok total=%d owned=%d public=%d thirdparty=%d trainable=%d cite_only=%d bytes=%d -> corpus/training/%s/\n",
+		counts["total"], counts["owned"], counts["public-record"], counts["third-party"],
+		counts["total"], counts["third-party"], len(body), day)
 	return nil
 }
