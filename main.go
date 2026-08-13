@@ -5920,9 +5920,24 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 	// Levels 1 to 3: category, domain, section. Sections are what a reader
 	// actually visits, so a domain with sections reports their combined page
 	// count and counts as live when any section is.
+	//
+	// The count is pages, except where a section IS one page holding many
+	// things. AI Jobs and Market Dynamics reported "1" beside a page carrying
+	// 1,721 listings, which reads as one job. Where a section has a single row
+	// and that row declares a larger `total`, the total is the honest number.
+	//
+	// Deliberately narrow. `total` does not mean the same thing everywhere —
+	// state-ai-laws reports 2,417 bills across 54 pages, ai-tools-catalog 320
+	// tools across 87 — and using it wherever it is larger would silently
+	// restate counts the site has shown for weeks. Only the one-page-many-items
+	// case is wrong, so only that case changes.
 	rows, err := db.Query(`SELECT t.slug, t.name, COALESCE(t.blurb,''), t.status,
 			COALESCE(t.live_path,''), COALESCE(t.parent_slug,''), t.level,
-			(SELECT COALESCE(sum(p.url_count),0) FROM twoai_pages p WHERE p.taxonomy_slug = t.slug)
+			(SELECT CASE
+				WHEN count(*) = 1 AND COALESCE(max(NULLIF(p.data->>'total','')::int),0) > COALESCE(sum(p.url_count),0)
+					THEN max(NULLIF(p.data->>'total','')::int)
+				ELSE COALESCE(sum(p.url_count),0) END
+			 FROM twoai_pages p WHERE p.taxonomy_slug = t.slug)
 		FROM twoai_taxonomy t WHERE t.level IN (1,2,3) ORDER BY t.level, t.sort`)
 	if err != nil {
 		return 0, err
