@@ -4642,13 +4642,30 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 	// reader landing on an OpenAI announcement had no way to reach the OpenAI
 	// profile and vice versa. Posts carry the uid of the company or tool that
 	// published them, and the template turns it into a link.
+	// A permalink is only worth minting when there is something on the page.
+	// Turning on the 27 vendor feeds took the archive from 397 posts to 4,681
+	// overnight, and 2,546 of those carry no summary at all: a headline, a date,
+	// and a link out. Four and a half thousand pages of that is the doorway-page
+	// pattern, it is what the blueprint means by "none thin", and at that scale
+	// it puts the whole domain's standing at risk to host announcements the
+	// vendor already publishes better.
+	//
+	// So a post gets its own page when it has a real summary to put on it.
+	// Everything else is listed on the hub linking straight to the vendor's
+	// original, which is where the site's own source rule points anyway.
+	//
+	// `source='intel'` is carried regardless: those 64 were published with
+	// permalinks before the feeds were switched on, and a published URL does
+	// not get withdrawn because a later rule would not have minted it.
+	const summaryFloor = 120
 	arows, err := db.Query(`SELECT p.slug, p.vendor, p.title, p.url, p.summary,
 			COALESCE(to_char(p.posted_on,'YYYY-MM-DD'),''),
 			COALESCE(p.entity_uid, f.entity_uid, ''),
-			COALESCE(p.entity_kind, f.entity_kind, '')
+			COALESCE(p.entity_kind, f.entity_kind, ''),
+			(length(p.summary) >= $1 OR p.source = 'intel') AS has_page
 		FROM twoai_vendor_posts p
 		LEFT JOIN twoai_vendor_feeds f ON lower(f.vendor) = lower(p.vendor)
-		ORDER BY p.posted_on DESC NULLS LAST, p.slug`)
+		ORDER BY p.posted_on DESC NULLS LAST, p.slug`, summaryFloor)
 	if err != nil {
 		return 0, err
 	}
@@ -4657,14 +4674,19 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 		Vendor     string `json:"vendor"`
 		EntityUID  string `json:"entity_uid,omitempty"`
 		EntityKind string `json:"entity_kind,omitempty"`
+		HasPage    bool   `json:"has_page"`
 	}
 	archiveOut := []archived{}
+	pageCount := 0
 	for arows.Next() {
 		var a archived
 		if err := arows.Scan(&a.Slug, &a.Vendor, &a.Title, &a.URL, &a.Summary, &a.Date,
-			&a.EntityUID, &a.EntityKind); err != nil {
+			&a.EntityUID, &a.EntityKind, &a.HasPage); err != nil {
 			arows.Close()
 			return 0, err
+		}
+		if a.HasPage {
+			pageCount++
 		}
 		archiveOut = append(archiveOut, a)
 	}
@@ -4703,8 +4725,8 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 	}); err != nil {
 		return 0, err
 	}
-	fmt.Printf("twoai_build: vendor news vendors=%d latest=%d archive=%d feeds=%d/%d ok=true\n",
-		len(blocks), len(latest), len(archiveOut), feedOK, feedCount)
+	fmt.Printf("twoai_build: vendor news vendors=%d latest=%d archive=%d pages=%d feeds=%d/%d ok=true\n",
+		len(blocks), len(latest), len(archiveOut), pageCount, feedOK, feedCount)
 	return len(blocks), nil
 }
 
