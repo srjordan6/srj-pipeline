@@ -3006,6 +3006,18 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_build: company fact sections=%d\n", factPages)
 
+	repoPages, err := twoaiRepos(db, today)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("twoai_build: repo sections=%d\n", repoPages)
+
+	statusPages, err := twoaiAPIStatus(db, today)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("twoai_build: status sections=%d\n", statusPages)
+
 	// Staleness tripwire for benchmark results. The result snapshots in
 	// twoai_benchmarks.results are hand-curated from named evaluators, not
 	// scraped: the source leaderboards are JS-rendered and re-baseline
@@ -3270,27 +3282,27 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 		return 0, nil
 	}
 	type paper struct {
-		UID              string `json:"uid"`
-		Title            string `json:"title"`
-		Authors          string `json:"authors,omitempty"`
-		Year             int    `json:"year,omitempty"`
-		Journal          string `json:"journal,omitempty"`
-		Citations        int    `json:"citations"`
-		URL              string `json:"url"`
-		Topic            string `json:"topic"`
-		Note             string `json:"note,omitempty"`
-		Added            string `json:"added,omitempty"`
-		Abstract         string `json:"abstract,omitempty"`
-		AbstractSource   string `json:"abstract_source,omitempty"`
-		DOI              string `json:"doi,omitempty"`
-		Volume           string `json:"volume,omitempty"`
-		Type             string `json:"paper_type,omitempty"`
-		ExpBeginner      string `json:"explain_beginner,omitempty"`
-		ExpPractitioner  string `json:"explain_practitioner,omitempty"`
-		ExpBusiness      string `json:"explain_business,omitempty"`
-		Slug             string `json:"slug,omitempty"`
-		TopicName        string `json:"topic_name,omitempty"`
-		PageURL          string `json:"page_url,omitempty"`
+		UID             string `json:"uid"`
+		Title           string `json:"title"`
+		Authors         string `json:"authors,omitempty"`
+		Year            int    `json:"year,omitempty"`
+		Journal         string `json:"journal,omitempty"`
+		Citations       int    `json:"citations"`
+		URL             string `json:"url"`
+		Topic           string `json:"topic"`
+		Note            string `json:"note,omitempty"`
+		Added           string `json:"added,omitempty"`
+		Abstract        string `json:"abstract,omitempty"`
+		AbstractSource  string `json:"abstract_source,omitempty"`
+		DOI             string `json:"doi,omitempty"`
+		Volume          string `json:"volume,omitempty"`
+		Type            string `json:"paper_type,omitempty"`
+		ExpBeginner     string `json:"explain_beginner,omitempty"`
+		ExpPractitioner string `json:"explain_practitioner,omitempty"`
+		ExpBusiness     string `json:"explain_business,omitempty"`
+		Slug            string `json:"slug,omitempty"`
+		TopicName       string `json:"topic_name,omitempty"`
+		PageURL         string `json:"page_url,omitempty"`
 	}
 	var all []paper
 	latest := ""
@@ -3385,11 +3397,11 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 			"citations": p.Citations, "url": p.URL,
 			"topic": p.Topic, "topic_slug": p.Topic, "topic_name": p.TopicName,
 			"abstract": p.Abstract, "abstract_source": p.AbstractSource,
-			"note": p.Note,
-			"explain_beginner": p.ExpBeginner,
+			"note":                 p.Note,
+			"explain_beginner":     p.ExpBeginner,
 			"explain_practitioner": p.ExpPractitioner,
-			"explain_business": p.ExpBusiness,
-			"added": p.Added, "generated": today,
+			"explain_business":     p.ExpBusiness,
+			"added":                p.Added, "generated": today,
 		}); err != nil {
 			return count, err
 		}
@@ -5253,7 +5265,10 @@ func benchResults(db *sql.DB) error {
 	if key := os.Getenv("AA_API_KEY"); key == "" {
 		fmt.Fprintln(os.Stderr, "bench_results: AA_API_KEY not set, hle and gpqa stay on the curated snapshot (free key: artificialanalysis.ai)")
 	} else {
-		for slug, cfg := range map[string]struct{ evalKeys []string; metric, srcURL string }{
+		for slug, cfg := range map[string]struct {
+			evalKeys       []string
+			metric, srcURL string
+		}{
 			"hle":  {[]string{"humanitys_last_exam", "hle"}, "Accuracy, Artificial Analysis protocol", "https://artificialanalysis.ai/evaluations/humanitys-last-exam"},
 			"gpqa": {[]string{"gpqa_diamond", "gpqa"}, "Accuracy on the 198-question Diamond subset", "https://artificialanalysis.ai/evaluations/gpqa-diamond"},
 		} {
@@ -5644,9 +5659,9 @@ func twoaiTimeline(db *sql.DB, today string, upsert func(path, kind string, v an
 	}
 
 	if err := upsert("timeline/index.json", "timeline", map[string]any{
-		"uid": twoaiUID("section:historical-timeline"),
+		"uid":  twoaiUID("section:historical-timeline"),
 		"eras": blocks, "total": len(all), "auto": auto,
-		"curated": len(all) - auto,
+		"curated":    len(all) - auto,
 		"first_year": all[0].Year, "last_year": all[len(all)-1].Year,
 		"generated": today,
 	}); err != nil {
@@ -5891,7 +5906,7 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 		idx = append(idx, map[string]any{
 			"slug": w.Slug, "label": w.Label, "start": w.Start, "end": w.End,
 			"bills": len(w.Bills), "federal": len(w.Federal), "courts": len(w.Courts),
-			"total": len(w.Bills) + len(w.Federal) + len(w.Courts),
+			"total":         len(w.Bills) + len(w.Federal) + len(w.Courts),
 			"jurisdictions": len(jur), "top_theme": topTheme,
 		})
 	}
@@ -6537,14 +6552,14 @@ func syncContent(db *sql.DB) error {
 // content files ever land on a local machine. This stage makes the repo a
 // generated artifact of the table:
 //
-//   1. Ensures the table exists.
-//   2. One-time backfill: any people/{slug}.json already in srj-content that
-//      has no SQL row is imported (ON CONFLICT DO NOTHING, so SQL always
-//      wins afterward). This absorbs the 37 pre-directive profiles without a
-//      manual load and is a no-op on every later run.
-//   3. Exports every SQL row to people/{slug}.json via the GitHub API,
-//      skipping files whose content is already identical, so quiet days
-//      produce zero commits.
+//  1. Ensures the table exists.
+//  2. One-time backfill: any people/{slug}.json already in srj-content that
+//     has no SQL row is imported (ON CONFLICT DO NOTHING, so SQL always
+//     wins afterward). This absorbs the 37 pre-directive profiles without a
+//     manual load and is a no-op on every later run.
+//  3. Exports every SQL row to people/{slug}.json via the GitHub API,
+//     skipping files whose content is already identical, so quiet days
+//     produce zero commits.
 //
 // roster.json is not a person and is left alone in the repo.
 func syncPeople(db *sql.DB) error {

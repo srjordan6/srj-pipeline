@@ -50,6 +50,8 @@ var twoaiModelSections = map[string][]string{
 	"audio-speech-models":     {"automatic-speech-recognition", "text-to-speech"},
 	"embedding-models":        {"sentence-similarity"},
 	"robotics-models":         {"robotics"},
+	"music-models":            {"text-to-audio"},
+	"ocr-translation-models":  {"translation", "image-to-text"},
 }
 
 func twoaiModelsEnsure(db *sql.DB) error {
