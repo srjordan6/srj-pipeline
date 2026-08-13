@@ -163,19 +163,33 @@ var faviconFiles = map[string]string{
 		"8OT/AdXL6chWnK4ZAAAAAElFTkSuQmCC",
 }
 
+// One file's failure no longer ends the stage. It used to return on the
+// first error, and on Aug 13 2026 that meant a single 403 on a new file
+// stopped the other 133 in the same set from being attempted, so the log
+// showed one failure where there were many and the cause looked narrower
+// than it was. Failures are counted and reported together at the end, and
+// the stage still fails so the run is not silently green.
 func runFavicons() error {
 	loadRemoteCovers()
+	var failed []string
 	for name, b64 := range faviconFiles {
 		data, err := base64.StdEncoding.DecodeString(b64)
 		if err != nil {
-			return fmt.Errorf("favicon %s: bad embed: %w", name, err)
+			fmt.Fprintf(os.Stderr, "favicons: %s: bad embed: %v\n", name, err)
+			failed = append(failed, name)
+			continue
 		}
 		if err := putToRepo("srjordan6/srj-site", "public/"+name,
 			"Favicon: "+name+" (SRJ monogram, generated from the brand logo)",
 			data); err != nil {
-			return fmt.Errorf("favicon %s: %w", name, err)
+			fmt.Fprintf(os.Stderr, "favicons: %s: %v\n", name, err)
+			failed = append(failed, name)
+			continue
 		}
 		fmt.Println("favicons: ensured", name)
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("favicons: %d of %d failed, first %s", len(failed), len(faviconFiles), failed[0])
 	}
 	return nil
 }

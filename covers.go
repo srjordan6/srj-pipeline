@@ -47,21 +47,28 @@ var coverSources = []struct {
 
 // Zip-delivered asset sets. Same trust model as coverSources, one URL and
 // one SHA-256 pin per archive, but the payload is a zip whose entries all
-// land under repoPrefix. Exists for the Book 06 figure previews: 134 small
-// PNGs that would be unmanageable as individual pinned entries. putToRepo
-// skips unchanged blobs, so after the first delivery a daily run costs one
-// zip fetch and cheap GET-compares.
+// land under repoPrefix.
+//
+// EMPTY ON PURPOSE, Aug 13 2026. The first use was the 134 Book 06 figure
+// previews, and it proved this delivery path does not exist: the pipeline's
+// GitHub token has no Contents write on srjordan6/srj-site, so the very
+// first PUT returned 403 and nothing shipped. The failure had been latent
+// for weeks because putToRepo compares blob SHAs and never writes a file
+// already in the repo, so the token was never exercised.
+//
+// The previews went to the srj-assets R2 bucket instead, which is where
+// Volume V keeps its own previews and where Book 06's full-size originals
+// already were, and they serve at the same URL through the Worker's asset
+// proxy. Repo delivery would also have meant one commit per file, which is
+// one Cloudflare build per file.
+//
+// Leave this empty unless the token gains that scope. If it ever does, the
+// right shape is still a single tree commit, not 134 contents-API calls.
 var zipSources = []struct {
 	repoPrefix string // repo path prefix each entry lands under, no leading slash
 	url        string
 	sha256     string
-}{
-	{
-		repoPrefix: "wp-content/uploads/The_Operating_Discipline_for_AI/The_AI_IT_Security_Implementation_and_Strategy/Graphics/",
-		url:        "https://x0.at/EDBr.zip",
-		sha256:     "e4f5e650e21b86aae601eee751c9d072f8ed58264db372309efb38a3afa67552",
-	},
-}
+}{}
 
 func loadZipAssets() {
 	for _, z := range zipSources {
