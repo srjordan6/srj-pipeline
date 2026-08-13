@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -43,28 +45,73 @@ var coverSources = []struct {
 	},
 }
 
+// Zip-delivered asset sets. Same trust model as coverSources, one URL and
+// one SHA-256 pin per archive, but the payload is a zip whose entries all
+// land under repoPrefix. Exists for the Book 06 figure previews: 134 small
+// PNGs that would be unmanageable as individual pinned entries. putToRepo
+// skips unchanged blobs, so after the first delivery a daily run costs one
+// zip fetch and cheap GET-compares.
+var zipSources = []struct {
+	repoPrefix string // repo path prefix each entry lands under, no leading slash
+	url        string
+	sha256     string
+}{
+	{
+		repoPrefix: "wp-content/uploads/The_Operating_Discipline_for_AI/The_AI_IT_Security_Implementation_and_Strategy/Graphics/",
+		url:        "https://x0.at/EDBr.zip",
+		sha256:     "e4f5e650e21b86aae601eee751c9d072f8ed58264db372309efb38a3afa67552",
+	},
+}
+
+func loadZipAssets() {
+	for _, z := range zipSources {
+		resp, err := http.Get(z.url)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "zip asset", z.url, ":", err)
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+		resp.Body.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "zip asset", z.url, "read:", err)
+			continue
+		}
+		if got := fmt.Sprintf("%x", sha256.Sum256(data)); got != z.sha256 {
+			fmt.Fprintln(os.Stderr, "zip asset", z.url, ": sha mismatch, refusing")
+			continue
+		}
+		zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "zip asset", z.url, ":", err)
+			continue
+		}
+		n := 0
+		for _, f := range zr.File {
+			if f.FileInfo().IsDir() {
+				continue
+			}
+			rc, err := f.Open()
+			if err != nil {
+				continue
+			}
+			b, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				continue
+			}
+			faviconFiles[z.repoPrefix+f.Name] = base64.StdEncoding.EncodeToString(b)
+			n++
+		}
+		fmt.Println("zip assets: merged", n, "files under", z.repoPrefix)
+	}
+}
+
 // loadRemoteCovers downloads each cover, verifies its hash, and merges it
 // into faviconFiles so runFavicons pushes it with the rest. Never fails the
 // stage: a dead link or bad byte just means this run skips that cover.
-//
-// An asset already in the repo is skipped without fetching. putToRepo
-// already made the push write-free once the blob matched, but the download
-// still ran every time, and runFavicons is called by the daily `all` pass
-// AND by hourlyCatchUp, so this was pulling several megabytes an hour from
-// the staging host to produce nothing. Existence is a sufficient test
-// because the only way a file reaches the repo is through this function,
-// which verifies the pinned SHA-256 first.
-//
-// The practical effect is that each cover retires its own staging URL after
-// the first successful run. That matters because the staging host is
-// ephemeral: when a link eventually expires, a retired asset says nothing
-// rather than warning every hour about a file that is already published.
 func loadRemoteCovers() {
 	client := &http.Client{Timeout: 60 * time.Second}
 	for _, c := range coverSources {
-		if repoHasFile("srjordan6/srj-site", "public/"+c.repoPath) {
-			continue
-		}
 		resp, err := client.Get(c.url)
 		if err != nil {
 			fmt.Println("covers: fetch failed, skipping", c.repoPath, err)
@@ -84,30 +131,4 @@ func loadRemoteCovers() {
 		faviconFiles[c.repoPath] = base64.StdEncoding.EncodeToString(data)
 		fmt.Println("covers: verified", c.repoPath, len(data), "bytes")
 	}
-}
-
-// repoHasFile reports whether a path exists in the repo. Any error, including
-// a missing token, answers false: the caller then falls back to fetching and
-// pushing, which is the behaviour this function is an optimisation over, so a
-// failed check costs bandwidth rather than correctness.
-func repoHasFile(repo, path string) bool {
-	tok := os.Getenv("GITHUB_TOKEN")
-	if tok == "" {
-		return false
-	}
-	req, err := http.NewRequest("GET",
-		"https://api.github.com/repos/"+repo+"/contents/"+path, nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "srj-pipeline/1.0")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
 }

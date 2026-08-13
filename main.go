@@ -224,6 +224,13 @@ func main() {
 	// an opaque Google News redirect. Own subcommand, never part of `all`, so
 	// a Google-side change can stall this and nothing else.
 	if src == "favicons" {
+		// Remote-sourced assets merge into faviconFiles before the push so
+		// the daily run ensures them alongside the embedded set. Wired here,
+		// not in hourlyCatchUp, so the zip fetch happens once a day, not 24
+		// times. If a staging URL has expired the loader logs and skips, and
+		// files already in the repo stay put.
+		loadRemoteCovers()
+		loadZipAssets()
 		if err := runFavicons(); err != nil {
 			fmt.Fprintln(os.Stderr, "favicons:", err)
 			os.Exit(1)
