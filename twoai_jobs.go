@@ -358,12 +358,16 @@ var twoaiSkillVocab = map[string][]string{
 // the skill NAMES only. The text is read and discarded: it belongs to the
 // employer, and what we keep is the fact that a skill was asked for.
 func twoaiExtractSkills(text string) []string {
+	// Empty slice, never nil. json.Marshal turns a nil slice into `null`, not
+	// `[]`, and `null` reaching a jsonb column makes jsonb_array_length fail
+	// with "cannot get array length of a scalar" — which is exactly what it did
+	// on the first run, losing 384 of 1,473 listings to a rejected upsert.
+	out := []string{}
 	if text == "" {
-		return nil
+		return out
 	}
 	l := " " + strings.ToLower(twoaiTagStrip.ReplaceAllString(text, " ")) + " "
 	l = strings.Join(strings.Fields(l), " ")
-	var out []string
 	for name, needles := range twoaiSkillVocab {
 		for _, n := range needles {
 			if strings.Contains(l, n) {
@@ -447,7 +451,8 @@ func twoaiJobsFetch(db *sql.DB) error {
 				job_category=EXCLUDED.job_category, salary_min=EXCLUDED.salary_min,
 				salary_max=EXCLUDED.salary_max, salary_period=EXCLUDED.salary_period,
 				seniority=EXCLUDED.seniority,
-				skills=CASE WHEN jsonb_array_length(EXCLUDED.skills) > 0
+				skills=CASE WHEN jsonb_typeof(EXCLUDED.skills) = 'array'
+				             AND jsonb_array_length(EXCLUDED.skills) > 0
 				            THEN EXCLUDED.skills ELSE twoai_jobs.skills END,
 				last_seen=now()`,
 			source, extID, strings.TrimSpace(title), strings.TrimSpace(company),
