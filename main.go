@@ -3929,17 +3929,19 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		return 0, err
 	}
 	type idx struct {
-		UID      string `json:"uid,omitempty"`
-		Name     string `json:"name"`
-		Moniker  string `json:"moniker,omitempty"`
-		Hook     string `json:"hook,omitempty"`
-		Fields   []any  `json:"fields,omitempty"`
-		Org      string `json:"org,omitempty"`
-		Title    string `json:"title,omitempty"`
-		Profiled bool   `json:"profiled"`
+		UID      string   `json:"uid,omitempty"`
+		Name     string   `json:"name"`
+		Moniker  string   `json:"moniker,omitempty"`
+		Hook     string   `json:"hook,omitempty"`
+		Fields   []any    `json:"fields,omitempty"`
+		Org      string   `json:"org,omitempty"`
+		Title    string   `json:"title,omitempty"`
+		Profiled bool     `json:"profiled"`
+		Cats     []string `json:"cats,omitempty"`
 	}
 	var list []idx
 	var docs []map[string]any
+	uidBySlug := map[string]string{}
 	for rows.Next() {
 		var slug, raw string
 		if rows.Scan(&slug, &raw) != nil {
@@ -3956,6 +3958,7 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		uid := twoaiEntityID(db, "person", name)
 		d["uid"] = uid
 		d["generated"] = today
+		uidBySlug[slug] = uid
 		docs = append(docs, d)
 		mon, _ := d["moniker"].(string)
 		hook, _ := d["hook"].(string)
@@ -4063,6 +4066,63 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		return 0, nil
 	}
 
+	// Category membership, from twoai_person_category. Seven categories are
+	// taxonomy sections (Stephen's 2026-08 request) and publish as hub pages
+	// below the category identifier path; the rest render as plain labels on a
+	// profile until a section exists for them. A person can hold several.
+	catTax := map[string]string{
+		"researchers":                   "people-researchers",
+		"founders-and-executives":       "people-founders",
+		"investors":                     "people-investors",
+		"open-source-maintainers":       "people-maintainers",
+		"professors-and-academics":      "people-academics",
+		"government-and-policy-leaders": "people-government",
+		"authors-and-communicators":     "people-authors",
+	}
+	type catRef struct {
+		Key  string `json:"key"`
+		Name string `json:"name"`
+		UID  string `json:"uid,omitempty"`
+	}
+	catName := map[string]string{}
+	catsByUID := map[string][]catRef{}
+	if crows, err := db.Query(`SELECT pc.slug, pc.category, c.name
+		FROM twoai_person_category pc
+		JOIN twoai_people_categories c ON c.key = pc.category
+		ORDER BY pc.slug, c.name`); err == nil {
+		for crows.Next() {
+			var slug, key, name string
+			if crows.Scan(&slug, &key, &name) != nil {
+				continue
+			}
+			catName[key] = name
+			uid := uidBySlug[slug]
+			if uid == "" {
+				continue
+			}
+			r := catRef{Key: key, Name: name}
+			if tax := catTax[key]; tax != "" {
+				r.UID = twoaiUID("section:" + tax)
+			}
+			catsByUID[uid] = append(catsByUID[uid], r)
+		}
+		crows.Close()
+	}
+	for _, d := range docs {
+		if uid, _ := d["uid"].(string); uid != "" && len(catsByUID[uid]) > 0 {
+			d["cats"] = catsByUID[uid]
+		}
+	}
+	for i := range list {
+		if len(catsByUID[list[i].UID]) > 0 {
+			keys := make([]string, 0, len(catsByUID[list[i].UID]))
+			for _, r := range catsByUID[list[i].UID] {
+				keys = append(keys, r.Key)
+			}
+			list[i].Cats = keys
+		}
+	}
+
 	count := 0
 	keep := make([]string, 0, len(docs))
 	for _, d := range docs {
@@ -4100,7 +4160,64 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 	}); err != nil {
 		return count, err
 	}
-	return count + 1, nil
+	count++
+
+	// The seven category sections publish as their own hub pages, one JSON per
+	// taxonomy slug, taxonomy_slug set to the section itself so the ecosystem
+	// map counts them. Members come only from profiled people: roster-only
+	// entries carry no category assignment, and a category page listing names
+	// that link nowhere would be padding. Written directly rather than through
+	// upsert because upsert derives taxonomy_slug from kind, and here it
+	// varies per page.
+	keepCats := make([]string, 0, len(catTax))
+	for key, tax := range catTax {
+		var name, blurb string
+		if db.QueryRow(`SELECT name, COALESCE(blurb,'') FROM twoai_taxonomy WHERE slug=$1`,
+			tax).Scan(&name, &blurb) != nil {
+			continue
+		}
+		if name == "" {
+			name = catName[key]
+		}
+		type member struct {
+			UID     string `json:"uid"`
+			Name    string `json:"name"`
+			Moniker string `json:"moniker,omitempty"`
+			Hook    string `json:"hook,omitempty"`
+		}
+		members := []member{}
+		for _, e := range list {
+			for _, k := range e.Cats {
+				if k == key {
+					members = append(members, member{UID: e.UID, Name: e.Name, Moniker: e.Moniker, Hook: e.Hook})
+					break
+				}
+			}
+		}
+		doc := map[string]any{
+			"uid": twoaiUID("section:" + tax), "key": key, "tax": tax,
+			"name": name, "blurb": blurb, "members": members,
+			"total": len(members), "generated": today,
+		}
+		j, _ := json.Marshal(doc)
+		path := "people/cat-" + tax + ".json"
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ($1,'person-category',$2::jsonb,$3,1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`,
+			path, string(j), tax); err != nil {
+			return count, err
+		}
+		keepCats = append(keepCats, path)
+		count++
+	}
+	if len(keepCats) > 0 {
+		if _, err := db.Exec(`DELETE FROM twoai_pages
+			WHERE kind = 'person-category' AND NOT (path = ANY($1))`, pq.Array(keepCats)); err != nil {
+			return count, err
+		}
+	}
+	return count, nil
 }
 
 // twoaiMCP renders the Model Context Protocol server tracker from the mirror
