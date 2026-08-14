@@ -274,6 +274,16 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 			if resp.StatusCode == 429 {
 				return 0, nil, fmt.Errorf("rate limited")
 			}
+			// ODP answers a zero-result search with 404, not an empty 200:
+			// the first fixed sweep 404'd on 01.AI, Copy.ai, and other
+			// companies that plausibly hold no granted US patents, while
+			// returning real counts for 16 others in the same run. A 404
+			// is a finding of nothing, not a failure - and since the
+			// section only lists companies with patents, a mistaken zero
+			// can only omit, never fabricate.
+			if resp.StatusCode == 404 {
+				return 0, nil, nil
+			}
 			if resp.StatusCode != 200 {
 				return 0, nil, fmt.Errorf("status %d", resp.StatusCode)
 			}
