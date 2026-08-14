@@ -270,10 +270,50 @@ func twoaiHardware(db *sql.DB, today string) (int, error) {
 			}
 		}
 		name, blurb := taxMeta(sec.slug)
-		if err := write(sec.path, sec.slug, map[string]any{
+		doc := map[string]any{
 			"name": name, "blurb": blurb, "shape": "learning",
 			"items": items, "total": len(items), "free": free, "with_code": withCode,
-		}); err != nil {
+		}
+		// The books page also lists the nine SRJ volumes - this site's own
+		// publisher - as a clearly labeled separate group, read from the
+		// same canonical books data the sources page renders. Labeled, not
+		// mixed: the independent list above it stays independent.
+		if sec.slug == "books" {
+			srjPaths := map[int]string{
+				1: "/books/ai-business-services/the-ai-business-enablement-audit/",
+				2: "/books/ai-business-services/the-ai-readiness-performance-assessment/",
+				3: "/books/ai-business-services/the-ai-risk-governance-review/",
+				4: "/books/ai-business-services/the-ai-efficiency-process-optimization/",
+				5: "/books/ai-risk-governance-security/the-ai-it-security-audit/",
+				6: "/books/ai-risk-governance-security/the-ai-it-security-implementation-strategy/",
+				7: "/books/ai-risk-governance-security/the-secure-by-design/",
+				8: "/books/ai-risk-governance-security/the-application-security/",
+				9: "/books/ai-risk-governance-security/the-cloud-infrastructure-security/",
+			}
+			var srj []map[string]any
+			brows, err := db.Query(`SELECT (b->>'number')::int, b->>'title', b->>'pillar',
+				b->>'status', COALESCE(b->>'published',''), COALESCE(b->>'amazon_url','')
+				FROM twoai_pages, jsonb_array_elements(data->'books') b
+				WHERE path='sources/index.json' ORDER BY (b->>'number')::int`)
+			if err == nil {
+				for brows.Next() {
+					var num int
+					var title, pillar, status, published, amazon string
+					if brows.Scan(&num, &title, &pillar, &status, &published, &amazon) == nil {
+						srj = append(srj, map[string]any{
+							"number": num, "title": title, "pillar": pillar,
+							"status": status, "published": published, "amazon": amazon,
+							"url": "https://srjconsultingservices.com" + srjPaths[num],
+						})
+					}
+				}
+				brows.Close()
+			}
+			if len(srj) > 0 {
+				doc["srj_books"] = srj
+			}
+		}
+		if err := write(sec.path, sec.slug, doc); err != nil {
 			return count, err
 		}
 		count++
