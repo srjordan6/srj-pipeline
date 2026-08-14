@@ -3606,33 +3606,24 @@ func twoaiSources(db *sql.DB, today string, upsert func(path, kind string, v any
 		AmazonURL string `json:"amazon_url,omitempty"`
 		Pages     int    `json:"pages,omitempty"`
 	}
+	// Read press_books directly - the canonical table - rather than the
+	// books/books.json copy in site_content. The copy went stale within
+	// three weeks of being introduced (book 5 published 2026-08-03; the
+	// copy still said forthcoming on 2026-08-14), which is the whole
+	// argument for never rendering from a snapshot when the table that
+	// produced it is one query away.
 	var books []book
-	var booksRaw string
-	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='books/books.json'`).Scan(&booksRaw); err == nil {
-		var doc struct {
-			Books []struct {
-				Number      json.Number `json:"book_number"`
-				Title       string      `json:"title"`
-				Subtitle    string      `json:"subtitle"`
-				Pillar      string      `json:"pillar"`
-				Status      string      `json:"status"`
-				PublishedOn string      `json:"published_on"`
-				AmazonURL   string      `json:"amazon_url"`
-				Pages       json.Number `json:"pages"`
-			} `json:"books"`
-		}
-		if json.Unmarshal([]byte(booksRaw), &doc) == nil {
-			for _, b := range doc.Books {
-				n, _ := b.Number.Int64()
-				p, _ := b.Pages.Int64()
-				books = append(books, book{
-					Number: int(n), Title: b.Title, Subtitle: b.Subtitle, Pillar: b.Pillar,
-					Status: b.Status, Published: b.PublishedOn, AmazonURL: b.AmazonURL,
-					Pages: int(p),
-				})
+	if brows, err := db.Query(`SELECT book_number, title, COALESCE(subtitle,''), pillar,
+		status, COALESCE(published_on::text,''), COALESCE(amazon_url,''), COALESCE(pages,0)
+		FROM press_books ORDER BY book_number`); err == nil {
+		for brows.Next() {
+			var b book
+			if brows.Scan(&b.Number, &b.Title, &b.Subtitle, &b.Pillar,
+				&b.Status, &b.Published, &b.AmazonURL, &b.Pages) == nil {
+				books = append(books, b)
 			}
-			sort.Slice(books, func(i, j int) bool { return books[i].Number < books[j].Number })
 		}
+		brows.Close()
 	}
 
 	if err := upsert("sources/index.json", "sources-hub", map[string]any{
