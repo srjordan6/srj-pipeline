@@ -52,6 +52,20 @@ var twoaiModelSections = map[string][]string{
 	"robotics-models":         {"robotics"},
 	"music-models":            {"text-to-audio"},
 	"ocr-translation-models":  {"translation", "image-to-text"},
+	// Entries below use "pipeline|filter" form: the part before the pipe is
+	// a pipeline_tag (may be empty), the part after is a Hub tag filter.
+	// Both are the Hub's own classification, so membership is the model
+	// authors' claim, stated as such on the pages.
+	"coding-models":         {"text-generation|code"},
+	"on-device-edge-models": {"text-generation|gguf"},
+	"scientific-models":     {"|chemistry", "|biology"},
+	"medical-models":        {"|medical"},
+	"legal-models":          {"|legal"},
+	"financial-models":      {"|finance"},
+	// Small language models are a parameter-count cut, not a tag: the
+	// fetch expands safetensors metadata and keeps models at or under
+	// four billion parameters.
+	"small-language-models": {"__slm__"},
 }
 
 func twoaiModelsEnsure(db *sql.DB) error {
@@ -108,6 +122,15 @@ func twoaiModelsFetch(db *sql.DB) {
 	for section, tags := range twoaiModelSections {
 		for _, tag := range tags {
 			url := "https://huggingface.co/api/models?pipeline_tag=" + tag + "&sort=downloads&direction=-1&limit=50"
+			if tag == "__slm__" {
+				url = "https://huggingface.co/api/models?pipeline_tag=text-generation&sort=downloads&direction=-1&limit=100&expand[]=safetensors&expand[]=downloads&expand[]=likes&expand[]=createdAt&expand[]=tags&expand[]=pipeline_tag"
+			} else if strings.Contains(tag, "|") {
+				parts := strings.SplitN(tag, "|", 2)
+				url = "https://huggingface.co/api/models?sort=downloads&direction=-1&limit=50&filter=" + parts[1]
+				if parts[0] != "" {
+					url += "&pipeline_tag=" + parts[0]
+				}
+			}
 			raw, err := twoaiJobsGet(url, nil)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "twoai_models: hf %s fetch failed, rendering last good data: %v\n", tag, err)
@@ -130,6 +153,19 @@ func twoaiModelsFetch(db *sql.DB) {
 				id, _ := m["id"].(string)
 				if id == "" {
 					continue
+				}
+				// The small-language cut keeps only models that declare a
+				// parameter count of four billion or fewer; a model that
+				// does not publish safetensors metadata cannot qualify.
+				if tag == "__slm__" {
+					st, _ := m["safetensors"].(map[string]any)
+					total, _ := st["total"].(float64)
+					if total <= 0 || total > 4e9 {
+						continue
+					}
+					if n >= 50 {
+						break
+					}
 				}
 				m["pipeline_tag"] = tag
 				j, _ := json.Marshal(m)
@@ -336,6 +372,37 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 	}
 	count := 0
 	var keep []string
+
+	// ---- Model Metadata Standard: the record behind every model row,
+	// documented as a page, including what is deliberately not tracked.
+	metaName, metaBlurb := taxMeta("model-metadata")
+	if err := write("model-metadata", map[string]any{
+		"name": metaName, "blurb": metaBlurb, "kind": "standard",
+		"open_fields": []map[string]string{
+			{"name": "Model ID and page", "source": "Hugging Face Hub", "desc": "The canonical repo id, linking to the model's own page."},
+			{"name": "Licence", "source": "Hub tags", "desc": "As declared by the publisher in the model's tags; blank when undeclared."},
+			{"name": "Downloads and likes", "source": "Hub", "desc": "All-time downloads and likes at fetch time; ranking key."},
+			{"name": "Release date", "source": "Hub createdAt", "desc": "When the repo was created on the Hub, which can trail the announcement."},
+			{"name": "Modality", "source": "Hub pipeline tag", "desc": "The task classification the section membership comes from."},
+			{"name": "Parameters", "source": "safetensors metadata", "desc": "Only where the publisher ships safetensors with a declared count; used for the Small Language Models cut."},
+		},
+		"api_fields": []map[string]string{
+			{"name": "Provider and model id", "source": "OpenRouter catalogue", "desc": "The serving provider and routed model id."},
+			{"name": "Context window", "source": "OpenRouter", "desc": "Maximum context length as listed by the provider."},
+			{"name": "Pricing", "source": "OpenRouter", "desc": "Dollars per million input and output tokens at fetch time."},
+			{"name": "Reasoning flag and modalities", "source": "OpenRouter", "desc": "Whether the model exposes step-by-step reasoning, and its input modalities."},
+		},
+		"not_tracked": []map[string]string{
+			{"name": "Training data", "why": "Most publishers do not disclose it; this site does not guess."},
+			{"name": "Benchmark scores", "why": "Self-reported numbers are not independently verifiable; leaderboards are linked from the research section instead."},
+			{"name": "Safety evaluations", "why": "No consistent free primary source exists across publishers yet."},
+			{"name": "Valuation-grade adoption claims", "why": "Downloads are the only adoption number a free primary source carries."},
+		},
+	}); err != nil {
+		return count, err
+	}
+	count++
+	keep = append(keep, "models/model-metadata.json")
 
 	// ---- Hugging Face sections: open-weight catalogs per modality.
 	hfRow := func(h hfModel) map[string]any {
