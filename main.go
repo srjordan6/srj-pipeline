@@ -3006,6 +3006,12 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_build: company fact sections=%d\n", factPages)
 
+	orgPages, err := twoaiOrgFacts(db, today)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("twoai_build: org fact sections=%d\n", orgPages)
+
 	repoPages, err := twoaiRepos(db, today)
 	if err != nil {
 		return err
