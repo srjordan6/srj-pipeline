@@ -242,11 +242,23 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 		client := &http.Client{Timeout: 60 * time.Second}
 		odpQuery := func(phrase string) (int, []map[string]any, error) {
 			esc := strings.ReplaceAll(phrase, `"`, ``)
+			// Body shape per the ODP spec and the PTAB mapping examples:
+			// sort is an array of {field, order} objects, pagination is a
+			// nested object, and date constraints go in rangeFilters, not
+			// in q. The first sweep sent a sort string, top-level limit,
+			// and a [* TO *] existence clause, and every query 400'd.
+			// The grantDate range floor doubles as the "granted only,
+			// since 2001" scope the pages state.
 			body, _ := json.Marshal(map[string]any{
-				"q":      `applicationMetaData.firstApplicantName:"` + esc + `" AND applicationMetaData.grantDate:[* TO *]`,
-				"sort":   "applicationMetaData.grantDate desc",
-				"limit":  5,
-				"offset": 0,
+				"q": `applicationMetaData.firstApplicantName:"` + esc + `"`,
+				"rangeFilters": []map[string]string{{
+					"field":     "applicationMetaData.grantDate",
+					"valueFrom": "2001-01-01", "valueTo": "2035-12-31",
+				}},
+				"sort": []map[string]string{{
+					"field": "applicationMetaData.grantDate", "order": "Desc",
+				}},
+				"pagination": map[string]int{"offset": 0, "limit": 5},
 				"fields": []string{"applicationMetaData.patentNumber",
 					"applicationMetaData.inventionTitle", "applicationMetaData.grantDate"},
 			})
