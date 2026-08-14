@@ -211,5 +211,114 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 			taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`, string(j)); err != nil {
 		return 0, err
 	}
-	return 1, nil
+	pages := 1
+
+	// ---- API Directory: curated provider rows, every docs URL verified
+	// before insertion, cross-referenced to the status feeds above and to
+	// company pages where the provider is a tracked entity.
+	type apiRow struct {
+		Provider  string `json:"provider"`
+		EntityUID string `json:"entity_uid,omitempty"`
+		BaseURL   string `json:"base_url"`
+		DocsURL   string `json:"docs_url"`
+		Auth      string `json:"auth"`
+		SDKs      string `json:"sdks"`
+		OAICompat bool   `json:"openai_compatible"`
+		Note      string `json:"note,omitempty"`
+		Verified  string `json:"verified"`
+		HasStatus bool   `json:"has_status"`
+	}
+	var apis []apiRow
+	if rows, err := db.Query(`SELECT d.provider, COALESCE(d.entity_uid,''), d.base_url, d.docs_url,
+			d.auth_note, d.sdks, d.openai_compatible, COALESCE(d.note,''), d.verified_on::text,
+			EXISTS (SELECT 1 FROM twoai_status_feeds f WHERE lower(f.provider)=lower(d.provider))
+		FROM twoai_api_directory d ORDER BY d.provider`); err == nil {
+		for rows.Next() {
+			var a apiRow
+			if rows.Scan(&a.Provider, &a.EntityUID, &a.BaseURL, &a.DocsURL, &a.Auth,
+				&a.SDKs, &a.OAICompat, &a.Note, &a.Verified, &a.HasStatus) == nil {
+				if a.EntityUID == "" {
+					db.QueryRow(`SELECT c->>'uid' FROM twoai_pages, jsonb_array_elements(data->'companies') c
+						WHERE path='companies/index.json' AND lower(c->>'name')=lower($1) LIMIT 1`,
+						a.Provider).Scan(&a.EntityUID)
+				}
+				apis = append(apis, a)
+			}
+		}
+		rows.Close()
+	}
+	if len(apis) > 0 {
+		var dn, dblurb string
+		db.QueryRow(`SELECT name, COALESCE(blurb,'') FROM twoai_taxonomy WHERE slug='api-directory'`).Scan(&dn, &dblurb)
+		compat := 0
+		for _, a := range apis {
+			if a.OAICompat {
+				compat++
+			}
+		}
+		dj, _ := json.Marshal(map[string]any{
+			"uid": twoaiUID("section:api-directory"), "tax": "api-directory",
+			"name": dn, "blurb": dblurb, "apis": apis, "total": len(apis),
+			"openai_compatible": compat, "generated": today,
+		})
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ('tech/api-directory.json','tech-section',$1::jsonb,'api-directory',1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`, string(dj)); err != nil {
+			return pages, err
+		}
+		pages++
+	}
+
+	// ---- Programming Languages: curated profiles joined with live counts
+	// from the tracked-repo catalogue, so "Python in AI work" is backed by
+	// which of the repos this site tracks are written in it.
+	type langRow struct {
+		Slug     string   `json:"slug"`
+		Name     string   `json:"name"`
+		Steward  string   `json:"steward"`
+		First    string   `json:"first_release"`
+		Role     string   `json:"ai_role"`
+		Source   string   `json:"source_url"`
+		Verified string   `json:"verified"`
+		Repos    []string `json:"repos,omitempty"`
+	}
+	var langs []langRow
+	if rows, err := db.Query(`SELECT slug, name, steward, first_release, ai_role, source_url, verified_on::text
+		FROM twoai_languages ORDER BY name`); err == nil {
+		for rows.Next() {
+			var l langRow
+			if rows.Scan(&l.Slug, &l.Name, &l.Steward, &l.First, &l.Role, &l.Source, &l.Verified) == nil {
+				if rr, err := db.Query(`SELECT repo FROM twoai_repo_catalog
+					WHERE lower(language)=lower($1) ORDER BY stars DESC LIMIT 6`, l.Name); err == nil {
+					for rr.Next() {
+						var fn string
+						if rr.Scan(&fn) == nil {
+							l.Repos = append(l.Repos, fn)
+						}
+					}
+					rr.Close()
+				}
+				langs = append(langs, l)
+			}
+		}
+		rows.Close()
+	}
+	if len(langs) > 0 {
+		var ln, lblurb string
+		db.QueryRow(`SELECT name, COALESCE(blurb,'') FROM twoai_taxonomy WHERE slug='programming-languages'`).Scan(&ln, &lblurb)
+		lj, _ := json.Marshal(map[string]any{
+			"uid": twoaiUID("section:programming-languages"), "tax": "programming-languages",
+			"name": ln, "blurb": lblurb, "languages": langs, "total": len(langs),
+			"generated": today,
+		})
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ('tech/programming-languages.json','tech-section',$1::jsonb,'programming-languages',1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`, string(lj)); err != nil {
+			return pages, err
+		}
+		pages++
+	}
+	return pages, nil
 }
