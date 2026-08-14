@@ -213,6 +213,52 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 	}
 	pages := 1
 
+	// ---- Re-verify curated source URLs so "verified {date}" on the
+	// rendered pages is a live daily claim, not the insertion date. A URL
+	// that answers 2xx/3xx gets today's date; anything else keeps its old
+	// date (the page then honestly shows staleness) and logs to stderr,
+	// which surfaces a dead docs link within one run. 403 bot walls stay
+	// stale by design rather than being blessed unseen.
+	reverify := func(table, urlCol, keyCol string) {
+		rows, err := db.Query(`SELECT ` + keyCol + `, ` + urlCol + ` FROM ` + table)
+		if err != nil {
+			return
+		}
+		type kv struct{ k, u string }
+		var all []kv
+		for rows.Next() {
+			var k, u string
+			if rows.Scan(&k, &u) == nil {
+				all = append(all, kv{k, u})
+			}
+		}
+		rows.Close()
+		client := &http.Client{Timeout: 15 * time.Second}
+		for _, x := range all {
+			req, _ := http.NewRequest("GET", x.u, nil)
+			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org link verification; contact: info@srjconsultingservices.com)")
+			resp, err := client.Do(req)
+			ok := false
+			if err == nil {
+				resp.Body.Close()
+				ok = resp.StatusCode < 400
+			}
+			if ok {
+				db.Exec(`UPDATE `+table+` SET verified_on=current_date WHERE `+keyCol+`=$1`, x.k)
+			} else {
+				code := 0
+				if resp != nil {
+					code = resp.StatusCode
+				}
+				fmt.Fprintf(os.Stderr, "twoai_apistatus: reverify %s %s: status %d err %v\n", table, x.u, code, err)
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+	reverify("twoai_api_directory", "docs_url", "provider")
+	reverify("twoai_languages", "source_url", "slug")
+	reverify("twoai_org_classifications", "source_url", "uid")
+
 	// ---- API Directory: curated provider rows, every docs URL verified
 	// before insertion, cross-referenced to the status feeds above and to
 	// company pages where the provider is a tracked entity.
