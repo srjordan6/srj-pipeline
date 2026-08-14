@@ -201,8 +201,8 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 				}})
 				if _, err := db.Exec(`INSERT INTO twoai_company_profiles
 					(uid, name, org_type, for_profit, ticker, cik, sources, verified_on, updated_at)
-					VALUES ($1,$2,'public',true,$3,$4,$5::jsonb,$6::date, now())
-					ON CONFLICT (uid) DO UPDATE SET org_type='public', for_profit=true,
+					VALUES ($1,$2,'public-company',true,$3,$4,$5::jsonb,$6::date, now())
+					ON CONFLICT (uid) DO UPDATE SET org_type='public-company', for_profit=true,
 						ticker=EXCLUDED.ticker, cik=EXCLUDED.cik, sources=EXCLUDED.sources,
 						verified_on=EXCLUDED.verified_on, updated_at=now()`,
 					v.UID, v.Name, ticker, cik10, string(src), today); err != nil {
@@ -341,7 +341,7 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 			COALESCE(t.data->'sec'->>'registrant',''), COALESCE(t.data->'sec'->'filings','[]')
 		FROM twoai_company_profiles p
 		LEFT JOIN twoai_pages t ON t.path = 'companies/' || p.uid || '.json'
-		WHERE p.org_type='public' AND p.cik IS NOT NULL ORDER BY p.name`); err == nil {
+		WHERE p.org_type='public-company' AND p.cik IS NOT NULL AND t.data ? 'sec' ORDER BY p.name`); err == nil {
 		for rows.Next() {
 			var x pub
 			var filings string
@@ -397,7 +397,7 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 	}
 	var patCos []patCo
 	if rows, err := db.Query(`SELECT uid, name, patents_count, COALESCE(patents_source,''),
-			org_type='public' AS is_public
+			org_type='public-company' AS is_public
 		FROM twoai_company_profiles WHERE patents_count IS NOT NULL AND patents_count > 0
 		ORDER BY patents_count DESC`); err == nil {
 		for rows.Next() {
