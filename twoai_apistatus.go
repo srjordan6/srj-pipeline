@@ -235,6 +235,9 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 		rows.Close()
 		client := &http.Client{Timeout: 15 * time.Second}
 		for _, x := range all {
+			if !strings.HasPrefix(x.u, "http") {
+				continue // internal cross-links and organizing rows have no external URL to verify
+			}
 			req, _ := http.NewRequest("GET", x.u, nil)
 			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org link verification; contact: info@srjconsultingservices.com)")
 			resp, err := client.Do(req)
@@ -261,6 +264,7 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 	reverify("twoai_hardware", "source_url", "slug")
 	reverify("twoai_learning", "source_url", "slug")
 	reverify("twoai_media", "source_url", "slug")
+	reverify("twoai_security", "source_url", "slug")
 
 	// ---- API Directory: curated provider rows, every docs URL verified
 	// before insertion, cross-referenced to the status feeds above and to
