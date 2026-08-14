@@ -46,6 +46,25 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 		return 0, err
 	}
 
+	// ---- One-shot backfill of pre-archive orphans.
+	//
+	// This stage shipped 2026-08-11, but story permalinks had been going
+	// live (and dying the next morning) since the daily briefing launched.
+	// One of them was being advertised while returning 404. The full record
+	// of every published slug survives in srj-content's git history of
+	// news/news.json, so the backfill replays that history and inserts
+	// whatever the archive is missing, with each story's own day as its
+	// published date. DO NOTHING on conflict: a story the archive already
+	// holds keeps its original capture untouched. Guarded by a sentinel
+	// slug from the advertised orphan, so this walks the history exactly
+	// once and never again.
+	var sentinel int
+	db.QueryRow(`SELECT count(*) FROM twoai_news_stories
+		WHERE slug='a-box-of-letters-in-a-vancouver-storage-unit-reveals-a-famil'`).Scan(&sentinel)
+	if sentinel == 0 {
+		twoaiNewsArchiveBackfill(db)
+	}
+
 	// Fetch what publish_news wrote earlier this run. A failure here is not
 	// fatal: the archive already holds everything published before today, and
 	// losing one day's capture is far better than failing the build.
@@ -137,4 +156,82 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 	}
 	fmt.Printf("twoai_build: news archive stories=%d ok=true\n", len(stories))
 	return len(stories), nil
+}
+
+// twoaiNewsArchiveBackfill replays the git history of srj-content's
+// news/news.json and inserts every story the archive does not already hold.
+// Failures are logged and skipped: a partial backfill is strictly better
+// than none, and the sentinel guard means an incomplete walk retries on the
+// next run because the sentinel slug (published 2026-08-10) will land only
+// when its day's version has been processed.
+func twoaiNewsArchiveBackfill(db *sql.DB) {
+	tok := os.Getenv("GITHUB_TOKEN")
+	hdr := map[string]string{}
+	if tok != "" {
+		hdr["Authorization"] = "Bearer " + tok
+	}
+	raw, err := twoaiJobsGet(
+		"https://api.github.com/repos/srjordan6/srj-content/commits?path=news/news.json&per_page=60", hdr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "twoai_build: news backfill commit list:", err)
+		return
+	}
+	var commits []struct {
+		SHA string `json:"sha"`
+	}
+	if err := json.Unmarshal(raw, &commits); err != nil {
+		fmt.Fprintln(os.Stderr, "twoai_build: news backfill parse commits:", err)
+		return
+	}
+	inserted, seen := 0, 0
+	// Oldest first, so a slug's published_on comes from the first edition
+	// that carried it and later editions leave it alone.
+	for i := len(commits) - 1; i >= 0; i-- {
+		body, err := twoaiJobsGet(
+			"https://raw.githubusercontent.com/srjordan6/srj-content/"+commits[i].SHA+"/news/news.json", hdr)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_build: news backfill version", commits[i].SHA[:10], err)
+			continue
+		}
+		time.Sleep(150 * time.Millisecond)
+		var doc struct {
+			Date    string           `json:"date"`
+			Stories []map[string]any `json:"stories"`
+		}
+		if json.Unmarshal(body, &doc) != nil || len(doc.Date) < 10 {
+			continue
+		}
+		day := doc.Date[:10]
+		if _, err := time.Parse("2006-01-02", day); err != nil {
+			continue
+		}
+		for _, s := range doc.Stories {
+			slug, _ := s["Slug"].(string)
+			headline, _ := s["Headline"].(string)
+			if slug == "" || headline == "" {
+				continue
+			}
+			if arts, ok := s["Articles"].([]any); ok && len(arts) > twoaiNewsArchiveMaxArticles {
+				s["Articles"] = arts[:twoaiNewsArchiveMaxArticles]
+			}
+			j, err := json.Marshal(s)
+			if err != nil {
+				continue
+			}
+			seen++
+			res, err := db.Exec(`INSERT INTO twoai_news_stories
+				(slug, headline, story, published_on, first_published)
+				VALUES ($1,$2,$3::jsonb,$4::date,($4||'T12:00:00Z')::timestamptz)
+				ON CONFLICT (slug) DO NOTHING`, slug, headline, string(j), day)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "twoai_build: news backfill insert:", err)
+				continue
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				inserted++
+			}
+		}
+	}
+	fmt.Printf("twoai_build: news backfill versions=%d stories_seen=%d inserted=%d\n",
+		len(commits), seen, inserted)
 }
