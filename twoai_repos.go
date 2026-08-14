@@ -10,7 +10,7 @@ package main
 // the page come from the GitHub REST API on every run.
 //
 // Unauthenticated GitHub allows 60 requests/hour per IP; one run costs one
-// request per repo (~30 total). GITHUB_API_TOKEN, if ever set in the cron
+// request per repo (57 total). GITHUB_API_TOKEN or GITHUB_TOKEN in the cron
 // env, raises the ceiling to 5,000. A failed fetch keeps the previous rows.
 
 import (
@@ -85,7 +85,15 @@ func twoaiRepos(db *sql.DB, today string) (int, error) {
 		req, _ := http.NewRequest("GET", "https://api.github.com/repos/"+repo, nil)
 		req.Header.Set("User-Agent", "theworldofai.org pipeline (contact: info@srjconsultingservices.com)")
 		req.Header.Set("Accept", "application/vnd.github+json")
-		if tok := os.Getenv("GITHUB_API_TOKEN"); tok != "" {
+		// GITHUB_API_TOKEN if present, else the cron's existing GITHUB_TOKEN
+		// (the contents-API PAT). Authentication alone lifts the API limit
+		// from 60/hr to 5,000/hr, which the 57-repo sweep needs; no extra
+		// permission is used or required.
+		tok := os.Getenv("GITHUB_API_TOKEN")
+		if tok == "" {
+			tok = os.Getenv("GITHUB_TOKEN")
+		}
+		if tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 		resp, err := client.Do(req)
