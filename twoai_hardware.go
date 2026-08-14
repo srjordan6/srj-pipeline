@@ -278,5 +278,88 @@ func twoaiHardware(db *sql.DB, today string) (int, error) {
 		}
 		count++
 	}
+
+	// ---- Media and Visual Repository: curated videos, podcasts, and
+	// openly licensed image/diagram sources, one verified URL each.
+	type mediaRow struct {
+		Slug     string `json:"slug"`
+		Name     string `json:"name"`
+		Creator  string `json:"creator"`
+		Kind     string `json:"kind"`
+		Note     string `json:"note"`
+		Extra    string `json:"extra"`
+		Source   string `json:"source_url"`
+		Verified string `json:"verified"`
+	}
+	for _, sec := range []struct{ slug, path string }{
+		{"video-library", "learn/media-video.json"},
+		{"podcasts", "learn/media-podcasts.json"},
+		{"image-library", "learn/media-images.json"},
+	} {
+		var items []mediaRow
+		rows, err := db.Query(`SELECT slug, name, creator, kind, note, extra, source_url, verified_on::text
+			FROM twoai_media WHERE section_slug=$1 ORDER BY slug`, sec.slug)
+		if err != nil {
+			return count, err
+		}
+		for rows.Next() {
+			var m mediaRow
+			if rows.Scan(&m.Slug, &m.Name, &m.Creator, &m.Kind, &m.Note, &m.Extra, &m.Source, &m.Verified) == nil {
+				items = append(items, m)
+			}
+		}
+		rows.Close()
+		if len(items) == 0 {
+			continue
+		}
+		name, blurb := taxMeta(sec.slug)
+		if err := write(sec.path, sec.slug, map[string]any{
+			"name": name, "blurb": blurb, "shape": "media",
+			"items": items, "total": len(items),
+		}); err != nil {
+			return count, err
+		}
+		count++
+	}
+
+	// ---- Industry use cases: per-industry sourced points plus honest
+	// thinness - a sector with no verifiable primary source beyond the
+	// Census adoption series says less rather than inventing case studies.
+	type indPoint struct {
+		Name   string `json:"name"`
+		Desc   string `json:"desc"`
+		Source string `json:"source"`
+	}
+	irows, err := db.Query(`SELECT slug, name, summary, points, verified_on::text FROM twoai_industries ORDER BY slug`)
+	if err != nil {
+		return count, err
+	}
+	type ind struct {
+		slug, name, summary, verified string
+		points                        []indPoint
+	}
+	var inds []ind
+	for irows.Next() {
+		var x ind
+		var pj string
+		if irows.Scan(&x.slug, &x.name, &x.summary, &pj, &x.verified) == nil {
+			json.Unmarshal([]byte(pj), &x.points)
+			inds = append(inds, x)
+		}
+	}
+	irows.Close()
+	for _, x := range inds {
+		name, blurb := taxMeta(x.slug)
+		if name == "" {
+			name = x.name
+		}
+		if err := write("industries/"+x.slug+".json", x.slug, map[string]any{
+			"name": name, "blurb": blurb, "shape": "industry",
+			"summary": x.summary, "points": x.points, "verified": x.verified,
+		}); err != nil {
+			return count, err
+		}
+		count++
+	}
 	return count, nil
 }
