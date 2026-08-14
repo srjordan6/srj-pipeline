@@ -1,6 +1,6 @@
 package main
 
-// ---- twoai_companyfacts: SEC EDGAR registrants and PatentsView portfolios --
+// ---- twoai_companyfacts: SEC EDGAR registrants and USPTO patent floors ----
 //
 // Fills twoai_company_profiles (public-company facts) and
 // twoai_company_patents (recent patents per company), then renders the
@@ -15,15 +15,17 @@ package main
 //     a human-verified note, never from fuzzy matching. A vendor with no
 //     exact match and no alias is treated as not SEC-registered.
 //
-//   PatentsView  https://search.patentsview.org/api/v1/patent/
-//     Free with an API key (PATENTSVIEW_API_KEY). Counts are phrase matches
-//     on assignees.assignee_organization, and assignee names fragment (IBM
-//     vs International Business Machines Corp), so every count is published
-//     as "patents naming X in the assignee", a floor rather than a census,
-//     with the exact query phrase stored in patents_source. Companies whose
-//     name is a common English word are skipped rather than overcounted.
+//   USPTO Open Data Portal  https://api.uspto.gov/api/v1/patent/applications/search
+//     Free with an API key (USPTO_ODP_API_KEY from data.uspto.gov).
+//     PatentsView, the original source here, decommissioned its API host
+//     when it migrated into ODP on 2026-03-20. Counts are granted patents
+//     since 2001 whose applicant name matches a fully normalised phrase;
+//     applicant names fragment the same company across variants, so every
+//     count is published as a floor with the exact phrase stored in
+//     patents_source. Companies whose name is a common English word are
+//     skipped rather than overcounted.
 //
-// The stage degrades per source: a failed EDGAR or PatentsView fetch leaves
+// The stage degrades per source: a failed EDGAR or USPTO fetch leaves
 // the previous rows rendering.
 
 import (
@@ -199,23 +201,23 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 					"name": "SEC EDGAR", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=" + cik10,
 					"note": "registrant " + s.Name + ", matched " + today,
 				}})
-				if _, err := db.Exec(`INSERT INTO twoai_company_profiles
-					(uid, name, org_type, for_profit, ticker, cik, sources, verified_on, updated_at)
-					VALUES ($1,$2,'public-company',true,$3,$4,$5::jsonb,$6::date, now())
-					ON CONFLICT (uid) DO UPDATE SET org_type='public-company', for_profit=true,
-						ticker=EXCLUDED.ticker, cik=EXCLUDED.cik, sources=EXCLUDED.sources,
-						verified_on=EXCLUDED.verified_on, updated_at=now()`,
-					v.UID, v.Name, ticker, cik10, string(src), today); err != nil {
-					return matched, err
-				}
-				// The submissions detail lives on the rendered doc, not in
-				// profile columns: exchange, SIC industry, registrant name,
-				// and the filing list attach to the company page below.
 				enrich, _ := json.Marshal(map[string]any{
 					"registrant": s.Name, "ticker": ticker, "exchange": exchange,
 					"cik": cik10, "industry": s.SIC, "filings": json.RawMessage(fj),
 					"verified": today,
 				})
+				if _, err := db.Exec(`INSERT INTO twoai_company_profiles
+					(uid, name, org_type, for_profit, ticker, cik, sources, edgar, verified_on, updated_at)
+					VALUES ($1,$2,'public-company',true,$3,$4,$5::jsonb,$6::jsonb,$7::date, now())
+					ON CONFLICT (uid) DO UPDATE SET org_type='public-company', for_profit=true,
+						ticker=EXCLUDED.ticker, cik=EXCLUDED.cik, sources=EXCLUDED.sources,
+						edgar=EXCLUDED.edgar, verified_on=EXCLUDED.verified_on, updated_at=now()`,
+					v.UID, v.Name, ticker, cik10, string(src), string(enrich), today); err != nil {
+					return matched, err
+				}
+				// Only ~60 of the 261 companies have full pages; the attach
+				// silently matches zero rows for the rest, which is why the
+				// section renders from profiles.edgar, not from the pages.
 				db.Exec(`UPDATE twoai_pages SET data=jsonb_set(data,'{sec}',$1::jsonb), updated_at=now()
 					WHERE path=$2`, string(enrich), "companies/"+v.UID+".json")
 				matched++
@@ -224,23 +226,33 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 		}
 	}
 
-	// ---- PatentsView: portfolio floor per company.
-	pvKey := os.Getenv("PATENTSVIEW_API_KEY")
-	pvDone := 0
-	if pvKey == "" {
-		fmt.Fprintf(os.Stderr, "twoai_companyfacts: PATENTSVIEW_API_KEY unset, skipping patents\n")
+	// ---- USPTO Open Data Portal: granted-patent floor per company.
+	//
+	// PatentsView's API host was decommissioned when the project migrated to
+	// the USPTO Open Data Portal on 2026-03-20, so patent facts come from the
+	// ODP Patent File Wrapper search: granted patents since 2001 whose
+	// applicant name matches the company. Different scope than the old
+	// assignee match (post-2001 applications, applicant not assignee), and
+	// the page copy says so. Requires USPTO_ODP_API_KEY from data.uspto.gov.
+	odpKey := os.Getenv("USPTO_ODP_API_KEY")
+	odpDone := 0
+	if odpKey == "" {
+		fmt.Fprintf(os.Stderr, "twoai_companyfacts: USPTO_ODP_API_KEY unset, skipping patents\n")
 	} else {
 		client := &http.Client{Timeout: 60 * time.Second}
-		pvQuery := func(phrase string) (int, []map[string]any, error) {
+		odpQuery := func(phrase string) (int, []map[string]any, error) {
+			esc := strings.ReplaceAll(phrase, `"`, ``)
 			body, _ := json.Marshal(map[string]any{
-				"q": map[string]any{"_text_phrase": map[string]string{"assignees.assignee_organization": phrase}},
-				"f": []string{"patent_id", "patent_title", "patent_date"},
-				"s": []map[string]string{{"patent_date": "desc"}},
-				"o": map[string]int{"size": 5},
+				"q":      `applicationMetaData.firstApplicantName:"` + esc + `" AND applicationMetaData.grantDate:[* TO *]`,
+				"sort":   "applicationMetaData.grantDate desc",
+				"limit":  5,
+				"offset": 0,
+				"fields": []string{"applicationMetaData.patentNumber",
+					"applicationMetaData.inventionTitle", "applicationMetaData.grantDate"},
 			})
-			req, _ := http.NewRequest("POST", "https://search.patentsview.org/api/v1/patent/", bytes.NewReader(body))
+			req, _ := http.NewRequest("POST", "https://api.uspto.gov/api/v1/patent/applications/search", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Api-Key", pvKey)
+			req.Header.Set("X-API-KEY", odpKey)
 			req.Header.Set("User-Agent", "theworldofai.org pipeline (contact: info@srjconsultingservices.com)")
 			resp, err := client.Do(req)
 			if err != nil {
@@ -254,51 +266,68 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 				return 0, nil, fmt.Errorf("status %d", resp.StatusCode)
 			}
 			var out struct {
-				Error     bool             `json:"error"`
-				TotalHits int              `json:"total_hits"`
-				Patents   []map[string]any `json:"patents"`
+				Count     int `json:"count"`
+				TotalHits int `json:"totalNumFound"`
+				Bag       []struct {
+					Meta struct {
+						PatentNumber   string `json:"patentNumber"`
+						InventionTitle string `json:"inventionTitle"`
+						GrantDate      string `json:"grantDate"`
+					} `json:"applicationMetaData"`
+				} `json:"patentFileWrapperDataBag"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 				return 0, nil, err
 			}
-			if out.Error {
-				return 0, nil, fmt.Errorf("api error=true")
+			total := out.TotalHits
+			if total == 0 && out.Count > 0 {
+				total = out.Count
 			}
-			return out.TotalHits, out.Patents, nil
+			var pats []map[string]any
+			for _, b := range out.Bag {
+				pats = append(pats, map[string]any{
+					"patent_id": b.Meta.PatentNumber, "patent_title": b.Meta.InventionTitle,
+					"patent_date": b.Meta.GrantDate,
+				})
+			}
+			return total, pats, nil
 		}
+		hardFails := 0
 		for _, v := range vendors {
-			phrase := v.Name
-			// Prefer the SEC registrant name where one exists: "Meta
-			// Platforms" counts cleanly where "Meta" would count noise.
+			// The phrase is the fully normalised registrant name where one
+			// exists ("meta platforms", never "meta platforms, ."), else the
+			// normalised vendor name.
+			phrase := cfNorm(v.Name)
 			var registrant sql.NullString
-			db.QueryRow(`SELECT data->'sec'->>'registrant' FROM twoai_pages
-				WHERE path=$1`, "companies/"+v.UID+".json").Scan(&registrant)
+			db.QueryRow(`SELECT edgar->>'registrant' FROM twoai_company_profiles
+				WHERE uid=$1`, v.UID).Scan(&registrant)
 			if registrant.Valid && registrant.String != "" {
-				phrase = cfSpaces.ReplaceAllString(strings.TrimSpace(
-					cfSuffix.ReplaceAllString(strings.ToLower(registrant.String), "")), " ")
-				phrase = strings.TrimSpace(phrase)
+				phrase = cfNorm(registrant.String)
 			}
-			if cfGenericNames[strings.ToLower(v.Name)] && phrase == v.Name {
+			if cfGenericNames[strings.ToLower(v.Name)] && !registrant.Valid {
 				continue
 			}
 			if len(phrase) < 4 {
 				continue
 			}
-			hits, pats, err := pvQuery(phrase)
-			time.Sleep(1400 * time.Millisecond) // 45 req/min limit
+			hits, pats, err := odpQuery(phrase)
+			time.Sleep(1000 * time.Millisecond)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "twoai_companyfacts: patentsview %q: %v\n", phrase, err)
-				if strings.Contains(err.Error(), "rate limited") {
+				hardFails++
+				fmt.Fprintf(os.Stderr, "twoai_companyfacts: uspto odp %q: %v\n", phrase, err)
+				if strings.Contains(err.Error(), "rate limited") || hardFails >= 5 {
+					fmt.Fprintf(os.Stderr, "twoai_companyfacts: aborting patent sweep after %d failures, prior rows keep rendering\n", hardFails)
 					break
 				}
 				continue
 			}
+			hardFails = 0
 			if _, err := db.Exec(`INSERT INTO twoai_company_profiles (uid, name, patents_count, patents_source, updated_at)
 				VALUES ($1,$2,$3,$4,now())
 				ON CONFLICT (uid) DO UPDATE SET patents_count=EXCLUDED.patents_count,
 					patents_source=EXCLUDED.patents_source, updated_at=now()`,
 				v.UID, v.Name, hits,
-				fmt.Sprintf("PatentsView assignee phrase %q, %s", phrase, today)); err != nil {
+				fmt.Sprintf("USPTO Open Data Portal, granted patents since 2001, applicant phrase %q, %s", phrase, today)); err != nil {
 				return matched, err
 			}
 			db.Exec(`DELETE FROM twoai_company_patents WHERE uid=$1`, v.UID)
@@ -312,9 +341,9 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 				db.Exec(`INSERT INTO twoai_company_patents (uid, patent_id, title, granted)
 					VALUES ($1,$2,$3,NULLIF($4,'')::date) ON CONFLICT DO NOTHING`, v.UID, pid, title, date)
 			}
-			pvDone++
+			odpDone++
 		}
-		fmt.Printf("twoai_companyfacts: patentsview queried=%d\n", pvDone)
+		fmt.Printf("twoai_companyfacts: uspto odp queried=%d\n", odpDone)
 	}
 
 	// ---- Render the two sections from what SQL now holds.
@@ -337,11 +366,11 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 	}
 	var pubs []pub
 	if rows, err := db.Query(`SELECT p.uid, p.name, COALESCE(p.ticker,''), COALESCE(p.cik,''),
-			COALESCE(t.data->'sec'->>'industry',''), COALESCE(t.data->'sec'->>'exchange',''),
-			COALESCE(t.data->'sec'->>'registrant',''), COALESCE(t.data->'sec'->'filings','[]')
+			COALESCE(p.edgar->>'industry',''), COALESCE(p.edgar->>'exchange',''),
+			COALESCE(p.edgar->>'registrant',''), COALESCE(p.edgar->'filings','[]')
 		FROM twoai_company_profiles p
-		LEFT JOIN twoai_pages t ON t.path = 'companies/' || p.uid || '.json'
-		WHERE p.org_type='public-company' AND p.cik IS NOT NULL AND t.data ? 'sec' ORDER BY p.name`); err == nil {
+		WHERE p.org_type='public-company' AND p.cik IS NOT NULL AND p.edgar IS NOT NULL
+			AND p.verified_on >= current_date - 7 ORDER BY p.name`); err == nil {
 		for rows.Next() {
 			var x pub
 			var filings string
