@@ -39,6 +39,30 @@ var twoaiRepoSections = map[string][]string{
 		"pytorch/pytorch", "tensorflow/tensorflow", "keras-team/keras",
 		"jax-ml/jax", "vercel/ai",
 	},
+	"autonomous-agents": {
+		"Significant-Gravitas/AutoGPT", "OpenHands/OpenHands",
+		"AntonOsika/gpt-engineer", "langroid/langroid",
+	},
+	"multi-agent-systems": {
+		"microsoft/autogen", "crewAIInc/crewAI", "camel-ai/camel",
+		"openai/swarm", "a2aproject/A2A",
+	},
+	"agent-memory-and-planning": {
+		"mem0ai/mem0", "letta-ai/letta", "getzep/zep",
+	},
+	"coding-and-browser-agents": {
+		"Aider-AI/aider", "cline/cline", "continuedev/continue",
+		"browser-use/browser-use", "browserbase/stagehand",
+	},
+	"voice-and-service-agents": {
+		"livekit/agents", "pipecat-ai/pipecat", "TEN-framework/ten-framework",
+	},
+	"mcp-sdks-registries": {
+		"modelcontextprotocol/typescript-sdk", "modelcontextprotocol/python-sdk",
+		"modelcontextprotocol/go-sdk", "modelcontextprotocol/java-sdk",
+		"modelcontextprotocol/csharp-sdk", "modelcontextprotocol/registry",
+		"modelcontextprotocol/inspector", "modelcontextprotocol/servers",
+	},
 }
 
 func twoaiReposEnsure(db *sql.DB) error {
@@ -185,5 +209,81 @@ func twoaiRepos(db *sql.DB, today string) (int, error) {
 		}
 		count++
 	}
+	// ---- MCP Clients: curated applications that speak the protocol, each
+	// row verified against its own site; the protocol's official client
+	// list is the canonical registry and is linked as such.
+	type clientRow struct {
+		Name       string `json:"name"`
+		Publisher  string `json:"publisher"`
+		URL        string `json:"url"`
+		OpenSource bool   `json:"open_source"`
+		Repo       string `json:"repo,omitempty"`
+		Note       string `json:"note"`
+		Verified   string `json:"verified"`
+	}
+	var clients []clientRow
+	if rows, err := db.Query(`SELECT name, publisher, url, open_source, COALESCE(repo,''), note, verified_on::text
+		FROM twoai_mcp_clients ORDER BY name`); err == nil {
+		for rows.Next() {
+			var c clientRow
+			if rows.Scan(&c.Name, &c.Publisher, &c.URL, &c.OpenSource, &c.Repo, &c.Note, &c.Verified) == nil {
+				clients = append(clients, c)
+			}
+		}
+		rows.Close()
+	}
+	if len(clients) > 0 {
+		var cn, cb string
+		db.QueryRow(`SELECT name, COALESCE(blurb,'') FROM twoai_taxonomy WHERE slug='mcp-clients'`).Scan(&cn, &cb)
+		oss := 0
+		for _, c := range clients {
+			if c.OpenSource {
+				oss++
+			}
+		}
+		cj, _ := json.Marshal(map[string]any{
+			"uid": twoaiUID("section:mcp-clients"), "tax": "mcp-clients",
+			"name": cn, "blurb": cb, "clients": clients, "total": len(clients),
+			"open_source": oss, "generated": today,
+		})
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ('repos/mcp-clients.json','tech-section',$1::jsonb,'mcp-clients',1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`, string(cj)); err != nil {
+			return count, err
+		}
+		count++
+	}
+
+	// ---- MCP Security and Authentication: the protocol's security model
+	// documented from the specification itself, sources linked per point.
+	var sn, sb string
+	db.QueryRow(`SELECT name, COALESCE(blurb,'') FROM twoai_taxonomy WHERE slug='mcp-security'`).Scan(&sn, &sb)
+	specAuth := "https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization"
+	specSec := "https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices"
+	sj, _ := json.Marshal(map[string]any{
+		"uid": twoaiUID("section:mcp-security"), "tax": "mcp-security",
+		"name": sn, "blurb": sb, "generated": today, "kind": "standard",
+		"points": []map[string]string{
+			{"name": "Authorization is OAuth 2.1", "source": specAuth,
+				"desc": "Remote MCP servers authenticate clients with OAuth 2.1: authorization-server discovery, dynamic client registration, and PKCE. Local stdio servers inherit the trust of the process that launched them instead."},
+			{"name": "The trust boundary sits at the server", "source": specSec,
+				"desc": "Every connected server can read what the client sends it and shape what the model sees in return. Connecting a server is granting it a capability, and the specification requires explicit user consent for tools and resources."},
+			{"name": "Tool descriptions are attack surface", "source": specSec,
+				"desc": "A malicious server can carry instructions in tool names, descriptions, or results that try to steer the model - prompt injection by tool metadata. Clients are expected to show users what a tool will do before it runs."},
+			{"name": "Confused-deputy and token-passthrough failures", "source": specSec,
+				"desc": "The specification forbids passing a client's token through to upstream APIs and warns against proxy patterns where a server exercises a user's authority beyond what was consented."},
+			{"name": "Credentials live with the user, not the model", "source": specAuth,
+				"desc": "Secrets flow through the authorization layer, never through model-visible text; a server that asks the model for a password is misdesigned by specification."},
+		},
+	})
+	if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+		VALUES ('repos/mcp-security.json','tech-section',$1::jsonb,'mcp-security',1)
+		ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+			taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`, string(sj)); err != nil {
+		return count, err
+	}
+	count++
+
 	return count, nil
 }
