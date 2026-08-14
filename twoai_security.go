@@ -30,7 +30,7 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 	var deepfakeBills, mcpServers, complianceDocs, lawsuitPages int
 	db.QueryRow(`SELECT count(*) FROM pipeline.documents WHERE source='legiscan'
 		AND (title ILIKE '%deepfake%' OR title ILIKE '%deep fake%' OR title ILIKE '%synthetic media%')`).Scan(&deepfakeBills)
-	db.QueryRow(`SELECT COALESCE(max(url_count),0) FROM twoai_pages WHERE path='mcp/index.json'`).Scan(&mcpServers)
+	db.QueryRow(`SELECT count(*) FROM twoai_pages WHERE kind='mcp-server'`).Scan(&mcpServers)
 	db.QueryRow(`SELECT count(*) FROM twoai_pages WHERE path LIKE 'compliance/%'`).Scan(&complianceDocs)
 	db.QueryRow(`SELECT COALESCE(sum(url_count),0) FROM twoai_pages WHERE kind='lawsuits'`).Scan(&lawsuitPages)
 
