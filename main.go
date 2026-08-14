@@ -3036,6 +3036,12 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_build: observatory sections=%d\n", obsPages)
 
+	graphPages, err := twoaiGraph(db, today)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("twoai_build: graph sections=%d\n", graphPages)
+
 	// Staleness tripwire for benchmark results. The result snapshots in
 	// twoai_benchmarks.results are hand-curated from named evaluators, not
 	// scraped: the source leaderboards are JS-rendered and re-baseline
