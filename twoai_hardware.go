@@ -220,5 +220,63 @@ func twoaiHardware(db *sql.DB, today string) (int, error) {
 		return count, err
 	}
 	count++
+
+	// ---- Education: books, courses, certifications from the curated
+	// twoai_learning table (all source URLs verified; re-verified daily).
+	type learnRow struct {
+		Slug     string `json:"slug"`
+		Name     string `json:"name"`
+		Provider string `json:"provider"`
+		Level    string `json:"level"`
+		Audience string `json:"audience"`
+		Cost     string `json:"cost"`
+		Note     string `json:"note"`
+		CodeURL  string `json:"code_url,omitempty"`
+		Renewal  string `json:"renewal,omitempty"`
+		Source   string `json:"source_url"`
+		Verified string `json:"verified"`
+	}
+	for _, sec := range []struct{ slug, path string }{
+		{"books", "learn/books.json"},
+		{"courses", "learn/courses.json"},
+		{"certifications", "learn/certifications.json"},
+	} {
+		var items []learnRow
+		rows, err := db.Query(`SELECT slug, name, provider, level, audience, cost, note,
+			COALESCE(code_url,''), COALESCE(renewal,''), source_url, verified_on::text
+			FROM twoai_learning WHERE section_slug=$1 ORDER BY slug`, sec.slug)
+		if err != nil {
+			return count, err
+		}
+		for rows.Next() {
+			var l learnRow
+			if rows.Scan(&l.Slug, &l.Name, &l.Provider, &l.Level, &l.Audience, &l.Cost,
+				&l.Note, &l.CodeURL, &l.Renewal, &l.Source, &l.Verified) == nil {
+				items = append(items, l)
+			}
+		}
+		rows.Close()
+		if len(items) == 0 {
+			continue
+		}
+		free := 0
+		withCode := 0
+		for _, l := range items {
+			if strings.HasPrefix(strings.ToLower(l.Cost), "free") {
+				free++
+			}
+			if l.CodeURL != "" {
+				withCode++
+			}
+		}
+		name, blurb := taxMeta(sec.slug)
+		if err := write(sec.path, sec.slug, map[string]any{
+			"name": name, "blurb": blurb, "shape": "learning",
+			"items": items, "total": len(items), "free": free, "with_code": withCode,
+		}); err != nil {
+			return count, err
+		}
+		count++
+	}
 	return count, nil
 }
