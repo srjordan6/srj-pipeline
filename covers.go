@@ -39,6 +39,11 @@ var coverSources = []struct {
 		sha256:   "6b25e9553eccdc69aadf167c6ee2826a7e0b62c8d970f63f11b100c93bf14a16",
 	},
 	{
+		repoPath: "briefings/AI_IT_Security_Implementation_Strategy_Executive_Briefing.pdf",
+		url:      "https://x0.at/1H35.pdf",
+		sha256:   "fb18956b874943e9ece9ecb3fa5d1e57adf661099b3bcfceb2b4dc72b7f9d4d9",
+	},
+	{
 		repoPath: "images/insights/ai-governance-update-aug-2026.png",
 		url:      "https://x0.at/uNzz.png",
 		sha256:   "8e3021564978593ff2d350df86c833f5caee22c1f6c69bc6447feefdbea7065b",
