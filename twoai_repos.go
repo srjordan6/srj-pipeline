@@ -293,5 +293,58 @@ func twoaiRepos(db *sql.DB, today string) (int, error) {
 	}
 	count++
 
+	// ---- Agent2Agent (A2A) Protocol: the horizontal complement to MCP,
+	// rendered from the curated twoai_a2a table (every row sourced to the
+	// v1.0 specification, the Linux Foundation, or Google, verified before
+	// insert and re-verified daily). Live star count comes from the repos
+	// sweep so the page never restates a number the site already tracks.
+	{
+		type a2aItem struct {
+			Slug   string `json:"slug"`
+			Group  string `json:"group"`
+			Name   string `json:"name"`
+			Body   string `json:"body"`
+			Source string `json:"source_name"`
+			URL    string `json:"source_url"`
+		}
+		var items []a2aItem
+		arows, err := db.Query(`SELECT slug, grp, name, body, source_name, source_url
+			FROM twoai_a2a ORDER BY CASE grp WHEN 'governance' THEN 1 WHEN 'mechanics' THEN 2 ELSE 3 END, sort`)
+		if err != nil {
+			return count, err
+		}
+		for arows.Next() {
+			var it a2aItem
+			if arows.Scan(&it.Slug, &it.Group, &it.Name, &it.Body, &it.Source, &it.URL) == nil {
+				items = append(items, it)
+			}
+		}
+		arows.Close()
+		if len(items) > 0 {
+			var an, ab string
+			db.QueryRow(`SELECT name, COALESCE(blurb,'') FROM twoai_taxonomy WHERE slug='a2a-protocol'`).Scan(&an, &ab)
+			var stars int
+			var pushed string
+			// Verified against production before commit: twoai_repo_catalog,
+			// stars and pushed_at inside the data jsonb (25,356 / 2026-08-15).
+			db.QueryRow(`SELECT COALESCE((data->>'stars')::int,0), COALESCE(data->>'pushed_at','')
+				FROM twoai_repo_catalog WHERE repo='a2aproject/A2A'`).Scan(&stars, &pushed)
+			var mcpN int
+			db.QueryRow(`SELECT count(*) FROM twoai_pages WHERE kind='mcp-server'`).Scan(&mcpN)
+			aj, _ := json.Marshal(map[string]any{
+				"uid": twoaiUID("section:a2a-protocol"), "tax": "a2a-protocol", "shape": "a2a",
+				"name": an, "blurb": ab, "generated": today, "items": items,
+				"repo_stars": stars, "repo_pushed": pushed, "mcp_servers": mcpN,
+			})
+			if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+				VALUES ('repos/a2a-protocol.json','tech-section',$1::jsonb,'a2a-protocol',1)
+				ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+					taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`, string(aj)); err != nil {
+				return count, err
+			}
+			count++
+		}
+	}
+
 	return count, nil
 }

@@ -265,6 +265,7 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 	reverify("twoai_learning", "source_url", "slug")
 	reverify("twoai_media", "source_url", "slug")
 	reverify("twoai_security", "source_url", "slug")
+	reverify("twoai_a2a", "source_url", "slug")
 
 	// ---- API Directory: curated provider rows, every docs URL verified
 	// before insertion, cross-referenced to the status feeds above and to
