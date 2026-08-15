@@ -6183,6 +6183,29 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 			}
 		}
 	}
+	// AI Security and Risk presents its SIX SECURITY DOMAINS at this level,
+	// not sixteen topics flat - the topics live grouped under the domains on
+	// the hub the domain path points to. Sixteen entries told a category-page
+	// reader nothing about how the coverage is organized.
+	if d := doms["ai-security-risk"]; d != nil && d.Path != "" {
+		topicPages := d.Pages
+		grows, gerr := db.Query(`SELECT slug, label, blurb FROM twoai_security_domain_defs ORDER BY sort`)
+		if gerr == nil {
+			var six []domain
+			for grows.Next() {
+				var slug, label, blurb string
+				if grows.Scan(&slug, &label, &blurb) == nil {
+					six = append(six, domain{Slug: "secdom-" + slug, Name: label, Blurb: blurb,
+						Status: "live", Path: d.Path + "#" + slug})
+				}
+			}
+			grows.Close()
+			if len(six) == 6 {
+				d.Sections = six
+				d.Pages = topicPages
+			}
+		}
+	}
 	for _, c := range cats {
 		for _, d := range c.Domains {
 			c.Pages += d.Pages
