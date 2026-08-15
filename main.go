@@ -3008,6 +3008,12 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_build: company fact sections=%d\n", factPages)
 
+	chPages, err := twoaiCompanyHarvest(db, today)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("twoai_build: company profiles patched=%d\n", chPages)
+
 	orgPages, err := twoaiOrgFacts(db, today)
 	if err != nil {
 		return err
@@ -3885,7 +3891,11 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 
 	for _, v := range order {
 		c := by[v]
-		c.Pages = len(c.Products) > 1 || len(c.Cases) > 0 || len(c.MCP) > 0
+		// Every tracked company gets a page. The directory was linking entries
+		// whose pages did not exist - a reader clicked a company and landed on
+		// nothing. Thin companies say less on their page; they no longer say
+		// nothing at a dead URL.
+		c.Pages = true
 		if c.Pages {
 			payload := map[string]any{"company": c, "generated": today}
 			if p, ok := profiles[c.UID]; ok && len(p) > 0 {
