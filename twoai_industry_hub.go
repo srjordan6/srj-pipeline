@@ -216,6 +216,164 @@ func readXLSX(data []byte) (map[string]*xlsxSheet, error) {
 	return out, nil
 }
 
+// ---- source harvest ---------------------------------------------------------
+//
+// The accumulation step Stephen asked for: fetch every source URL the sector
+// points cite, extract what the page actually says about AI (paragraphs
+// containing AI-related terms, falling back to the lead text), and store a
+// bounded excerpt keyed by content hash. The per-sector analysis then reads
+// the harvested source text, not just our one-line notes about it, and
+// regenerates when a source page's AI content materially changes.
+
+var ihTagRe = regexp.MustCompile(`(?s)<script.*?</script>|<style.*?</style>|<[^>]+>`)
+var ihWsRe = regexp.MustCompile(`[ \t\r\f]+`)
+var aiTermRe = regexp.MustCompile(`(?i)\b(AI|artificial intelligence|machine learning|automation|autonomous|algorithm|generative|LLM|model)\b`)
+
+var ihBlockRe = regexp.MustCompile(`(?i)</(p|div|li|h1|h2|h3|h4|td|tr|section|article)>|<br\s*/?>`)
+var ihMetaRe = regexp.MustCompile(`(?is)<meta[^>]+(?:name="description"|property="og:description")[^>]+content="([^"]{40,})"|<meta[^>]+content="([^"]{40,})"[^>]+(?:name="description"|property="og:description")`)
+var ihTitleRe = regexp.MustCompile(`(?is)<title[^>]*>([^<]{5,200})</title>`)
+
+func twoaiHarvestExtract(raw []byte) string {
+	// block-level closers become newlines first, so single-line HTML still
+	// yields paragraph structure for the filter below
+	pre := ihBlockRe.ReplaceAllString(string(raw), "\n")
+	txt := ihTagRe.ReplaceAllString(pre, " ")
+	txt = strings.ReplaceAll(txt, "&amp;", "&")
+	txt = strings.ReplaceAll(txt, "&nbsp;", " ")
+	txt = strings.ReplaceAll(txt, "&#39;", "'")
+	txt = strings.ReplaceAll(txt, "&quot;", "\"")
+	txt = ihWsRe.ReplaceAllString(txt, " ")
+	var paras []string
+	for _, ln := range strings.Split(txt, "\n") {
+		ln = strings.TrimSpace(ln)
+		if len(ln) < 120 {
+			continue
+		}
+		paras = append(paras, ln)
+	}
+	// prefer AI-relevant paragraphs; fall back to the lead of the page
+	var keep []string
+	seen := map[string]bool{}
+	total := 0
+	for _, pgh := range paras {
+		if !aiTermRe.MatchString(pgh) {
+			continue
+		}
+		key := pgh[:60]
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if len(pgh) > 900 {
+			pgh = pgh[:900]
+		}
+		keep = append(keep, pgh)
+		total += len(pgh)
+		if total > 4500 {
+			break
+		}
+	}
+	if len(keep) == 0 {
+		for _, pgh := range paras {
+			if len(pgh) > 900 {
+				pgh = pgh[:900]
+			}
+			keep = append(keep, pgh)
+			total += len(pgh)
+			if total > 2000 {
+				break
+			}
+		}
+	}
+	// JS-rendered pages carry their substance in title and meta description;
+	// harvest those so a single-page app still yields what the page says.
+	var meta []string
+	if m := ihTitleRe.FindSubmatch(raw); m != nil {
+		meta = append(meta, strings.TrimSpace(string(m[1])))
+	}
+	for _, m := range ihMetaRe.FindAllSubmatch(raw, 2) {
+		v := string(m[1])
+		if v == "" {
+			v = string(m[2])
+		}
+		if v != "" {
+			meta = append(meta, strings.TrimSpace(v))
+		}
+	}
+	if len(meta) > 0 {
+		keep = append([]string{strings.Join(meta, " — ")}, keep...)
+	}
+	out := strings.Join(keep, "\n")
+	if len(out) > 5200 {
+		out = out[:5200]
+	}
+	return out
+}
+
+func twoaiHarvestSources(db *sql.DB) error {
+	rows, err := db.Query(`SELECT i.slug, p->>'name', p->>'source'
+		FROM twoai_industries i, jsonb_array_elements(i.points) p
+		WHERE p->>'source' LIKE 'http%'`)
+	if err != nil {
+		return err
+	}
+	type job struct{ slug, name, url string }
+	var jobs []job
+	for rows.Next() {
+		var j job
+		if rows.Scan(&j.slug, &j.name, &j.url) == nil {
+			jobs = append(jobs, j)
+		}
+	}
+	rows.Close()
+	client := &http.Client{Timeout: 20 * time.Second}
+	fetched, skipped, failed := 0, 0, 0
+	for _, j := range jobs {
+		// once per day per URL: reruns and multi-sector shared URLs are free
+		var last string
+		db.QueryRow(`SELECT fetched_on::text FROM twoai_source_harvest WHERE url=$1`, j.url).Scan(&last)
+		if last == time.Now().UTC().Format("2006-01-02") {
+			skipped++
+			continue
+		}
+		req, _ := http.NewRequest("GET", j.url, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org source harvest; info@srjconsultingservices.com)")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml")
+		resp, ferr := client.Do(req)
+		status, extract := 0, ""
+		if ferr == nil {
+			status = resp.StatusCode
+			if status == 200 {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+				extract = twoaiHarvestExtract(body)
+			}
+			resp.Body.Close()
+		}
+		h := sha256.Sum256([]byte(extract))
+		if status == 200 && extract != "" {
+			fetched++
+			if _, err := db.Exec(`INSERT INTO twoai_source_harvest (url, sector_slug, source_name, http_status, extract, content_hash, fetched_on)
+				VALUES ($1,$2,$3,$4,$5,$6,current_date)
+				ON CONFLICT (url) DO UPDATE SET sector_slug=$2, source_name=$3, http_status=$4,
+					extract=$5, content_hash=$6, fetched_on=current_date`,
+				j.url, j.slug, j.name, status, extract, hex.EncodeToString(h[:8])); err != nil {
+				return err
+			}
+		} else {
+			failed++
+			// keep yesterday's extract; only bump status and date
+			db.Exec(`INSERT INTO twoai_source_harvest (url, sector_slug, source_name, http_status, fetched_on)
+				VALUES ($1,$2,$3,$4,current_date)
+				ON CONFLICT (url) DO UPDATE SET http_status=$4, fetched_on=current_date`,
+				j.url, j.slug, j.name, status)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	fmt.Printf("twoai_industry_hub: harvest fetched=%d unchanged_today=%d failed=%d of %d sources\n",
+		fetched, skipped, failed, len(jobs))
+	return nil
+}
+
 // ---- Anthropic messages call ----------------------------------------------
 
 func twoaiClaudeAnalyze(payload string) (model, body string, err error) {
@@ -286,15 +444,18 @@ func twoaiClaudeAnalyzeSector(sector, payload string) (model, body string, err e
 	}
 	system := "You write sector analysis for theworldofai.org, a sourced AI reference site. " +
 		"You are given JSON for one industry: its official Census adoption figure when the survey " +
-		"covers it, and this site's curated, source-verified points about the sector. Write what AI " +
-		"is actually used for in this industry and what the record shows, in plain English prose, " +
-		"3 to 4 short paragraphs, no headings, no bullets, no preamble. Cover, where the data " +
-		"supports it: adoption relative to expectations, where the money and vendors documented in " +
-		"the points concentrate, the risks and regulatory posture the points show, and what a " +
-		"reader deciding whether to deploy should take from it. HARD RULES: use ONLY facts in the " +
-		"JSON, name organizations only if they appear in the JSON, every percentage must appear " +
-		"verbatim in the JSON, and if the census figure is absent or suppressed say nothing about " +
-		"it rather than guessing. Plain sentences, no hype, commas over dashes."
+		"covers it, this site's curated points, and source_page_excerpts, the text this site's " +
+		"pipeline harvested from each cited source page. The excerpts are your primary material: " +
+		"synthesize what these sources collectively show about AI use in this industry, in plain " +
+		"English prose, 4 to 6 short paragraphs, no headings, no bullets, no preamble. Attribute " +
+		"specific findings to their source organization by name as it appears in the JSON (per the " +
+		"Census Bureau, per NRF, and so on). Cover, where the material supports it: measured " +
+		"adoption, what AI is deployed for, where vendors and money concentrate, ROI evidence the " +
+		"sources report, risks and the regulatory posture, and what a reader deciding whether to " +
+		"deploy should take from it. HARD RULES: use ONLY facts in the JSON, name organizations " +
+		"only if they appear in the JSON, every percentage must appear verbatim in the JSON, and " +
+		"where the sources are silent, say less rather than filling in. Plain sentences, no hype, " +
+		"commas over dashes."
 	reqBody, _ := json.Marshal(map[string]any{
 		"model":      model,
 		"max_tokens": 1200,
@@ -354,6 +515,11 @@ func twoaiValidateAnalysis(payload, body string) error {
 // ---- the stage --------------------------------------------------------------
 
 func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
+	// 0. HARVEST the cited sources themselves --------------------------------
+	if err := twoaiHarvestSources(db); err != nil {
+		return 0, err
+	}
+
 	// 1. FETCH ---------------------------------------------------------------
 	type answerSeries struct {
 		Answer string            `json:"answer"`
@@ -573,8 +739,26 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 		for _, j := range jobs {
 			var pts []pt
 			json.Unmarshal([]byte(j.pointsJSON), &pts)
+			type srcText struct {
+				Source  string `json:"source_org"`
+				URL     string `json:"url"`
+				Excerpt string `json:"what_the_page_says"`
+			}
+			var harvested []srcText
+			hrows, herr := db.Query(`SELECT source_name, url, extract FROM twoai_source_harvest
+				WHERE sector_slug=$1 AND extract <> '' ORDER BY url`, j.slug)
+			if herr == nil {
+				for hrows.Next() {
+					var st srcText
+					if hrows.Scan(&st.Source, &st.URL, &st.Excerpt) == nil {
+						harvested = append(harvested, st)
+					}
+				}
+				hrows.Close()
+			}
 			payload := map[string]any{
 				"sector": j.name, "what_this_page_covers": j.blurb, "sourced_points": pts,
+				"source_page_excerpts": harvested,
 			}
 			var bt *naicsStat
 			if m, ok := btosNAICS[j.slug]; ok {
@@ -623,6 +807,8 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 			if bt != nil {
 				patchDoc["btos"] = bt
 			}
+			patchDoc["sources_read"] = len(harvested)
+			patchDoc["sources_total"] = len(pts)
 			if len(patchDoc) > 0 {
 				pd, _ := json.Marshal(patchDoc)
 				if res, err := db.Exec(`UPDATE twoai_pages SET data = data || $1::jsonb, updated_at=now()
@@ -636,9 +822,56 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 		fmt.Printf("twoai_industry_hub: sector analyses generated=%d pages_patched=%d\n", generated, patched)
 	}
 
+	// 2c. CROSS-INDUSTRY synthesis for the hub: the 21 sector analyses plus
+	// the national and sector Census figures, synthesized into findings.
+	{
+		type secAn struct {
+			Sector string `json:"sector"`
+			Body   string `json:"analysis"`
+		}
+		var all []secAn
+		arows, aerr2 := db.Query(`SELECT DISTINCT ON (a.metric) t.name, a.body
+			FROM twoai_industry_analysis a
+			JOIN twoai_taxonomy t ON t.slug = 'industry-' || replace(a.metric,'sector-','')
+			WHERE a.metric LIKE 'sector-%' ORDER BY a.metric, a.generated_on DESC`)
+		if aerr2 == nil {
+			for arows.Next() {
+				var sa secAn
+				if arows.Scan(&sa.Sector, &sa.Body) == nil {
+					all = append(all, sa)
+				}
+			}
+			arows.Close()
+		}
+		if len(all) > 0 {
+			xp := map[string]any{"national_btos": metrics, "sector_analyses": all}
+			xj, _ := json.Marshal(xp)
+			xh := sha256.Sum256(xj)
+			xHash := hex.EncodeToString(xh[:8])
+			var exists int
+			db.QueryRow(`SELECT count(*) FROM twoai_industry_analysis WHERE metric='cross-industry' AND data_hash=$1`, xHash).Scan(&exists)
+			if exists == 0 && os.Getenv("ANTHROPIC_API_KEY") != "" {
+				model, body, xerr := twoaiClaudeAnalyzeSector("All 21 industries, synthesized", string(xj))
+				if xerr != nil {
+					fmt.Printf("twoai_industry_hub: cross-industry synthesis skipped: %v\n", xerr)
+				} else if verr := twoaiValidateAnalysis(string(xj), body); verr != nil {
+					fmt.Printf("twoai_industry_hub: cross-industry synthesis REJECTED (%v)\n", verr)
+				} else {
+					db.Exec(`INSERT INTO twoai_industry_analysis (metric, data_hash, model, body, generated_on)
+						VALUES ('cross-industry',$1,$2,$3,current_date) ON CONFLICT (metric, data_hash) DO NOTHING`,
+						xHash, model, body)
+					fmt.Printf("twoai_industry_hub: cross-industry synthesis generated hash=%s\n", xHash)
+				}
+			}
+		}
+	}
+
 	var anModel, anBody, anDate string
 	db.QueryRow(`SELECT model, body, generated_on::text FROM twoai_industry_analysis
 		WHERE metric='btos-ai-use' ORDER BY generated_on DESC LIMIT 1`).Scan(&anModel, &anBody, &anDate)
+	var synModel, synBody, synDate string
+	db.QueryRow(`SELECT model, body, generated_on::text FROM twoai_industry_analysis
+		WHERE metric='cross-industry' ORDER BY generated_on DESC LIMIT 1`).Scan(&synModel, &synBody, &synDate)
 
 	// 3. RENDER ----------------------------------------------------------------
 	type finding struct {
@@ -699,6 +932,13 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 	if anBody != "" {
 		doc["analysis"] = map[string]any{"model": anModel, "body": anBody, "generated_on": anDate}
 	}
+	if synBody != "" {
+		doc["synthesis"] = map[string]any{"model": synModel, "body": synBody, "generated_on": synDate}
+	}
+	var hOK, hAll int
+	db.QueryRow(`SELECT count(*) FILTER (WHERE extract <> ''), count(*) FROM twoai_source_harvest`).Scan(&hOK, &hAll)
+	doc["sources_read"] = hOK
+	doc["sources_total"] = hAll
 	dj, _ := json.Marshal(doc)
 	if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
 		VALUES ('industries/index.json','industry-hub',$1::jsonb,'industry-use-cases',1)
