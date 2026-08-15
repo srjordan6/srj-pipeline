@@ -396,6 +396,10 @@ func twoaiHardware(db *sql.DB, today string) (int, error) {
 		if err := write("industries/"+x.slug+".json", x.slug, map[string]any{
 			"name": name, "blurb": blurb, "shape": "industry",
 			"summary": x.summary, "points": x.points, "verified": x.verified,
+			// total lets the ecosystem hub report the depth of the sector
+			// page instead of "1" - the one-page-many-items rule that jobs
+			// earned. Real estate is 17 sourced points, not one page.
+			"total": len(x.points),
 		}); err != nil {
 			return count, err
 		}
