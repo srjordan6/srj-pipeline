@@ -39,6 +39,14 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 	db.QueryRow(`SELECT count(*) FROM twoai_pages WHERE path LIKE 'compliance/%'`).Scan(&complianceDocs)
 	db.QueryRow(`SELECT COALESCE(sum(url_count),0) FROM twoai_pages WHERE kind='lawsuits'`).Scan(&lawsuitPages)
 
+	domainLabels := map[string]string{
+		"gov":  "Security Governance and Risk Management",
+		"ops":  "Security Operations",
+		"arch": "Architecture and Engineering",
+		"app":  "Application and Product Security",
+		"tprm": "Third-Party and Supply Chain Risk",
+		"data": "Data Protection and Privacy",
+	}
 	for _, slug := range twoaiSecuritySections {
 		type item struct {
 			Slug   string `json:"slug"`
@@ -64,11 +72,33 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 		if len(items) == 0 {
 			continue // a security section never ships empty
 		}
+		// The six-domain treatment: substantive curated prose per security
+		// domain, sourced from the SRJ security volumes and the standards
+		// spine, so a topic renders under every domain it genuinely touches.
+		type domainBlock struct {
+			Slug  string `json:"slug"`
+			Label string `json:"label"`
+			Body  string `json:"body"`
+		}
+		var domains []domainBlock
+		drows, err := db.Query(`SELECT domain_slug, body FROM twoai_security_domains
+			WHERE section_slug=$1 ORDER BY sort`, slug)
+		if err != nil {
+			return count, err
+		}
+		for drows.Next() {
+			var d domainBlock
+			if drows.Scan(&d.Slug, &d.Body) == nil {
+				d.Label = domainLabels[d.Slug]
+				domains = append(domains, d)
+			}
+		}
+		drows.Close()
 		var name, blurb string
 		db.QueryRow(`SELECT name, COALESCE(blurb,'') FROM twoai_taxonomy WHERE slug=$1`, slug).Scan(&name, &blurb)
 		doc := map[string]any{
 			"uid": twoaiUID("section:" + slug), "tax": slug, "generated": today,
-			"name": name, "blurb": blurb, "items": items,
+			"name": name, "blurb": blurb, "items": items, "domains": domains,
 			"stats": map[string]int{
 				"deepfake_bills": deepfakeBills, "mcp_servers": mcpServers,
 				"compliance_docs": complianceDocs, "lawsuit_pages": lawsuitPages,
