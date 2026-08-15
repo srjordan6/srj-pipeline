@@ -25,6 +25,8 @@ var twoaiHardwareSections = []string{
 	"datacenters", "networking-fabric", "power-and-cooling",
 }
 
+const twoaiAmazonTag = "theworldofa0b-20"
+
 func twoaiHardware(db *sql.DB, today string) (int, error) {
 	count := 0
 
@@ -300,6 +302,18 @@ func twoaiHardware(db *sql.DB, today string) (int, error) {
 					var num int
 					var title, pillar, status, published, amazon string
 					if brows.Scan(&num, &title, &pillar, &status, &published, &amazon) == nil {
+						// Amazon Associates tag for theworldofai.org. Appended only
+						// to real Amazon product URLs; forthcoming titles carry no
+						// amazon_url and stay untagged. The disclosure renders beside
+						// the links, which the operating agreement requires - a policy
+						// page on its own does not satisfy it.
+						if amazon != "" && strings.Contains(amazon, "amazon.com/") && !strings.Contains(amazon, "tag=") {
+							if strings.Contains(amazon, "?") {
+								amazon += "&tag=" + twoaiAmazonTag
+							} else {
+								amazon += "?tag=" + twoaiAmazonTag
+							}
+						}
 						srj = append(srj, map[string]any{
 							"number": num, "title": title, "pillar": pillar,
 							"status": status, "published": published, "amazon": amazon,
