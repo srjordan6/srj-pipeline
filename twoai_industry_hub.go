@@ -393,44 +393,8 @@ func twoaiClaudeAnalyze(payload string) (model, body string, err error) {
 		"in the JSON. Describe direction and magnitude of change, what the gap between current and " +
 		"expected use implies, and what the do-not-know share suggests, strictly from the data given. " +
 		"Plain sentences, no hype, commas over dashes."
-	reqBody, _ := json.Marshal(map[string]any{
-		"model":      model,
-		"max_tokens": 1200,
-		"system":     system,
-		"messages": []map[string]string{
-			{"role": "user", "content": "The data:\n" + payload + "\n\nWrite the analysis now."},
-		},
-	})
-	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(reqBody))
-	req.Header.Set("content-type", "application/json")
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	client := &http.Client{Timeout: 90 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return model, "", err
-	}
-	defer resp.Body.Close()
-	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != 200 {
-		return model, "", fmt.Errorf("anthropic status %d: %.200s", resp.StatusCode, rb)
-	}
-	var out struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(rb, &out); err != nil {
-		return model, "", err
-	}
-	var sb strings.Builder
-	for _, c := range out.Content {
-		if c.Type == "text" {
-			sb.WriteString(c.Text)
-		}
-	}
-	return model, strings.TrimSpace(sb.String()), nil
+	body, err = twoaiClaudeCall(model, system, "The data:\n"+payload+"\n\nWrite the analysis now.")
+	return model, body, err
 }
 
 func twoaiClaudeAnalyzeSector(sector, payload string) (model, body string, err error) {
@@ -456,44 +420,63 @@ func twoaiClaudeAnalyzeSector(sector, payload string) (model, body string, err e
 		"only if they appear in the JSON, every percentage must appear verbatim in the JSON, and " +
 		"where the sources are silent, say less rather than filling in. Plain sentences, no hype, " +
 		"commas over dashes."
+	body, err = twoaiClaudeCall(model, system, "Sector: "+sector+"\nThe data:\n"+payload+"\n\nWrite the analysis now.")
+	return model, body, err
+}
+
+// twoaiClaudeCall posts a messages request with one retry on rate limits
+// and overloads: 429 and 529 wait out the backoff and try once more, so a
+// 22-call run does not lose its biggest payloads to a burst limit.
+func twoaiClaudeCall(model, system, user string) (string, error) {
+	key := os.Getenv("ANTHROPIC_API_KEY")
 	reqBody, _ := json.Marshal(map[string]any{
-		"model":      model,
-		"max_tokens": 1200,
-		"system":     system,
-		"messages": []map[string]string{
-			{"role": "user", "content": "Sector: " + sector + "\nThe data:\n" + payload + "\n\nWrite the analysis now."},
-		},
+		"model": model, "max_tokens": 1200, "system": system,
+		"messages": []map[string]string{{"role": "user", "content": user}},
 	})
-	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(reqBody))
-	req.Header.Set("content-type", "application/json")
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	client := &http.Client{Timeout: 90 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return model, "", err
-	}
-	defer resp.Body.Close()
-	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != 200 {
-		return model, "", fmt.Errorf("anthropic status %d: %.200s", resp.StatusCode, rb)
-	}
-	var out struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(rb, &out); err != nil {
-		return model, "", err
-	}
-	var sb strings.Builder
-	for _, c := range out.Content {
-		if c.Type == "text" {
-			sb.WriteString(c.Text)
+	client := &http.Client{Timeout: 120 * time.Second}
+	for attempt := 0; attempt < 2; attempt++ {
+		req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(reqBody))
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("x-api-key", key)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt == 0 {
+				time.Sleep(25 * time.Second)
+				continue
+			}
+			return "", err
 		}
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode == 429 || resp.StatusCode == 529 {
+			if attempt == 0 {
+				time.Sleep(30 * time.Second)
+				continue
+			}
+			return "", fmt.Errorf("anthropic status %d after retry", resp.StatusCode)
+		}
+		if resp.StatusCode != 200 {
+			return "", fmt.Errorf("anthropic status %d: %.200s", resp.StatusCode, rb)
+		}
+		var out struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(rb, &out); err != nil {
+			return "", err
+		}
+		var sb strings.Builder
+		for _, c := range out.Content {
+			if c.Type == "text" {
+				sb.WriteString(c.Text)
+			}
+		}
+		return strings.TrimSpace(sb.String()), nil
 	}
-	return model, strings.TrimSpace(sb.String()), nil
+	return "", fmt.Errorf("unreachable")
 }
 
 // every percentage in the analysis must exist verbatim in the payload
@@ -793,7 +776,7 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 						VALUES ($1,$2,$3,$4,current_date) ON CONFLICT (metric, data_hash) DO NOTHING`,
 						metricKey, secHash, model, body)
 					generated++
-					time.Sleep(400 * time.Millisecond)
+					time.Sleep(1500 * time.Millisecond)
 				}
 			}
 			// patch the sector page written earlier this run
