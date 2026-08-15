@@ -28,8 +28,13 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 	count := 0
 	// Live context the domain can compute from tables the site already keeps.
 	var deepfakeBills, mcpServers, complianceDocs, lawsuitPages int
-	db.QueryRow(`SELECT count(*) FROM pipeline.documents WHERE source='legiscan'
-		AND (title ILIKE '%deepfake%' OR title ILIKE '%deep fake%' OR title ILIKE '%synthetic media%')`).Scan(&deepfakeBills)
+	// Counted from the state-law pages the site itself renders - the same
+	// verify-against-production rule the graph census learned at seq 308:
+	// pipeline.documents has no source column and the first guess scanned 0.
+	db.QueryRow(`SELECT count(*) FROM twoai_pages, jsonb_array_elements(data->'bills') b
+		WHERE kind='state-law' AND jsonb_typeof(data->'bills')='array'
+		AND (b->>'title' ILIKE '%deepfake%' OR b->>'title' ILIKE '%deep fake%'
+			OR b->>'title' ILIKE '%synthetic%')`).Scan(&deepfakeBills)
 	db.QueryRow(`SELECT count(*) FROM twoai_pages WHERE kind='mcp-server'`).Scan(&mcpServers)
 	db.QueryRow(`SELECT count(*) FROM twoai_pages WHERE path LIKE 'compliance/%'`).Scan(&complianceDocs)
 	db.QueryRow(`SELECT COALESCE(sum(url_count),0) FROM twoai_pages WHERE kind='lawsuits'`).Scan(&lawsuitPages)
