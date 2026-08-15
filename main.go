@@ -3032,6 +3032,12 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_build: hardware+dataset sections=%d\n", hwPages)
 
+	ihPages, err := twoaiIndustryHub(db, today)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("twoai_build: industry hub sections=%d\n", ihPages)
+
 	obsPages, err := twoaiObservatory(db, today)
 	if err != nil {
 		return err
