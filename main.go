@@ -229,7 +229,9 @@ func main() {
 		// not in hourlyCatchUp, so the zip fetch happens once a day, not 24
 		// times. If a staging URL has expired the loader logs and skips, and
 		// files already in the repo stay put.
-		loadRemoteCovers()
+		// loadRemoteCovers is called inside runFavicons; calling it here too
+		// fetched and verified every cover twice per run (visible as a
+		// duplicated log block). The zip assets still load here.
 		loadZipAssets()
 		if err := runFavicons(); err != nil {
 			fmt.Fprintln(os.Stderr, "favicons:", err)
