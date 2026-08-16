@@ -563,8 +563,17 @@ func twoaiBillSocialToMarky(db *sql.DB) (int, error) {
 				"linkedIn", "linkedInProfile", "facebook", "twitter",
 				"pinterest", "googleBusiness", "youtube",
 			},
+			// Pinterest requires a title on the pin and silently produces a
+			// poor result without one; YouTube takes one too. The caption is
+			// the wrong thing to put there, so each gets a real title built
+			// from the bill rather than a truncated first line.
 			"platform_overrides": []map[string]any{
 				{"platform": "twitter", "caption": short},
+				{"platform": "pinterest",
+					"title": fmt.Sprintf("%s %s enacted: %s", it.state, it.bill, it.subject),
+					"link":  "https://theworldofai.org/ai-compliance/"},
+				{"platform": "youtube",
+					"title": fmt.Sprintf("%s %s: %s", it.state, it.bill, it.subject)},
 			},
 			"metadata": map[string]string{
 				"state": it.state, "bill": it.bill,
