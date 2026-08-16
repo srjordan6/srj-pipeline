@@ -153,9 +153,16 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 	todayStr := time.Now().UTC().Format("2006-01-02")
 	fetched, skipped, nosite, failed := 0, 0, 0, 0
 	for _, e := range ents {
-		var last string
-		db.QueryRow(`SELECT fetched_on::text FROM twoai_company_harvest WHERE uid=$1`, e.uid).Scan(&last)
-		if last == todayStr {
+		// Freshness skip applies ONLY to rows that already hold readable text
+		// from today. The earlier form skipped on the date alone, which meant a
+		// row stamped by a previous run that failed to resolve a site was
+		// treated as fresh and never retried, so an improved resolver could
+		// not reach the companies it was written for. Rows with no site or no
+		// text retry every run: resolution is a database lookup, and a fetch
+		// only follows when resolution actually yields a site.
+		var last, lastExtract string
+		db.QueryRow(`SELECT fetched_on::text, extract FROM twoai_company_harvest WHERE uid=$1`, e.uid).Scan(&last, &lastExtract)
+		if last == todayStr && lastExtract != "" {
 			skipped++
 			continue
 		}
