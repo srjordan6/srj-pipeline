@@ -25,7 +25,7 @@ import (
 	"time"
 )
 
-const twoaiCompanyGenCap = 35
+const twoaiCompanyGenCap = 60
 
 var siteNameRe = regexp.MustCompile(`[^a-z0-9]+`)
 
@@ -58,7 +58,72 @@ func twoaiCompanyResolveSite(db *sql.DB, uid, name string) (string, string) {
 			return "https://" + host + "/", "vendor feed"
 		}
 	}
+	// Third tier: the product URLs we already verified for this company. 259
+	// of 261 tracked companies have at least one, and a tool's own page is on
+	// the vendor's domain, so reducing it to the registrable host yields the
+	// company site without guessing from the name. Skip shared hosts, where
+	// the URL belongs to a platform rather than the company.
+	var pageData string
+	if db.QueryRow(`SELECT data::text FROM twoai_pages WHERE path=$1`, "companies/"+uid+".json").Scan(&pageData) == nil {
+		var pd struct {
+			Company struct {
+				Products []struct {
+					URL string `json:"url"`
+				} `json:"products"`
+			} `json:"company"`
+		}
+		if json.Unmarshal([]byte(pageData), &pd) == nil {
+			for _, pr := range pd.Company.Products {
+				if h := twoaiRegistrableHost(pr.URL); h != "" {
+					return "https://" + h + "/", "tracked product URL"
+				}
+			}
+		}
+	}
 	return "", ""
+}
+
+// Hosts that serve many vendors: a URL here identifies a listing, not the
+// company's own site, so it must never become a company website.
+var twoaiSharedHosts = map[string]bool{
+	"github.com": true, "huggingface.co": true, "apps.apple.com": true,
+	"play.google.com": true, "chromewebstore.google.com": true, "chrome.google.com": true,
+	"marketplace.visualstudio.com": true, "pypi.org": true, "npmjs.com": true,
+	"docs.google.com": true, "sites.google.com": true, "notion.site": true,
+	"gitlab.com": true, "sourceforge.net": true, "medium.com": true,
+	"linkedin.com": true, "x.com": true, "twitter.com": true, "youtube.com": true,
+	"workspace.google.com": true, "microsoft.com": true, "google.com": true,
+	"amazon.com": true, "aws.amazon.com": true, "azure.microsoft.com": true,
+}
+
+func twoaiRegistrableHost(raw string) string {
+	i := strings.Index(raw, "://")
+	if i < 0 {
+		return ""
+	}
+	host := raw[i+3:]
+	if j := strings.IndexAny(host, "/?#"); j > 0 {
+		host = host[:j]
+	}
+	host = strings.TrimPrefix(strings.ToLower(host), "www.")
+	if host == "" || !strings.Contains(host, ".") {
+		return ""
+	}
+	parts := strings.Split(host, ".")
+	// keep three labels for two-part public suffixes (co.uk, com.cn, com.au)
+	if len(parts) > 2 {
+		suffix2 := parts[len(parts)-2] + "." + parts[len(parts)-1]
+		switch suffix2 {
+		case "co.uk", "com.cn", "com.au", "co.jp", "co.il", "com.br", "co.in", "co.kr":
+			host = strings.Join(parts[len(parts)-3:], ".")
+		default:
+			host = suffix2
+		}
+	}
+	if twoaiSharedHosts[host] {
+		return ""
+	}
+	return host
 }
 
 func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
