@@ -3000,6 +3000,9 @@ func twoaiBuild(db *sql.DB) error {
 	if _, err := twoaiBillEventsQueue(db, today); err != nil {
 		return err
 	}
+	if _, err := twoaiBillAlertsSend(db); err != nil {
+		return err
+	}
 
 	newsArchive, err := twoaiNewsArchive(db, upsert)
 	if err != nil {

@@ -23,9 +23,11 @@ package main
 // part that failed and nothing double-posts.
 
 import (
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/smtp"
 	"os"
 	"regexp"
 	"strings"
@@ -297,6 +299,16 @@ func twoaiBillEventsQueue(db *sql.DB, today string) (int, error) {
 		return 0, err
 	}
 
+	// ONE SOCIAL POST PER DAY. Stephen's cadence: a newly enacted law is a
+	// post, not a burst. If several laws land on the same day, the rest wait
+	// their turn rather than flooding the feed and burning the audience's
+	// attention on a single afternoon. Alerts are NOT throttled: he wants to
+	// know about every enactment the day it is detected, and an inbox can
+	// absorb what a feed cannot.
+	var queuedToday int
+	db.QueryRow(`SELECT count(*) FROM twoai_bill_outbox
+		WHERE channel='social' AND queued_on = current_date`).Scan(&queuedToday)
+
 	rows, err := db.Query(`SELECT state, bill_number, title, description, status_date::text, url
 		FROM twoai_bill_events
 		WHERE relevant AND status = 4 AND (social_on IS NULL OR notified_on IS NULL)
@@ -323,10 +335,18 @@ func twoaiBillEventsQueue(db *sql.DB, today string) (int, error) {
 		social := fmt.Sprintf(
 			"%s just enacted %s: %s\n\nIt became law on %s. We track every AI bill that actually passes, not just the ones that get headlines.\n\nFull record: theworldofai.org/ai-compliance/",
 			it.state, it.bill, subject, it.date)
-		if _, err := db.Exec(`INSERT INTO twoai_bill_outbox (channel, state, bill_number, subject, body, url)
-			VALUES ('social',$1,$2,$3,$4,$5) ON CONFLICT (channel, state, bill_number) DO NOTHING`,
-			it.state, it.bill, subject, social, it.url); err != nil {
-			return queued, err
+		if queuedToday < 1 {
+			res, err := db.Exec(`INSERT INTO twoai_bill_outbox (channel, state, bill_number, subject, body, url)
+				VALUES ('social',$1,$2,$3,$4,$5) ON CONFLICT (channel, state, bill_number) DO NOTHING`,
+				it.state, it.bill, subject, social, it.url)
+			if err != nil {
+				return queued, err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				queuedToday++
+				db.Exec(`UPDATE twoai_bill_events SET social_on = current_date
+					WHERE state=$1 AND bill_number=$2 AND status=4`, it.state, it.bill)
+			}
 		}
 
 		alert := fmt.Sprintf(
@@ -338,9 +358,9 @@ func twoaiBillEventsQueue(db *sql.DB, today string) (int, error) {
 			return queued, err
 		}
 
-		if _, err := db.Exec(`UPDATE twoai_bill_events
-			SET social_on = COALESCE(social_on, current_date), notified_on = COALESCE(notified_on, current_date)
-			WHERE state=$1 AND bill_number=$2 AND status=4`, it.state, it.bill); err != nil {
+		if _, err := db.Exec(`UPDATE twoai_bill_events SET notified_on = current_date
+			WHERE state=$1 AND bill_number=$2 AND status=4 AND notified_on IS NULL`,
+			it.state, it.bill); err != nil {
 			return queued, err
 		}
 		queued++
@@ -355,4 +375,120 @@ func twoaiBillEventsQueue(db *sql.DB, today string) (int, error) {
 		fmt.Printf("twoai_bill_events: %d alerts queued but TWOAI_ALERT_WEBHOOK is not set, so nothing was delivered\n", unsent)
 	}
 	return queued, nil
+}
+
+// ---- Email delivery of the alert -----------------------------------------
+//
+// Stephen wants enactments in his inbox. Sending is deliberately narrow: it
+// only ever sends the alert channel, never the social post, and it marks each
+// row sent the moment delivery succeeds so a retry cannot send twice.
+//
+// Configuration, all on the Render cron:
+//
+//	TWOAI_ALERT_SMTP_HOST   e.g. smtp.gmail.com
+//	TWOAI_ALERT_SMTP_PORT   587 (STARTTLS) or 465 (implicit TLS)
+//	TWOAI_ALERT_SMTP_USER   the sending mailbox
+//	TWOAI_ALERT_SMTP_PASS   an app password, not the account password
+//	TWOAI_ALERT_TO          recipient
+//
+// If any is missing the stage says so and leaves the queue intact, because a
+// silently undelivered alert is worse than an obvious one: the whole point is
+// that Stephen learns a bill passed without having to check.
+func twoaiBillAlertsSend(db *sql.DB) (int, error) {
+	host := os.Getenv("TWOAI_ALERT_SMTP_HOST")
+	port := os.Getenv("TWOAI_ALERT_SMTP_PORT")
+	user := os.Getenv("TWOAI_ALERT_SMTP_USER")
+	pass := os.Getenv("TWOAI_ALERT_SMTP_PASS")
+	to := os.Getenv("TWOAI_ALERT_TO")
+	if host == "" || user == "" || pass == "" || to == "" {
+		var pending int
+		db.QueryRow(`SELECT count(*) FROM twoai_bill_outbox WHERE channel='alert' AND sent_on IS NULL`).Scan(&pending)
+		if pending > 0 {
+			fmt.Printf("twoai_bill_events: %d alerts queued but SMTP is not configured, nothing delivered\n", pending)
+		}
+		return 0, nil
+	}
+	if port == "" {
+		port = "587"
+	}
+
+	rows, err := db.Query(`SELECT id, subject, body, url FROM twoai_bill_outbox
+		WHERE channel='alert' AND sent_on IS NULL ORDER BY id LIMIT 20`)
+	if err != nil {
+		return 0, err
+	}
+	type msg struct {
+		id                 int
+		subject, body, url string
+	}
+	var msgs []msg
+	for rows.Next() {
+		var m msg
+		if rows.Scan(&m.id, &m.subject, &m.body, &m.url) == nil {
+			msgs = append(msgs, m)
+		}
+	}
+	rows.Close()
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+
+	addr := host + ":" + port
+	auth := smtp.PlainAuth("", user, pass, host)
+	sent := 0
+	for _, m := range msgs {
+		payload := []byte("From: " + user + "\r\n" +
+			"To: " + to + "\r\n" +
+			"Subject: [AI law enacted] " + m.subject + "\r\n" +
+			"Content-Type: text/plain; charset=UTF-8\r\n\r\n" +
+			m.body + "\r\n")
+		var serr error
+		if port == "465" {
+			serr = twoaiSendImplicitTLS(addr, host, auth, user, to, payload)
+		} else {
+			serr = smtp.SendMail(addr, auth, user, []string{to}, payload)
+		}
+		if serr != nil {
+			fmt.Printf("twoai_bill_events: alert send failed (%v), queue left intact\n", serr)
+			break
+		}
+		if _, err := db.Exec(`UPDATE twoai_bill_outbox SET sent_on = current_date WHERE id=$1`, m.id); err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	if sent > 0 {
+		fmt.Printf("twoai_bill_events: alerts emailed=%d to %s\n", sent, to)
+	}
+	return sent, nil
+}
+
+// Port 465 speaks TLS from the first byte, which smtp.SendMail does not do.
+func twoaiSendImplicitTLS(addr, host string, auth smtp.Auth, from, to string, payload []byte) error {
+	conn, err := tls.Dial("tcp", addr, &tls.Config{ServerName: host})
+	if err != nil {
+		return err
+	}
+	c, err := smtp.NewClient(conn, host)
+	if err != nil {
+		return err
+	}
+	defer c.Quit()
+	if err := c.Auth(auth); err != nil {
+		return err
+	}
+	if err := c.Mail(from); err != nil {
+		return err
+	}
+	if err := c.Rcpt(to); err != nil {
+		return err
+	}
+	w, err := c.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(payload); err != nil {
+		return err
+	}
+	return w.Close()
 }
