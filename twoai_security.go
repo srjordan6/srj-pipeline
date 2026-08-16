@@ -108,25 +108,43 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 		// end-to-end scenario, a control framework, board questions, the
 		// trust chain). Present only where a topic has earned that depth.
 		type deepBlock struct {
-			Grp   string `json:"grp"`
 			Label string `json:"label"`
 			Body  string `json:"body"`
 		}
-		var deep []deepBlock
-		ddrows, derr := db.Query(`SELECT grp, label, body FROM twoai_security_deepdive
-			WHERE section_slug=$1 ORDER BY CASE grp
-				WHEN 'layer' THEN 1 WHEN 'attack' THEN 2 WHEN 'scenario' THEN 3
-				WHEN 'framework' THEN 4 WHEN 'board' THEN 5 WHEN 'trust' THEN 6 ELSE 7 END, sort`, slug)
+		type deepGroup struct {
+			Grp     string      `json:"grp"`
+			Heading string      `json:"heading"`
+			Intro   string      `json:"intro"`
+			Layout  string      `json:"layout"`
+			Blocks  []deepBlock `json:"blocks"`
+		}
+		var deep []deepGroup
+		ddrows, derr := db.Query(`SELECT grp, heading, intro, layout FROM twoai_security_deepdive_groups
+			WHERE section_slug=$1 ORDER BY sort`, slug)
 		if derr != nil {
 			return count, derr
 		}
 		for ddrows.Next() {
-			var dbk deepBlock
-			if ddrows.Scan(&dbk.Grp, &dbk.Label, &dbk.Body) == nil {
-				deep = append(deep, dbk)
+			var dg deepGroup
+			if ddrows.Scan(&dg.Grp, &dg.Heading, &dg.Intro, &dg.Layout) == nil {
+				deep = append(deep, dg)
 			}
 		}
 		ddrows.Close()
+		for gi := range deep {
+			brows, berr := db.Query(`SELECT label, body FROM twoai_security_deepdive
+				WHERE section_slug=$1 AND grp=$2 ORDER BY sort`, slug, deep[gi].Grp)
+			if berr != nil {
+				return count, berr
+			}
+			for brows.Next() {
+				var dbk deepBlock
+				if brows.Scan(&dbk.Label, &dbk.Body) == nil {
+					deep[gi].Blocks = append(deep[gi].Blocks, dbk)
+				}
+			}
+			brows.Close()
+		}
 		var domains []domainBlock
 		drows, err := db.Query(`SELECT domain_slug, body FROM twoai_security_domains
 			WHERE section_slug=$1 ORDER BY sort`, slug)
