@@ -549,8 +549,11 @@ func twoaiBillSocialToMarky(db *sql.DB) (int, error) {
 			"caption": it.body,
 			"link":    "https://theworldofai.org/ai-compliance/",
 			"status":  "NEW",
+			// X excluded: posting through the API is now a paid tier, and an
+			// unpaid post either fails or costs money nobody approved. The
+			// five below cover the audience this content is written for.
 			"restrict_publish_to": []string{
-				"linkedIn", "linkedInProfile", "facebook", "twitter",
+				"linkedIn", "linkedInProfile", "facebook",
 				"pinterest", "googleBusiness",
 			},
 			// Pinterest requires a title on the pin and silently produces a
