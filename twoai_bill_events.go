@@ -23,10 +23,13 @@ package main
 // part that failed and nothing double-posts.
 
 import (
+	"bytes"
 	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/smtp"
 	"os"
 	"regexp"
@@ -491,4 +494,106 @@ func twoaiSendImplicitTLS(addr, host string, auth smtp.Auth, from, to string, pa
 		return err
 	}
 	return w.Close()
+}
+
+// ---- Marky delivery of the social post -----------------------------------
+//
+// The stage previously wrote captions into twoai_bill_outbox and stopped
+// there, and I described that as "queued", which was wrong in the way that
+// matters: a row in our own Postgres is not a social post. Stephen went
+// looking in Marky and found nothing. This closes the gap.
+//
+// Posts are created with status NEW, never scheduled and never published.
+// Stephen schedules. The daily throttle upstream already limits this to one
+// bill per day, so this sends at most one draft per run.
+//
+// Platform selection is deliberate: everything except Instagram, Instagram
+// Story, and TikTok. A statutory compliance update is not what those
+// audiences are there for, and posting it anyway trains people to scroll past
+// the account.
+func twoaiBillSocialToMarky(db *sql.DB) (int, error) {
+	key := os.Getenv("MARKY_API_KEY")
+	bizID := os.Getenv("MARKY_BUSINESS_ID")
+	if key == "" || bizID == "" {
+		var pending int
+		db.QueryRow(`SELECT count(*) FROM twoai_bill_outbox WHERE channel='social' AND sent_on IS NULL`).Scan(&pending)
+		if pending > 0 {
+			fmt.Printf("twoai_bill_events: %d social drafts queued but MARKY_API_KEY/MARKY_BUSINESS_ID unset, nothing reached Marky\n", pending)
+		}
+		return 0, nil
+	}
+
+	rows, err := db.Query(`SELECT id, state, bill_number, subject, body, url
+		FROM twoai_bill_outbox WHERE channel='social' AND sent_on IS NULL
+		ORDER BY id LIMIT 3`)
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		id                              int
+		state, bill, subject, body, url string
+	}
+	var items []row
+	for rows.Next() {
+		var r row
+		if rows.Scan(&r.id, &r.state, &r.bill, &r.subject, &r.body, &r.url) == nil {
+			items = append(items, r)
+		}
+	}
+	rows.Close()
+
+	client := &http.Client{Timeout: 45 * time.Second}
+	created := 0
+	for _, it := range items {
+		// X gets its own short form. The full caption reads well on LinkedIn
+		// and Facebook and is far past the limit on X, so a single caption
+		// across every platform would either truncate badly or force the long
+		// form to be written short for everyone.
+		short := fmt.Sprintf("%s %s is now law. %s\n\nWe verify every AI law against the legislative record, not press coverage.\n\ntheworldofai.org/ai-compliance/",
+			it.state, it.bill, it.subject)
+		if len(short) > 270 {
+			short = short[:267] + "..."
+		}
+
+		payload := map[string]any{
+			"caption": it.body,
+			"link":    "https://theworldofai.org/ai-compliance/",
+			"status":  "NEW",
+			"restrict_publish_to": []string{
+				"linkedIn", "linkedInProfile", "facebook", "twitter",
+				"pinterest", "googleBusiness", "youtube",
+			},
+			"platform_overrides": []map[string]any{
+				{"platform": "twitter", "caption": short},
+			},
+			"metadata": map[string]string{
+				"state": it.state, "bill": it.bill,
+				"kind": "enacted-law", "source": "twoai_bill_outbox",
+			},
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest("POST",
+			"https://api.mymarky.ai/api/businesses/"+bizID+"/posts", bytes.NewReader(body))
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("authorization", "Bearer "+key)
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("twoai_bill_events: marky post failed (%v), queue left intact\n", err)
+			break
+		}
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode != 200 && resp.StatusCode != 201 {
+			fmt.Printf("twoai_bill_events: marky status %d (%.180s), queue left intact\n", resp.StatusCode, rb)
+			break
+		}
+		if _, err := db.Exec(`UPDATE twoai_bill_outbox SET sent_on = current_date WHERE id=$1`, it.id); err != nil {
+			return created, err
+		}
+		created++
+	}
+	if created > 0 {
+		fmt.Printf("twoai_bill_events: marky drafts created=%d (status NEW, Stephen schedules)\n", created)
+	}
+	return created, nil
 }
