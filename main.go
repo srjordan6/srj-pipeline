@@ -6472,6 +6472,23 @@ func syncContent(db *sql.DB) error {
 		return err
 	}
 
+	// Book excerpts for the topbar, regenerated from press_book_excerpts on
+	// every run so adding a verified excerpt in SQL is the whole workflow.
+	// Only rows marked active ship, and each carries the book it came from so
+	// the topbar line always links to its own source.
+	if _, err := db.Exec(`INSERT INTO site_content (path, data)
+		SELECT 'books/excerpts.json', jsonb_build_object(
+			'note','Verbatim excerpts from the SRJ book series, rendered in the site topbar and linked to the book they came from.',
+			'generated', current_date::text,
+			'excerpts', COALESCE(jsonb_agg(jsonb_build_object(
+				'book_number', e.book_number, 'title', b.title, 'url', b.url_path,
+				'excerpt', e.excerpt, 'section', e.source_section) ORDER BY e.book_number, e.id), '[]'::jsonb))
+		FROM press_book_excerpts e JOIN press_books b ON b.book_number = e.book_number
+		WHERE e.active
+		ON CONFLICT (path) DO UPDATE SET data = EXCLUDED.data`); err != nil {
+		fmt.Printf("sync_content: book excerpts refresh skipped: %v\n", err)
+	}
+
 	outOfScope := func(p string) bool {
 		if !strings.HasSuffix(p, ".json") || strings.HasPrefix(p, ".github/") {
 			return true
