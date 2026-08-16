@@ -2986,6 +2986,21 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	// Enactment trigger: detect bills that became law, then publish, write
+	// news, and queue the social post and Stephen's alert from that one event.
+	if _, err := twoaiBillEvents(db, today); err != nil {
+		return err
+	}
+	if _, err := twoaiBillEventsPublish(db, today, upsert); err != nil {
+		return err
+	}
+	if _, err := twoaiBillEventsNews(db, today); err != nil {
+		return err
+	}
+	if _, err := twoaiBillEventsQueue(db, today); err != nil {
+		return err
+	}
+
 	newsArchive, err := twoaiNewsArchive(db, upsert)
 	if err != nil {
 		return err
