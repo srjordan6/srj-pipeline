@@ -50,6 +50,33 @@ import (
 )
 
 const btosURL = "https://www.census.gov/hfp/btos/downloads/National.xlsx"
+
+var twoaiNationalSystem = "You write analysis for theworldofai.org, a sourced AI reference site. " +
+	"You are given survey data as JSON. Write what the numbers mean for the AI industry " +
+	"in plain English prose: 3 to 4 short paragraphs, no headings, no bullet points, no preamble. " +
+	"HARD RULES: use ONLY facts and figures present in the JSON. Do not bring in any outside " +
+	"statistic, company, product, or event. Every percentage you mention must appear verbatim " +
+	"in the JSON. Never compute, round, sum, subtract, or average figures: a percentage may only " +
+	"be stated if those exact characters appear in the JSON. Describe direction and magnitude of change, what the gap between current and " +
+	"expected use implies, and what the do-not-know share suggests, strictly from the data given. " +
+	"Plain sentences, no hype, commas over dashes."
+
+var twoaiSectorSystem = "You write sector analysis for theworldofai.org, a sourced AI reference site. " +
+	"You are given JSON for one industry: its official Census adoption figure when the survey " +
+	"covers it, this site's curated points, and source_page_excerpts, the text this site's " +
+	"pipeline harvested from each cited source page. The excerpts are your primary material: " +
+	"synthesize what these sources collectively show about AI use in this industry, in plain " +
+	"English prose, 4 to 6 short paragraphs, no headings, no bullets, no preamble. Attribute " +
+	"specific findings to their source organization by name as it appears in the JSON (per the " +
+	"Census Bureau, per NRF, and so on). Cover, where the material supports it: measured " +
+	"adoption, what AI is deployed for, where vendors and money concentrate, ROI evidence the " +
+	"sources report, risks and the regulatory posture, and what a reader deciding whether to " +
+	"deploy should take from it. HARD RULES: use ONLY facts in the JSON, name organizations " +
+	"only if they appear in the JSON, every percentage must appear verbatim in the JSON, never " +
+	"computed, rounded, summed, or averaged from it, and " +
+	"where the sources are silent, say less rather than filling in. Plain sentences, no hype, " +
+	"commas over dashes."
+
 const btosSectorURL = "https://www.census.gov/hfp/btos/downloads/Sector.xlsx"
 
 // NAICS 2-digit sector for each industry page that BTOS covers. BTOS surveys
@@ -385,15 +412,36 @@ func twoaiClaudeAnalyze(payload string) (model, body string, err error) {
 	if model == "" {
 		model = "claude-sonnet-4-6"
 	}
-	system := "You write analysis for theworldofai.org, a sourced AI reference site. " +
-		"You are given survey data as JSON. Write what the numbers mean for the AI industry " +
-		"in plain English prose: 3 to 4 short paragraphs, no headings, no bullet points, no preamble. " +
-		"HARD RULES: use ONLY facts and figures present in the JSON. Do not bring in any outside " +
-		"statistic, company, product, or event. Every percentage you mention must appear verbatim " +
-		"in the JSON. Describe direction and magnitude of change, what the gap between current and " +
-		"expected use implies, and what the do-not-know share suggests, strictly from the data given. " +
-		"Plain sentences, no hype, commas over dashes."
+	system := twoaiNationalSystem
 	body, err = twoaiClaudeCall(model, system, "The data:\n"+payload+"\n\nWrite the analysis now.")
+	return model, body, err
+}
+
+func twoaiClaudeAnalyzeExtra(payload, extra string) (model, body string, err error) {
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		return "", "", fmt.Errorf("not configured")
+	}
+	model = os.Getenv("TWOAI_ANALYSIS_MODEL")
+	if model == "" {
+		model = "claude-sonnet-4-6"
+	}
+	system := twoaiNationalSystem
+	body, err = twoaiClaudeCall(model, system, "The data:\n"+payload+"\n\nWrite the analysis now."+extra)
+	return model, body, err
+}
+
+func twoaiClaudeAnalyzeSectorExtra(sector, payload, extra string) (model, body string, err error) {
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		return "", "", fmt.Errorf("not configured")
+	}
+	model = os.Getenv("TWOAI_ANALYSIS_MODEL")
+	if model == "" {
+		model = "claude-sonnet-4-6"
+	}
+	system := twoaiSectorSystem
+	body, err = twoaiClaudeCall(model, system, "Sector: "+sector+"\nThe data:\n"+payload+"\n\nWrite the analysis now."+extra)
 	return model, body, err
 }
 
@@ -406,20 +454,7 @@ func twoaiClaudeAnalyzeSector(sector, payload string) (model, body string, err e
 	if model == "" {
 		model = "claude-sonnet-4-6"
 	}
-	system := "You write sector analysis for theworldofai.org, a sourced AI reference site. " +
-		"You are given JSON for one industry: its official Census adoption figure when the survey " +
-		"covers it, this site's curated points, and source_page_excerpts, the text this site's " +
-		"pipeline harvested from each cited source page. The excerpts are your primary material: " +
-		"synthesize what these sources collectively show about AI use in this industry, in plain " +
-		"English prose, 4 to 6 short paragraphs, no headings, no bullets, no preamble. Attribute " +
-		"specific findings to their source organization by name as it appears in the JSON (per the " +
-		"Census Bureau, per NRF, and so on). Cover, where the material supports it: measured " +
-		"adoption, what AI is deployed for, where vendors and money concentrate, ROI evidence the " +
-		"sources report, risks and the regulatory posture, and what a reader deciding whether to " +
-		"deploy should take from it. HARD RULES: use ONLY facts in the JSON, name organizations " +
-		"only if they appear in the JSON, every percentage must appear verbatim in the JSON, and " +
-		"where the sources are silent, say less rather than filling in. Plain sentences, no hype, " +
-		"commas over dashes."
+	system := twoaiSectorSystem
 	body, err = twoaiClaudeCall(model, system, "Sector: "+sector+"\nThe data:\n"+payload+"\n\nWrite the analysis now.")
 	return model, body, err
 }
@@ -477,6 +512,31 @@ func twoaiClaudeCall(model, system, user string) (string, error) {
 		return strings.TrimSpace(sb.String()), nil
 	}
 	return "", fmt.Errorf("unreachable")
+}
+
+// twoaiAnalyzeValidated runs a generation and, if the validator rejects it,
+// makes ONE corrective retry that names the offending figure - the chronic
+// rejection mode is the model deriving a number (a delta, a rounding, an
+// average) rather than quoting one, and telling it exactly which figure to
+// drop fixes nearly all of them.
+func twoaiAnalyzeValidated(gen func(extra string) (string, string, error), payload string) (string, string, error) {
+	model, body, err := gen("")
+	if err != nil {
+		return model, body, err
+	}
+	verr := twoaiValidateAnalysis(payload, body)
+	if verr == nil {
+		return model, body, nil
+	}
+	model, body, err = gen("\n\nYour previous draft was rejected because it contained a figure not present in the data: " +
+		verr.Error() + ". Rewrite the analysis using only percentages that appear verbatim, character for character, in the JSON. Do not compute, round, sum, subtract, or average any figure.")
+	if err != nil {
+		return model, body, err
+	}
+	if verr2 := twoaiValidateAnalysis(payload, body); verr2 != nil {
+		return model, body, fmt.Errorf("rejected after corrective retry: %v", verr2)
+	}
+	return model, body, nil
 }
 
 // every percentage in the analysis must exist verbatim in the payload
@@ -679,11 +739,11 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 		db.QueryRow(`SELECT count(*) FROM twoai_industry_analysis WHERE metric='btos-ai-use' AND data_hash=$1`, dataHash).Scan(&exists)
 		if exists == 0 {
 			pj, _ := json.Marshal(metrics)
-			model, body, aerr := twoaiClaudeAnalyze(string(pj))
+			model, body, aerr := twoaiAnalyzeValidated(func(extra string) (string, string, error) {
+				return twoaiClaudeAnalyzeExtra(string(pj), extra)
+			}, string(pj))
 			if aerr != nil {
-				fmt.Printf("twoai_industry_hub: analysis skipped: %v\n", aerr)
-			} else if verr := twoaiValidateAnalysis(string(pj), body); verr != nil {
-				fmt.Printf("twoai_industry_hub: analysis REJECTED (%v), previous keeps rendering\n", verr)
+				fmt.Printf("twoai_industry_hub: analysis skipped/rejected: %v\n", aerr)
 			} else {
 				if _, err := db.Exec(`INSERT INTO twoai_industry_analysis (metric, data_hash, model, body, generated_on)
 					VALUES ('btos-ai-use',$1,$2,$3,current_date) ON CONFLICT (metric, data_hash) DO NOTHING`,
@@ -766,11 +826,11 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 			var exists int
 			db.QueryRow(`SELECT count(*) FROM twoai_industry_analysis WHERE metric=$1 AND data_hash=$2`, metricKey, secHash).Scan(&exists)
 			if exists == 0 && os.Getenv("ANTHROPIC_API_KEY") != "" {
-				model, body, aerr := twoaiClaudeAnalyzeSector(j.name, string(pj))
+				model, body, aerr := twoaiAnalyzeValidated(func(extra string) (string, string, error) {
+					return twoaiClaudeAnalyzeSectorExtra(j.name, string(pj), extra)
+				}, string(pj))
 				if aerr != nil {
-					fmt.Printf("twoai_industry_hub: %s analysis skipped: %v\n", j.slug, aerr)
-				} else if verr := twoaiValidateAnalysis(string(pj), body); verr != nil {
-					fmt.Printf("twoai_industry_hub: %s analysis REJECTED (%v)\n", j.slug, verr)
+					fmt.Printf("twoai_industry_hub: %s analysis skipped/rejected: %v\n", j.slug, aerr)
 				} else {
 					db.Exec(`INSERT INTO twoai_industry_analysis (metric, data_hash, model, body, generated_on)
 						VALUES ($1,$2,$3,$4,current_date) ON CONFLICT (metric, data_hash) DO NOTHING`,
@@ -834,11 +894,11 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 			var exists int
 			db.QueryRow(`SELECT count(*) FROM twoai_industry_analysis WHERE metric='cross-industry' AND data_hash=$1`, xHash).Scan(&exists)
 			if exists == 0 && os.Getenv("ANTHROPIC_API_KEY") != "" {
-				model, body, xerr := twoaiClaudeAnalyzeSector("All 21 industries, synthesized", string(xj))
+				model, body, xerr := twoaiAnalyzeValidated(func(extra string) (string, string, error) {
+					return twoaiClaudeAnalyzeSectorExtra("All 21 industries, synthesized", string(xj), extra)
+				}, string(xj))
 				if xerr != nil {
-					fmt.Printf("twoai_industry_hub: cross-industry synthesis skipped: %v\n", xerr)
-				} else if verr := twoaiValidateAnalysis(string(xj), body); verr != nil {
-					fmt.Printf("twoai_industry_hub: cross-industry synthesis REJECTED (%v)\n", verr)
+					fmt.Printf("twoai_industry_hub: cross-industry synthesis skipped/rejected: %v\n", xerr)
 				} else {
 					db.Exec(`INSERT INTO twoai_industry_analysis (metric, data_hash, model, body, generated_on)
 						VALUES ('cross-industry',$1,$2,$3,current_date) ON CONFLICT (metric, data_hash) DO NOTHING`,
