@@ -545,35 +545,22 @@ func twoaiBillSocialToMarky(db *sql.DB) (int, error) {
 	client := &http.Client{Timeout: 45 * time.Second}
 	created := 0
 	for _, it := range items {
-		// X gets its own short form. The full caption reads well on LinkedIn
-		// and Facebook and is far past the limit on X, so a single caption
-		// across every platform would either truncate badly or force the long
-		// form to be written short for everyone.
-		short := fmt.Sprintf("%s %s is now law. %s\n\nWe verify every AI law against the legislative record, not press coverage.\n\ntheworldofai.org/ai-compliance/",
-			it.state, it.bill, it.subject)
-		if len(short) > 270 {
-			short = short[:267] + "..."
-		}
-
 		payload := map[string]any{
 			"caption": it.body,
 			"link":    "https://theworldofai.org/ai-compliance/",
 			"status":  "NEW",
 			"restrict_publish_to": []string{
 				"linkedIn", "linkedInProfile", "facebook", "twitter",
-				"pinterest", "googleBusiness", "youtube",
+				"pinterest", "googleBusiness",
 			},
 			// Pinterest requires a title on the pin and silently produces a
-			// poor result without one; YouTube takes one too. The caption is
-			// the wrong thing to put there, so each gets a real title built
-			// from the bill rather than a truncated first line.
+			// poor result without one, so it gets a real title built from the
+			// bill plus the destination link. No other platform override: the
+			// single caption goes everywhere else as written.
 			"platform_overrides": []map[string]any{
-				{"platform": "twitter", "caption": short},
 				{"platform": "pinterest",
 					"title": fmt.Sprintf("%s %s enacted: %s", it.state, it.bill, it.subject),
 					"link":  "https://theworldofai.org/ai-compliance/"},
-				{"platform": "youtube",
-					"title": fmt.Sprintf("%s %s: %s", it.state, it.bill, it.subject)},
 			},
 			"metadata": map[string]string{
 				"state": it.state, "bill": it.bill,
