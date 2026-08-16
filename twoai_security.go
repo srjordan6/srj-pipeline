@@ -103,6 +103,30 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 			}
 		}
 		trows.Close()
+		// Deep-dive blocks: per-topic structured treatments beyond the
+		// four-part standard, grouped (layers of the chain, attack areas, an
+		// end-to-end scenario, a control framework, board questions, the
+		// trust chain). Present only where a topic has earned that depth.
+		type deepBlock struct {
+			Grp   string `json:"grp"`
+			Label string `json:"label"`
+			Body  string `json:"body"`
+		}
+		var deep []deepBlock
+		ddrows, derr := db.Query(`SELECT grp, label, body FROM twoai_security_deepdive
+			WHERE section_slug=$1 ORDER BY CASE grp
+				WHEN 'layer' THEN 1 WHEN 'attack' THEN 2 WHEN 'scenario' THEN 3
+				WHEN 'framework' THEN 4 WHEN 'board' THEN 5 WHEN 'trust' THEN 6 ELSE 7 END, sort`, slug)
+		if derr != nil {
+			return count, derr
+		}
+		for ddrows.Next() {
+			var dbk deepBlock
+			if ddrows.Scan(&dbk.Grp, &dbk.Label, &dbk.Body) == nil {
+				deep = append(deep, dbk)
+			}
+		}
+		ddrows.Close()
 		var domains []domainBlock
 		drows, err := db.Query(`SELECT domain_slug, body FROM twoai_security_domains
 			WHERE section_slug=$1 ORDER BY sort`, slug)
@@ -121,7 +145,7 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 		db.QueryRow(`SELECT name, COALESCE(blurb,'') FROM twoai_taxonomy WHERE slug=$1`, slug).Scan(&name, &blurb)
 		doc := map[string]any{
 			"uid": twoaiUID("section:" + slug), "tax": slug, "generated": today,
-			"name": name, "blurb": blurb, "items": items, "domains": domains, "topic": topic,
+			"name": name, "blurb": blurb, "items": items, "domains": domains, "topic": topic, "deep": deep,
 			"stats": map[string]int{
 				"deepfake_bills": deepfakeBills, "mcp_servers": mcpServers,
 				"compliance_docs": complianceDocs, "lawsuit_pages": lawsuitPages,
