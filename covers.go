@@ -39,6 +39,11 @@ var coverSources = []struct {
 		sha256:   "6b25e9553eccdc69aadf167c6ee2826a7e0b62c8d970f63f11b100c93bf14a16",
 	},
 	{
+		repoPath: "covers/the-ai-lawyer-cover.jpg",
+		url:      "https://x0.at/HEuD.jpg",
+		sha256:   "b0d3aaf519e726c116e4e36260e9654a08637304cd7b060b4afae6f1b67729bc",
+	},
+	{
 		repoPath: "briefings/AI_IT_Security_Implementation_Strategy_Executive_Briefing.pdf",
 		url:      "https://x0.at/1H35.pdf",
 		sha256:   "fb18956b874943e9ece9ecb3fa5d1e57adf661099b3bcfceb2b4dc72b7f9d4d9",
