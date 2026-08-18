@@ -147,8 +147,26 @@ func twoaiModelsFetch(db *sql.DB) {
 			}
 			// Replace only this tag's rows, keyed on the pipeline_tag we
 			// asked for, so one failed tag never wipes a healthy one.
+			// What was here before this run, so the log can report what CHANGED
+			// rather than how many rows we asked for. Every tag printed "50
+			// models" every day because 50 is the API limit, not a finding: the
+			// line reported the ceiling and looked identical forever whether the
+			// top fifty had churned completely or not moved at all.
+			prior := map[string]bool{}
+			if pr, err := tx.Query(`SELECT ext_id FROM twoai_model_catalog
+				WHERE source='huggingface' AND section=$1 AND data->>'pipeline_tag'=$2`, section, tag); err == nil {
+				for pr.Next() {
+					var id string
+					if pr.Scan(&id) == nil {
+						prior[id] = true
+					}
+				}
+				pr.Close()
+			}
 			tx.Exec(`DELETE FROM twoai_model_catalog WHERE source='huggingface' AND section=$1 AND data->>'pipeline_tag'=$2`, section, tag)
 			n := 0
+			added := 0
+			seenNow := map[string]bool{}
 			for _, m := range models {
 				id, _ := m["id"].(string)
 				if id == "" {
@@ -174,10 +192,25 @@ func twoaiModelsFetch(db *sql.DB) {
 					ON CONFLICT (source, ext_id, section) DO UPDATE SET name=EXCLUDED.name, data=EXCLUDED.data, fetched_at=now()`,
 					id, id, section, string(j)); err == nil {
 					n++
+					seenNow[id] = true
+					if !prior[id] {
+						added++
+					}
 				}
 			}
 			if err := tx.Commit(); err == nil {
-				fmt.Printf("twoai_models: hf %s (%s) %d models\n", tag, section, n)
+				dropped := 0
+				for id := range prior {
+					if !seenNow[id] {
+						dropped++
+					}
+				}
+				// Silent when the top N has not moved, which on all-time-download
+				// rankings is most days. A line now means something happened.
+				if added > 0 || dropped > 0 || len(prior) == 0 {
+					fmt.Printf("twoai_models: hf %s (%s) %d models, %d new, %d dropped\n",
+						tag, section, n, added, dropped)
+				}
 			}
 			time.Sleep(500 * time.Millisecond)
 		}

@@ -4202,7 +4202,12 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 				dup := false
 				for _, pn := range profiledNames {
 					if sameHuman(n, pn) {
-						fmt.Fprintf(os.Stderr, "twoai_build: roster %q is the profiled %q, skipping the duplicate\n", n, pn)
+						// Silent by design. This match is permanent and correct:
+						// the roster and site_people spell the same person two
+						// ways, the merge resolves it, and saying so on every run
+						// forever reports a success as though it were a warning.
+						// A name that stops matching shows up as a new stub in the
+						// directory, which is the visible signal that matters.
 						dup = true
 						break
 					}

@@ -56,17 +56,32 @@ func twoaiHardware(db *sql.DB, today string) (int, error) {
 		SourceURL string `json:"source_url"`
 		EntityUID string `json:"entity_uid,omitempty"`
 		Verified  string `json:"verified"`
+		// Why the verified date has stopped moving, when it has. Empty for a
+		// link that checks out normally. Without this a reader sees a date
+		// quietly ageing and cannot tell whether we stopped looking or the
+		// publisher stopped answering.
+		VerifyNote string `json:"verify_note,omitempty"`
 	}
 	for _, sec := range twoaiHardwareSections {
 		var items []hwRow
-		rows, err := db.Query(`SELECT slug, name, maker, note, source_url, COALESCE(entity_uid,''), verified_on::text
-			FROM twoai_hardware WHERE section_slug=$1 ORDER BY slug`, sec)
+		rows, err := db.Query(`SELECT h.slug, h.name, h.maker, h.note, h.source_url,
+				COALESCE(h.entity_uid,''), h.verified_on::text,
+				CASE
+				  WHEN v.outcome = 'blocked' THEN
+				    'The publisher blocks automated checks, so this link is confirmed by hand rather than daily.'
+				  WHEN v.outcome IN ('dead','unreachable') THEN
+				    'This link stopped answering; the entry stays until a replacement source is found.'
+				  ELSE ''
+				END
+			FROM twoai_hardware h
+			LEFT JOIN twoai_link_verify v ON v.url = h.source_url
+			WHERE h.section_slug=$1 ORDER BY h.slug`, sec)
 		if err != nil {
 			return count, err
 		}
 		for rows.Next() {
 			var h hwRow
-			if rows.Scan(&h.Slug, &h.Name, &h.Maker, &h.Note, &h.SourceURL, &h.EntityUID, &h.Verified) == nil {
+			if rows.Scan(&h.Slug, &h.Name, &h.Maker, &h.Note, &h.SourceURL, &h.EntityUID, &h.Verified, &h.VerifyNote) == nil {
 				if h.EntityUID == "" {
 					db.QueryRow(`SELECT c->>'uid' FROM twoai_pages, jsonb_array_elements(data->'companies') c
 						WHERE path='companies/index.json' AND lower(c->>'name')=lower($1) LIMIT 1`,

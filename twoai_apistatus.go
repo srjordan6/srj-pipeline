@@ -414,14 +414,27 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 		Role     string   `json:"ai_role"`
 		Source   string   `json:"source_url"`
 		Verified string   `json:"verified"`
-		Repos    []string `json:"repos,omitempty"`
+		// See twoai_hardware: says WHY a verified date has stopped moving, so a
+		// stale date is explained rather than merely old.
+		VerifyNote string   `json:"verify_note,omitempty"`
+		Repos      []string `json:"repos,omitempty"`
 	}
 	var langs []langRow
-	if rows, err := db.Query(`SELECT slug, name, steward, first_release, ai_role, source_url, verified_on::text
-		FROM twoai_languages ORDER BY name`); err == nil {
+	if rows, err := db.Query(`SELECT l.slug, l.name, l.steward, l.first_release, l.ai_role,
+			l.source_url, l.verified_on::text,
+			CASE
+			  WHEN v.outcome = 'blocked' THEN
+			    'The publisher blocks automated checks, so this link is confirmed by hand rather than daily.'
+			  WHEN v.outcome IN ('dead','unreachable') THEN
+			    'This link stopped answering; the entry stays until a replacement source is found.'
+			  ELSE ''
+			END
+		FROM twoai_languages l
+		LEFT JOIN twoai_link_verify v ON v.url = l.source_url
+		ORDER BY l.name`); err == nil {
 		for rows.Next() {
 			var l langRow
-			if rows.Scan(&l.Slug, &l.Name, &l.Steward, &l.First, &l.Role, &l.Source, &l.Verified) == nil {
+			if rows.Scan(&l.Slug, &l.Name, &l.Steward, &l.First, &l.Role, &l.Source, &l.Verified, &l.VerifyNote) == nil {
 				if rr, err := db.Query(`SELECT repo FROM twoai_repo_catalog
 					WHERE lower(language)=lower($1) ORDER BY stars DESC LIMIT 6`, l.Name); err == nil {
 					for rr.Next() {
