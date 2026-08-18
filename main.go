@@ -2955,6 +2955,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	downloads, err := twoaiDownloads(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
 	companies, err := twoaiCompanies(db, today, upsert)
 	if err != nil {
 		return err
@@ -3154,8 +3159,8 @@ func twoaiBuild(db *sql.DB) error {
 			staleTimeline, oldestTimeline.String)
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d skills=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive, skillPages)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d skills=%d downloads=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive, skillPages, downloads)
 	return nil
 }
 
