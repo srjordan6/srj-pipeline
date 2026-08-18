@@ -262,11 +262,11 @@ func main() {
 	// an opaque Google News redirect. Own subcommand, never part of `all`, so
 	// a Google-side change can stall this and nothing else.
 	if src == "favicons" {
-		// Remote-sourced assets merge into faviconFiles before the push so
-		// the daily run ensures them alongside the embedded set. Wired here,
-		// not in hourlyCatchUp, so the zip fetch happens once a day, not 24
-		// times. If a staging URL has expired the loader logs and skips, and
-		// files already in the repo stay put.
+		// Remote-sourced assets merge into faviconFiles before the push, so a
+		// run ensures them alongside the embedded set. If a staging URL has
+		// expired the loader logs and skips, and files already in the repo stay
+		// put. This stage is no longer in the daily sequence: run it when a
+		// cover, briefing or icon actually changes.
 		// loadRemoteCovers is called inside runFavicons; calling it here too
 		// fetched and verified every cover twice per run (visible as a
 		// duplicated log block). The zip assets still load here.

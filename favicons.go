@@ -17,15 +17,9 @@ package main
 // no writes.
 
 import (
-	"database/sql"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"strings"
-	"time"
 )
 
 var faviconFiles = map[string]string{
@@ -190,87 +184,6 @@ func runFavicons() error {
 	}
 	if len(failed) > 0 {
 		return fmt.Errorf("favicons: %d of %d failed, first %s", len(failed), len(faviconFiles), failed[0])
-	}
-	return nil
-}
-
-// hourlyCatchUp runs after every email_route pass, which the
-// srj-email-coordinator cron fires at the top of each hour. It exists
-// because Render cron deploys do not run the job: code and SQL changes
-// otherwise sit unpublished until the daily 11:00 UTC `all` run. Every step
-// here is idempotent, so an hourly cadence costs a handful of GETs when
-// nothing changed. The whole pass is skipped when the service has no
-// GITHUB_TOKEN, since both steps write through the GitHub contents API.
-//
-// The Cloudflare hook fires only when the srj-content HEAD actually moved,
-// read unauthenticated since the repo is public: pushes to srj-site
-// (favicons) trigger a build natively, but srj-site does not watch
-// srj-content, so content-only changes need the hook.
-func hourlyCatchUp(db *sql.DB) {
-	if os.Getenv("GITHUB_TOKEN") == "" {
-		fmt.Println("catchup: no GITHUB_TOKEN on this service, skipping")
-		return
-	}
-	if err := runFavicons(); err != nil {
-		fmt.Fprintln(os.Stderr, "catchup favicons:", err)
-	}
-	pre := contentHead()
-	if err := syncContent(db); err != nil {
-		fmt.Fprintln(os.Stderr, "catchup sync_content:", err)
-		return
-	}
-	post := contentHead()
-	if pre != "" && post != "" && pre != post {
-		fmt.Println("catchup: srj-content moved", pre[:8], "->", post[:8], "firing deploy hook")
-		if err := fireDeployHook(); err != nil {
-			fmt.Fprintln(os.Stderr, "catchup deploy hook:", err)
-		}
-	}
-}
-
-// contentHead returns the srj-content main HEAD sha, or "" on any failure.
-// Unauthenticated: the repo is public.
-func contentHead() string {
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, _ := http.NewRequest("GET", "https://api.github.com/repos/srjordan6/srj-content/commits/main", nil)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "srj-pipeline/1.0")
-	resp, err := client.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return ""
-	}
-	var out struct {
-		SHA string `json:"sha"`
-	}
-	if json.NewDecoder(resp.Body).Decode(&out) != nil {
-		return ""
-	}
-	return out.SHA
-}
-
-// fireDeployHook POSTs the srj-site Cloudflare deploy hook. Uses
-// CLOUDFLARE_DEPLOY_HOOK when set (the main pipeline cron has it); falls
-// back to the known hook URL so the hourly coordinator, which may not
-// carry that env var, can still trigger builds. The hook grants exactly
-// one capability, starting a build, and nothing else.
-func fireDeployHook() error {
-	hook := strings.TrimSpace(os.Getenv("CLOUDFLARE_DEPLOY_HOOK"))
-	if hook == "" {
-		hook = "https://api.cloudflare.com/client/v4/workers/builds/deploy_hooks/e69389bf-e2f0-4d52-8eb2-8fb0fdb75e02"
-	}
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Post(hook, "application/json", nil)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("deploy hook %d: %.200s", resp.StatusCode, b)
 	}
 	return nil
 }
