@@ -3848,9 +3848,31 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 			}
 			lr.Close()
 		}
+		// MCP servers this company published. The registry names servers with a
+		// reverse-DNS namespace before the slash: ai.anthropic/..., com.microsoft/...,
+		// co.vantaj/... We attribute a server only when the LAST label of that
+		// namespace equals the company name exactly, once both are reduced to
+		// letters and digits.
+		//
+		// This replaced a LIKE '%name%' substring test, which was wrong 101 times
+		// out of 105 measured across the built content set. Short company names
+		// are substrings of unrelated words: Box collected mailbox, toolbox and
+		// dropbox-mcp-server; SAP collected whatsapp and trendsapi; Meta collected
+		// metadock and primeta; Vanta collected co.vantaj, an unrelated uptime
+		// monitoring company. Each false match published a sentence claiming a
+		// company had shipped software it had nothing to do with, on pages whose
+		// own first paragraph promises they draw only from records.
+		//
+		// The regex anchors the label between a dot (or the start) and the slash.
+		// Legitimate servers published under a namespace that does not carry the
+		// company's name are dropped too; that is the right trade, because silence
+		// is recoverable and a false attribution is not. Where a real one is
+		// dropped the fix is an explicit alias, never a looser test.
+		nsPattern := "(^|\\.)" + regexp.QuoteMeta(strings.ToLower(entityPunctRe.ReplaceAllString(strings.ToLower(v), ""))) + "/"
 		mr, err := db.Query(`SELECT slug, name, COALESCE(description,'') FROM twoai_mcp_servers
-			WHERE status='active' AND lower(name) LIKE $1 ORDER BY name LIMIT 12`,
-			"%"+strings.ToLower(strings.ReplaceAll(v, " ", ""))+"%")
+			WHERE status='active'
+			  AND regexp_replace(lower(split_part(name, '/', 1)), '[^a-z0-9.]', '', 'g') || '/' ~ $1
+			ORDER BY name LIMIT 12`, nsPattern)
 		if err == nil {
 			for mr.Next() {
 				var slug, name, desc string
