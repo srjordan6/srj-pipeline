@@ -56,7 +56,7 @@ func main() {
 		// the database's own environment, so running the stage here trades hourly
 		// triage for daily triage and gets the mailboxes moving again. Run() ignores
 		// failures, so a bad mail run cannot block the site build.
-		for _, s := range []string{"email_route", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_onet", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"email_route", "inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_onet", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -288,6 +288,14 @@ func main() {
 			}
 		}
 		fmt.Printf("resolve_gnews: done fixed=%d missed=%d of %d\n", fixed, missed, len(todo))
+		return
+	}
+
+	if src == "inkbox_pull" {
+		if err := inkboxPull(db); err != nil {
+			fmt.Fprintln(os.Stderr, "inkbox_pull:", err)
+			os.Exit(1)
+		}
 		return
 	}
 
