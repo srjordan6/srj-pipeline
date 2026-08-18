@@ -21,11 +21,21 @@ package main
 //   book matters generally        -> books_kdp
 //   a specific Volume I-IX        -> books_vol{n}
 //   career, credentials, bios     -> career
-//   website, code, hosting        -> srj
+//   website, code, hosting        -> srj or theworldofai, by which site
 //   publishing, launch, promo     -> theworldofai
 //   spans several projects        -> all of them (the bridge row says so)
 //   nothing claims it             -> escalation only, no bridge spam
 // Deadline, financial, or legal language always escalates on top of routing.
+//
+// The website branch was one project until 2026-08-18. Stephen runs two sites
+// and the original table sent every hosting, deployment and search-console
+// mail to srj, so theworldofai.org's own operational mail landed in the wrong
+// mailbox: in the first seventeen days every message that project received
+// was a Draft2Digital book notice, and not one was about the site. Two things
+// fix it. erPreRoute decides by sender and by the domain the mail names,
+// before the model is consulted at all, because a Search Console alert naming
+// theworldofai.org is not a judgement call. Where that does not match, the
+// verdict now carries site, and the website branch splits on it.
 //
 // Failure shape: a message that cannot be fetched or categorized stays
 // UNREAD and is retried next run; the unique gmail_msg_id in the log makes
@@ -216,6 +226,7 @@ func erFetch(token, id string) (erMessage, error) {
 type erVerdict struct {
 	Noise          bool   `json:"noise"`
 	Expertise      string `json:"expertise"` // book|career|website|publishing|unknown
+	Site           string `json:"site"`      // srj|twoai|unknown, only meaningful when expertise is website
 	Volume         int    `json:"volume"`    // 1-9, or 0
 	Deadline       bool   `json:"deadline"`
 	FinancialLegal bool   `json:"financial_legal"`
@@ -232,10 +243,13 @@ func erCategorize(m erMessage) (erVerdict, error) {
 		"Categorize this email. noise=true means marketing, newsletters, receipts, or automated mail no project needs to act on. " +
 		"expertise: book (manuscripts, covers, ISBNs, KDP, pricing), career (roles, credentials, bios), " +
 		"website (architecture, code, hosting, deployment), publishing (launch timing, promotion, newsletter), or unknown. " +
+		"site: which of the two sites the email concerns. srj for srjconsultingservices.com, the srj-site repo, or the advisory business. " +
+		"twoai for theworldofai.org, the twoai-site or twoai-content repos, the atlas, or its newsletter. unknown if neither or both. " +
+		"Only meaningful when expertise is website; send unknown otherwise. " +
 		"volume: 1-9 only when the email concerns one specific volume, else 0. " +
 		"deadline=true for time-sensitive language; financial_legal=true for money, contracts, or legal language.\n\n" +
 		"From: " + m.From + "\nSubject: " + m.Subject + "\n\n" + m.Body +
-		"\n\nReply with ONLY this JSON, no prose: {\"noise\":bool,\"expertise\":\"...\",\"volume\":int,\"deadline\":bool,\"financial_legal\":bool}"
+		"\n\nReply with ONLY this JSON, no prose: {\"noise\":bool,\"expertise\":\"...\",\"site\":\"...\",\"volume\":int,\"deadline\":bool,\"financial_legal\":bool}"
 	body, _ := json.Marshal(map[string]any{
 		"model": "claude-haiku-4-5", "max_tokens": 150,
 		"messages": []map[string]string{{"role": "user", "content": prompt}},
@@ -286,6 +300,7 @@ func erKeywordFallback(m erMessage) erVerdict {
 	case strings.Contains(t, "launch") || strings.Contains(t, "newsletter") || strings.Contains(t, "promotion"):
 		v.Expertise = "publishing"
 	}
+	v.Site = erWhichSite(t)
 	for i := 1; i <= 9; i++ {
 		if strings.Contains(t, fmt.Sprintf("volume %d", i)) || strings.Contains(t, "volume "+[]string{"i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix"}[i-1]+" ") {
 			v.Volume = i
@@ -295,6 +310,54 @@ func erKeywordFallback(m erMessage) erVerdict {
 	v.Deadline = strings.Contains(t, "deadline") || strings.Contains(t, "urgent") || strings.Contains(t, "by friday")
 	v.FinancialLegal = strings.Contains(t, "invoice") || strings.Contains(t, "contract") || strings.Contains(t, "payment") || strings.Contains(t, "legal")
 	return v
+}
+
+// erWhichSite names the site a piece of text is about, by the domains and
+// repository names only that site uses. Returns srj, twoai, both, or unknown.
+// Shared by the keyword fallback and the pre-route so the two cannot drift.
+func erWhichSite(lowered string) string {
+	twoai := strings.Contains(lowered, "theworldofai.org") ||
+		strings.Contains(lowered, "theworldofai") ||
+		strings.Contains(lowered, "twoai-site") ||
+		strings.Contains(lowered, "twoai-content")
+	srj := strings.Contains(lowered, "srjconsultingservices.com") ||
+		strings.Contains(lowered, "srj-site")
+	switch {
+	case twoai && srj:
+		return "both"
+	case twoai:
+		return "twoai"
+	case srj:
+		return "srj"
+	}
+	return "unknown"
+}
+
+// erPreRoute answers before the model is asked, for senders whose subject is
+// machine-identifiable. Search Console, Cloudflare, GitHub, Beehiiv and
+// AdSense all name the property they are about, so which project owns the
+// mail is a lookup, not a judgement, and it should not depend on a model that
+// can be down or wrong. Returns nil when nothing matches, which leaves erRoute
+// in charge exactly as before.
+func erPreRoute(m erMessage) []string {
+	f := strings.ToLower(m.From)
+	infra := (strings.Contains(f, "google.com") && strings.Contains(strings.ToLower(m.Subject), "search console")) ||
+		strings.Contains(f, "notify.cloudflare.com") ||
+		strings.Contains(f, "noreply@github.com") ||
+		strings.Contains(f, "beehiiv.com") ||
+		strings.Contains(f, "adsense")
+	if !infra {
+		return nil
+	}
+	switch erWhichSite(strings.ToLower(m.Subject + " " + m.Body)) {
+	case "both":
+		return []string{"theworldofai", "srj"}
+	case "twoai":
+		return []string{"theworldofai"}
+	case "srj":
+		return []string{"srj"}
+	}
+	return nil // an infra sender naming neither site: let the model decide
 }
 
 func erRoute(v erVerdict) []string {
@@ -307,6 +370,14 @@ func erRoute(v erVerdict) []string {
 	case "career":
 		return []string{"career"}
 	case "website":
+		switch v.Site {
+		case "twoai":
+			return []string{"theworldofai"}
+		case "both":
+			return []string{"theworldofai", "srj"}
+		}
+		// srj and unknown both land here: srj owned the website branch alone
+		// before the split, so an unnamed site keeps its historical home.
 		return []string{"srj"}
 	case "publishing":
 		return []string{"theworldofai"}
@@ -385,8 +456,14 @@ func emailRoute(db *sql.DB) error {
 			failed++
 			continue
 		}
-		projects := erRoute(v)
-		needsUser := v.Expertise == "unknown" || v.Deadline || v.FinancialLegal
+		projects := erPreRoute(m)
+		preRouted := projects != nil
+		if !preRouted {
+			projects = erRoute(v)
+		}
+		// A pre-routed message has a known owner by definition, so "no project
+		// claims it" cannot be true of it however the model classified it.
+		needsUser := (v.Expertise == "unknown" && !preRouted) || v.Deadline || v.FinancialLegal
 		if v.Noise {
 			projects, needsUser = nil, false
 		}
