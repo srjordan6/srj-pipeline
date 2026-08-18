@@ -75,7 +75,20 @@ func main() {
 		// The stage itself is untouched and still runs on demand: `pipeline
 		// email_route`. It needs GOOGLE_SA_EMAIL and GOOGLE_SA_KEY on whatever
 		// host runs it, plus gmail.modify in the domain-wide delegation grant.
-		for _, s := range []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_onet", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
+		//
+		// favicons is also OUT of the daily run, Stephen's decision 2026-08-18.
+		// It is a one-shot idempotent push of binary assets into srj-site:
+		// four favicons embedded as base64, plus book covers, executive-briefing
+		// PDFs and insight images merged in by loadRemoteCovers and the zip
+		// asset sets. Every file it handles is already in the repo, so a daily
+		// run is a few dozen GETs that write nothing and print an "ensured" line
+		// per file - the log noise Stephen asked about, with no product.
+		//
+		// Assets change when a book ships or a cover is replaced, which is an
+		// event, not a daily rhythm. Run `pipeline favicons` at that point. The
+		// stage is unchanged and still idempotent, so running it costs nothing
+		// but the GETs.
+		for _, s := range []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_onet", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
