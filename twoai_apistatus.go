@@ -213,12 +213,54 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 	}
 	pages := 1
 
-	// ---- Re-verify curated source URLs so "verified {date}" on the
-	// rendered pages is a live daily claim, not the insertion date. A URL
-	// that answers 2xx/3xx gets today's date; anything else keeps its old
-	// date (the page then honestly shows staleness) and logs to stderr,
-	// which surfaces a dead docs link within one run. 403 bot walls stay
-	// stale by design rather than being blessed unseen.
+	// ---- Re-verify curated source URLs so "verified {date}" on the rendered
+	// pages is a live daily claim rather than the insertion date. A URL that
+	// answers 2xx/3xx gets today's date; anything else keeps its old date, so
+	// the page honestly shows staleness rather than blessing a link nobody
+	// checked.
+	//
+	// WHY THIS GREW A STATE TABLE. The old version logged every failure on
+	// every run, which meant the same three lines appeared in the log daily and
+	// forever, because some publishers will never answer a robot:
+	//
+	//   isocpp.org answers 403 with "cf-mitigated: challenge" - a Cloudflare bot
+	//   wall. It returns 403 to a plain client, to a browser user-agent, and to
+	//   full browser headers alike. There is no header combination that gets in.
+	//
+	//   amd.com answers 503 to our honest user-agent over both HTTP/2 and
+	//   HTTP/1.1, and 200 to a Chrome string. Their WAF is filtering on the
+	//   agent itself. Over HTTP/2 the rejection surfaces as "stream error:
+	//   INTERNAL_ERROR" rather than a clean status, which is why that message
+	//   looked like a transport bug and is not one.
+	//
+	// We do not spoof Chrome to get past either. This crawler says who it is and
+	// gives a contact address, and a site that declines a self-identified robot
+	// is entitled to; pretending to be a browser to harvest a page we are told
+	// not to harvest is not a habit worth having on a site that publishes a
+	// lawsuit tracker about exactly that behaviour.
+	//
+	// So the outcomes are classified and remembered instead. A blocked link is
+	// logged when it FIRST blocks and then weekly, not daily. A dead link, 404
+	// or 410, is logged every run, because that one is ours to fix. The state
+	// lives in twoai_link_verify so the rendered pages can eventually say
+	// "publisher blocks automated checks, last confirmed {date}" rather than
+	// showing a verified date that quietly ages.
+	classify := func(code int, err error) string {
+		switch {
+		case err == nil && code < 400:
+			return "ok"
+		case code == 404 || code == 410:
+			return "dead"
+		case code == 401 || code == 403 || code == 429 || code == 451 || code == 503:
+			return "blocked"
+		case err != nil && strings.Contains(err.Error(), "INTERNAL_ERROR"):
+			return "blocked" // HTTP/2 stream reset: how a WAF refusal arrives
+		case err != nil:
+			return "unreachable"
+		default:
+			return "error"
+		}
+	}
 	reverify := func(table, urlCol, keyCol string) {
 		rows, err := db.Query(`SELECT ` + keyCol + `, ` + urlCol + ` FROM ` + table)
 		if err != nil {
@@ -240,20 +282,57 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 			}
 			req, _ := http.NewRequest("GET", x.u, nil)
 			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org link verification; contact: info@srjconsultingservices.com)")
+			req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 			resp, err := client.Do(req)
-			ok := false
+			code := 0
 			if err == nil {
+				code = resp.StatusCode
 				resp.Body.Close()
-				ok = resp.StatusCode < 400
 			}
-			if ok {
+			outcome := classify(code, err)
+			errText := ""
+			if err != nil {
+				errText = err.Error()
+			}
+
+			var prior string
+			var priorFails int
+			db.QueryRow(`SELECT outcome, consecutive_failures FROM twoai_link_verify WHERE url=$1`,
+				x.u).Scan(&prior, &priorFails)
+
+			if outcome == "ok" {
 				db.Exec(`UPDATE `+table+` SET verified_on=current_date WHERE `+keyCol+`=$1`, x.k)
-			} else {
-				code := 0
-				if resp != nil {
-					code = resp.StatusCode
+				db.Exec(`INSERT INTO twoai_link_verify (url, source_table, source_key, outcome,
+						last_status, last_error, consecutive_failures, first_failed_on, last_ok_on, checked_on)
+					VALUES ($1,$2,$3,'ok',$4,NULL,0,NULL,current_date,current_date)
+					ON CONFLICT (url) DO UPDATE SET outcome='ok', last_status=EXCLUDED.last_status,
+						last_error=NULL, consecutive_failures=0, first_failed_on=NULL,
+						last_ok_on=current_date, checked_on=current_date`,
+					x.u, table, x.k, code)
+				if prior != "" && prior != "ok" {
+					fmt.Fprintf(os.Stderr, "twoai_apistatus: %s %s recovered (was %s)\n", table, x.u, prior)
 				}
-				fmt.Fprintf(os.Stderr, "twoai_apistatus: reverify %s %s: status %d err %v\n", table, x.u, code, err)
+			} else {
+				fails := priorFails + 1
+				db.Exec(`INSERT INTO twoai_link_verify (url, source_table, source_key, outcome,
+						last_status, last_error, consecutive_failures, first_failed_on, checked_on)
+					VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),1,current_date,current_date)
+					ON CONFLICT (url) DO UPDATE SET outcome=EXCLUDED.outcome,
+						last_status=EXCLUDED.last_status, last_error=EXCLUDED.last_error,
+						consecutive_failures=twoai_link_verify.consecutive_failures + 1,
+						first_failed_on=COALESCE(twoai_link_verify.first_failed_on, current_date),
+						checked_on=current_date`,
+					x.u, table, x.k, outcome, code, errText)
+
+				// A dead link is our problem and is said every run. A blocked one
+				// is the publisher's choice and is said on the first day and then
+				// weekly, so a permanent bot wall stops drowning the log.
+				say := outcome == "dead" || outcome == "unreachable" ||
+					fails == 1 || prior != outcome || fails%7 == 0
+				if say {
+					fmt.Fprintf(os.Stderr, "twoai_apistatus: %s %s: %s (status %d, day %d) %v\n",
+						table, x.u, outcome, code, fails, err)
+				}
 			}
 			time.Sleep(300 * time.Millisecond)
 		}
