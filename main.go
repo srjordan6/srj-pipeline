@@ -50,13 +50,32 @@ func main() {
 		return
 	}
 	if src == "all" {
-		// email_route leads the daily run. Its own hourly cron in Oregon cannot
-		// reach the database, which lives in Ohio behind an allow list, so it has
-		// failed every hour since 2026-08-14 20:00 UTC. This cron is already in
-		// the database's own environment, so running the stage here trades hourly
-		// triage for daily triage and gets the mailboxes moving again. Run() ignores
-		// failures, so a bad mail run cannot block the site build.
-		for _, s := range []string{"email_route", "inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_onet", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
+		// email_route is RETIRED from the daily run, Stephen's decision 2026-08-18.
+		//
+		// It ran from 2026-08-01 to 2026-08-12 and wrote 58 bridge rows across
+		// eight projects. Thirty-seven were never acked, including all sixteen to
+		// books_kdp and all fourteen to srj. Its last dozen rows were six
+		// Draft2Digital "Published:" auto-notices, three Render failure alerts,
+		// one piece of account-deletion marketing, and two genuine replies that
+		// were sitting in the inbox anyway. Five in six of its output was
+		// automated notification mail that a filter rule routes just as well.
+		//
+		// What made it redundant: the Inkbox gateway now pushes mail into
+		// project_bridge within seconds of arrival, which was this stage's main
+		// job. inkbox_pull stays in the sequence as the daily reconciler that
+		// sweeps up whatever the gateway missed while the PC was down.
+		//
+		// What is genuinely lost, stated rather than glossed: nothing now triages
+		// the general srj@srjconsultingservices.com inbox, so deadline, financial
+		// and legal language in mail nobody addressed to a project mailbox is
+		// spotted by reading the inbox, not by a machine. The stage caught a Manus
+		// account-deletion deadline and repeated focms-api failures that way. That
+		// is the cost of this decision and it is accepted, not overlooked.
+		//
+		// The stage itself is untouched and still runs on demand: `pipeline
+		// email_route`. It needs GOOGLE_SA_EMAIL and GOOGLE_SA_KEY on whatever
+		// host runs it, plus gmail.modify in the domain-wide delegation grant.
+		for _, s := range []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_onet", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others

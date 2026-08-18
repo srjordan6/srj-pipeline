@@ -4,6 +4,28 @@ package main
 // 2026, delivered as inst.docx from a sibling chat and rebuilt here for the
 // platform's actual conventions).
 //
+// RETIRED FROM THE DAILY RUN on 2026-08-18, Stephen's decision, after being
+// measured rather than assumed. Between Aug 1 and Aug 12 it wrote 58 bridge
+// rows; 37 were never acked, including every row it sent to books_kdp and to
+// srj. Its last dozen rows were six Draft2Digital auto-notices, three Render
+// failure alerts, one marketing mail, and two genuine replies already visible
+// in the inbox. The Inkbox gateway now delivers project mail into
+// project_bridge within seconds, which was this stage's main purpose, so the
+// routing half had become duplicate work producing rows nobody read.
+//
+// The code is left intact and still runs on demand as `pipeline email_route`.
+// To bring it back, add it to the "all" sequence in main.go and set
+// GOOGLE_SA_EMAIL and GOOGLE_SA_KEY on the host, with gmail.modify granted in
+// the domain-wide delegation. Those variables were never set on the pipeline
+// cron, which is why every run since the stage moved there failed at
+// erSAToken with "GOOGLE_SA_EMAIL and GOOGLE_SA_KEY must be set" wrapped in a
+// delegation hint that pointed at the wrong problem.
+//
+// WHAT RETIRING IT COSTS: no machine now triages the general
+// srj@srjconsultingservices.com inbox for deadline, financial or legal
+// language. That escalation path was the part of this stage that earned its
+// keep, and it is gone until something replaces it.
+//
 // Watches the srj@srjconsultingservices.com inbox hourly, has Claude Haiku
 // categorize each unread message, routes it into project_bridge for the
 // owning Claude project(s), escalates anything that needs Stephen's own
@@ -418,7 +440,10 @@ func emailRoute(db *sql.DB) error {
 		"https://www.googleapis.com/auth/gmail.send",
 	})
 	if err != nil {
-		return fmt.Errorf("gmail auth (is gmail.modify granted in domain-wide delegation?): %w", err)
+		// The wrapped error names the real fault. Missing credentials fail here
+		// before any Google call is made, so a delegation hint on its own sends
+		// the reader to Google Admin when nothing has left the container.
+		return fmt.Errorf("gmail auth failed: %w (if the credentials ARE set, check that gmail.modify is granted in domain-wide delegation)", err)
 	}
 
 	// The coordinator's own escalation mail arrives in this same inbox, so
