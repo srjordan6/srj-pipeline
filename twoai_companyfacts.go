@@ -259,8 +259,14 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 					"field": "applicationMetaData.grantDate", "order": "Desc",
 				}},
 				"pagination": map[string]int{"offset": 0, "limit": 5},
+				// firstApplicantName is requested so the applicant string the
+				// match was actually made on is stored alongside the patent.
+				// Without it the attribution cannot be audited after the fact,
+				// which is exactly how the MCP substring bug survived: a join
+				// that discards its own evidence cannot be checked.
 				"fields": []string{"applicationMetaData.patentNumber",
-					"applicationMetaData.inventionTitle", "applicationMetaData.grantDate"},
+					"applicationMetaData.inventionTitle", "applicationMetaData.grantDate",
+					"applicationMetaData.firstApplicantName"},
 			})
 			req, _ := http.NewRequest("POST", "https://api.uspto.gov/api/v1/patent/applications/search", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
@@ -292,9 +298,10 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 				TotalHits int `json:"totalNumFound"`
 				Bag       []struct {
 					Meta struct {
-						PatentNumber   string `json:"patentNumber"`
-						InventionTitle string `json:"inventionTitle"`
-						GrantDate      string `json:"grantDate"`
+						PatentNumber       string `json:"patentNumber"`
+						InventionTitle     string `json:"inventionTitle"`
+						GrantDate          string `json:"grantDate"`
+						FirstApplicantName string `json:"firstApplicantName"`
 					} `json:"applicationMetaData"`
 				} `json:"patentFileWrapperDataBag"`
 			}
@@ -309,7 +316,7 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 			for _, b := range out.Bag {
 				pats = append(pats, map[string]any{
 					"patent_id": b.Meta.PatentNumber, "patent_title": b.Meta.InventionTitle,
-					"patent_date": b.Meta.GrantDate,
+					"patent_date": b.Meta.GrantDate, "applicant": b.Meta.FirstApplicantName,
 				})
 			}
 			return total, pats, nil
@@ -357,11 +364,19 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 				pid, _ := p["patent_id"].(string)
 				title, _ := p["patent_title"].(string)
 				date, _ := p["patent_date"].(string)
+				applicant, _ := p["applicant"].(string)
 				if pid == "" {
 					continue
 				}
-				db.Exec(`INSERT INTO twoai_company_patents (uid, patent_id, title, granted)
-					VALUES ($1,$2,$3,NULLIF($4,'')::date) ON CONFLICT DO NOTHING`, v.UID, pid, title, date)
+				// applicant and match_phrase record WHY this row was attributed to
+				// this company: the applicant string USPTO returned, and the phrase
+				// we searched on. Both are needed to audit the join later.
+				db.Exec(`INSERT INTO twoai_company_patents (uid, patent_id, title, granted, applicant, match_phrase)
+					VALUES ($1,$2,$3,NULLIF($4,'')::date,NULLIF($5,''),$6)
+					ON CONFLICT (uid, patent_id) DO UPDATE SET title=EXCLUDED.title,
+						granted=EXCLUDED.granted, applicant=EXCLUDED.applicant,
+						match_phrase=EXCLUDED.match_phrase`,
+					v.UID, pid, title, date, applicant, phrase)
 			}
 			odpDone++
 		}
