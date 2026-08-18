@@ -4,3 +4,7 @@ publish.env.cmd
 # Local build artifacts
 pipeline-local.exe
 pipeline
+
+# Windows-built local binary (from testing inkbox_pull on the PC)
+pipeline.exe
+*.exe
