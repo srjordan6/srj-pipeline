@@ -3096,6 +3096,12 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	vibe, err := twoaiVibeCoding(db, today, upsert)
+	if err != nil {
+		return err
+	}
+	_ = vibe
+
 	companies, err := twoaiCompanies(db, today, upsert)
 	if err != nil {
 		return err
