@@ -189,6 +189,18 @@ func main() {
 	// Runs after twoai_build, which is what writes the pages it reads.
 	// twoai_ask: retrieval probe. Prints the chunks the index would hand an
 	// answer model for a question, and generates nothing.
+	// serve: the site assistant endpoint. Deployed as a Render Web Service from
+	// this repo with `./pipeline serve`, in the database's own environment,
+	// because the retrieval index sits behind a one-IP allow list a Worker
+	// cannot cross.
+	if src == "serve" {
+		if err := twoaiServe(db); err != nil {
+			fmt.Fprintln(os.Stderr, "serve:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "twoai_ask" {
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, `usage: pipeline twoai_ask "your question"`)
@@ -3113,6 +3125,17 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	downloads, err := twoaiDownloads(db, today, upsert)
+	if err != nil {
+		return err
+	}
+
+	vibe, err := twoaiVibeCoding(db, today, upsert)
+	if err != nil {
+		return err
+	}
+	_ = vibe
+
 	companies, err := twoaiCompanies(db, today, upsert)
 	if err != nil {
 		return err
@@ -3312,8 +3335,8 @@ func twoaiBuild(db *sql.DB) error {
 			staleTimeline, oldestTimeline.String)
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d skills=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive, skillPages)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d skills=%d downloads=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive, skillPages, downloads)
 	return nil
 }
 
