@@ -437,8 +437,18 @@ func twoaiEmbedRun(db *sql.DB) error {
 		}
 		n := start
 		for _, c := range twoaiChunk(text) {
-			h := sha256.Sum256([]byte(c))
-			want = append(want, chunkRow{key, n, url, title, kind, c, hex.EncodeToString(h[:16])})
+			// EVERY CHUNK CARRIES ITS PAGE TITLE. Without this, a chunk of the
+			// New York Times case page is a paragraph of docket text that never
+			// says "OpenAI" or "lawsuit", so "is OpenAI being sued over training
+			// data" ranked the company profile and a weekly digest above 89 case
+			// pages and the assistant answered that we do not cover it. We do.
+			//
+			// The title is what the chunk is ABOUT, and embedding a passage
+			// without it throws that away. Cheap, and it fixes the class of
+			// question this site exists to answer.
+			body := title + "\n\n" + c
+			h := sha256.Sum256([]byte(body))
+			want = append(want, chunkRow{key, n, url, title, kind, body, hex.EncodeToString(h[:16])})
 			n++
 		}
 		return n
