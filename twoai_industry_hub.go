@@ -539,13 +539,69 @@ func twoaiAnalyzeValidated(gen func(extra string) (string, string, error), paylo
 	return model, body, nil
 }
 
-// every percentage in the analysis must exist verbatim in the payload
+// Every percentage in the analysis must exist in the payload. The guard exists
+// because the chronic failure mode is a model DERIVING a number - a delta, a
+// rounding, an average - and presenting it as sourced.
+//
+// BUT THE PAYLOAD DOES NOT ONLY SPEAK IN DIGITS. Source pages write percentages
+// three ways, and a validator that recognises only "57%" rejects correct work:
+//
+//   57%                      the digit form
+//   57 percent               digits with the word
+//   Fifty-seven percent      spelled out, which is house style at many
+//                            publishers and is what CEP writes
+//
+// The nonprofits sector failed on exactly this on 2026-08-19: the CEP excerpt
+// in the payload reads "Fifty-seven percent of leaders say foundation grants
+// are harder to get", the model correctly rendered it as 57%, and the guard
+// threw the whole analysis away twice - once on the first pass and again after
+// a corrective retry that told the model to remove a figure that was never
+// wrong. A false rejection is not a safe failure here: it silently drops a
+// sector's analysis and leaves the page thinner, while teaching nobody
+// anything.
+//
+// So the allowed set is built from all three forms. The check on the OUTPUT
+// stays strict and digit-only, because our own prose should be precise.
 var pctRe = regexp.MustCompile(`\d+(?:\.\d+)?%`)
+var pctWordRe = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*percent`)
+var spelledPctRe = regexp.MustCompile(`(?i)\b((?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[- ](?:one|two|three|four|five|six|seven|eight|nine))?|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|one|two|three|four|five|six|seven|eight|nine)\s+percent`)
+
+var numWords = map[string]int{
+	"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+	"eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+	"fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+	"nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+	"sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+
+// spelledToNumber turns "fifty-seven" into 57, and "seven" into 7.
+func spelledToNumber(s string) (int, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	parts := strings.FieldsFunc(s, func(r rune) bool { return r == '-' || r == ' ' })
+	total, ok := 0, false
+	for _, part := range parts {
+		v, found := numWords[part]
+		if !found {
+			return 0, false
+		}
+		total += v
+		ok = true
+	}
+	return total, ok
+}
 
 func twoaiValidateAnalysis(payload, body string) error {
 	have := map[string]bool{}
 	for _, p := range pctRe.FindAllString(payload, -1) {
 		have[p] = true
+	}
+	for _, m := range pctWordRe.FindAllStringSubmatch(payload, -1) {
+		have[m[1]+"%"] = true
+	}
+	for _, m := range spelledPctRe.FindAllStringSubmatch(payload, -1) {
+		if n, ok := spelledToNumber(m[1]); ok {
+			have[fmt.Sprintf("%d%%", n)] = true
+		}
 	}
 	for _, p := range pctRe.FindAllString(body, -1) {
 		if !have[p] {
