@@ -85,6 +85,26 @@ func twoaiCompanyResolveSite(db *sql.DB, uid, name string) (string, string) {
 
 // Hosts that serve many vendors: a URL here identifies a listing, not the
 // company's own site, so it must never become a company website.
+// Two-label public suffixes. Under each of these, the registrable name is the
+// THIRD label from the right: shlab.org.cn, not org.cn.
+var twoaiTwoLabelSuffixes = map[string]bool{
+	// China
+	"com.cn": true, "org.cn": true, "net.cn": true, "gov.cn": true, "edu.cn": true, "ac.cn": true,
+	// United Kingdom
+	"co.uk": true, "org.uk": true, "ac.uk": true, "gov.uk": true, "me.uk": true, "net.uk": true,
+	// Australia, Japan, Korea, India, Brazil, Israel
+	"com.au": true, "net.au": true, "org.au": true, "edu.au": true, "gov.au": true,
+	"co.jp": true, "or.jp": true, "ne.jp": true, "ac.jp": true, "go.jp": true,
+	"co.kr": true, "or.kr": true, "re.kr": true,
+	"co.in": true, "net.in": true, "org.in": true, "ac.in": true, "gov.in": true,
+	"com.br": true, "net.br": true, "org.br": true,
+	"co.il": true, "org.il": true, "ac.il": true, "gov.il": true,
+	// Others seen in this directory
+	"com.sg": true, "com.hk": true, "com.tw": true, "co.nz": true, "co.za": true,
+	"com.mx": true, "com.tr": true, "co.id": true, "com.ar": true, "com.my": true,
+	"go.id": true, "or.id": true, "ac.uk.com": false,
+}
+
 var twoaiSharedHosts = map[string]bool{
 	"github.com": true, "huggingface.co": true, "apps.apple.com": true,
 	"play.google.com": true, "chromewebstore.google.com": true, "chrome.google.com": true,
@@ -110,13 +130,23 @@ func twoaiRegistrableHost(raw string) string {
 		return ""
 	}
 	parts := strings.Split(host, ".")
-	// keep three labels for two-part public suffixes (co.uk, com.cn, com.au)
+	// Reduce to the registrable domain, keeping three labels where the last two
+	// are a public suffix rather than a registrable name.
+	//
+	// THIS LIST WAS TOO SHORT AND IT SILENTLY CORRUPTED A URL. Shanghai AI
+	// Laboratory's site is shlab.org.cn; "org.cn" was not in the switch, so the
+	// default branch reduced the host to "org.cn" and the harvester spent every
+	// run fetching https://org.cn/, which is not the lab and not anything. The
+	// failure was invisible because a bad host looks identical to an unreachable
+	// one in the counters.
+	//
+	// Any suffix added here must be a genuine public suffix - a registry under
+	// which third parties register names - not merely a common second label.
 	if len(parts) > 2 {
 		suffix2 := parts[len(parts)-2] + "." + parts[len(parts)-1]
-		switch suffix2 {
-		case "co.uk", "com.cn", "com.au", "co.jp", "co.il", "com.br", "co.in", "co.kr":
+		if twoaiTwoLabelSuffixes[suffix2] {
 			host = strings.Join(parts[len(parts)-3:], ".")
-		default:
+		} else {
 			host = suffix2
 		}
 	}
@@ -151,7 +181,7 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 
 	client := &http.Client{Timeout: 20 * time.Second}
 	todayStr := time.Now().UTC().Format("2006-01-02")
-	fetched, skipped, nosite, failed := 0, 0, 0, 0
+	fetched, skipped, nosite, failed, blocked := 0, 0, 0, 0, 0
 	for _, e := range ents {
 		// Freshness skip applies ONLY to rows that already hold readable text
 		// from today. The earlier form skipped on the date alone, which meant a
@@ -197,7 +227,16 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 				return 0, err
 			}
 		} else {
-			failed++
+			// A publisher refusing a self-identified robot is not our failure,
+			// and counting it as one buries the handful that ARE. Same rule as
+			// the curated-link sweep: blocked is the site's choice, failed is a
+			// fetch that should have worked.
+			switch {
+			case status == 401 || status == 403 || status == 429 || status == 451 || status == 402:
+				blocked++
+			default:
+				failed++
+			}
 			db.Exec(`INSERT INTO twoai_company_harvest (uid, name, url, resolved_via, http_status, fetched_on)
 				VALUES ($1,$2,$3,$4,$5,current_date)
 				ON CONFLICT (uid) DO UPDATE SET url=$3, resolved_via=$4, http_status=$5, fetched_on=current_date`,
@@ -205,8 +244,20 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	fmt.Printf("twoai_company_harvest: fetched=%d unchanged_today=%d no_site=%d failed=%d of %d companies\n",
-		fetched, skipped, nosite, failed, len(ents))
+	// Blocked is reported separately from failed so a growing number of real
+	// faults cannot hide behind a stable number of bot walls.
+	fmt.Printf("twoai_company_harvest: fetched=%d unchanged_today=%d no_site=%d blocked=%d failed=%d of %d companies\n",
+		fetched, skipped, nosite, blocked, failed, len(ents))
+	if failed > 0 {
+		var names string
+		db.QueryRow(`SELECT string_agg(name || ' (' || COALESCE(http_status::text,'no response') || ')', ', ' ORDER BY name)
+			FROM twoai_company_harvest
+			WHERE fetched_on = current_date AND (http_status IS NULL
+				OR http_status NOT IN (200, 401, 402, 403, 429, 451))`).Scan(&names)
+		if names != "" {
+			fmt.Fprintf(os.Stderr, "twoai_company_harvest: failing sites: %s\n", names)
+		}
+	}
 
 	// ---- generate profiles from the harvest, capped per run ----------------
 	generated, patched := 0, 0
