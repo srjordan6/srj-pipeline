@@ -5064,7 +5064,8 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 			COALESCE(to_char(p.posted_on,'YYYY-MM-DD'),''),
 			COALESCE(p.entity_uid, f.entity_uid, ''),
 			COALESCE(p.entity_kind, f.entity_kind, ''),
-			(length(p.summary) >= $1 OR p.source = 'intel') AS has_page
+			(length(p.summary) >= $1 OR p.source = 'intel') AS has_page,
+			COALESCE(p.reader_note, '')
 		FROM twoai_vendor_posts p
 		LEFT JOIN twoai_vendor_feeds f ON lower(f.vendor) = lower(p.vendor)
 		ORDER BY p.posted_on DESC NULLS LAST, p.slug`, summaryFloor)
@@ -5077,13 +5078,18 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 		EntityUID  string `json:"entity_uid,omitempty"`
 		EntityKind string `json:"entity_kind,omitempty"`
 		HasPage    bool   `json:"has_page"`
+		// This site's own reading of what a post means for its readers. Kept
+		// apart from Summary because Summary is the vendor's own words and
+		// this is not. Empty on most posts, and the template renders nothing
+		// rather than inventing one.
+		ReaderNote string `json:"reader_note,omitempty"`
 	}
 	archiveOut := []archived{}
 	pageCount := 0
 	for arows.Next() {
 		var a archived
 		if err := arows.Scan(&a.Slug, &a.Vendor, &a.Title, &a.URL, &a.Summary, &a.Date,
-			&a.EntityUID, &a.EntityKind, &a.HasPage); err != nil {
+			&a.EntityUID, &a.EntityKind, &a.HasPage, &a.ReaderNote); err != nil {
 			arows.Close()
 			return 0, err
 		}
