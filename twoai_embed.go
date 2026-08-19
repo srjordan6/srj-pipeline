@@ -197,7 +197,181 @@ func vecLiteral(v []float32) string {
 	return "[" + strings.Join(parts, ",") + "]"
 }
 
+// twoaiURLIndex builds path/uid -> public URL resolution once per run.
+//
+// WHY A LOOKUP AND NOT A SWITCH. The first version of this stage hardcoded a
+// handful of path prefixes and returned empty for everything else, so 2,432 of
+// 2,766 documents were silently skipped and the index covered 12% of the site.
+// Worse, the flagship lawsuit tracker was absent entirely and every glossary
+// chunk cited the hub rather than the term page it came from - an answer would
+// have said "see the glossary" instead of naming the entry.
+//
+// The taxonomy already knows where every section lives, so the uid map is read
+// from it rather than guessed. Prefix rules cover the factories whose URLs are
+// mechanical.
+func twoaiURLIndex(db *sql.DB) map[string]string {
+	idx := map[string]string{}
+	if r, err := db.Query(`SELECT slug, live_path FROM twoai_taxonomy
+		WHERE status='live' AND live_path IS NOT NULL AND live_path NOT LIKE '%#%'`); err == nil {
+		for r.Next() {
+			var slug, path string
+			if r.Scan(&slug, &path) == nil {
+				idx["tax:"+slug] = "https://theworldofai.org" + path
+			}
+		}
+		r.Close()
+	}
+	return idx
+}
+
+// twoaiDocURL resolves ONE document to its page URL. Empty means the document
+// is a bundle handled by twoaiBundleItems, or has no page of its own.
+func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string {
+	const base = "https://theworldofai.org"
+	name := strings.TrimSuffix(path[strings.Index(path, "/")+1:], ".json")
+	prefix := path[:strings.Index(path, "/")]
+
+	// Sections addressed by taxonomy slug: the taxonomy owns the URL, so a
+	// section that moves takes its citations with it.
+	if tax, ok := doc["tax"].(string); ok {
+		if u, found := idx["tax:"+tax]; found {
+			return u
+		}
+	}
+	if u, found := idx["tax:"+name]; found {
+		return u
+	}
+
+	switch prefix {
+	case "companies":
+		if name == "index" {
+			return ""
+		}
+		return base + "/companies/" + name + "/"
+	case "mcp":
+		if name == "index" {
+			return ""
+		}
+		return base + "/mcp/" + name + "/"
+	case "laws":
+		if name == "index" {
+			return base + "/ai-laws/"
+		}
+		return base + "/ai-laws/" + name + "/"
+	case "downloads":
+		if name == "index" {
+			return base + "/downloads/"
+		}
+		return base + "/downloads/" + name + "/"
+	case "people":
+		if name == "roster" || name == "index" {
+			return ""
+		}
+		return base + "/ai-ecosystem/ecosystem-entities-market-and-operations/" + name + "/"
+	case "tools":
+		if strings.HasPrefix(name, "cat-") {
+			return base + "/ai-tools/category/" + strings.TrimPrefix(name, "cat-") + "/"
+		}
+		if name == "tools" || name == "index" {
+			return base + "/ai-tools/"
+		}
+		return base + "/ai-tools/" + name + "/"
+	case "research":
+		if name == "index" {
+			return base + "/research/"
+		}
+		return base + "/research/" + name + "/"
+	case "compliance":
+		if name == "index" {
+			return base + "/ai-compliance/"
+		}
+		return base + "/ai-compliance/" + name + "/"
+	case "prompts":
+		return base + "/ai-prompts/"
+	case "skills":
+		if name == "index" {
+			return base + "/skills/"
+		}
+		return base + "/skills/" + strings.TrimPrefix(name, "occupation-") + "/"
+	case "benchmarks":
+		return base + "/benchmarks/"
+	case "week":
+		return base + "/this-week-in-ai/" + name + "/"
+	case "static":
+		return base + "/" + name + "/"
+	}
+	// Anything carrying its own uid renders under the ecosystem routes.
+	if uid, ok := doc["uid"].(string); ok && uid != "" {
+		for _, cat := range []string{"technology-and-core-infrastructure",
+			"ecosystem-entities-market-and-operations", "research-knowledge-and-learning",
+			"enterprise-applications-governance-and-tools"} {
+			if u, found := idx["uid:"+uid]; found {
+				return u
+			}
+			_ = cat
+		}
+	}
+	return ""
+}
+
+// twoaiBundleItems splits a bundle document into its constituent pages. A
+// bundle embedded whole would cite the hub instead of the page that actually
+// answers the question, which defeats the point of the index.
+func twoaiBundleItems(path string, doc map[string]any) []map[string]any {
+	base := "https://theworldofai.org"
+	out := []map[string]any{}
+	add := func(item any, url, title string) {
+		if url == "" || title == "" {
+			return
+		}
+		out = append(out, map[string]any{"__url": url, "__title": title, "item": item})
+	}
+	switch path {
+	case "lawsuits/lawsuits.json":
+		if cases, ok := doc["cases"].([]any); ok {
+			for _, c := range cases {
+				m, _ := c.(map[string]any)
+				slug, _ := m["slug"].(string)
+				name, _ := m["case_name"].(string)
+				add(m, base+"/ai-lawsuits/"+slug+"/", name)
+			}
+		}
+	case "glossary/glossary.json":
+		if terms, ok := doc["terms"].([]any); ok {
+			for _, t := range terms {
+				m, _ := t.(map[string]any)
+				slug, _ := m["slug"].(string)
+				name, _ := m["term"].(string)
+				add(m, base+"/ai-glossary/"+slug+"/", name)
+			}
+		}
+	case "news/archive.json":
+		if st, ok := doc["stories"].([]any); ok {
+			for _, x := range st {
+				m, _ := x.(map[string]any)
+				slug, _ := m["slug"].(string)
+				title, _ := m["Title"].(string)
+				add(m, base+"/ai-news/"+slug+"/", title)
+			}
+		}
+	case "news/vendor.json":
+		if arr, ok := doc["archive"].([]any); ok {
+			for _, x := range arr {
+				m, _ := x.(map[string]any)
+				slug, _ := m["slug"].(string)
+				title, _ := m["title"].(string)
+				if hp, ok := m["has_page"].(bool); ok && !hp {
+					continue
+				}
+				add(m, base+"/ai-news/vendor/"+slug+"/", title)
+			}
+		}
+	}
+	return out
+}
+
 func twoaiEmbedRun(db *sql.DB) error {
+	idx := twoaiURLIndex(db)
 	rows, err := db.Query(`SELECT path, kind, data::text FROM twoai_pages ORDER BY path`)
 	if err != nil {
 		return err
@@ -209,6 +383,24 @@ func twoaiEmbedRun(db *sql.DB) error {
 		body, hash      string
 	}
 	var want []chunkRow
+	skipped := 0
+
+	emit := func(key, url, title, kind string, payload any, start int) int {
+		var sb strings.Builder
+		twoaiFlatten(payload, &sb, 0)
+		text := strings.TrimSpace(sb.String())
+		if len(text) < 200 {
+			return start
+		}
+		n := start
+		for _, c := range twoaiChunk(text) {
+			h := sha256.Sum256([]byte(c))
+			want = append(want, chunkRow{key, n, url, title, kind, c, hex.EncodeToString(h[:16])})
+			n++
+		}
+		return n
+	}
+
 	for rows.Next() {
 		var path, kind, raw string
 		if rows.Scan(&path, &kind, &raw) != nil {
@@ -218,6 +410,17 @@ func twoaiEmbedRun(db *sql.DB) error {
 		if json.Unmarshal([]byte(raw), &doc) != nil {
 			continue
 		}
+
+		// Bundles first: one document, many pages, each cited separately.
+		if items := twoaiBundleItems(path, doc); len(items) > 0 {
+			for _, it := range items {
+				url, _ := it["__url"].(string)
+				title, _ := it["__title"].(string)
+				emit(path+"::"+url, url, title, kind, it["item"], 0)
+			}
+			continue
+		}
+
 		title, _ := doc["name"].(string)
 		if title == "" {
 			title, _ = doc["title"].(string)
@@ -225,23 +428,12 @@ func twoaiEmbedRun(db *sql.DB) error {
 		if title == "" {
 			title = path
 		}
-		var sb strings.Builder
-		twoaiFlatten(doc, &sb, 0)
-		text := strings.TrimSpace(sb.String())
-		if len(text) < 200 {
-			continue
-		}
-		// The page URL is derived from the document path, which is the same
-		// mapping the site build uses. A chunk that cannot name its page is
-		// useless for citation, so those are skipped rather than stored.
-		url := twoaiPathToURL(path)
+		url := twoaiDocURL(path, doc, idx)
 		if url == "" {
+			skipped++
 			continue
 		}
-		for i, c := range twoaiChunk(text) {
-			h := sha256.Sum256([]byte(c))
-			want = append(want, chunkRow{path, i, url, title, kind, c, hex.EncodeToString(h[:16])})
-		}
+		emit(path, url, title, kind, doc, 0)
 	}
 	rows.Close()
 
@@ -259,22 +451,42 @@ func twoaiEmbedRun(db *sql.DB) error {
 	}
 
 	var todo []chunkRow
+	live := map[string]bool{}
 	for _, c := range want {
+		live[fmt.Sprintf("%s#%d", c.path, c.n)] = true
 		if have[fmt.Sprintf("%s#%d", c.path, c.n)] != c.hash {
 			todo = append(todo, c)
 		}
 	}
 
-	// Chunks whose page no longer exists are removed, so the index cannot answer
-	// from a page a reader can no longer open.
+	// Chunks no longer produced by any document are removed, so the index cannot
+	// answer from a page a reader can no longer open.
 	var removed int64
-	if res, err := db.Exec(`DELETE FROM twoai_embeddings e
-		WHERE NOT EXISTS (SELECT 1 FROM twoai_pages p WHERE p.path = e.path)`); err == nil {
-		removed, _ = res.RowsAffected()
+	if r, err := db.Query(`SELECT path, chunk_no FROM twoai_embeddings`); err == nil {
+		type k struct {
+			p string
+			n int
+		}
+		var dead []k
+		for r.Next() {
+			var p string
+			var n int
+			if r.Scan(&p, &n) == nil && !live[fmt.Sprintf("%s#%d", p, n)] {
+				dead = append(dead, k{p, n})
+			}
+		}
+		r.Close()
+		for _, d := range dead {
+			if res, err := db.Exec(`DELETE FROM twoai_embeddings WHERE path=$1 AND chunk_no=$2`, d.p, d.n); err == nil {
+				a, _ := res.RowsAffected()
+				removed += a
+			}
+		}
 	}
 
 	if len(todo) == 0 {
-		fmt.Printf("twoai_embed: chunks=%d up to date, removed=%d\n", len(want), removed)
+		fmt.Printf("twoai_embed: chunks=%d up to date, skipped_docs=%d removed=%d\n",
+			len(want), skipped, removed)
 		return nil
 	}
 
@@ -324,32 +536,7 @@ func twoaiEmbedRun(db *sql.DB) error {
 	}
 	wg.Wait()
 
-	fmt.Printf("twoai_embed: chunks=%d changed=%d stored=%d failed=%d removed=%d model=%s\n",
-		len(want), len(todo), stored, failed, removed, twoaiEmbedModel)
+	fmt.Printf("twoai_embed: chunks=%d changed=%d stored=%d failed=%d skipped_docs=%d removed=%d model=%s\n",
+		len(want), len(todo), stored, failed, skipped, removed, twoaiEmbedModel)
 	return nil
-}
-
-// twoaiPathToURL maps a content document path to the public URL of the page it
-// renders, so a retrieved chunk can be cited. Anything not mapped returns empty
-// and is skipped: a chunk that cannot name its page has no business in an index
-// whose only job is attribution.
-func twoaiPathToURL(path string) string {
-	base := "https://theworldofai.org"
-	switch {
-	case strings.HasPrefix(path, "laws/"):
-		return base + "/ai-laws/" + strings.TrimSuffix(strings.TrimPrefix(path, "laws/"), ".json") + "/"
-	case strings.HasPrefix(path, "lawsuits/") && path != "lawsuits/lawsuits.json":
-		return base + "/ai-lawsuits/" + strings.TrimSuffix(strings.TrimPrefix(path, "lawsuits/"), ".json") + "/"
-	case strings.HasPrefix(path, "companies/") && path != "companies/index.json":
-		return base + "/companies/" + strings.TrimSuffix(strings.TrimPrefix(path, "companies/"), ".json") + "/"
-	case strings.HasPrefix(path, "downloads/") && path != "downloads/index.json":
-		return base + "/downloads/" + strings.TrimSuffix(strings.TrimPrefix(path, "downloads/"), ".json") + "/"
-	case strings.HasPrefix(path, "security/"):
-		return base + "/ai-ecosystem/enterprise-applications-governance-and-tools/"
-	case strings.HasPrefix(path, "ecosystem/"):
-		return base + "/ai-ecosystem/"
-	case path == "glossary/glossary.json":
-		return base + "/ai-glossary/"
-	}
-	return ""
 }
