@@ -47,6 +47,28 @@ const (
 )
 
 var twoaiWS = regexp.MustCompile(`[ \t]+`)
+
+// HTML REACHED THE INDEX. 578 chunks carried raw <p>, <h2 id=...>, <nav class=...>
+// markup, visible in the first retrieval probe: the top result for "AI laws in
+// Texas" opened with a nav element. Tags are not just noise, they are PAID
+// noise - every one is tokens sent to the answer model that cannot help it, and
+// they dilute the embedding of the sentence they wrap.
+var twoaiTag = regexp.MustCompile(`<[^>]{1,200}>`)
+var twoaiEnt = strings.NewReplacer(
+	"&amp;", "&", "&lt;", "<", "&gt;", ">", "&quot;", `"`, "&#39;", "'",
+	"&rsquo;", "\u2019", "&ldquo;", `"`, "&rdquo;", `"`, "&nbsp;", " ", "&mdash;", "-",
+)
+
+func twoaiStripHTML(s string) string {
+	if !strings.Contains(s, "<") {
+		return s
+	}
+	// Block tags become paragraph breaks so the chunker still has boundaries to
+	// split on; everything else simply goes.
+	s = regexp.MustCompile(`(?i)</(p|div|h[1-6]|li|tr|section)>`).ReplaceAllString(s, "\n\n")
+	return twoaiEnt.Replace(twoaiTag.ReplaceAllString(s, " "))
+}
+
 var twoaiBlank = regexp.MustCompile(`\n{3,}`)
 
 // twoaiFlatten turns a page document into readable prose. It deliberately keeps
@@ -58,7 +80,7 @@ func twoaiFlatten(v any, out *strings.Builder, depth int) {
 	}
 	switch t := v.(type) {
 	case string:
-		s := strings.TrimSpace(t)
+		s := strings.TrimSpace(twoaiStripHTML(t))
 		// Skip URLs, slugs, dates and other machine strings.
 		if len(s) < 25 || strings.HasPrefix(s, "http") || !strings.Contains(s, " ") {
 			return
@@ -370,6 +392,27 @@ func twoaiBundleItems(path string, doc map[string]any) []map[string]any {
 	return out
 }
 
+// twoaiDocTitle finds the human name of a page, checking where each factory
+// actually puts it. Returns empty when there is none, which is a reason to skip
+// the document rather than to invent a label.
+func twoaiDocTitle(doc map[string]any) string {
+	for _, k := range []string{"name", "title", "label", "term", "case_name", "heading"} {
+		if s, ok := doc[k].(string); ok && len(strings.TrimSpace(s)) > 1 {
+			return strings.TrimSpace(s)
+		}
+	}
+	for _, nest := range []string{"company", "person", "tool", "sec", "topic", "item", "week"} {
+		if m, ok := doc[nest].(map[string]any); ok {
+			for _, k := range []string{"name", "title", "label", "term"} {
+				if s, ok := m[k].(string); ok && len(strings.TrimSpace(s)) > 1 {
+					return strings.TrimSpace(s)
+				}
+			}
+		}
+	}
+	return ""
+}
+
 func twoaiEmbedRun(db *sql.DB) error {
 	idx := twoaiURLIndex(db)
 	rows, err := db.Query(`SELECT path, kind, data::text FROM twoai_pages ORDER BY path`)
@@ -421,12 +464,16 @@ func twoaiEmbedRun(db *sql.DB) error {
 			continue
 		}
 
-		title, _ := doc["name"].(string)
+		// A CITATION LABELLED "companies/d9ea9793.json" IS NOT A CITATION.
+		// 731 chunks across 313 pages carried a filename as their title because
+		// the fallback was the path. Company documents nest the name under
+		// "company", weekly digests use "label", and several factories use
+		// "sec" or "topic". Checked in order, and a document that still has no
+		// human title is skipped rather than cited by filename.
+		title := twoaiDocTitle(doc)
 		if title == "" {
-			title, _ = doc["title"].(string)
-		}
-		if title == "" {
-			title = path
+			skipped++
+			continue
 		}
 		url := twoaiDocURL(path, doc, idx)
 		if url == "" {
@@ -557,11 +604,19 @@ func twoaiAsk(db *sql.DB, question string) error {
 	if err != nil {
 		return err
 	}
-	rows, err := db.Query(`SELECT title, url, left(body, 220),
-			1 - (embedding <=> $1::vector) AS score
-		FROM twoai_embeddings
-		ORDER BY embedding <=> $1::vector
-		LIMIT 5`, vecLiteral(vecs[0]))
+	// AT MOST TWO CHUNKS PER PAGE. The first probe returned five chunks of the
+	// same Texas page: the retrieval was right but the answer model would have
+	// seen one source five times and had nothing to corroborate it against. A
+	// question usually has one best page and several that qualify it, and the
+	// qualifying ones are where an honest answer comes from.
+	rows, err := db.Query(`SELECT title, url, body, score FROM (
+			SELECT title, url, left(body, 220) AS body,
+				1 - (embedding <=> $1::vector) AS score,
+				row_number() OVER (PARTITION BY url ORDER BY embedding <=> $1::vector) AS rn
+			FROM twoai_embeddings
+			ORDER BY embedding <=> $1::vector
+			LIMIT 40
+		) q WHERE rn <= 2 ORDER BY score DESC LIMIT 6`, vecLiteral(vecs[0]))
 	if err != nil {
 		return err
 	}
