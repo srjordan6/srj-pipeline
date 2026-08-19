@@ -2819,6 +2819,34 @@ func twoaiBuild(db *sql.DB) error {
 	}
 
 	// ---- F2: glossary, straight from the library already in site_content.
+	//
+	// TWO TABLES HOLD GLOSSARY TERMS AND ONLY ONE OF THEM RENDERS. This block
+	// reads site_content['resources/glossary.json'], which is the richer record
+	// (it carries slug and origin, which the term pages use). The SRJ side also
+	// maintains synced_glossary_terms, which has no slug and no origin.
+	//
+	// On 2026-08-18 eight new terms were written to synced_glossary_terms and
+	// nowhere else. They never appeared on the site and never would have: this
+	// stage cannot see that table. The count sat at 522 through repeated runs
+	// while the other table said 536, and the eight URLs 404ed, which was
+	// misread as a publish lag rather than a wrong source. The terms were
+	// merged into site_content on 2026-08-19 and the drift check below exists
+	// so the next divergence announces itself instead of hiding.
+	//
+	// Deliberately a warning, not a merge. Auto-copying between two tables
+	// whose shapes differ would invent slugs silently, and a slug is a URL that
+	// can never move once published.
+	var syncedActive, inLibrary int
+	db.QueryRow(`SELECT count(*) FROM synced_glossary_terms WHERE is_active`).Scan(&syncedActive)
+	db.QueryRow(`SELECT jsonb_array_length(data->'terms') FROM site_content
+		WHERE path='resources/glossary.json'`).Scan(&inLibrary)
+	if syncedActive > 0 && inLibrary > 0 && syncedActive != inLibrary {
+		fmt.Fprintf(os.Stderr,
+			"twoai_build: GLOSSARY DRIFT: synced_glossary_terms has %d active, site_content library has %d. "+
+				"Only the library renders. Terms present in one and not the other will not publish.\n",
+			syncedActive, inLibrary)
+	}
+
 	var glossary string
 	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='resources/glossary.json'`).Scan(&glossary); err == nil && glossary != "" {
 		var g map[string]any
