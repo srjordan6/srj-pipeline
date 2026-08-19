@@ -50,13 +50,45 @@ func main() {
 		return
 	}
 	if src == "all" {
-		// email_route leads the daily run. Its own hourly cron in Oregon cannot
-		// reach the database, which lives in Ohio behind an allow list, so it has
-		// failed every hour since 2026-08-14 20:00 UTC. This cron is already in
-		// the database's own environment, so running the stage here trades hourly
-		// triage for daily triage and gets the mailboxes moving again. Run() ignores
-		// failures, so a bad mail run cannot block the site build.
-		for _, s := range []string{"email_route", "inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "vendor_notes", "twoai_onet", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
+		// email_route is RETIRED from the daily run, Stephen's decision 2026-08-18.
+		//
+		// It ran from 2026-08-01 to 2026-08-12 and wrote 58 bridge rows across
+		// eight projects. Thirty-seven were never acked, including all sixteen to
+		// books_kdp and all fourteen to srj. Its last dozen rows were six
+		// Draft2Digital "Published:" auto-notices, three Render failure alerts,
+		// one piece of account-deletion marketing, and two genuine replies that
+		// were sitting in the inbox anyway. Five in six of its output was
+		// automated notification mail that a filter rule routes just as well.
+		//
+		// What made it redundant: the Inkbox gateway now pushes mail into
+		// project_bridge within seconds of arrival, which was this stage's main
+		// job. inkbox_pull stays in the sequence as the daily reconciler that
+		// sweeps up whatever the gateway missed while the PC was down.
+		//
+		// What is genuinely lost, stated rather than glossed: nothing now triages
+		// the general srj@srjconsultingservices.com inbox, so deadline, financial
+		// and legal language in mail nobody addressed to a project mailbox is
+		// spotted by reading the inbox, not by a machine. The stage caught a Manus
+		// account-deletion deadline and repeated focms-api failures that way. That
+		// is the cost of this decision and it is accepted, not overlooked.
+		//
+		// The stage itself is untouched and still runs on demand: `pipeline
+		// email_route`. It needs GOOGLE_SA_EMAIL and GOOGLE_SA_KEY on whatever
+		// host runs it, plus gmail.modify in the domain-wide delegation grant.
+		//
+		// favicons is also OUT of the daily run, Stephen's decision 2026-08-18.
+		// It is a one-shot idempotent push of binary assets into srj-site:
+		// four favicons embedded as base64, plus book covers, executive-briefing
+		// PDFs and insight images merged in by loadRemoteCovers and the zip
+		// asset sets. Every file it handles is already in the repo, so a daily
+		// run is a few dozen GETs that write nothing and print an "ensured" line
+		// per file - the log noise Stephen asked about, with no product.
+		//
+		// Assets change when a book ships or a cover is replaced, which is an
+		// event, not a daily rhythm. Run `pipeline favicons` at that point. The
+		// stage is unchanged and still idempotent, so running it costs nothing
+		// but the GETs.
+		for _, s := range []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "vendor_notes", "twoai_onet", "twoai_build", "twoai_embed", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -148,6 +180,35 @@ func main() {
 	if src == "url_registry" {
 		if err := urlRegistry(db); err != nil {
 			fmt.Fprintln(os.Stderr, "url_registry:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// twoai_embed builds the retrieval index the site assistant answers from.
+	// Runs after twoai_build, which is what writes the pages it reads.
+	if src == "twoai_embed" {
+		if err := twoaiEmbedRun(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_embed:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// twoai_indexnow pushes newly published URLs to Bing, Yandex, Naver and
+	// Seznam. Runs after url_registry, which is what decides "new".
+	// `pipeline twoai_indexnow verify` checks the key file is readable without
+	// submitting anything.
+	if src == "twoai_indexnow" {
+		if len(os.Args) > 2 && os.Args[2] == "verify" {
+			if err := verifyIndexNowKey(); err != nil {
+				fmt.Fprintln(os.Stderr, "twoai_indexnow:", err)
+				os.Exit(1)
+			}
+			return
+		}
+		if err := twoaiIndexNow(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_indexnow:", err)
 			os.Exit(1)
 		}
 		return
