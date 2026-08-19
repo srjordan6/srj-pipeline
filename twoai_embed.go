@@ -401,7 +401,16 @@ func twoaiDocTitle(doc map[string]any) string {
 			return strings.TrimSpace(s)
 		}
 	}
-	for _, nest := range []string{"company", "person", "tool", "sec", "topic", "item", "week"} {
+	// The nest list is checked against the ACTUAL documents, not guessed. Adding
+	// the title requirement without checking took skipped_docs from 12 to 1,941
+	// in one run: every MCP server page nests under "server", which was not on
+	// this list, so 1,896 pages left the index silently. They had been present
+	// before, titled by filename, which is why the count moved rather than the
+	// build failing. A stricter rule is only an improvement if it is also right.
+	for _, nest := range []string{
+		"company", "person", "tool", "sec", "topic", "item", "week",
+		"server", "paper", "case", "profile", "bench", "occupation", "hub",
+	} {
 		if m, ok := doc[nest].(map[string]any); ok {
 			for _, k := range []string{"name", "title", "label", "term"} {
 				if s, ok := m[k].(string); ok && len(strings.TrimSpace(s)) > 1 {
