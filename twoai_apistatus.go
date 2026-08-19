@@ -21,6 +21,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -275,46 +276,65 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 			}
 		}
 		rows.Close()
+		// CONCURRENT, because 144 curated URLs at one request plus a 300ms pause
+		// each is roughly a minute of waiting per run and the URLs are spread
+		// across as many different publishers. Six at a time keeps at most one
+		// request per host in flight, which is the thing politeness actually
+		// requires; the per-request pause was standing in for that and cost a
+		// minute a day to do it worse.
 		client := &http.Client{Timeout: 15 * time.Second}
+		var vmu sync.Mutex
+		var vwg sync.WaitGroup
+		vsem := make(chan struct{}, 6)
 		for _, x := range all {
-			if !strings.HasPrefix(x.u, "http") {
-				continue // internal cross-links and organizing rows have no external URL to verify
-			}
-			req, _ := http.NewRequest("GET", x.u, nil)
-			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org link verification; contact: info@srjconsultingservices.com)")
-			req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-			resp, err := client.Do(req)
-			code := 0
-			if err == nil {
-				code = resp.StatusCode
-				resp.Body.Close()
-			}
-			outcome := classify(code, err)
-			errText := ""
-			if err != nil {
-				errText = err.Error()
-			}
+			vwg.Add(1)
+			go func(x kv) {
+				defer vwg.Done()
+				vsem <- struct{}{}
+				defer func() { <-vsem }()
+				if !strings.HasPrefix(x.u, "http") {
+					return // internal cross-links and organizing rows have no external URL to verify
+				}
+				req, _ := http.NewRequest("GET", x.u, nil)
+				req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org link verification; contact: info@srjconsultingservices.com)")
+				req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+				resp, err := client.Do(req)
+				code := 0
+				if err == nil {
+					code = resp.StatusCode
+					resp.Body.Close()
+				}
+				outcome := classify(code, err)
+				errText := ""
+				if err != nil {
+					errText = err.Error()
+				}
+				// Everything below touches the database and the log, so it is done
+				// one worker at a time. The network wait, which is the expensive
+				// part, already happened in parallel.
+				vmu.Lock()
+				defer vmu.Unlock()
 
-			var prior string
-			var priorFails int
-			db.QueryRow(`SELECT outcome, consecutive_failures FROM twoai_link_verify WHERE url=$1`,
-				x.u).Scan(&prior, &priorFails)
+				var prior string
+				var priorFails int
+				db.QueryRow(`SELECT outcome, consecutive_failures FROM twoai_link_verify WHERE url=$1`,
+					x.u).Scan(&prior, &priorFails)
 
-			if outcome == "ok" {
-				db.Exec(`UPDATE `+table+` SET verified_on=current_date WHERE `+keyCol+`=$1`, x.k)
-				db.Exec(`INSERT INTO twoai_link_verify (url, source_table, source_key, outcome,
+				if outcome == "ok" {
+					db.Exec(`UPDATE `+table+` SET verified_on=current_date WHERE `+keyCol+`=$1`, x.k)
+					db.Exec(`INSERT INTO twoai_link_verify (url, source_table, source_key, outcome,
 						last_status, last_error, consecutive_failures, first_failed_on, last_ok_on, checked_on)
 					VALUES ($1,$2,$3,'ok',$4,NULL,0,NULL,current_date,current_date)
 					ON CONFLICT (url) DO UPDATE SET outcome='ok', last_status=EXCLUDED.last_status,
 						last_error=NULL, consecutive_failures=0, first_failed_on=NULL,
 						last_ok_on=current_date, checked_on=current_date`,
-					x.u, table, x.k, code)
-				if prior != "" && prior != "ok" {
-					fmt.Fprintf(os.Stderr, "twoai_apistatus: %s %s recovered (was %s)\n", table, x.u, prior)
-				}
-			} else {
-				fails := priorFails + 1
-				db.Exec(`INSERT INTO twoai_link_verify (url, source_table, source_key, outcome,
+						x.u, table, x.k, code)
+					if prior != "" && prior != "ok" {
+						fmt.Fprintf(os.Stderr, "twoai_apistatus: %s %s recovered (was %s)\n", table, x.u, prior)
+					}
+				} else {
+					fails := priorFails + 1
+					db.Exec(`INSERT INTO twoai_link_verify (url, source_table, source_key, outcome,
 						last_status, last_error, consecutive_failures, first_failed_on, checked_on)
 					VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),1,current_date,current_date)
 					ON CONFLICT (url) DO UPDATE SET outcome=EXCLUDED.outcome,
@@ -322,20 +342,21 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 						consecutive_failures=twoai_link_verify.consecutive_failures + 1,
 						first_failed_on=COALESCE(twoai_link_verify.first_failed_on, current_date),
 						checked_on=current_date`,
-					x.u, table, x.k, outcome, code, errText)
+						x.u, table, x.k, outcome, code, errText)
 
-				// A dead link is our problem and is said every run. A blocked one
-				// is the publisher's choice and is said on the first day and then
-				// weekly, so a permanent bot wall stops drowning the log.
-				say := outcome == "dead" || outcome == "unreachable" ||
-					fails == 1 || prior != outcome || fails%7 == 0
-				if say {
-					fmt.Fprintf(os.Stderr, "twoai_apistatus: %s %s: %s (status %d, day %d) %v\n",
-						table, x.u, outcome, code, fails, err)
+					// A dead link is our problem and is said every run. A blocked one
+					// is the publisher's choice and is said on the first day and then
+					// weekly, so a permanent bot wall stops drowning the log.
+					say := outcome == "dead" || outcome == "unreachable" ||
+						fails == 1 || prior != outcome || fails%7 == 0
+					if say {
+						fmt.Fprintf(os.Stderr, "twoai_apistatus: %s %s: %s (status %d, day %d) %v\n",
+							table, x.u, outcome, code, fails, err)
+					}
 				}
-			}
-			time.Sleep(300 * time.Millisecond)
+			}(x)
 		}
+		vwg.Wait()
 	}
 	reverify("twoai_api_directory", "docs_url", "provider")
 	reverify("twoai_languages", "source_url", "slug")
@@ -407,13 +428,13 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 	// from the tracked-repo catalogue, so "Python in AI work" is backed by
 	// which of the repos this site tracks are written in it.
 	type langRow struct {
-		Slug     string   `json:"slug"`
-		Name     string   `json:"name"`
-		Steward  string   `json:"steward"`
-		First    string   `json:"first_release"`
-		Role     string   `json:"ai_role"`
-		Source   string   `json:"source_url"`
-		Verified string   `json:"verified"`
+		Slug     string `json:"slug"`
+		Name     string `json:"name"`
+		Steward  string `json:"steward"`
+		First    string `json:"first_release"`
+		Role     string `json:"ai_role"`
+		Source   string `json:"source_url"`
+		Verified string `json:"verified"`
 		// See twoai_hardware: says WHY a verified date has stopped moving, so a
 		// stale date is explained rather than merely old.
 		VerifyNote string   `json:"verify_note,omitempty"`

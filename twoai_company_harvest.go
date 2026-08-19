@@ -22,6 +22,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -181,7 +182,18 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 
 	client := &http.Client{Timeout: 20 * time.Second}
 	todayStr := time.Now().UTC().Format("2006-01-02")
+	// FETCHING RUNS CONCURRENTLY. 261 sites at one request plus a 250ms pause
+	// each is over a minute of pure waiting even when every site answers fast,
+	// and a handful of slow hosts stretch it much further. The requests are to
+	// 261 DIFFERENT hosts, so concurrency here does not concentrate load on
+	// anyone: eight in flight means at most one request per host at a time,
+	// which is politer than it sounds.
+	//
+	// Site RESOLUTION stays sequential because it is database work and cheap.
+	// Only the network call is parallel.
 	fetched, skipped, nosite, failed, blocked := 0, 0, 0, 0, 0
+	type fetchJob struct{ uid, name, site, via string }
+	var fetchJobs []fetchJob
 	for _, e := range ents {
 		// Freshness skip applies ONLY to rows that already hold readable text
 		// from today. The earlier form skipped on the date alone, which meant a
@@ -203,47 +215,65 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 				ON CONFLICT (uid) DO UPDATE SET fetched_on=current_date`, e.uid, e.name)
 			continue
 		}
-		req, _ := http.NewRequest("GET", site, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org company directory; info@srjconsultingservices.com)")
-		req.Header.Set("Accept", "text/html,application/xhtml+xml")
-		resp, ferr := client.Do(req)
-		status, extract := 0, ""
-		if ferr == nil {
-			status = resp.StatusCode
-			if status == 200 {
-				body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-				extract = twoaiHarvestExtract(body)
+		fetchJobs = append(fetchJobs, fetchJob{e.uid, e.name, site, via})
+	}
+
+	var hmu sync.Mutex
+	var hwg sync.WaitGroup
+	hsem := make(chan struct{}, 8)
+	for _, j := range fetchJobs {
+		hwg.Add(1)
+		go func(e fetchJob) {
+			defer hwg.Done()
+			hsem <- struct{}{}
+			defer func() { <-hsem }()
+			site, via := e.site, e.via
+			req, _ := http.NewRequest("GET", site, nil)
+			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org company directory; info@srjconsultingservices.com)")
+			req.Header.Set("Accept", "text/html,application/xhtml+xml")
+			resp, ferr := client.Do(req)
+			status, extract := 0, ""
+			if ferr == nil {
+				status = resp.StatusCode
+				if status == 200 {
+					body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+					extract = twoaiHarvestExtract(body)
+				}
+				resp.Body.Close()
 			}
-			resp.Body.Close()
-		}
-		h := sha256.Sum256([]byte(extract))
-		if status == 200 && extract != "" {
-			fetched++
-			if _, err := db.Exec(`INSERT INTO twoai_company_harvest (uid, name, url, resolved_via, http_status, extract, content_hash, fetched_on)
+			h := sha256.Sum256([]byte(extract))
+			hmu.Lock()
+			defer hmu.Unlock()
+			if status == 200 && extract != "" {
+				fetched++
+				if _, err := db.Exec(`INSERT INTO twoai_company_harvest (uid, name, url, resolved_via, http_status, extract, content_hash, fetched_on)
 				VALUES ($1,$2,$3,$4,$5,$6,$7,current_date)
 				ON CONFLICT (uid) DO UPDATE SET name=$2, url=$3, resolved_via=$4, http_status=$5,
 					extract=$6, content_hash=$7, fetched_on=current_date`,
-				e.uid, e.name, site, via, status, extract, hex.EncodeToString(h[:8])); err != nil {
-				return 0, err
-			}
-		} else {
-			// A publisher refusing a self-identified robot is not our failure,
-			// and counting it as one buries the handful that ARE. Same rule as
-			// the curated-link sweep: blocked is the site's choice, failed is a
-			// fetch that should have worked.
-			switch {
-			case status == 401 || status == 403 || status == 429 || status == 451 || status == 402:
-				blocked++
-			default:
-				failed++
-			}
-			db.Exec(`INSERT INTO twoai_company_harvest (uid, name, url, resolved_via, http_status, fetched_on)
+					e.uid, e.name, site, via, status, extract, hex.EncodeToString(h[:8])); err != nil {
+					// One row failing to store is not worth abandoning the sweep,
+					// and inside a worker there is nobody to return the error to.
+					fmt.Fprintf(os.Stderr, "twoai_company_harvest: store %s: %v\n", e.name, err)
+				}
+			} else {
+				// A publisher refusing a self-identified robot is not our failure,
+				// and counting it as one buries the handful that ARE. Same rule as
+				// the curated-link sweep: blocked is the site's choice, failed is a
+				// fetch that should have worked.
+				switch {
+				case status == 401 || status == 403 || status == 429 || status == 451 || status == 402:
+					blocked++
+				default:
+					failed++
+				}
+				db.Exec(`INSERT INTO twoai_company_harvest (uid, name, url, resolved_via, http_status, fetched_on)
 				VALUES ($1,$2,$3,$4,$5,current_date)
 				ON CONFLICT (uid) DO UPDATE SET url=$3, resolved_via=$4, http_status=$5, fetched_on=current_date`,
-				e.uid, e.name, site, via, status)
-		}
-		time.Sleep(250 * time.Millisecond)
+					e.uid, e.name, site, via, status)
+			}
+		}(j)
 	}
+	hwg.Wait()
 	// Blocked is reported separately from failed so a growing number of real
 	// faults cannot hide behind a stable number of bot walls.
 	fmt.Printf("twoai_company_harvest: fetched=%d unchanged_today=%d no_site=%d blocked=%d failed=%d of %d companies\n",
@@ -260,59 +290,110 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 	}
 
 	// ---- generate profiles from the harvest, capped per run ----------------
+	//
+	// GENERATION RUNS CONCURRENTLY, PATCHING DOES NOT. Measured on the
+	// 2026-08-19 run, this step took 4m16s: up to 60 Claude calls at roughly
+	// four seconds each, strictly one after another, plus a 1.5s sleep between
+	// successes. The calls are independent - one company's profile never
+	// depends on another's - so they are the textbook case for a small worker
+	// pool.
+	//
+	// Six at a time, not sixty. The cap is about the API's rate limit and about
+	// being a considerate client, not about what Go can do; six replaces the
+	// per-call sleep with steady pressure. The page patching that follows stays
+	// sequential because it is pure database work, already fast, and ordering
+	// makes the log readable.
 	generated, patched := 0, 0
-	for _, e := range ents {
-		var url2, extract string
-		db.QueryRow(`SELECT url, extract FROM twoai_company_harvest WHERE uid=$1`, e.uid).Scan(&url2, &extract)
-
-		// facts this site already holds, straight from the page doc
-		var pageData string
-		if db.QueryRow(`SELECT data::text FROM twoai_pages WHERE path=$1`, "companies/"+e.uid+".json").Scan(&pageData) != nil {
-			continue
-		}
-		var pd map[string]any
-		json.Unmarshal([]byte(pageData), &pd)
-		payload := map[string]any{"company": e.name, "held_facts": pd["company"]}
-		if extract != "" {
-			payload["company_website"] = url2
-			payload["what_the_company_site_says"] = extract
-		}
-		pj, _ := json.Marshal(payload)
-		h := sha256.Sum256(pj)
-		cHash := hex.EncodeToString(h[:8])
-		metricKey := "company-" + e.uid
-
-		var exists int
-		db.QueryRow(`SELECT count(*) FROM twoai_industry_analysis WHERE metric=$1 AND data_hash=$2`, metricKey, cHash).Scan(&exists)
-		if exists == 0 && os.Getenv("ANTHROPIC_API_KEY") != "" && generated < twoaiCompanyGenCap && extract != "" {
-			model := os.Getenv("TWOAI_ANALYSIS_MODEL")
-			if model == "" {
-				model = "claude-sonnet-4-6"
+	type genJob struct {
+		uid, name, metricKey, cHash, payload string
+	}
+	var jobs []genJob
+	if os.Getenv("ANTHROPIC_API_KEY") != "" {
+		for _, e := range ents {
+			if len(jobs) >= twoaiCompanyGenCap {
+				break
 			}
-			system := "You write company profiles for theworldofai.org, a sourced AI reference site. " +
-				"You are given JSON: the text this site's pipeline harvested from the company's own " +
-				"website, and the facts this site already holds about it (products tracked, lawsuits, " +
-				"MCP servers, SEC and patent facts where present). Write 2 to 3 short paragraphs of " +
-				"plain English: what the company is and does per its own site, its AI products and " +
-				"position, and anything the held facts add (litigation, filings, registry presence). " +
-				"HARD RULES: use ONLY facts in the JSON. Name only products, people, and organizations " +
-				"that appear in the JSON. Every percentage and dollar figure must appear verbatim in " +
-				"the JSON. Marketing language from the site gets reported neutrally (the company " +
-				"describes itself as...), never adopted. If the material is thin, write less. " +
-				"Plain sentences, no hype, commas over dashes."
-			body, aerr := twoaiClaudeCall(model, system, "Company: "+e.name+"\nThe data:\n"+string(pj)+"\n\nWrite the profile now.")
-			if aerr != nil {
-				fmt.Printf("twoai_company_harvest: %s profile skipped: %v\n", e.name, aerr)
-			} else if verr := twoaiValidateAnalysis(string(pj), body); verr != nil {
-				fmt.Printf("twoai_company_harvest: %s profile REJECTED (%v)\n", e.name, verr)
-			} else {
+			var url2, extract string
+			db.QueryRow(`SELECT url, extract FROM twoai_company_harvest WHERE uid=$1`, e.uid).Scan(&url2, &extract)
+			if extract == "" {
+				continue
+			}
+			var pageData string
+			if db.QueryRow(`SELECT data::text FROM twoai_pages WHERE path=$1`, "companies/"+e.uid+".json").Scan(&pageData) != nil {
+				continue
+			}
+			var pd map[string]any
+			json.Unmarshal([]byte(pageData), &pd)
+			payload := map[string]any{
+				"company": e.name, "held_facts": pd["company"],
+				"company_website": url2, "what_the_company_site_says": extract,
+			}
+			pj, _ := json.Marshal(payload)
+			h := sha256.Sum256(pj)
+			cHash := hex.EncodeToString(h[:8])
+			metricKey := "company-" + e.uid
+			var exists int
+			db.QueryRow(`SELECT count(*) FROM twoai_industry_analysis WHERE metric=$1 AND data_hash=$2`,
+				metricKey, cHash).Scan(&exists)
+			if exists == 0 {
+				jobs = append(jobs, genJob{e.uid, e.name, metricKey, cHash, string(pj)})
+			}
+		}
+	}
+	if len(jobs) > 0 {
+		model := os.Getenv("TWOAI_ANALYSIS_MODEL")
+		if model == "" {
+			model = "claude-sonnet-4-6"
+		}
+		system := "You write company profiles for theworldofai.org, a sourced AI reference site. " +
+			"You are given JSON: the text this site's pipeline harvested from the company's own " +
+			"website, and the facts this site already holds about it (products tracked, lawsuits, " +
+			"MCP servers, SEC and patent facts where present). Write 2 to 3 short paragraphs of " +
+			"plain English: what the company is and does per its own site, its AI products and " +
+			"position, and anything the held facts add (litigation, filings, registry presence). " +
+			"HARD RULES: use ONLY facts in the JSON. Name only products, people, and organizations " +
+			"that appear in the JSON. Every percentage and dollar figure must appear verbatim in " +
+			"the JSON. Marketing language from the site gets reported neutrally (the company " +
+			"describes itself as...), never adopted. If the material is thin, write less. " +
+			"Plain sentences, no hype, commas over dashes."
+		sem := make(chan struct{}, 6)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for _, j := range jobs {
+			wg.Add(1)
+			go func(j genJob) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				body, aerr := twoaiClaudeCall(model, system,
+					"Company: "+j.name+"\nThe data:\n"+j.payload+"\n\nWrite the profile now.")
+				mu.Lock()
+				defer mu.Unlock()
+				if aerr != nil {
+					fmt.Printf("twoai_company_harvest: %s profile skipped: %v\n", j.name, aerr)
+					return
+				}
+				if verr := twoaiValidateAnalysis(j.payload, body); verr != nil {
+					fmt.Printf("twoai_company_harvest: %s profile REJECTED (%v)\n", j.name, verr)
+					return
+				}
 				db.Exec(`INSERT INTO twoai_industry_analysis (metric, data_hash, model, body, generated_on)
 					VALUES ($1,$2,$3,$4,current_date) ON CONFLICT (metric, data_hash) DO NOTHING`,
-					metricKey, cHash, model, body)
+					j.metricKey, j.cHash, model, body)
 				generated++
-				time.Sleep(1500 * time.Millisecond)
-			}
+			}(j)
 		}
+		wg.Wait()
+	}
+
+	// Patching is pure database work: read whatever profile exists for this
+	// company, whether written seconds ago by the pool above or on an earlier
+	// run, and merge it into the page document. Sequential on purpose; it is
+	// fast and the order keeps the log readable.
+	for _, e := range ents {
+		var url2 string
+		db.QueryRow(`SELECT url FROM twoai_company_harvest WHERE uid=$1`, e.uid).Scan(&url2)
+		metricKey := "company-" + e.uid
 
 		var pModel, pBody, pDate string
 		db.QueryRow(`SELECT model, body, generated_on::text FROM twoai_industry_analysis
