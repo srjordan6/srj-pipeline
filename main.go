@@ -50,45 +50,13 @@ func main() {
 		return
 	}
 	if src == "all" {
-		// email_route is RETIRED from the daily run, Stephen's decision 2026-08-18.
-		//
-		// It ran from 2026-08-01 to 2026-08-12 and wrote 58 bridge rows across
-		// eight projects. Thirty-seven were never acked, including all sixteen to
-		// books_kdp and all fourteen to srj. Its last dozen rows were six
-		// Draft2Digital "Published:" auto-notices, three Render failure alerts,
-		// one piece of account-deletion marketing, and two genuine replies that
-		// were sitting in the inbox anyway. Five in six of its output was
-		// automated notification mail that a filter rule routes just as well.
-		//
-		// What made it redundant: the Inkbox gateway now pushes mail into
-		// project_bridge within seconds of arrival, which was this stage's main
-		// job. inkbox_pull stays in the sequence as the daily reconciler that
-		// sweeps up whatever the gateway missed while the PC was down.
-		//
-		// What is genuinely lost, stated rather than glossed: nothing now triages
-		// the general srj@srjconsultingservices.com inbox, so deadline, financial
-		// and legal language in mail nobody addressed to a project mailbox is
-		// spotted by reading the inbox, not by a machine. The stage caught a Manus
-		// account-deletion deadline and repeated focms-api failures that way. That
-		// is the cost of this decision and it is accepted, not overlooked.
-		//
-		// The stage itself is untouched and still runs on demand: `pipeline
-		// email_route`. It needs GOOGLE_SA_EMAIL and GOOGLE_SA_KEY on whatever
-		// host runs it, plus gmail.modify in the domain-wide delegation grant.
-		//
-		// favicons is also OUT of the daily run, Stephen's decision 2026-08-18.
-		// It is a one-shot idempotent push of binary assets into srj-site:
-		// four favicons embedded as base64, plus book covers, executive-briefing
-		// PDFs and insight images merged in by loadRemoteCovers and the zip
-		// asset sets. Every file it handles is already in the repo, so a daily
-		// run is a few dozen GETs that write nothing and print an "ensured" line
-		// per file - the log noise Stephen asked about, with no product.
-		//
-		// Assets change when a book ships or a cover is replaced, which is an
-		// event, not a daily rhythm. Run `pipeline favicons` at that point. The
-		// stage is unchanged and still idempotent, so running it costs nothing
-		// but the GETs.
-		for _, s := range []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_onet", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "export_corpus", "deploy_site"} {
+		// email_route leads the daily run. Its own hourly cron in Oregon cannot
+		// reach the database, which lives in Ohio behind an allow list, so it has
+		// failed every hour since 2026-08-14 20:00 UTC. This cron is already in
+		// the database's own environment, so running the stage here trades hourly
+		// triage for daily triage and gets the mailboxes moving again. Run() ignores
+		// failures, so a bad mail run cannot block the site build.
+		for _, s := range []string{"email_route", "inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "favicons", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "vendor_notes", "twoai_onet", "twoai_build", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -185,25 +153,6 @@ func main() {
 		return
 	}
 
-	// twoai_indexnow pushes newly published URLs to Bing, Yandex, Naver and
-	// Seznam. Runs after url_registry, which is what decides "new".
-	// `pipeline twoai_indexnow verify` checks the key file is readable without
-	// submitting anything.
-	if src == "twoai_indexnow" {
-		if len(os.Args) > 2 && os.Args[2] == "verify" {
-			if err := verifyIndexNowKey(); err != nil {
-				fmt.Fprintln(os.Stderr, "twoai_indexnow:", err)
-				os.Exit(1)
-			}
-			return
-		}
-		if err := twoaiIndexNow(db); err != nil {
-			fmt.Fprintln(os.Stderr, "twoai_indexnow:", err)
-			os.Exit(1)
-		}
-		return
-	}
-
 	if src == "bench_results" {
 		if err := benchResults(db); err != nil {
 			fmt.Fprintln(os.Stderr, "bench_results:", err)
@@ -281,11 +230,11 @@ func main() {
 	// an opaque Google News redirect. Own subcommand, never part of `all`, so
 	// a Google-side change can stall this and nothing else.
 	if src == "favicons" {
-		// Remote-sourced assets merge into faviconFiles before the push, so a
-		// run ensures them alongside the embedded set. If a staging URL has
-		// expired the loader logs and skips, and files already in the repo stay
-		// put. This stage is no longer in the daily sequence: run it when a
-		// cover, briefing or icon actually changes.
+		// Remote-sourced assets merge into faviconFiles before the push so
+		// the daily run ensures them alongside the embedded set. Wired here,
+		// not in hourlyCatchUp, so the zip fetch happens once a day, not 24
+		// times. If a staging URL has expired the loader logs and skips, and
+		// files already in the repo stay put.
 		// loadRemoteCovers is called inside runFavicons; calling it here too
 		// fetched and verified every cover twice per run (visible as a
 		// duplicated log block). The zip assets still load here.
@@ -339,6 +288,14 @@ func main() {
 			}
 		}
 		fmt.Printf("resolve_gnews: done fixed=%d missed=%d of %d\n", fixed, missed, len(todo))
+		return
+	}
+
+	if src == "vendor_notes" {
+		if err := vendorNotes(db); err != nil {
+			fmt.Fprintln(os.Stderr, "vendor_notes:", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -1711,17 +1668,7 @@ func clGet(path string, params map[string]string, out any) error {
 	}
 	req.URL.RawQuery = q.Encode()
 	req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
-	// COURTLISTENER_TOKEN has been read here since this function was written;
-	// search works anonymously, docket-detail reads need the token. On
-	// 2026-08-19 I added a second, identical block above this one and told
-	// Stephen to go and create a token that already existed. The duplicate is
-	// removed; this is the original and it was never missing.
-	//
-	// If the sweep is still being throttled, the question is therefore NOT
-	// whether the code sends a token. It is whether the variable is set on the
-	// host that runs the stage, and whether the authenticated ceiling is simply
-	// being reached. Check the value on the cron before touching this code.
-	if tok := strings.TrimSpace(os.Getenv("COURTLISTENER_TOKEN")); tok != "" {
+	if tok := os.Getenv("COURTLISTENER_TOKEN"); tok != "" {
 		req.Header.Set("Authorization", "Token "+tok)
 	}
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -2829,86 +2776,11 @@ func twoaiBuild(db *sql.DB) error {
 	}
 
 	// ---- F2: glossary, straight from the library already in site_content.
-	//
-	// TWO TABLES HOLD GLOSSARY TERMS AND ONLY ONE OF THEM RENDERS. This block
-	// reads site_content['resources/glossary.json'], which is the richer record
-	// (it carries slug and origin, which the term pages use). The SRJ side also
-	// maintains synced_glossary_terms, which has no slug and no origin.
-	//
-	// On 2026-08-18 eight new terms were written to synced_glossary_terms and
-	// nowhere else. They never appeared on the site and never would have: this
-	// stage cannot see that table. The count sat at 522 through repeated runs
-	// while the other table said 536, and the eight URLs 404ed, which was
-	// misread as a publish lag rather than a wrong source. The terms were
-	// merged into site_content on 2026-08-19 and the drift check below exists
-	// so the next divergence announces itself instead of hiding.
-	//
-	// Deliberately a warning, not a merge. Auto-copying between two tables
-	// whose shapes differ would invent slugs silently, and a slug is a URL that
-	// can never move once published.
-	var syncedActive, inLibrary int
-	db.QueryRow(`SELECT count(*) FROM synced_glossary_terms WHERE is_active`).Scan(&syncedActive)
-	db.QueryRow(`SELECT jsonb_array_length(data->'terms') FROM site_content
-		WHERE path='resources/glossary.json'`).Scan(&inLibrary)
-	if syncedActive > 0 && inLibrary > 0 && syncedActive != inLibrary {
-		fmt.Fprintf(os.Stderr,
-			"twoai_build: GLOSSARY DRIFT: synced_glossary_terms has %d active, site_content library has %d. "+
-				"Only the library renders. Terms present in one and not the other will not publish.\n",
-			syncedActive, inLibrary)
-	}
-
 	var glossary string
 	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='resources/glossary.json'`).Scan(&glossary); err == nil && glossary != "" {
 		var g map[string]any
 		if json.Unmarshal([]byte(glossary), &g) == nil {
 			g["generated"] = today
-
-			// AUDIENCE LENSES: 2,109 rows across 522 terms, written to explain
-			// each term to a child, a developer, a regulator, a CISO and the
-			// rest. They live in twoai_glossary_lenses, the term page has
-			// rendered them since it was built, and NOTHING HAS EVER PUT THEM IN
-			// THE PAGE DOCUMENT. The template guards on t.lenses, that key never
-			// existed in site_content, so the guard was false for every term and
-			// the whole section silently disappeared. Months of writing, live in
-			// SQL, invisible on the site.
-			//
-			// Merged here rather than into site_content because site_content is
-			// the shared library both sites read, and the lenses are ours.
-			lensRows, lerr := db.Query(`SELECT term_slug, audience, body
-				FROM twoai_glossary_lenses ORDER BY term_slug, audience`)
-			if lerr == nil {
-				byTerm := map[string][]map[string]string{}
-				for lensRows.Next() {
-					var slug, audience, body string
-					if lensRows.Scan(&slug, &audience, &body) == nil && slug != "" {
-						byTerm[slug] = append(byTerm[slug], map[string]string{
-							"audience": audience, "body": body,
-						})
-					}
-				}
-				lensRows.Close()
-				attached, missing := 0, 0
-				if terms, ok := g["terms"].([]any); ok {
-					for _, raw := range terms {
-						t, ok := raw.(map[string]any)
-						if !ok {
-							continue
-						}
-						slug, _ := t["slug"].(string)
-						if ls, found := byTerm[slug]; found {
-							t["lenses"] = ls
-							attached++
-						} else {
-							missing++
-						}
-					}
-				}
-				// Said out loud because a silent zero here is exactly how this
-				// went unnoticed: a term set with no lenses attached looks
-				// identical to a term set that never had any.
-				fmt.Printf("twoai_build: glossary lenses attached to %d terms, %d without\n",
-					attached, missing)
-			}
 			if err := upsert("glossary/glossary.json", "glossary", g); err != nil {
 				return err
 			}
@@ -3090,17 +2962,6 @@ func twoaiBuild(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-
-	downloads, err := twoaiDownloads(db, today, upsert)
-	if err != nil {
-		return err
-	}
-
-	vibe, err := twoaiVibeCoding(db, today, upsert)
-	if err != nil {
-		return err
-	}
-	_ = vibe
 
 	companies, err := twoaiCompanies(db, today, upsert)
 	if err != nil {
@@ -3301,8 +3162,8 @@ func twoaiBuild(db *sql.DB) error {
 			staleTimeline, oldestTimeline.String)
 	}
 
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d skills=%d downloads=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive, skillPages, downloads)
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d skills=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive, skillPages)
 	return nil
 }
 
@@ -3995,31 +3856,9 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 			}
 			lr.Close()
 		}
-		// MCP servers this company published. The registry names servers with a
-		// reverse-DNS namespace before the slash: ai.anthropic/..., com.microsoft/...,
-		// co.vantaj/... We attribute a server only when the LAST label of that
-		// namespace equals the company name exactly, once both are reduced to
-		// letters and digits.
-		//
-		// This replaced a LIKE '%name%' substring test, which was wrong 101 times
-		// out of 105 measured across the built content set. Short company names
-		// are substrings of unrelated words: Box collected mailbox, toolbox and
-		// dropbox-mcp-server; SAP collected whatsapp and trendsapi; Meta collected
-		// metadock and primeta; Vanta collected co.vantaj, an unrelated uptime
-		// monitoring company. Each false match published a sentence claiming a
-		// company had shipped software it had nothing to do with, on pages whose
-		// own first paragraph promises they draw only from records.
-		//
-		// The regex anchors the label between a dot (or the start) and the slash.
-		// Legitimate servers published under a namespace that does not carry the
-		// company's name are dropped too; that is the right trade, because silence
-		// is recoverable and a false attribution is not. Where a real one is
-		// dropped the fix is an explicit alias, never a looser test.
-		nsPattern := "(^|\\.)" + regexp.QuoteMeta(strings.ToLower(entityPunctRe.ReplaceAllString(strings.ToLower(v), ""))) + "/"
 		mr, err := db.Query(`SELECT slug, name, COALESCE(description,'') FROM twoai_mcp_servers
-			WHERE status='active'
-			  AND regexp_replace(lower(split_part(name, '/', 1)), '[^a-z0-9.]', '', 'g') || '/' ~ $1
-			ORDER BY name LIMIT 12`, nsPattern)
+			WHERE status='active' AND lower(name) LIKE $1 ORDER BY name LIMIT 12`,
+			"%"+strings.ToLower(strings.ReplaceAll(v, " ", ""))+"%")
 		if err == nil {
 			for mr.Next() {
 				var slug, name, desc string
@@ -4312,12 +4151,7 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 				dup := false
 				for _, pn := range profiledNames {
 					if sameHuman(n, pn) {
-						// Silent by design. This match is permanent and correct:
-						// the roster and site_people spell the same person two
-						// ways, the merge resolves it, and saying so on every run
-						// forever reports a success as though it were a warning.
-						// A name that stops matching shows up as a new stub in the
-						// directory, which is the visible signal that matters.
+						fmt.Fprintf(os.Stderr, "twoai_build: roster %q is the profiled %q, skipping the duplicate\n", n, pn)
 						dup = true
 						break
 					}
