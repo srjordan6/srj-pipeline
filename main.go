@@ -1711,6 +1711,18 @@ func clGet(path string, params map[string]string, out any) error {
 	}
 	req.URL.RawQuery = q.Encode()
 	req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
+	// AUTHENTICATE WHEN WE CAN. CourtListener throttles anonymous callers hard,
+	// and the daily logs show it: "rate limited, ending sweep early" on nearly
+	// every run, docket refreshes abandoned partway, and 14 tracked cases with
+	// no development recorded because their docket has never been reached.
+	// A free API token raises the ceiling by orders of magnitude.
+	//
+	// Absence is not fatal - the sweep still works anonymously, just slowly and
+	// partially - so this reads the token if it is there and says nothing if it
+	// is not. Set COURTLISTENER_TOKEN on the cron to use it.
+	if tok := strings.TrimSpace(os.Getenv("COURTLISTENER_TOKEN")); tok != "" {
+		req.Header.Set("Authorization", "Token "+tok)
+	}
 	if tok := os.Getenv("COURTLISTENER_TOKEN"); tok != "" {
 		req.Header.Set("Authorization", "Token "+tok)
 	}

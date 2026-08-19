@@ -242,85 +242,129 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 		client := &http.Client{Timeout: 60 * time.Second}
 		odpQuery := func(phrase string) (int, []map[string]any, error) {
 			esc := strings.ReplaceAll(phrase, `"`, ``)
-			// Body shape per the ODP spec and the PTAB mapping examples:
-			// sort is an array of {field, order} objects, pagination is a
-			// nested object, and date constraints go in rangeFilters, not
-			// in q. The first sweep sent a sort string, top-level limit,
-			// and a [* TO *] existence clause, and every query 400'd.
-			// The grantDate range floor doubles as the "granted only,
-			// since 2001" scope the pages state.
-			body, _ := json.Marshal(map[string]any{
-				"q": `applicationMetaData.firstApplicantName:"` + esc + `"`,
-				"rangeFilters": []map[string]string{{
-					"field":     "applicationMetaData.grantDate",
-					"valueFrom": "2001-01-01", "valueTo": "2035-12-31",
-				}},
-				"sort": []map[string]string{{
-					"field": "applicationMetaData.grantDate", "order": "Desc",
-				}},
-				"pagination": map[string]int{"offset": 0, "limit": 5},
-				// firstApplicantName is requested so the applicant string the
-				// match was actually made on is stored alongside the patent.
-				// Without it the attribution cannot be audited after the fact,
-				// which is exactly how the MCP substring bug survived: a join
-				// that discards its own evidence cannot be checked.
-				"fields": []string{"applicationMetaData.patentNumber",
-					"applicationMetaData.inventionTitle", "applicationMetaData.grantDate",
-					"applicationMetaData.firstApplicantName"},
-			})
-			req, _ := http.NewRequest("POST", "https://api.uspto.gov/api/v1/patent/applications/search", bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-API-KEY", odpKey)
-			req.Header.Set("User-Agent", "theworldofai.org pipeline (contact: info@srjconsultingservices.com)")
-			resp, err := client.Do(req)
-			if err != nil {
-				return 0, nil, err
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode == 429 {
-				return 0, nil, fmt.Errorf("rate limited")
-			}
-			// ODP answers a zero-result search with 404, not an empty 200:
-			// the first fixed sweep 404'd on 01.AI, Copy.ai, and other
-			// companies that plausibly hold no granted US patents, while
-			// returning real counts for 16 others in the same run. A 404
-			// is a finding of nothing, not a failure - and since the
-			// section only lists companies with patents, a mistaken zero
-			// can only omit, never fabricate.
-			if resp.StatusCode == 404 {
-				return 0, nil, nil
-			}
-			if resp.StatusCode != 200 {
-				return 0, nil, fmt.Errorf("status %d", resp.StatusCode)
-			}
-			var out struct {
-				Count     int `json:"count"`
-				TotalHits int `json:"totalNumFound"`
-				Bag       []struct {
-					Meta struct {
-						PatentNumber       string `json:"patentNumber"`
-						InventionTitle     string `json:"inventionTitle"`
-						GrantDate          string `json:"grantDate"`
-						FirstApplicantName string `json:"firstApplicantName"`
-					} `json:"applicationMetaData"`
-				} `json:"patentFileWrapperDataBag"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-				return 0, nil, err
-			}
-			total := out.TotalHits
-			if total == 0 && out.Count > 0 {
-				total = out.Count
-			}
-			var pats []map[string]any
-			for _, b := range out.Bag {
-				pats = append(pats, map[string]any{
-					"patent_id": b.Meta.PatentNumber, "patent_title": b.Meta.InventionTitle,
-					"patent_date": b.Meta.GrantDate, "applicant": b.Meta.FirstApplicantName,
+			// Retry loop exists solely for rate limiting; see the 429 branch.
+			for attempt := 0; ; attempt++ {
+				// Body shape per the ODP spec and the PTAB mapping examples:
+				// sort is an array of {field, order} objects, pagination is a
+				// nested object, and date constraints go in rangeFilters, not
+				// in q. The first sweep sent a sort string, top-level limit,
+				// and a [* TO *] existence clause, and every query 400'd.
+				// The grantDate range floor doubles as the "granted only,
+				// since 2001" scope the pages state.
+				body, _ := json.Marshal(map[string]any{
+					"q": `applicationMetaData.firstApplicantName:"` + esc + `"`,
+					"rangeFilters": []map[string]string{{
+						"field":     "applicationMetaData.grantDate",
+						"valueFrom": "2001-01-01", "valueTo": "2035-12-31",
+					}},
+					"sort": []map[string]string{{
+						"field": "applicationMetaData.grantDate", "order": "Desc",
+					}},
+					"pagination": map[string]int{"offset": 0, "limit": 5},
+					// firstApplicantName is requested so the applicant string the
+					// match was actually made on is stored alongside the patent.
+					// Without it the attribution cannot be audited after the fact,
+					// which is exactly how the MCP substring bug survived: a join
+					// that discards its own evidence cannot be checked.
+					"fields": []string{"applicationMetaData.patentNumber",
+						"applicationMetaData.inventionTitle", "applicationMetaData.grantDate",
+						"applicationMetaData.firstApplicantName"},
 				})
+				req, _ := http.NewRequest("POST", "https://api.uspto.gov/api/v1/patent/applications/search", bytes.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-API-KEY", odpKey)
+				req.Header.Set("User-Agent", "theworldofai.org pipeline (contact: info@srjconsultingservices.com)")
+				resp, err := client.Do(req)
+				if err != nil {
+					return 0, nil, err
+				}
+				defer resp.Body.Close()
+				// RATE LIMITING IS A WAIT, NOT A FAILURE. This used to return an
+				// error, and the caller treated any rate-limit error as fatal to the
+				// whole sweep: one 429 aborted the run. The log line "aborting patent
+				// sweep after 1 failures" therefore appeared on EVERY cron run, and
+				// the sweep never got past the same handful of companies, because it
+				// restarted from the same place each day and hit the limit in the
+				// same spot.
+				//
+				// ODP publishes a per-minute limit. Waiting it out costs seconds and
+				// finishes the job; aborting costs the whole sweep and repeats
+				// tomorrow. Three waits, lengthening, then give up on this ONE
+				// company rather than on all of them.
+				if resp.StatusCode == 429 {
+					if attempt < 3 {
+						wait := time.Duration(20*(attempt+1)) * time.Second
+						fmt.Fprintf(os.Stderr, "twoai_companyfacts: uspto odp rate limited, waiting %s (attempt %d/3)\n", wait, attempt+1)
+						time.Sleep(wait)
+						continue
+					}
+					return 0, nil, fmt.Errorf("rate limited after 3 waits")
+				}
+				// ODP answers a zero-result search with 404, not an empty 200:
+				// the first fixed sweep 404'd on 01.AI, Copy.ai, and other
+				// companies that plausibly hold no granted US patents, while
+				// returning real counts for 16 others in the same run. A 404
+				// is a finding of nothing, not a failure - and since the
+				// section only lists companies with patents, a mistaken zero
+				// can only omit, never fabricate.
+				if resp.StatusCode == 404 {
+					return 0, nil, nil
+				}
+				if resp.StatusCode != 200 {
+					return 0, nil, fmt.Errorf("status %d", resp.StatusCode)
+				}
+				var out struct {
+					Count     int `json:"count"`
+					TotalHits int `json:"totalNumFound"`
+					Bag       []struct {
+						Meta struct {
+							PatentNumber       string `json:"patentNumber"`
+							InventionTitle     string `json:"inventionTitle"`
+							GrantDate          string `json:"grantDate"`
+							FirstApplicantName string `json:"firstApplicantName"`
+						} `json:"applicationMetaData"`
+					} `json:"patentFileWrapperDataBag"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+					return 0, nil, err
+				}
+				total := out.TotalHits
+				if total == 0 && out.Count > 0 {
+					total = out.Count
+				}
+				var pats []map[string]any
+				for _, b := range out.Bag {
+					pats = append(pats, map[string]any{
+						"patent_id": b.Meta.PatentNumber, "patent_title": b.Meta.InventionTitle,
+						"patent_date": b.Meta.GrantDate, "applicant": b.Meta.FirstApplicantName,
+					})
+				}
+				return total, pats, nil
 			}
-			return total, pats, nil
 		}
+		// SWEEP THE STALEST FIRST, so a run that stops early still advances the
+		// frontier. Before this, the sweep walked the hub order every time: an
+		// abort partway through meant tomorrow re-queried the same companies,
+		// hit the limit in the same place, and the tail of the directory was
+		// never reached at all. Ordering by how long ago each company was last
+		// checked makes every run pick up where the last one gave up, whatever
+		// the reason it gave up.
+		lastSeen := map[string]string{}
+		if r, err := db.Query(`SELECT uid, COALESCE(updated_at::text,'') FROM twoai_company_profiles`); err == nil {
+			for r.Next() {
+				var uid, ts string
+				if r.Scan(&uid, &ts) == nil {
+					lastSeen[uid] = ts
+				}
+			}
+			r.Close()
+		}
+		sort.SliceStable(vendors, func(i, j int) bool {
+			// Never-checked companies first (empty string sorts before any
+			// timestamp), then oldest checked.
+			return lastSeen[vendors[i].UID] < lastSeen[vendors[j].UID]
+		})
+
 		hardFails := 0
 		for _, v := range vendors {
 			// The phrase is the fully normalised registrant name where one
@@ -345,7 +389,7 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 				hardFails++
 				fmt.Fprintf(os.Stderr, "twoai_companyfacts: uspto odp %q: %v\n", phrase, err)
 				if strings.Contains(err.Error(), "rate limited") || hardFails >= 5 {
-					fmt.Fprintf(os.Stderr, "twoai_companyfacts: aborting patent sweep after %d failures, prior rows keep rendering\n", hardFails)
+					fmt.Fprintf(os.Stderr, "twoai_companyfacts: stopping patent sweep after %d consecutive failures at %d companies queried; the stalest are done first so tomorrow resumes further on, and prior rows keep rendering\n", hardFails, odpDone)
 					break
 				}
 				continue
@@ -380,7 +424,7 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 			}
 			odpDone++
 		}
-		fmt.Printf("twoai_companyfacts: uspto odp queried=%d\n", odpDone)
+		fmt.Printf("twoai_companyfacts: uspto odp queried=%d of %d companies\n", odpDone, len(vendors))
 	}
 
 	// ---- Render the two sections from what SQL now holds.
