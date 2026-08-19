@@ -540,3 +540,46 @@ func twoaiEmbedRun(db *sql.DB) error {
 		len(want), len(todo), stored, failed, skipped, removed, twoaiEmbedModel)
 	return nil
 }
+
+// twoaiAsk is a retrieval probe: embed a question, print what the index would
+// hand an answer model, and stop there. No generation.
+//
+// It exists because retrieval quality is the whole ballgame and it must be
+// judged on real questions before a single line of front end is written. If the
+// top chunks for "what are the AI laws in Texas" are not the Texas page, no
+// answer model will save it, and a fluent answer over bad retrieval is worse
+// than no assistant at all: it would be confidently wrong with a citation
+// attached.
+//
+// Usage: pipeline twoai_ask "is openai being sued over training data"
+func twoaiAsk(db *sql.DB, question string) error {
+	vecs, err := twoaiEmbedBatch([]string{question})
+	if err != nil {
+		return err
+	}
+	rows, err := db.Query(`SELECT title, url, left(body, 220),
+			1 - (embedding <=> $1::vector) AS score
+		FROM twoai_embeddings
+		ORDER BY embedding <=> $1::vector
+		LIMIT 5`, vecLiteral(vecs[0]))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	fmt.Printf("\nQ: %s\n\n", question)
+	i := 0
+	for rows.Next() {
+		var title, url, body string
+		var score float64
+		if rows.Scan(&title, &url, &body, &score) != nil {
+			continue
+		}
+		i++
+		fmt.Printf("%d. [%.3f] %s\n   %s\n   %s...\n\n", i, score, title, url,
+			strings.TrimSpace(strings.ReplaceAll(body, "\n", " ")))
+	}
+	if i == 0 {
+		fmt.Println("no matches at all, which means the index is empty or the vector dimension is wrong")
+	}
+	return nil
+}

@@ -187,6 +187,20 @@ func main() {
 
 	// twoai_embed builds the retrieval index the site assistant answers from.
 	// Runs after twoai_build, which is what writes the pages it reads.
+	// twoai_ask: retrieval probe. Prints the chunks the index would hand an
+	// answer model for a question, and generates nothing.
+	if src == "twoai_ask" {
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, `usage: pipeline twoai_ask "your question"`)
+			os.Exit(1)
+		}
+		if err := twoaiAsk(db, strings.Join(os.Args[2:], " ")); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_ask:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "twoai_embed" {
 		if err := twoaiEmbedRun(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_embed:", err)
