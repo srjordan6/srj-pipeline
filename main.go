@@ -3908,6 +3908,12 @@ func twoaiSources(db *sql.DB, today string, upsert func(path, kind string, v any
 var entitySuffixRe = regexp.MustCompile(`(?i)[ ,]+(inc|incorporated|llc|l\.l\.c|ltd|limited|corp|corporation|co|company|plc|gmbh|sa|s\.a|ag|pbc|lp|llp|holdings|labs|technologies|technology)\.?$`)
 var entityPunctRe = regexp.MustCompile(`[^a-z0-9]+`)
 
+// nonAlnumLower reduces a name to letters and digits for exact-equality
+// matching. Shared by every join that must not be a substring test.
+func nonAlnumLower(s string) string {
+	return entityPunctRe.ReplaceAllString(strings.ToLower(s), "")
+}
+
 func twoaiEntityID(db *sql.DB, kind, name string) string {
 	n := strings.ToLower(strings.TrimSpace(name))
 	for {
@@ -4553,6 +4559,19 @@ func twoaiMCP(db *sql.DB, today string, upsert func(path, kind string, v any) er
 		Vendor    string `json:"vendor,omitempty"`
 		Published string `json:"published,omitempty"`
 		Updated   string `json:"updated,omitempty"`
+		// Connection detail, all from the registry record.
+		RemoteType  string `json:"remote_type,omitempty"`
+		RemoteURL   string `json:"remote_url,omitempty"`
+		PkgID       string `json:"package_id,omitempty"`
+		PkgRegistry string `json:"package_registry,omitempty"`
+		PkgVersion  string `json:"package_version,omitempty"`
+		// Publisher context.
+		Namespace   string   `json:"namespace,omitempty"`
+		CompanyUID  string   `json:"company_uid,omitempty"`
+		Siblings    []string `json:"siblings,omitempty"`
+		SiblingSlug []string `json:"sibling_slugs,omitempty"`
+		// Whether this page carries enough to stand on its own in an index.
+		Indexable bool `json:"indexable"`
 	}
 	var all []srv
 	for rows.Next() {
@@ -4570,12 +4589,38 @@ func twoaiMCP(db *sql.DB, today string, upsert func(path, kind string, v any) er
 				s.RepoURL = r.URL
 			}
 		}
-		// How you actually reach it: a hosted endpoint, or something you run.
+		// How you actually reach it, and with WHAT. The registry carries the
+		// transport type, the package registry and the identifier to install;
+		// a page that omits them is a name and a sentence, which is why these
+		// pages were noindexed in the first place. Everything below is read
+		// from the registry record, never inferred.
 		switch {
 		case remotesRaw != "" && remotesRaw != "null":
 			s.Transport = "remote"
+			var rem []struct {
+				Type string `json:"type"`
+				URL  string `json:"url"`
+			}
+			if json.Unmarshal([]byte(remotesRaw), &rem) == nil && len(rem) > 0 {
+				s.RemoteType = rem[0].Type
+				s.RemoteURL = rem[0].URL
+			}
 		case packagesRaw != "" && packagesRaw != "null":
 			s.Transport = "local package"
+			var pkg []struct {
+				Identifier   string `json:"identifier"`
+				RegistryType string `json:"registryType"`
+				Version      string `json:"version"`
+				Transport    struct {
+					Type string `json:"type"`
+				} `json:"transport"`
+			}
+			if json.Unmarshal([]byte(packagesRaw), &pkg) == nil && len(pkg) > 0 {
+				s.PkgID = pkg[0].Identifier
+				s.PkgRegistry = pkg[0].RegistryType
+				s.PkgVersion = pkg[0].Version
+				s.RemoteType = pkg[0].Transport.Type
+			}
 		}
 		// The registry namespaces names by reverse domain, so the leading
 		// segments identify the publisher.
@@ -4585,12 +4630,66 @@ func twoaiMCP(db *sql.DB, today string, upsert func(path, kind string, v any) er
 				parts[l], parts[r] = parts[r], parts[l]
 			}
 			s.Vendor = strings.Join(parts, ".")
+			s.Namespace = s.Name[:i]
 		}
 		all = append(all, s)
 	}
 	rows.Close()
 	if len(all) == 0 {
 		return 0, nil
+	}
+
+	// Servers published under the same reverse-DNS namespace are the same
+	// publisher, which is a real relationship the registry states rather than
+	// one we infer. Linking them turns 1,900 orphans into families a reader can
+	// navigate, and gives each page somewhere to go.
+	byNS := map[string][]int{}
+	for i, s := range all {
+		if s.Namespace != "" {
+			byNS[s.Namespace] = append(byNS[s.Namespace], i)
+		}
+	}
+	// Company profiles, matched on EXACT normalised equality of the namespace's
+	// last label, the same rule as src/lib/mcpAttribution.ts. Never a substring:
+	// that is how 101 false attributions reached production on 2026-08-18.
+	companyByName := map[string]string{}
+	if cr, err := db.Query(`SELECT uid, name FROM twoai_entities WHERE kind='company'`); err == nil {
+		for cr.Next() {
+			var uid, name string
+			if cr.Scan(&uid, &name) == nil {
+				companyByName[nonAlnumLower(name)] = uid
+			}
+		}
+		cr.Close()
+	}
+
+	for i := range all {
+		s := &all[i]
+		if s.Namespace != "" {
+			label := s.Namespace
+			if d := strings.LastIndex(label, "."); d >= 0 {
+				label = label[d+1:]
+			}
+			s.CompanyUID = companyByName[nonAlnumLower(label)]
+		}
+		for _, j := range byNS[s.Namespace] {
+			if j == i || len(s.Siblings) >= 8 {
+				continue
+			}
+			t := all[j].Title
+			if t == "" {
+				t = all[j].Name
+			}
+			s.Siblings = append(s.Siblings, t)
+			s.SiblingSlug = append(s.SiblingSlug, all[j].Slug)
+		}
+		// INDEXABLE means the page stands on its own: a description, a way to
+		// actually connect to it, and a source to verify against. Pages that
+		// fail this stay noindex, because the honest fix for a thin page is to
+		// keep it out of the index, not to pad it.
+		s.Indexable = s.Desc != "" &&
+			(s.RemoteURL != "" || s.PkgID != "") &&
+			(s.RepoURL != "" || s.Website != "")
 	}
 
 	count := 0
