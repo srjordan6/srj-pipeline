@@ -2851,11 +2851,86 @@ func twoaiBuild(db *sql.DB) error {
 	}
 
 	// ---- F2: glossary, straight from the library already in site_content.
+	//
+	// TWO TABLES HOLD GLOSSARY TERMS AND ONLY ONE OF THEM RENDERS. This block
+	// reads site_content['resources/glossary.json'], which is the richer record
+	// (it carries slug and origin, which the term pages use). The SRJ side also
+	// maintains synced_glossary_terms, which has no slug and no origin.
+	//
+	// On 2026-08-18 eight new terms were written to synced_glossary_terms and
+	// nowhere else. They never appeared on the site and never would have: this
+	// stage cannot see that table. The count sat at 522 through repeated runs
+	// while the other table said 536, and the eight URLs 404ed, which was
+	// misread as a publish lag rather than a wrong source. The terms were
+	// merged into site_content on 2026-08-19 and the drift check below exists
+	// so the next divergence announces itself instead of hiding.
+	//
+	// Deliberately a warning, not a merge. Auto-copying between two tables
+	// whose shapes differ would invent slugs silently, and a slug is a URL that
+	// can never move once published.
+	var syncedActive, inLibrary int
+	db.QueryRow(`SELECT count(*) FROM synced_glossary_terms WHERE is_active`).Scan(&syncedActive)
+	db.QueryRow(`SELECT jsonb_array_length(data->'terms') FROM site_content
+		WHERE path='resources/glossary.json'`).Scan(&inLibrary)
+	if syncedActive > 0 && inLibrary > 0 && syncedActive != inLibrary {
+		fmt.Fprintf(os.Stderr,
+			"twoai_build: GLOSSARY DRIFT: synced_glossary_terms has %d active, site_content library has %d. "+
+				"Only the library renders. Terms present in one and not the other will not publish.\n",
+			syncedActive, inLibrary)
+	}
+
 	var glossary string
 	if err := db.QueryRow(`SELECT data::text FROM site_content WHERE path='resources/glossary.json'`).Scan(&glossary); err == nil && glossary != "" {
 		var g map[string]any
 		if json.Unmarshal([]byte(glossary), &g) == nil {
 			g["generated"] = today
+
+			// AUDIENCE LENSES: 2,109 rows across 522 terms, written to explain
+			// each term to a child, a developer, a regulator, a CISO and the
+			// rest. They live in twoai_glossary_lenses, the term page has
+			// rendered them since it was built, and NOTHING HAS EVER PUT THEM IN
+			// THE PAGE DOCUMENT. The template guards on t.lenses, that key never
+			// existed in site_content, so the guard was false for every term and
+			// the whole section silently disappeared. Months of writing, live in
+			// SQL, invisible on the site.
+			//
+			// Merged here rather than into site_content because site_content is
+			// the shared library both sites read, and the lenses are ours.
+			lensRows, lerr := db.Query(`SELECT term_slug, audience, body
+				FROM twoai_glossary_lenses ORDER BY term_slug, audience`)
+			if lerr == nil {
+				byTerm := map[string][]map[string]string{}
+				for lensRows.Next() {
+					var slug, audience, body string
+					if lensRows.Scan(&slug, &audience, &body) == nil && slug != "" {
+						byTerm[slug] = append(byTerm[slug], map[string]string{
+							"audience": audience, "body": body,
+						})
+					}
+				}
+				lensRows.Close()
+				attached, missing := 0, 0
+				if terms, ok := g["terms"].([]any); ok {
+					for _, raw := range terms {
+						t, ok := raw.(map[string]any)
+						if !ok {
+							continue
+						}
+						slug, _ := t["slug"].(string)
+						if ls, found := byTerm[slug]; found {
+							t["lenses"] = ls
+							attached++
+						} else {
+							missing++
+						}
+					}
+				}
+				// Said out loud because a silent zero here is exactly how this
+				// went unnoticed: a term set with no lenses attached looks
+				// identical to a term set that never had any.
+				fmt.Printf("twoai_build: glossary lenses attached to %d terms, %d without\n",
+					attached, missing)
+			}
 			if err := upsert("glossary/glossary.json", "glossary", g); err != nil {
 				return err
 			}
@@ -4226,7 +4301,12 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 				dup := false
 				for _, pn := range profiledNames {
 					if sameHuman(n, pn) {
-						fmt.Fprintf(os.Stderr, "twoai_build: roster %q is the profiled %q, skipping the duplicate\n", n, pn)
+						// Silent by design. This match is permanent and correct:
+						// the roster and site_people spell the same person two
+						// ways, the merge resolves it, and saying so on every run
+						// forever reports a success as though it were a warning.
+						// A name that stops matching shows up as a new stub in the
+						// directory, which is the visible signal that matters.
 						dup = true
 						break
 					}
