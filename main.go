@@ -2852,6 +2852,53 @@ func twoaiBuild(db *sql.DB) error {
 		var g map[string]any
 		if json.Unmarshal([]byte(glossary), &g) == nil {
 			g["generated"] = today
+
+			// AUDIENCE LENSES: 2,109 rows across 522 terms, written to explain
+			// each term to a child, a developer, a regulator, a CISO and the
+			// rest. They live in twoai_glossary_lenses, the term page has
+			// rendered them since it was built, and NOTHING HAS EVER PUT THEM IN
+			// THE PAGE DOCUMENT. The template guards on t.lenses, that key never
+			// existed in site_content, so the guard was false for every term and
+			// the whole section silently disappeared. Months of writing, live in
+			// SQL, invisible on the site.
+			//
+			// Merged here rather than into site_content because site_content is
+			// the shared library both sites read, and the lenses are ours.
+			lensRows, lerr := db.Query(`SELECT term_slug, audience, body
+				FROM twoai_glossary_lenses ORDER BY term_slug, audience`)
+			if lerr == nil {
+				byTerm := map[string][]map[string]string{}
+				for lensRows.Next() {
+					var slug, audience, body string
+					if lensRows.Scan(&slug, &audience, &body) == nil && slug != "" {
+						byTerm[slug] = append(byTerm[slug], map[string]string{
+							"audience": audience, "body": body,
+						})
+					}
+				}
+				lensRows.Close()
+				attached, missing := 0, 0
+				if terms, ok := g["terms"].([]any); ok {
+					for _, raw := range terms {
+						t, ok := raw.(map[string]any)
+						if !ok {
+							continue
+						}
+						slug, _ := t["slug"].(string)
+						if ls, found := byTerm[slug]; found {
+							t["lenses"] = ls
+							attached++
+						} else {
+							missing++
+						}
+					}
+				}
+				// Said out loud because a silent zero here is exactly how this
+				// went unnoticed: a term set with no lenses attached looks
+				// identical to a term set that never had any.
+				fmt.Printf("twoai_build: glossary lenses attached to %d terms, %d without\n",
+					attached, missing)
+			}
 			if err := upsert("glossary/glossary.json", "glossary", g); err != nil {
 				return err
 			}
