@@ -231,19 +231,59 @@ func vecLiteral(v []float32) string {
 // The taxonomy already knows where every section lives, so the uid map is read
 // from it rather than guessed. Prefix rules cover the factories whose URLs are
 // mechanical.
-func twoaiURLIndex(db *sql.DB) map[string]string {
+//
+// TWO KEY FAMILIES. "tax:"+slug resolves documents that name their taxonomy
+// slug. "uid:"+segment resolves documents that carry only their entity uid:
+// the last segment of an entity node's live_path IS that uid, which is why the
+// jobs hub document (uid 995676ef) and the taxonomy row for AI Jobs and Market
+// Dynamics (live_path ending /995676ef/) can be joined without a guess. The
+// first version of twoaiDocURL consulted "uid:" keys that nothing ever wrote,
+// so the fallback compiled, ran, and resolved nothing - the same silent-skip
+// shape as the 12% index above, one layer down.
+type twoaiTaxNode struct {
+	Slug, Name, Parent, Blurb, Path string
+	Level                           int
+}
+
+func twoaiTaxIndex(db *sql.DB) (map[string]string, []twoaiTaxNode) {
 	idx := map[string]string{}
-	if r, err := db.Query(`SELECT slug, live_path FROM twoai_taxonomy
-		WHERE status='live' AND live_path IS NOT NULL AND live_path NOT LIKE '%#%'`); err == nil {
-		for r.Next() {
-			var slug, path string
-			if r.Scan(&slug, &path) == nil {
-				idx["tax:"+slug] = "https://theworldofai.org" + path
-			}
-		}
-		r.Close()
+	var nodes []twoaiTaxNode
+	r, err := db.Query(`SELECT t.slug, t.name, coalesce(p.name,''), coalesce(t.blurb,''),
+			t.live_path, t.level
+		FROM twoai_taxonomy t
+		LEFT JOIN twoai_taxonomy p ON p.slug = t.parent_slug
+		WHERE t.status='live' AND t.live_path IS NOT NULL
+		ORDER BY t.level, t.sort, t.slug`)
+	if err != nil {
+		return idx, nodes
 	}
-	return idx
+	for r.Next() {
+		var n twoaiTaxNode
+		if r.Scan(&n.Slug, &n.Name, &n.Parent, &n.Blurb, &n.Path, &n.Level) != nil {
+			continue
+		}
+		nodes = append(nodes, n)
+		if strings.Contains(n.Path, "#") {
+			continue
+		}
+		url := "https://theworldofai.org" + n.Path
+		if _, dup := idx["tax:"+n.Slug]; !dup {
+			idx["tax:"+n.Slug] = url
+		}
+		// Several taxonomy rows share one live_path (a domain and the section
+		// inside it). Level ordering in the query means the broader name claims
+		// the uid key and the dup guard keeps it, so the jobs hub is titled
+		// "AI Jobs and Market Dynamics" rather than its narrowest alias.
+		seg := strings.Trim(n.Path, "/")
+		if i := strings.LastIndex(seg, "/"); i >= 0 {
+			seg = seg[i+1:]
+		}
+		if _, dup := idx["uid:"+seg]; !dup {
+			idx["uid:"+seg] = url
+		}
+	}
+	r.Close()
+	return idx, nodes
 }
 
 // twoaiDocURL resolves ONE document to its page URL. Empty means the document
@@ -322,15 +362,13 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 	case "static":
 		return base + "/" + name + "/"
 	}
-	// Anything carrying its own uid renders under the ecosystem routes.
+	// Anything carrying its own uid renders at the entity node whose live_path
+	// ends in that uid. The keys are written by twoaiTaxIndex; the earlier
+	// version of this fallback looped over category names while consulting a
+	// map nothing populated, so it never resolved a single document.
 	if uid, ok := doc["uid"].(string); ok && uid != "" {
-		for _, cat := range []string{"technology-and-core-infrastructure",
-			"ecosystem-entities-market-and-operations", "research-knowledge-and-learning",
-			"enterprise-applications-governance-and-tools"} {
-			if u, found := idx["uid:"+uid]; found {
-				return u
-			}
-			_ = cat
+		if u, found := idx["uid:"+uid]; found {
+			return u
 		}
 	}
 	return ""
@@ -500,7 +538,7 @@ func fallback(v, def string) string {
 }
 
 func twoaiEmbedRun(db *sql.DB) error {
-	idx := twoaiURLIndex(db)
+	idx, taxNodes := twoaiTaxIndex(db)
 	rows, err := db.Query(`SELECT path, kind, data::text FROM twoai_pages ORDER BY path`)
 	if err != nil {
 		return err
@@ -643,6 +681,53 @@ func twoaiEmbedRun(db *sql.DB) error {
 		emit(path, url, title, kind, doc, 0)
 	}
 	rows.Close()
+
+	// EVERY LIVE SECTION GETS A DIRECTORY CHUNK, composed from twoai_taxonomy.
+	//
+	// WHY. Hub and section documents are data structures rather than prose: the
+	// jobs hub is arrays of listings and salary rows, the company hub is 261
+	// summary records, the skills hub is an O*NET matrix. twoaiFlatten keeps
+	// only sentences a human would read, so these documents flattened to under
+	// the floor and dropped out of the index without a trace - jobs-hub,
+	// company-hub, skills-hub and most other hub kinds sat at zero chunks. The
+	// visible failure, found by Stephen on 2026-08-19: asked how to get a job,
+	// the assistant never pointed at the AI Jobs and Market Dynamics section or
+	// the AI Company Directory, because for the assistant neither existed. It
+	// answered from the only job-shaped text it had, vendor news posts and MCP
+	// job-board server entries.
+	//
+	// THE SOURCE IS THE TAXONOMY, NOT INVENTION. Every chunk is the section's
+	// own authored name and blurb plus its parent's name, the same words the
+	// site renders on its section pages. Composition from fields, the rule
+	// twoaiComposeSparse already established. Anchored live_paths (#salary,
+	// #skills) are kept: the anchor is a real destination and the citation
+	// should land the reader on it.
+	//
+	// KEYED UNDER taxonomy/{slug}, which no twoai_pages path uses, so these rows
+	// ride the same reconciler as everything else: a section that goes dark in
+	// the taxonomy leaves the index on the next run.
+	for _, n := range taxNodes {
+		if strings.TrimSpace(n.Blurb) == "" {
+			continue
+		}
+		var b strings.Builder
+		b.WriteString(n.Name)
+		b.WriteString(" is a section of The World of AI")
+		if n.Parent != "" {
+			b.WriteString(", part of ")
+			b.WriteString(n.Parent)
+		}
+		b.WriteString(". ")
+		b.WriteString(strings.TrimSpace(n.Blurb))
+		body := n.Name + "\n\n" + b.String()
+		if len(body) < 60 {
+			continue
+		}
+		h := sha256.Sum256([]byte(body))
+		want = append(want, chunkRow{"taxonomy/" + n.Slug, 0,
+			"https://theworldofai.org" + n.Path, n.Name, "taxonomy",
+			body, hex.EncodeToString(h[:16])})
+	}
 
 	have := map[string]string{}
 	if r, err := db.Query(`SELECT path, chunk_no, body_hash FROM twoai_embeddings WHERE model=$1`,
