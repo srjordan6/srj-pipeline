@@ -3368,7 +3368,80 @@ func twoaiBuild(db *sql.DB) error {
 // Credentials are R2 S3-compatible and scoped to this bucket alone. They are
 // checked by name and never printed: the stage reports which are missing so a
 // misconfiguration is obvious from the log without leaking anything.
+// twoaiPublishGuard is the poison-the-well backstop. The pipeline rebuilds
+// twoai_pages from many upstream sources every run; a corrupted feed, a
+// spoofed API response, or a bug in one build stage can collapse the page set,
+// and without a check the collapse would publish over thousands of good pages
+// on the next export with no human in the loop. A site whose whole value is
+// being trustworthy enough to cite must not silently ship a fraction of
+// itself.
+//
+// The rule is RELATIVE, not a fixed floor: compare this run's page count to
+// the highest count ever published, stored in twoai_publish_hwm. If the count
+// has fallen below a fraction of the high-water mark, refuse to publish and
+// return an error, so yesterday's bundle keeps serving. A legitimate large
+// removal (a section retired on purpose) clears the gate by lowering the
+// threshold once: set the env override TWOAI_PUBLISH_MIN to the new floor for
+// one run, or the operator re-baselines the mark by hand. The mark only ever
+// rises automatically; it never falls on its own, which is the point.
+//
+// Returns (ok, count, err). ok=false means DO NOT PUBLISH.
+func twoaiPublishGuard(db *sql.DB) (bool, int, error) {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_publish_hwm (
+		id int PRIMARY KEY DEFAULT 1,
+		high_water int NOT NULL,
+		updated_at timestamptz NOT NULL DEFAULT now(),
+		CONSTRAINT twoai_publish_hwm_single CHECK (id = 1))`); err != nil {
+		return false, 0, err
+	}
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM twoai_pages`).Scan(&count); err != nil {
+		return false, 0, err
+	}
+	if count == 0 {
+		return false, 0, fmt.Errorf("publish guard: twoai_pages is empty, refusing to publish")
+	}
+	var hwm int
+	db.QueryRow(`SELECT high_water FROM twoai_publish_hwm WHERE id = 1`).Scan(&hwm)
+
+	// First run, or the mark grew: this count is at least as high as any seen,
+	// so it is trustworthy and becomes the new mark. Publish.
+	if count >= hwm {
+		db.Exec(`INSERT INTO twoai_publish_hwm (id, high_water, updated_at)
+			VALUES (1, $1, now())
+			ON CONFLICT (id) DO UPDATE SET high_water = EXCLUDED.high_water, updated_at = now()`, count)
+		return true, count, nil
+	}
+
+	// Below the mark. A small dip is normal churn; a collapse is the attack.
+	// Threshold is 85% of the mark by default, overridable for a deliberate
+	// large removal.
+	threshold := (hwm * 85) / 100
+	if env := os.Getenv("TWOAI_PUBLISH_MIN"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v >= 0 {
+			threshold = v
+		}
+	}
+	if count < threshold {
+		return false, count, fmt.Errorf(
+			"publish guard: %d pages is below the safety threshold of %d (high-water %d); "+
+				"refusing to publish so the last good bundle keeps serving. If this drop is "+
+				"intentional, set TWOAI_PUBLISH_MIN=%d for one run to re-baseline",
+			count, threshold, hwm, count)
+	}
+	// Within the acceptable band below the mark: publish, but do NOT lower the
+	// mark. The mark tracks the best the site has ever been, so a run that is
+	// merely a bit smaller cannot erode the bar the next collapse is measured
+	// against.
+	return true, count, nil
+}
+
 func twoaiPublishR2(db *sql.DB) error {
+	if ok, n, err := twoaiPublishGuard(db); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("publish guard blocked R2 publish at %d pages", n)
+	}
 	keyID := os.Getenv("R2_ACCESS_KEY_ID")
 	secret := os.Getenv("R2_SECRET_ACCESS_KEY")
 	endpoint := strings.TrimRight(os.Getenv("R2_S3_ENDPOINT"), "/")
@@ -6698,6 +6771,11 @@ func twoaiWeekRecap(db *sql.DB, label, start, end string, analysis map[string]an
 // against the tree so unchanged rows cost nothing. Export-only: SQL is the
 // origin here, there is nothing to backfill.
 func twoaiPublish(db *sql.DB) error {
+	if ok, n, err := twoaiPublishGuard(db); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("publish guard blocked GitHub publish at %d pages", n)
+	}
 	tok := os.Getenv("GITHUB_TOKEN")
 	if tok == "" {
 		return fmt.Errorf("GITHUB_TOKEN not set")
