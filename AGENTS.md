@@ -61,6 +61,24 @@ If your commit removes lines outside its own subject, stop and rebase properly.
    would vanish without a redirect.
 7. **Do not spoof a browser to defeat a bot wall.** This crawler identifies
    itself and carries a contact address.
+8. **Never delete source data.** Rows are added, updated, or soft-marked
+   (`delisted_at` on the model catalog is the pattern), never destroyed; a
+   later API response that omits a filing or a patent does not un-exist it.
+   Derived-cache DELETEs (twoai_pages reconcilers, embeddings, vectorize
+   bookkeeping, the auto-timeline) are correct by design because a re-run
+   reproduces them; that distinction governs any audit of a destructive
+   statement. Enforced 2026-08-19, commit b8ec206.
+9. **The publish guard is load-bearing.** `twoaiPublishGuard` refuses both
+   publish paths when the page count falls below 85% of the all-time
+   high-water mark (`twoai_publish_hwm`), so a collapsed build cannot
+   overwrite thousands of good pages. A deliberate large removal re-baselines
+   with `TWOAI_PUBLISH_MIN` for one run. Do not weaken it, and do not move it
+   into the stage sequencer, which ignores subprocess exit codes.
+10. **Directory chunks compose from fields, never invent.** The taxonomy's own
+    name and blurb are the only source for the assistant's section chunks and
+    their intent lines; a trigger word must already be in the section's text
+    before its question form is appended (twoai_embed.go, commits 73bf4c3 and
+    4d96415).
 
 ## Logging
 
@@ -79,7 +97,8 @@ whether a run is in progress before pushing, or expect to restart it.
 ## Where the reasoning lives
 
 Architecture and history are in SQL, not in this repo: `site_arch_doc`
-(`platform-v1-2026-08-18` and `v3-2026-08-18`) and `site_arch_changelog`, which
-records failures and reversals at the same length as successes. Read the
+(current version `v4-2026-08-20`, which adds sections for the site assistant
+and the security posture; prior versions are kept) and `site_arch_changelog`,
+which records failures and reversals at the same length as successes. Read the
 changelog before concluding something is missing — it may have been removed
 deliberately, and the reason will be there.
