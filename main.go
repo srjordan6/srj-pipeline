@@ -88,7 +88,7 @@ func main() {
 		// event, not a daily rhythm. Run `pipeline favicons` at that point. The
 		// stage is unchanged and still idempotent, so running it costs nothing
 		// but the GETs.
-		for _, s := range []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "vendor_notes", "twoai_onet", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "vendor_notes", "twoai_onet", "twoai_ga_top", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -301,6 +301,14 @@ func main() {
 	if src == "twoai_onet" {
 		if err := twoaiOnet(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_onet:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_ga_top" {
+		if err := twoaiGATop(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_ga_top:", err)
 			os.Exit(1)
 		}
 		return
@@ -3037,6 +3045,42 @@ func twoaiBuild(db *sql.DB) error {
 		statics++
 	}
 	sr.Close()
+
+	// ---- Most-visited pages, from twoai_ga_top_pages (the twoai_ga_top stage,
+	// GA4 Data API). Exported as meta/popular-pages.json for the footer's
+	// "Most visited" list. Reads the LATEST stored day rather than requiring
+	// today: if the GA stage skipped (env missing, API refusal), the footer
+	// keeps showing the last real ranking instead of going blank, and the
+	// staleness is visible in the file's own day field.
+	pr, err := db.Query(`SELECT day::text, rank, path, views, coalesce(title,'')
+		FROM twoai_ga_top_pages
+		WHERE day = (SELECT max(day) FROM twoai_ga_top_pages)
+		ORDER BY rank`)
+	if err == nil {
+		type popRow struct {
+			Rank  int    `json:"rank"`
+			Path  string `json:"path"`
+			Views int    `json:"views"`
+			Title string `json:"title"`
+		}
+		var popDay string
+		var pops []popRow
+		for pr.Next() {
+			var p popRow
+			if pr.Scan(&popDay, &p.Rank, &p.Path, &p.Views, &p.Title) == nil {
+				pops = append(pops, p)
+			}
+		}
+		pr.Close()
+		if len(pops) > 0 {
+			if err := upsert("meta/popular-pages.json", "meta", map[string]any{
+				"slug": "popular-pages", "day": popDay, "generated": today,
+				"pages": pops,
+			}); err != nil {
+				return err
+			}
+		}
+	}
 
 	// ---- F4 tools directory. Catalog and deep profiles both already live in
 	// site_content; this renders a hub, one page per category, and one page per
