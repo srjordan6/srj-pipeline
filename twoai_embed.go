@@ -245,6 +245,61 @@ type twoaiTaxNode struct {
 	Level                           int
 }
 
+// twoaiIntentLine turns a section's name and blurb into the question forms a
+// reader would type to reach it, so the directory chunk's embedding sits near
+// natural queries and not only near topical nouns. It composes, never invents:
+// every phrase is built from words already in the name or blurb. Returns "" if
+// the section has no recognizable user-intent shape, in which case the chunk
+// keeps only its descriptive text.
+func twoaiIntentLine(name, blurb string) string {
+	hay := strings.ToLower(name + " " + blurb)
+	var qs []string
+	// Each trigger is a topic the section demonstrably covers (the word is in
+	// its own name or blurb); the appended question is the register a person
+	// uses for that topic. This is the same "compose from fields" rule the
+	// rest of the file follows - the trigger gates on the section's own text.
+	add := func(present []string, questions ...string) {
+		for _, w := range present {
+			if strings.Contains(hay, w) {
+				qs = append(qs, questions...)
+				return
+			}
+		}
+	}
+	add([]string{"job", "hiring", "employ", "career", "roles", "workforce"},
+		"How do I get a job in AI? Who is hiring for AI roles and what do they pay?")
+	add([]string{"skill", "learn", "training", "course", "upskill"},
+		"What skills do I need for AI work and how do I learn them?")
+	add([]string{"company", "companies", "vendor", "startup", "lab", "provider"},
+		"Which companies work in AI, what do they build, and how do they compare?")
+	add([]string{"tool", "product", "platform", "app"},
+		"What AI tools are available and which one should I use?")
+	add([]string{"law", "regulation", "policy", "compliance", "governance", "act"},
+		"What are the AI laws and rules, and how do I comply?")
+	add([]string{"lawsuit", "litigation", "court", "case"},
+		"Who is being sued over AI and what is the status of the case?")
+	add([]string{"model", "benchmark", "leaderboard"},
+		"Which AI models exist and which performs best?")
+	add([]string{"research", "paper", "arxiv", "study"},
+		"What does the latest AI research say?")
+	add([]string{"news", "announcement", "launch", "update"},
+		"What is the latest AI news?")
+	if len(qs) == 0 {
+		return ""
+	}
+	// One line, the strongest match first; the add order above is priority
+	// order, and de-duplication keeps a multi-topic section from repeating.
+	seen := map[string]bool{}
+	var out []string
+	for _, q := range qs {
+		if !seen[q] {
+			seen[q] = true
+			out = append(out, q)
+		}
+	}
+	return strings.Join(out, " ")
+}
+
 func twoaiTaxIndex(db *sql.DB) (map[string]string, []twoaiTaxNode) {
 	idx := map[string]string{}
 	var nodes []twoaiTaxNode
@@ -719,6 +774,20 @@ func twoaiEmbedRun(db *sql.DB) error {
 		}
 		b.WriteString(". ")
 		b.WriteString(strings.TrimSpace(n.Blurb))
+		// INTENT LINE. The name and blurb describe what a section IS in
+		// institutional voice ("AI Jobs and Market Dynamics ... roles,
+		// salaries, required skills"). A reader asks in a different register
+		// ("how do I get a job in AI", "who is hiring"), and bge-m3 embeds the
+		// two far enough apart that the section lost to vendor news on the
+		// exact query it exists to answer. This appends the question forms a
+		// person types to reach this section, composed ONLY from the section's
+		// own name and blurb - the destination it points to is a real page,
+		// the words are the taxonomy's own. It nudges the vector toward
+		// question-shaped queries without inventing a claim.
+		if q := twoaiIntentLine(n.Name, n.Blurb); q != "" {
+			b.WriteString(" ")
+			b.WriteString(q)
+		}
 		body := n.Name + "\n\n" + b.String()
 		if len(body) < 60 {
 			continue
