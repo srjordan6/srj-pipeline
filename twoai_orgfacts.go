@@ -244,7 +244,9 @@ func twoaiOrgFacts(db *sql.DB, today string) (int, error) {
 		if len(filings) == 0 {
 			continue
 		}
-		db.Exec(`DELETE FROM twoai_company_formd WHERE uid=$1`, v.UID)
+		// NEVER-DELETE: filings persist even when a later SEC search no longer
+		// returns them; the (uid, accession) upsert keeps returned rows fresh and
+		// fetched_at dates the ones that stopped appearing.
 		for _, f := range filings {
 			db.Exec(`INSERT INTO twoai_company_formd
 				(uid, accession, issuer, filed, first_sale, total_offering, total_sold, amendment, doc_url)

@@ -105,12 +105,12 @@ func twoaiObservatory(db *sql.DB, today string) (int, error) {
 
 	// ---- Model Release Cadence: createdAt of every tracked open model.
 	var modelsTracked int
-	db.QueryRow(`SELECT count(*) FROM twoai_model_catalog WHERE source='huggingface'`).Scan(&modelsTracked)
+	db.QueryRow(`SELECT count(*) FROM twoai_model_catalog WHERE source='huggingface' AND delisted_at IS NULL`).Scan(&modelsTracked)
 	cadence := collect(`SELECT to_char(date_trunc('month',(data->>'createdAt')::timestamptz),'YYYY-MM') AS month, count(*) AS n
-		FROM twoai_model_catalog WHERE source='huggingface' AND data->>'createdAt' IS NOT NULL
+		FROM twoai_model_catalog WHERE source='huggingface' AND delisted_at IS NULL AND data->>'createdAt' IS NOT NULL
 		GROUP BY 1 ORDER BY 1 DESC LIMIT 24`)
 	newest := collect(`SELECT data->>'id' AS id, (data->>'createdAt')::date::text AS released, section
-		FROM twoai_model_catalog WHERE source='huggingface' AND data->>'createdAt' IS NOT NULL
+		FROM twoai_model_catalog WHERE source='huggingface' AND delisted_at IS NULL AND data->>'createdAt' IS NOT NULL
 		ORDER BY (data->>'createdAt')::timestamptz DESC LIMIT 12`)
 	snap("models_tracked", float64(modelsTracked))
 	if err := write("obs-release-cadence", row{
@@ -159,9 +159,9 @@ func twoaiObservatory(db *sql.DB, today string) (int, error) {
 
 	// ---- Hugging Face Trends: leaders, licences, arrivals across the catalogue.
 	var dlTotal float64
-	db.QueryRow(`SELECT COALESCE(sum((data->>'downloads')::float),0) FROM twoai_model_catalog WHERE source='huggingface'`).Scan(&dlTotal)
+	db.QueryRow(`SELECT COALESCE(sum((data->>'downloads')::float),0) FROM twoai_model_catalog WHERE source='huggingface' AND delisted_at IS NULL`).Scan(&dlTotal)
 	leaders := collect(`SELECT DISTINCT ON (data->>'id') data->>'id' AS id, (data->>'downloads')::bigint AS downloads
-		FROM twoai_model_catalog WHERE source='huggingface' ORDER BY data->>'id', (data->>'downloads')::bigint DESC`)
+		FROM twoai_model_catalog WHERE source='huggingface' AND delisted_at IS NULL ORDER BY data->>'id', (data->>'downloads')::bigint DESC`)
 	if len(leaders) > 1 {
 		for i := 0; i < len(leaders); i++ {
 			for j := i + 1; j < len(leaders); j++ {
@@ -178,7 +178,7 @@ func twoaiObservatory(db *sql.DB, today string) (int, error) {
 	}
 	licences := collect(`SELECT COALESCE(lic,'undeclared') AS licence, count(*) AS n FROM (
 		SELECT DISTINCT ON (data->>'id') (SELECT replace(t,'license:','') FROM jsonb_array_elements_text(data->'tags') t WHERE t LIKE 'license:%' LIMIT 1) AS lic
-		FROM twoai_model_catalog WHERE source='huggingface' ORDER BY data->>'id') x
+		FROM twoai_model_catalog WHERE source='huggingface' AND delisted_at IS NULL ORDER BY data->>'id') x
 		GROUP BY 1 ORDER BY 2 DESC LIMIT 12`)
 	snap("hf_downloads_total", dlTotal)
 	if err := write("obs-huggingface", row{

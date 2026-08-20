@@ -403,7 +403,8 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 				fmt.Sprintf("USPTO Open Data Portal, granted patents since 2001, applicant phrase %q, %s", phrase, today)); err != nil {
 				return matched, err
 			}
-			db.Exec(`DELETE FROM twoai_company_patents WHERE uid=$1`, v.UID)
+			// NEVER-DELETE: a granted patent does not un-exist; the (uid, patent_id)
+			// upsert refreshes returned rows and history stays queryable.
 			for _, p := range pats {
 				pid, _ := p["patent_id"].(string)
 				title, _ := p["patent_title"].(string)

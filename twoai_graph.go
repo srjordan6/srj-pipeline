@@ -48,13 +48,13 @@ func twoaiGraph(db *sql.DB, today string) (int, error) {
 	nodes := []nrow{
 		{"Companies", one(`SELECT jsonb_array_length(data->'companies') FROM twoai_pages WHERE path='companies/index.json'`),
 			"8-char entity uid", "/ai-ecosystem/ecosystem-entities-market-and-operations/"},
-		{"Open models", one(`SELECT count(DISTINCT data->>'id') FROM twoai_model_catalog WHERE source='huggingface'`),
+		{"Open models", one(`SELECT count(DISTINCT data->>'id') FROM twoai_model_catalog WHERE source='huggingface' AND delisted_at IS NULL`),
 			"Hugging Face repo id", "/ai-ecosystem/technology-and-core-infrastructure/87868942/"},
-		{"API models", one(`SELECT count(*) FROM twoai_model_catalog WHERE source='openrouter'`),
+		{"API models", one(`SELECT count(*) FROM twoai_model_catalog WHERE source='openrouter' AND delisted_at IS NULL`),
 			"provider/model id", "/ai-ecosystem/technology-and-core-infrastructure/56f96b2b/"},
 		{"Research papers", one(`SELECT count(*) FROM twoai_research_papers`),
 			"DOI or arXiv id, linked to the original publisher", "/research/"},
-		{"Papers cited by tracked models", one(`SELECT count(DISTINCT t) FROM twoai_model_catalog, jsonb_array_elements_text(data->'tags') t WHERE source='huggingface' AND t LIKE 'arxiv:%'`),
+		{"Papers cited by tracked models", one(`SELECT count(DISTINCT t) FROM twoai_model_catalog, jsonb_array_elements_text(data->'tags') t WHERE source='huggingface' AND delisted_at IS NULL AND t LIKE 'arxiv:%'`),
 			"arXiv id from the model's own tags", "/research/"},
 		{"People", one(`SELECT count(*) FROM twoai_pages WHERE kind='person'`),
 			"8-char person uid", "/ai-ecosystem/ecosystem-entities-market-and-operations/"},
@@ -96,7 +96,7 @@ func twoaiGraph(db *sql.DB, today string) (int, error) {
 		Home   string `json:"home"`
 	}
 	edges := []erow{
-		{"Model cites paper", one(`SELECT count(*) FROM (SELECT DISTINCT data->>'id', t FROM twoai_model_catalog, jsonb_array_elements_text(data->'tags') t WHERE source='huggingface' AND t LIKE 'arxiv:%') x`),
+		{"Model cites paper", one(`SELECT count(*) FROM (SELECT DISTINCT data->>'id', t FROM twoai_model_catalog, jsonb_array_elements_text(data->'tags') t WHERE source='huggingface' AND delisted_at IS NULL AND t LIKE 'arxiv:%') x`),
 			"arXiv ids the model authors put in their own Hub tags", "/ai-ecosystem/technology-and-core-infrastructure/87868942/"},
 		{"Company named in lawsuit", one(`SELECT COALESCE(sum((c->>'cases')::int),0) FROM twoai_pages, jsonb_array_elements(data->'companies') c WHERE path='companies/index.json'`),
 			"defendant matching against the CourtListener docket tracker", "/ai-lawsuits/"},
@@ -112,7 +112,7 @@ func twoaiGraph(db *sql.DB, today string) (int, error) {
 			"exact-name match against EDGAR company search, verified within 7 days", "/ai-ecosystem/ecosystem-entities-market-and-operations/a185389c/"},
 		{"Person belongs to category", one(`SELECT count(*) FROM twoai_person_category`),
 			"curated assignment in the people directory", "/ai-ecosystem/ecosystem-entities-market-and-operations/"},
-		{"Model belongs to modality section", one(`SELECT count(*) FROM twoai_model_catalog WHERE source='huggingface'`),
+		{"Model belongs to modality section", one(`SELECT count(*) FROM twoai_model_catalog WHERE source='huggingface' AND delisted_at IS NULL`),
 			"the Hub's own pipeline tag or tag filter, provenance stated per section", "/ai-ecosystem/technology-and-core-infrastructure/87868942/"},
 		{"API tracked by status feed", one(`SELECT count(DISTINCT provider) FROM twoai_status_snapshots`),
 			"provider status feed polled every run", "/ai-ecosystem/technology-and-core-infrastructure/5b57e70c/"},

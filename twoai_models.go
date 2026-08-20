@@ -21,8 +21,9 @@ package main
 //
 // FAILURE MODE. A fetch that errors leaves the previous catalog rows in
 // place and renders from them, so an upstream outage ages the pages by a day
-// instead of blanking them. The per-source delete happens only after its
-// fetch succeeds.
+// instead of blanking them. Delisting is marked only after its fetch
+// succeeds, and rows are never deleted: a delisted model keeps its
+// last-known record with delisted_at set.
 
 import (
 	"database/sql"
@@ -77,6 +78,15 @@ func twoaiModelsEnsure(db *sql.DB) error {
 		data jsonb NOT NULL,
 		fetched_at timestamptz NOT NULL DEFAULT now(),
 		PRIMARY KEY (source, ext_id, section))`)
+	if err != nil {
+		return err
+	}
+	// NEVER-DELETE (standing directive 2026-08-19): catalog rows are marked
+	// delisted rather than removed, so a model that leaves OpenRouter or drops
+	// out of a Hugging Face top-50 remains queryable with the data it last
+	// carried. Every live read filters delisted_at IS NULL, so rendered pages
+	// are unchanged; the history simply stops being destroyed.
+	_, err = db.Exec(`ALTER TABLE twoai_model_catalog ADD COLUMN IF NOT EXISTS delisted_at timestamptz`)
 	return err
 }
 
@@ -95,8 +105,11 @@ func twoaiModelsFetch(db *sql.DB) {
 		} else {
 			tx, err := db.Begin()
 			if err == nil {
-				tx.Exec(`DELETE FROM twoai_model_catalog WHERE source='openrouter'`)
+				// Upsert-and-mark, never delete-and-rebuild: a model still listed
+				// is refreshed and revived if it had been marked delisted; one no
+				// longer listed gains delisted_at and keeps its last-known data.
 				n := 0
+				current := make([]string, 0, len(body.Data))
 				for _, m := range body.Data {
 					id, _ := m["id"].(string)
 					name, _ := m["name"].(string)
@@ -106,13 +119,23 @@ func twoaiModelsFetch(db *sql.DB) {
 					j, _ := json.Marshal(m)
 					if _, err := tx.Exec(`INSERT INTO twoai_model_catalog (source, ext_id, name, section, data)
 						VALUES ('openrouter', $1, $2, 'api', $3::jsonb)
-						ON CONFLICT (source, ext_id, section) DO UPDATE SET name=EXCLUDED.name, data=EXCLUDED.data, fetched_at=now()`,
+						ON CONFLICT (source, ext_id, section) DO UPDATE SET name=EXCLUDED.name, data=EXCLUDED.data, fetched_at=now(), delisted_at=NULL`,
 						id, name, string(j)); err == nil {
 						n++
+						current = append(current, id)
+					}
+				}
+				delisted := 0
+				if len(current) > 0 {
+					if res, err := tx.Exec(`UPDATE twoai_model_catalog SET delisted_at=now()
+						WHERE source='openrouter' AND delisted_at IS NULL AND NOT (ext_id = ANY($1))`, pq.Array(current)); err == nil {
+						if d, err := res.RowsAffected(); err == nil {
+							delisted = int(d)
+						}
 					}
 				}
 				if err := tx.Commit(); err == nil {
-					fmt.Printf("twoai_models: openrouter %d models\n", n)
+					fmt.Printf("twoai_models: openrouter %d models, %d newly delisted\n", n, delisted)
 				}
 			}
 		}
@@ -154,7 +177,7 @@ func twoaiModelsFetch(db *sql.DB) {
 			// top fifty had churned completely or not moved at all.
 			prior := map[string]bool{}
 			if pr, err := tx.Query(`SELECT ext_id FROM twoai_model_catalog
-				WHERE source='huggingface' AND section=$1 AND data->>'pipeline_tag'=$2`, section, tag); err == nil {
+				WHERE source='huggingface' AND section=$1 AND data->>'pipeline_tag'=$2 AND delisted_at IS NULL`, section, tag); err == nil {
 				for pr.Next() {
 					var id string
 					if pr.Scan(&id) == nil {
@@ -163,7 +186,6 @@ func twoaiModelsFetch(db *sql.DB) {
 				}
 				pr.Close()
 			}
-			tx.Exec(`DELETE FROM twoai_model_catalog WHERE source='huggingface' AND section=$1 AND data->>'pipeline_tag'=$2`, section, tag)
 			n := 0
 			added := 0
 			seenNow := map[string]bool{}
@@ -189,13 +211,27 @@ func twoaiModelsFetch(db *sql.DB) {
 				j, _ := json.Marshal(m)
 				if _, err := tx.Exec(`INSERT INTO twoai_model_catalog (source, ext_id, name, section, data)
 					VALUES ('huggingface', $1, $2, $3, $4::jsonb)
-					ON CONFLICT (source, ext_id, section) DO UPDATE SET name=EXCLUDED.name, data=EXCLUDED.data, fetched_at=now()`,
+					ON CONFLICT (source, ext_id, section) DO UPDATE SET name=EXCLUDED.name, data=EXCLUDED.data, fetched_at=now(), delisted_at=NULL`,
 					id, id, section, string(j)); err == nil {
 					n++
 					seenNow[id] = true
 					if !prior[id] {
 						added++
 					}
+				}
+			}
+			// Rows this run did not see leave the live set but keep their data.
+			if len(seenNow) > 0 {
+				gone := make([]string, 0, 4)
+				for id := range prior {
+					if !seenNow[id] {
+						gone = append(gone, id)
+					}
+				}
+				if len(gone) > 0 {
+					tx.Exec(`UPDATE twoai_model_catalog SET delisted_at=now()
+						WHERE source='huggingface' AND section=$1 AND data->>'pipeline_tag'=$2
+						  AND delisted_at IS NULL AND ext_id = ANY($3)`, section, tag, pq.Array(gone))
 				}
 			}
 			if err := tx.Commit(); err == nil {
@@ -280,7 +316,7 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 		HFID                    string
 	}
 	var api []orModel
-	rows, err := db.Query(`SELECT data FROM twoai_model_catalog WHERE source='openrouter'`)
+	rows, err := db.Query(`SELECT data FROM twoai_model_catalog WHERE source='openrouter' AND delisted_at IS NULL`)
 	if err != nil {
 		return 0, err
 	}
@@ -352,7 +388,7 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 		Downloads, Likes          int
 	}
 	hfBySection := map[string][]hfModel{}
-	rows, err = db.Query(`SELECT section, data FROM twoai_model_catalog WHERE source='huggingface'`)
+	rows, err = db.Query(`SELECT section, data FROM twoai_model_catalog WHERE source='huggingface' AND delisted_at IS NULL`)
 	if err != nil {
 		return 0, err
 	}
