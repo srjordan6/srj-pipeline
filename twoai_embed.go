@@ -422,6 +422,83 @@ func twoaiDocTitle(doc map[string]any) string {
 	return ""
 }
 
+// twoaiComposeSparse writes one plain sentence from the fields of a record too
+// sparse to flatten into useful retrieval text. Returns empty when there is
+// nothing to say, because an empty page should stay out of the index rather
+// than be padded into it.
+func twoaiComposeSparse(payload any) string {
+	m, ok := payload.(map[string]any)
+	if !ok {
+		return ""
+	}
+	// Unwrap the single nested object these documents use.
+	for _, k := range []string{"server", "tool", "person", "company", "item"} {
+		if inner, ok := m[k].(map[string]any); ok {
+			m = inner
+			break
+		}
+	}
+	str := func(k string) string {
+		v, _ := m[k].(string)
+		return strings.TrimSpace(v)
+	}
+	name := str("title")
+	if name == "" {
+		name = str("name")
+	}
+	if name == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	desc := str("description")
+	vendor := str("vendor")
+	switch {
+	case str("namespace") != "" || str("remote_url") != "" || str("package_id") != "":
+		// An MCP registry server.
+		b.WriteString(name + " is a Model Context Protocol server")
+		if vendor != "" {
+			b.WriteString(" published by " + vendor)
+		}
+		b.WriteString(" and listed in the official MCP registry. ")
+		if desc != "" {
+			b.WriteString(desc + " ")
+		}
+		if u := str("remote_url"); u != "" {
+			b.WriteString("It is hosted by its publisher and connects over " +
+				fallback(str("remote_type"), "HTTP") + ", so nothing is installed locally. ")
+		} else if pid := str("package_id"); pid != "" {
+			b.WriteString("It runs locally, installed from " +
+				fallback(str("package_registry"), "a package registry") + " as " + pid +
+				", and communicates over " + fallback(str("remote_type"), "stdio") + ". ")
+		}
+		if v := str("version"); v != "" {
+			b.WriteString("The registry lists version " + v + ". ")
+		}
+	default:
+		b.WriteString(name)
+		if vendor != "" {
+			b.WriteString(", from " + vendor)
+		}
+		b.WriteString(". ")
+		if desc != "" {
+			b.WriteString(desc)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if len(out) < 60 {
+		return ""
+	}
+	return out
+}
+
+func fallback(v, def string) string {
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	return v
+}
+
 func twoaiEmbedRun(db *sql.DB) error {
 	idx := twoaiURLIndex(db)
 	rows, err := db.Query(`SELECT path, kind, data::text FROM twoai_pages ORDER BY path`)
@@ -437,11 +514,58 @@ func twoaiEmbedRun(db *sql.DB) error {
 	var want []chunkRow
 	skipped := 0
 
+	// twoaiSubject pulls the one sentence that says what a page is ABOUT, from
+	// wherever the factory puts it. Prefixed to every chunk of that page.
+	subjectOf := func(payload any) string {
+		m, ok := payload.(map[string]any)
+		if !ok {
+			return ""
+		}
+		for _, k := range []string{"server", "tool", "person", "company", "item", "case"} {
+			if inner, ok := m[k].(map[string]any); ok {
+				m = inner
+				break
+			}
+		}
+		for _, k := range []string{"significance", "summary", "hook", "description",
+			"definition", "blurb", "answer", "tagline"} {
+			if v, ok := m[k].(string); ok {
+				v = strings.TrimSpace(v)
+				if len(v) > 40 {
+					if len(v) > 400 {
+						v = v[:400]
+					}
+					return v
+				}
+			}
+		}
+		return ""
+	}
+
 	emit := func(key, url, title, kind string, payload any, start int) int {
+		subject := subjectOf(payload)
 		var sb strings.Builder
 		twoaiFlatten(payload, &sb, 0)
 		text := strings.TrimSpace(sb.String())
+
+		// SPARSE RECORDS GET A COMPOSED SENTENCE RATHER THAN BEING DROPPED.
+		// An MCP registry document flattens to about 100 characters: a title
+		// and one short description, with the endpoint and package identifier
+		// skipped as machine strings. Under the 200-character floor, so all
+		// 1,900 were silently absent and the assistant could not answer "is
+		// there an MCP server for Stripe" about a directory this site is one of
+		// the few places to maintain.
+		//
+		// The sentence is ASSEMBLED FROM FIELDS, never invented: what it is,
+		// who published it, how it connects. That is composition, not
+		// fabrication - the same facts the page renders, written as prose a
+		// retrieval model can match against.
 		if len(text) < 200 {
+			if composed := twoaiComposeSparse(payload); composed != "" {
+				text = strings.TrimSpace(title + "\n\n" + composed + "\n\n" + text)
+			}
+		}
+		if len(text) < 120 {
 			return start
 		}
 		n := start
@@ -455,7 +579,24 @@ func twoaiEmbedRun(db *sql.DB) error {
 			// The title is what the chunk is ABOUT, and embedding a passage
 			// without it throws that away. Cheap, and it fixes the class of
 			// question this site exists to answer.
-			body := title + "\n\n" + c
+			// EVERY CHUNK CARRIES THE SUBJECT LINE, not just the title.
+			//
+			// The New York Times case has five chunks. One holds the sentence
+			// that says what the case IS - the Times alleges OpenAI copied
+			// millions of articles to train GPT models. The other four are raw
+			// docket text: motions to seal, amicus deadlines, lists of OpenAI
+			// corporate entities. Ask "is OpenAI being sued over training data"
+			// and those four match nothing, so the definitive training-data case
+			// on the site ranked below a weekly digest.
+			//
+			// A docket entry read alone is unanswerable. Read under a line
+			// saying which case it belongs to and what that case is about, it
+			// becomes retrievable, which is how a person reads it too.
+			lead := title
+			if subject != "" {
+				lead = title + "\n" + subject
+			}
+			body := lead + "\n\n" + c
 			h := sha256.Sum256([]byte(body))
 			want = append(want, chunkRow{key, n, url, title, kind, body, hex.EncodeToString(h[:16])})
 			n++
