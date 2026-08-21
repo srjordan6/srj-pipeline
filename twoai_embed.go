@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -707,6 +708,19 @@ func twoaiEmbedRun(db *sql.DB) error {
 			continue
 		}
 
+		// THE JOBS HUB IS DATA, NOT PROSE, so its chunks are composed from
+		// the listings themselves; the generic emit would floor them away.
+		if kind == "jobs-hub" {
+			if url := twoaiDocURL(path, doc, idx); url != "" {
+				for i, body := range twoaiJobsChunks(doc) {
+					h := sha256.Sum256([]byte(body))
+					want = append(want, chunkRow{path, i, url,
+						"AI Job Listings", kind, body, hex.EncodeToString(h[:16])})
+				}
+			}
+			continue
+		}
+
 		// Bundles first: one document, many pages, each cited separately.
 		if items := twoaiBundleItems(path, doc); len(items) > 0 {
 			for _, it := range items {
@@ -951,4 +965,142 @@ func twoaiAsk(db *sql.DB, question string) error {
 		fmt.Println("no matches at all, which means the index is empty or the vector dimension is wrong")
 	}
 	return nil
+}
+
+// twoaiJobsChunks composes retrieval chunks for the jobs hub from the listing
+// data itself.
+//
+// WHY THIS EXISTS. The jobs hub document is arrays: 2,000+ listing records,
+// salary rows, an O*NET skills matrix. twoaiFlatten keeps prose, so the hub
+// contributed only its taxonomy directory chunk - a description of what the
+// section IS, with not one actual job in the index. Asked for open remote
+// jobs on 2026-08-20, the assistant retrieved MCP job-board server entries
+// and the directory chunk, and honestly concluded the site lists no
+// positions. It lists 2,124.
+//
+// COMPOSED, NEVER INVENTED. Every line is a listing's own title, company and
+// location; every count is computed from the same array the page renders.
+// The layout mirrors how people ask: a summary chunk for "who is hiring",
+// remote chunks for "remote AI jobs" (the exact query that failed), and one
+// chunk per job function so "AI safety roles" or "ML engineering jobs" lands
+// on lines of real openings rather than a section blurb.
+//
+// BOUNDED. Lines are capped per chunk to stay inside twoaiChunkChars, and
+// overflow is stated ("and N more on the page") rather than silently cut, the
+// same honesty rule the ecosystem counts follow. Listings churn daily, so
+// these hashes churn daily; that is the embed reconciler working as designed,
+// at ~20 chunks of cost.
+func twoaiJobsChunks(doc map[string]any) []string {
+	type job struct{ title, company, location, function string }
+	var jobs []job
+	arr, _ := doc["jobs"].([]any)
+	for _, it := range arr {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		s := func(k string) string { v, _ := m[k].(string); return strings.TrimSpace(v) }
+		j := job{s("title"), s("company"), s("location"), s("function")}
+		if j.title == "" || j.company == "" {
+			continue
+		}
+		jobs = append(jobs, j)
+	}
+	if len(jobs) == 0 {
+		return nil
+	}
+	line := func(j job) string {
+		l := j.title + " — " + j.company
+		if j.location != "" {
+			l += " (" + j.location + ")"
+		}
+		return l
+	}
+	var remote []job
+	byFn := map[string][]job{}
+	var fnOrder []string
+	for _, j := range jobs {
+		if strings.Contains(strings.ToLower(j.location), "remote") {
+			remote = append(remote, j)
+		}
+		if j.function != "" {
+			if _, seen := byFn[j.function]; !seen {
+				fnOrder = append(fnOrder, j.function)
+			}
+			byFn[j.function] = append(byFn[j.function], j)
+		}
+	}
+	sort.SliceStable(fnOrder, func(a, b int) bool { return len(byFn[fnOrder[a]]) > len(byFn[fnOrder[b]]) })
+
+	gen, _ := doc["generated"].(string)
+	header := fmt.Sprintf("AI Job Listings\nThe World of AI lists %d open AI and AI-security positions with direct employer application links, refreshed daily", len(jobs))
+	if gen != "" {
+		header += " (last updated " + gen + ")"
+	}
+	header += fmt.Sprintf(". %d roles are remote or partly remote. Every listing below is open now; browse, filter and apply from the Job Listings page.", len(remote))
+
+	var chunks []string
+
+	// Summary: the "who is hiring / how many jobs" answer, with the question
+	// forms appended in the reader's register, same rule as twoaiIntentLine.
+	var sum strings.Builder
+	sum.WriteString(header)
+	sum.WriteString("\nLargest categories: ")
+	max := len(fnOrder)
+	if max > 10 {
+		max = 10
+	}
+	for i := 0; i < max; i++ {
+		if i > 0 {
+			sum.WriteString(", ")
+		}
+		fmt.Fprintf(&sum, "%s (%d)", fnOrder[i], len(byFn[fnOrder[i]]))
+	}
+	sum.WriteString(". How do I get a job in AI? Who is hiring for AI roles right now? What AI jobs are open, including remote positions?")
+	chunks = append(chunks, sum.String())
+
+	// Remote listings: the query that demonstrably failed gets lines of real
+	// openings, not a description.
+	const perChunk = 20
+	const maxRemoteChunks = 4
+	for i := 0; i < len(remote) && len(chunks) <= maxRemoteChunks; i += perChunk {
+		end := i + perChunk
+		if end > len(remote) {
+			end = len(remote)
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s\nRemote AI jobs currently listed (%d of %d remote openings):\n", header, end-i, len(remote))
+		for _, j := range remote[i:end] {
+			b.WriteString(line(j))
+			b.WriteString("\n")
+		}
+		if end < len(remote) && len(chunks) == maxRemoteChunks {
+			fmt.Fprintf(&b, "and %d more remote roles on the page.", len(remote)-end)
+		}
+		chunks = append(chunks, b.String())
+	}
+
+	// One chunk per function, largest first, capped so daily churn stays
+	// proportionate to what it buys.
+	const maxFnChunks = 14
+	const fnLines = 16
+	for i := 0; i < len(fnOrder) && i < maxFnChunks; i++ {
+		fn := fnOrder[i]
+		list := byFn[fn]
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s\n%s roles, %d open:\n", header, fn, len(list))
+		n := len(list)
+		if n > fnLines {
+			n = fnLines
+		}
+		for _, j := range list[:n] {
+			b.WriteString(line(j))
+			b.WriteString("\n")
+		}
+		if len(list) > n {
+			fmt.Fprintf(&b, "and %d more %s openings on the page.", len(list)-n, fn)
+		}
+		chunks = append(chunks, b.String())
+	}
+	return chunks
 }
