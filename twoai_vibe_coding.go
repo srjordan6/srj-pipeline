@@ -123,9 +123,24 @@ func twoaiVibeCoding(db *sql.DB, today string, upsert func(path, kind string, v 
 
 	// The tools a vibe coder is actually choosing between, counted from the
 	// catalogue rather than listed by hand so the number cannot go stale.
+	// Coding-tool count, read from this site's OWN catalog in site_content
+	// rather than from synced_tools. synced_tools is a shared table written by
+	// another system, and on 2026-08-20 a sync there ingested rendered page
+	// headings as tool rows ("Coding & Developer Tools 30 tools" stored as a
+	// tool name) and deactivated every real row, which silently turned this
+	// count into 0 on a live page. A number this page renders must come from
+	// the source this project owns and can verify.
 	var codingTools int
-	db.QueryRow(`SELECT count(*) FROM synced_tools
-		WHERE category='Coding & Developer Tools' AND is_active`).Scan(&codingTools)
+	db.QueryRow(`SELECT count(*) FROM site_content,
+		jsonb_array_elements(data->'tools') t
+		WHERE path='resources/tools.json'
+		  AND t->>'category' = 'Coding & Developer Tools'`).Scan(&codingTools)
+	// A zero here means the catalog read failed or the category was renamed,
+	// never that the site has no coding tools. Say so in the log rather than
+	// rendering a confident nothing.
+	if codingTools == 0 {
+		fmt.Println("twoai_vibe_coding: WARNING coding tool count came back 0 from resources/tools.json; check the category label")
+	}
 
 	// Written into content/tech/, which is one of the four directories the
 	// Technology and Core Infrastructure route reads at build time. Writing it
