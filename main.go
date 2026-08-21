@@ -3191,7 +3191,36 @@ func twoaiBuild(db *sql.DB) error {
 				continue
 			}
 			var opts []string
-			if source == "compliance" {
+			if source == "model_catalog" {
+				// Every foundation-model vendor currently on the serving market,
+				// from the same catalog that renders the models section - not a
+				// hand-kept shortlist that goes stale. OpenRouter names come as
+				// "Vendor: Model"; the vendor half, deduplicated, is the list.
+				mr, err := db.Query(`SELECT DISTINCT split_part(name,':',1)
+					FROM twoai_model_catalog
+					WHERE source='openrouter' AND delisted_at IS NULL AND name LIKE '%:%'
+					ORDER BY 1`)
+				if err == nil {
+					for mr.Next() {
+						var v string
+						if mr.Scan(&v) == nil && v != "" {
+							opts = append(opts, v)
+						}
+					}
+					mr.Close()
+				}
+				// Families that matter to candidates but are not routed through
+				// OpenRouter, then the catch-all; static_options is the fallback
+				// if the catalog query ever returns nothing.
+				if len(opts) > 0 {
+					opts = append(opts,
+						"Stability AI (Stable Diffusion)", "Black Forest Labs (FLUX)",
+						"Midjourney", "Runway", "ElevenLabs",
+						"Open-weight fine-tunes (any family)")
+				} else {
+					json.Unmarshal([]byte(raw), &opts)
+				}
+			} else if source == "compliance" {
 				cr, err := db.Query(`SELECT data->>'title' FROM site_content
 					WHERE path LIKE 'governance/%'
 					  AND path NOT IN ('governance/_meta.json','governance/sources.json','governance/ai-tools.json')
