@@ -42,13 +42,17 @@ import (
 
 const corpusTarball = "https://codeload.github.com/srjordan6/srj-content/tar.gz/refs/heads/main"
 
-var corpusDBTables = []struct{ table, rtype, prov string }{
-	{"synced_glossary_terms", "glossary-term", "owned"},
-	{"synced_laws", "law-summary", "owned"},
-	{"synced_tools", "tool-entry", "owned"},
-	{"ai_lawsuits", "lawsuit-tracked", "public-record"},
-	{"ai_lawsuit_candidates", "lawsuit-candidate", "public-record"},
-	{"ai_intel_candidates", "intel-candidate", "third-party"},
+// The synced_ tables use is_active as a soft delete: inactive rows are
+// history (superseded entries, and as of 2026-08-20 a batch of scraped page
+// headings kept for the record), not content. Exporting them as "owned"
+// corpus records shipped junk once; the filter makes that impossible.
+var corpusDBTables = []struct{ table, rtype, prov, where string }{
+	{"synced_glossary_terms", "glossary-term", "owned", "WHERE is_active"},
+	{"synced_laws", "law-summary", "owned", "WHERE is_active"},
+	{"synced_tools", "tool-entry", "owned", "WHERE is_active"},
+	{"ai_lawsuits", "lawsuit-tracked", "public-record", ""},
+	{"ai_lawsuit_candidates", "lawsuit-candidate", "public-record", ""},
+	{"ai_intel_candidates", "intel-candidate", "third-party", ""},
 }
 
 var corpusContentDirs = map[string][2]string{
@@ -164,7 +168,11 @@ func corpusRecord(id, rtype, prov, source string, d map[string]any) map[string]a
 func corpusDBRecords(db *sql.DB) ([]map[string]any, error) {
 	var out []map[string]any
 	for _, t := range corpusDBTables {
-		rows, err := db.Query("SELECT * FROM " + t.table)
+		q := "SELECT * FROM " + t.table
+		if t.where != "" {
+			q += " " + t.where
+		}
+		rows, err := db.Query(q)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", t.table, err)
 		}
