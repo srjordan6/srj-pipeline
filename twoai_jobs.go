@@ -477,6 +477,14 @@ func twoaiJobsFetch(db *sql.DB) error {
 		"anthropic": "Anthropic", "cloudflare": "Cloudflare", "databricks": "Databricks",
 		"xai": "xAI", "scaleai": "Scale AI", "okta": "Okta", "datadog": "Datadog",
 		"sentinellabs": "SentinelOne",
+		// Verified live 2026-08-21, each returning open listings.
+		"togetherai": "Together AI", "stabilityai": "Stability AI", "vercel": "Vercel",
+		"coreweave": "CoreWeave", "sambanovasystems": "SambaNova Systems",
+		"assemblyai": "AssemblyAI", "figureai": "Figure", "snorkelai": "Snorkel AI",
+		"lightningai": "Lightning AI", "cresta": "Cresta", "observeai": "Observe.AI",
+		"dataiku": "Dataiku", "imbue": "Imbue", "gleanwork": "Glean",
+		"nebius": "Nebius", "tenstorrent": "Tenstorrent", "waymo": "Waymo",
+		"duolingo": "Duolingo", "elastic": "Elastic", "gitlab": "GitLab",
 	}
 	for slug, name := range greenhouse {
 		b, err := twoaiJobsGet("https://boards-api.greenhouse.io/v1/boards/"+slug+"/jobs?content=true", nil)
@@ -511,6 +519,18 @@ func twoaiJobsFetch(db *sql.DB) error {
 	ashby := map[string]string{
 		"openai": "OpenAI", "elevenlabs": "ElevenLabs", "cursor": "Cursor",
 		"sierra": "Sierra", "runway": "Runway",
+		// Verified live 2026-08-21, each returning open listings.
+		"perplexity": "Perplexity", "cohere": "Cohere", "abridge": "Abridge",
+		"uipath": "UiPath", "suno": "Suno", "midjourney": "Midjourney",
+		"replit": "Replit", "notion": "Notion", "physicalintelligence": "Physical Intelligence",
+		"cognition": "Cognition", "poolside": "Poolside", "deepgram": "Deepgram",
+		"modal": "Modal", "baseten": "Baseten", "anyscale": "Anyscale",
+		"writer": "Writer", "decagon": "Decagon", "tavus": "Tavus",
+		"ideogram": "Ideogram", "cerebras": "Cerebras", "pinecone": "Pinecone",
+		"harvey": "Harvey", "runpod": "RunPod", "fireworks": "Fireworks AI",
+		"pika": "Pika", "synthesia": "Synthesia", "character": "Character.AI",
+		"crusoe": "Crusoe", "lambda": "Lambda", "mercor": "Mercor",
+		"thinkingmachines": "Thinking Machines Lab", "linear": "Linear",
 	}
 	for slug, name := range ashby {
 		b, err := twoaiJobsGet("https://api.ashbyhq.com/posting-api/job-board/"+slug, nil)
@@ -571,6 +591,75 @@ func twoaiJobsFetch(db *sql.DB) error {
 			}
 			save("lever", slug+":"+j.ID, j.Text, name, j.Categories.Location,
 				j.WorkplaceType == "remote", "", j.HostedURL, posted, j.DescPlain)
+		}
+	}
+
+	// ---- SmartRecruiters public postings API (no auth). Paged at 100;
+	// the public job URL follows the documented jobs.smartrecruiters.com
+	// pattern of company identifier + posting id.
+	smartrecruiters := map[string]string{"ServiceNow": "ServiceNow"}
+	for slug, name := range smartrecruiters {
+		for offset := 0; offset < 600; offset += 100 {
+			b, err := twoaiJobsGet(fmt.Sprintf(
+				"https://api.smartrecruiters.com/v1/companies/%s/postings?limit=100&offset=%d", slug, offset), nil)
+			if err != nil {
+				warn("smartrecruiters/"+slug, err)
+				break
+			}
+			var d struct {
+				TotalFound int `json:"totalFound"`
+				Content    []struct {
+					ID           string `json:"id"`
+					Name         string `json:"name"`
+					ReleasedDate string `json:"releasedDate"`
+					Location     struct {
+						FullLocation string `json:"fullLocation"`
+						Remote       bool   `json:"remote"`
+					} `json:"location"`
+				} `json:"content"`
+			}
+			if err := json.Unmarshal(b, &d); err != nil {
+				warn("smartrecruiters/"+slug, err)
+				break
+			}
+			for _, j := range d.Content {
+				save("smartrecruiters", slug+":"+j.ID, j.Name, name, j.Location.FullLocation,
+					j.Location.Remote, "", "https://jobs.smartrecruiters.com/"+slug+"/"+j.ID,
+					j.ReleasedDate, "")
+			}
+			if offset+100 >= d.TotalFound || len(d.Content) == 0 {
+				break
+			}
+		}
+	}
+
+	// ---- Workable public widget API (no auth), one call per account.
+	workable := map[string]string{"huggingface": "Hugging Face"}
+	for slug, name := range workable {
+		b, err := twoaiJobsGet("https://apply.workable.com/api/v1/widget/accounts/"+slug, nil)
+		if err != nil {
+			warn("workable/"+slug, err)
+			continue
+		}
+		var d struct {
+			Jobs []struct {
+				Title       string `json:"title"`
+				Shortcode   string `json:"shortcode"`
+				URL         string `json:"url"`
+				Remote      bool   `json:"telecommuting"`
+				City        string `json:"city"`
+				Country     string `json:"country"`
+				PublishedOn string `json:"published_on"`
+			} `json:"jobs"`
+		}
+		if err := json.Unmarshal(b, &d); err != nil {
+			warn("workable/"+slug, err)
+			continue
+		}
+		for _, j := range d.Jobs {
+			loc := strings.TrimPrefix(j.City+", "+j.Country, ", ")
+			save("workable", slug+":"+j.Shortcode, j.Title, name, loc,
+				j.Remote, "", j.URL, j.PublishedOn, "")
 		}
 	}
 
