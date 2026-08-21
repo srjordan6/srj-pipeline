@@ -3171,6 +3171,58 @@ func twoaiBuild(db *sql.DB) error {
 		toolPages++
 	}
 
+	// ---- Talent Network form options. The join form's dropdowns come from the
+	// same SQL that drives everything else: talent_questions rows, with the
+	// governance list resolved live from the compliance library so a new
+	// framework page automatically becomes a choosable answer. Published as
+	// talent/options.json and baked into /talent/join/ at build.
+	tqRows, tqErr := db.Query(`SELECT question_key, label, source, static_options::text
+		FROM talent_questions WHERE active ORDER BY sort_order`)
+	if tqErr == nil {
+		type tq struct {
+			Key     string   `json:"key"`
+			Label   string   `json:"label"`
+			Options []string `json:"options"`
+		}
+		var qs []tq
+		for tqRows.Next() {
+			var key, label, source, raw string
+			if tqRows.Scan(&key, &label, &source, &raw) != nil {
+				continue
+			}
+			var opts []string
+			if source == "compliance" {
+				cr, err := db.Query(`SELECT data->>'title' FROM site_content
+					WHERE path LIKE 'governance/%'
+					  AND path NOT IN ('governance/_meta.json','governance/sources.json','governance/ai-tools.json')
+					  AND COALESCE(data->>'title','') <> '' ORDER BY data->>'title'`)
+				if err == nil {
+					for cr.Next() {
+						var t string
+						if cr.Scan(&t) == nil {
+							opts = append(opts, t)
+						}
+					}
+					cr.Close()
+				}
+			} else {
+				json.Unmarshal([]byte(raw), &opts)
+			}
+			if len(opts) > 0 {
+				qs = append(qs, tq{Key: key, Label: label, Options: opts})
+			}
+		}
+		tqRows.Close()
+		if len(qs) > 0 {
+			if err := upsert("talent/options.json", "talent-options", map[string]any{
+				"generated": today, "questions": qs,
+			}); err != nil {
+				return err
+			}
+			fmt.Printf("twoai_build: talent options questions=%d\n", len(qs))
+		}
+	}
+
 	compliance, err := twoaiCompliance(db, today, upsert)
 	if err != nil {
 		return err
