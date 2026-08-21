@@ -51,8 +51,27 @@ import (
 // access to the service account itself via Property Access Management.
 func gaSAToken(scope string) (string, error) {
 	email, key := os.Getenv("GOOGLE_SA_EMAIL"), os.Getenv("GOOGLE_SA_KEY")
-	if email == "" || key == "" {
-		return "", fmt.Errorf("GOOGLE_SA_EMAIL and GOOGLE_SA_KEY must be set")
+	if key == "" {
+		return "", fmt.Errorf("GOOGLE_SA_KEY must be set")
+	}
+	// A PASTED SERVICE-ACCOUNT JSON FILE NAMES ITS OWN ACCOUNT, so when the
+	// key is JSON, client_email from inside it is authoritative and
+	// GOOGLE_SA_EMAIL is ignored. The 2026-08-20/21 failures were a valid key
+	// signed under a different account's GOOGLE_SA_EMAIL; Google reports that
+	// mismatch as "Invalid JWT Signature", which reads like a broken key and
+	// is not. Two env vars that must agree will eventually disagree - reading
+	// the pair from one file removes the class of failure, not one instance.
+	if strings.Contains(key, "client_email") {
+		var sa struct {
+			ClientEmail string `json:"client_email"`
+			PrivateKey  string `json:"private_key"`
+		}
+		if json.Unmarshal([]byte(key), &sa) == nil && sa.ClientEmail != "" && sa.PrivateKey != "" {
+			email, key = sa.ClientEmail, sa.PrivateKey
+		}
+	}
+	if email == "" {
+		return "", fmt.Errorf("no service-account email: set GOOGLE_SA_EMAIL or paste the full JSON key")
 	}
 	block, _ := pem.Decode([]byte(strings.ReplaceAll(key, `\n`, "\n")))
 	if block == nil {
