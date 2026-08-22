@@ -22,7 +22,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -159,6 +162,37 @@ func talentPublish(db *sql.DB, today string, upsert func(path, kind string, data
 		qr.Close()
 	}
 
+	// Fresh listings for the match engine: same 3-day render window the jobs
+	// page uses, loaded once and scored against every live profile.
+	type jobRow struct {
+		Title    string `json:"title"`
+		Company  string `json:"company"`
+		Location string `json:"location"`
+		URL      string `json:"url"`
+		Posted   string `json:"posted_on,omitempty"`
+		Remote   bool   `json:"remote"`
+		hay      string
+	}
+	var jobPool []jobRow
+	if jr, err := db.Query(`SELECT title, company, COALESCE(location,''), remote, url,
+			COALESCE(posted_on::text,''), COALESCE(skills::text,'[]')
+		FROM twoai_jobs WHERE last_seen > now() - interval '3 days'`); err == nil {
+		for jr.Next() {
+			var j jobRow
+			var skillsRaw string
+			if jr.Scan(&j.Title, &j.Company, &j.Location, &j.Remote, &j.URL, &j.Posted, &skillsRaw) != nil {
+				continue
+			}
+			var sk []string
+			json.Unmarshal([]byte(skillsRaw), &sk)
+			j.hay = strings.ToLower(j.Title + " " + j.Company + " " + strings.Join(sk, " "))
+			jobPool = append(jobPool, j)
+		}
+		jr.Close()
+	}
+	paren := regexp.MustCompile(`\s*\([^)]*\)`)
+	stop := map[string]bool{"ai": true, "other": true, "none": true, "yes": true, "no": true}
+
 	rows, err := db.Query(`SELECT tai_id, profile, answers, share_pdf, has_photo, d1_updated
 		FROM twoai_talent_profiles WHERE status='live' ORDER BY tai_id`)
 	if err != nil {
@@ -210,6 +244,49 @@ func talentPublish(db *sql.DB, today string, upsert func(path, kind string, data
 			}
 		}
 
+		// Match engine: a member term hits when it appears in the listing's
+		// title, company, or extracted skills. Terms are the member's own
+		// verified selections, lowercased, parentheticals stripped; short and
+		// generic tokens are dropped so "AI" cannot match everything.
+		terms := map[string]bool{}
+		for _, ans := range a {
+			for _, sel := range append(append([]string{}, ans.Selections...), ans.Other) {
+				t := strings.ToLower(strings.TrimSpace(paren.ReplaceAllString(sel, "")))
+				if len(t) >= 3 && !stop[t] {
+					terms[t] = true
+				}
+			}
+		}
+		type scored struct {
+			jobRow
+			score int
+		}
+		var hits []scored
+		for _, j := range jobPool {
+			sc := 0
+			for t := range terms {
+				if strings.Contains(j.hay, t) {
+					sc++
+				}
+			}
+			if sc > 0 {
+				hits = append(hits, scored{j, sc})
+			}
+		}
+		sort.Slice(hits, func(i, k int) bool {
+			if hits[i].score != hits[k].score {
+				return hits[i].score > hits[k].score
+			}
+			return hits[i].Posted > hits[k].Posted
+		})
+		if len(hits) > 12 {
+			hits = hits[:12]
+		}
+		var matches []jobRow
+		for _, h := range hits {
+			matches = append(matches, h.jobRow)
+		}
+
 		// D1's updated_at is epoch seconds; the page prints this verbatim,
 		// so format it as a date here rather than shipping a raw integer.
 		if secs, err2 := strconv.ParseInt(updated, 10, 64); err2 == nil && secs > 1000000000 {
@@ -218,6 +295,7 @@ func talentPublish(db *sql.DB, today string, upsert func(path, kind string, data
 		entry := map[string]any{
 			"tai_id": taiID, "share_pdf": sharePdf, "has_photo": hasPhoto,
 			"years": years, "skills": skills, "updated": updated,
+			"matches": matches,
 		}
 		for _, k := range []string{"first_name", "headline", "location", "availability", "rate",
 			"summary", "certifications", "publications", "awards", "work_experience", "education"} {
@@ -235,6 +313,23 @@ func talentPublish(db *sql.DB, today string, upsert func(path, kind string, data
 	}
 	if err := upsert("talent/profiles.json", "talent-profiles", map[string]any{
 		"generated": today, "profiles": profiles,
+	}); err != nil {
+		return err
+	}
+	// Digest feed for the Worker's weekly mailer: public-safe by construction
+	// (derived from public profiles and public listings), top 8 per member.
+	digest := map[string]any{}
+	for _, e := range profiles {
+		m, _ := e["matches"].([]jobRow)
+		if len(m) > 8 {
+			m = m[:8]
+		}
+		digest[e["tai_id"].(string)] = map[string]any{
+			"first_name": e["first_name"], "matches": m,
+		}
+	}
+	if err := upsert("talent/matches.json", "talent-matches", map[string]any{
+		"generated": today, "members": digest,
 	}); err != nil {
 		return err
 	}
