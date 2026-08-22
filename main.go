@@ -6967,7 +6967,7 @@ func twoaiPublish(db *sql.DB) error {
 		return err
 	}
 	defer rows.Close()
-	exported, unchanged := 0, 0
+	exported, unchanged, failed := 0, 0, 0
 	for rows.Next() {
 		var path, pretty string
 		if err := rows.Scan(&path, &pretty); err != nil {
@@ -6997,11 +6997,35 @@ func twoaiPublish(db *sql.DB) error {
 		prb, _ := io.ReadAll(pr.Body)
 		pr.Body.Close()
 		if pr.StatusCode != 200 && pr.StatusCode != 201 {
-			return fmt.Errorf("github PUT %s %d: %.200s", path, pr.StatusCode, prb)
+			// One transient GitHub 500 used to abort the whole export here,
+			// leaving every path that sorts after the failing file unpublished
+			// (2026-08-22: a 500 on an mcp/ file kept talent/ out of the repo
+			// and 404'd the first live talent page). Retry once, then log and
+			// move on; the daily diff republishes anything still missing.
+			time.Sleep(2 * time.Second)
+			r2, _ := http.NewRequest("PUT", "https://api.github.com/repos/srjordan6/twoai-content/contents/"+path, bytes.NewReader(pb))
+			r2.Header.Set("Authorization", "Bearer "+tok)
+			r2.Header.Set("Accept", "application/vnd.github+json")
+			r2.Header.Set("User-Agent", "srj-pipeline/1.0")
+			if pr2, err2 := client.Do(r2); err2 == nil {
+				prb2, _ := io.ReadAll(pr2.Body)
+				pr2.Body.Close()
+				if pr2.StatusCode == 200 || pr2.StatusCode == 201 {
+					exported++
+					continue
+				}
+				prb = prb2
+			}
+			failed++
+			fmt.Fprintf(os.Stderr, "twoai_publish: github PUT %s failed twice (skipped): %.200s\n", path, prb)
+			continue
 		}
 		exported++
 	}
-	fmt.Printf("twoai_publish: exported=%d unchanged=%d ok=true\n", exported, unchanged)
+	fmt.Printf("twoai_publish: exported=%d unchanged=%d failed=%d ok=%v\n", exported, unchanged, failed, failed == 0)
+	if failed > 20 {
+		return fmt.Errorf("twoai_publish: %d PUTs failed, likely systemic", failed)
+	}
 	return nil
 }
 
