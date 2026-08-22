@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -314,6 +315,7 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 		Reasoning               bool
 		InputMods               []string
 		HFID                    string
+		Expires, Cutoff         string
 	}
 	var api []orModel
 	rows, err := db.Query(`SELECT data FROM twoai_model_catalog WHERE source='openrouter' AND delisted_at IS NULL`)
@@ -342,6 +344,12 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 		}
 		if c, ok := m["context_length"].(float64); ok {
 			o.Context = int(c)
+		}
+		if v, ok := m["expiration_date"].(string); ok {
+			o.Expires = v
+		}
+		if v, ok := m["knowledge_cutoff"].(string); ok {
+			o.Cutoff = v
 		}
 		if p, ok := m["pricing"].(map[string]any); ok {
 			o.PromptPM = perMillion(p, "prompt")
@@ -540,6 +548,8 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 				"reasoning":     o.Reasoning,
 				"multimodal":    len(o.InputMods) > 1,
 				"open_weights":  o.HFID != "",
+				"knowledge_cutoff": o.Cutoff,
+				"expires":          o.Expires,
 			}
 		}
 		stats := func(list []orModel) map[string]any {
@@ -686,11 +696,39 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 		if cheapBig != nil {
 			doc["cheapest_128k"] = apiRow(*cheapBig)
 		}
+		// Scheduled retirements: expiration dates come straight from the
+		// routing catalog; nobody else publishes a deprecation calendar.
+		var retiring []map[string]any
+		for _, o := range api {
+			if o.Expires != "" {
+				retiring = append(retiring, map[string]any{
+					"name": o.Name, "url": o.URL, "provider": o.Provider, "expires": o.Expires,
+				})
+			}
+		}
+		sort.Slice(retiring, func(i, j int) bool { return retiring[i]["expires"].(string) < retiring[j]["expires"].(string) })
+		if len(retiring) > 0 {
+			doc["retiring"] = retiring
+		}
 		if err := write("api-pricing", doc); err != nil {
 			return count, err
 		}
 		keep = append(keep, "models/api-pricing.json")
 		count++
+
+		// ---- Serving providers directory: who actually runs the inference,
+		// where they are headquartered, and their policy/status pages. The
+		// jurisdiction angle (HQ country, datacenter regions) is governance
+		// data no other model catalog joins in.
+		if provDoc := twoaiFetchServingProviders(); provDoc != nil {
+			name, blurb := taxMeta("serving-providers")
+			provDoc["name"], provDoc["blurb"] = name, blurb
+			if err := write("serving-providers", provDoc); err != nil {
+				return count, err
+			}
+			keep = append(keep, "models/serving-providers.json")
+			count++
+		}
 	}
 
 	if len(keep) > 0 {
@@ -700,4 +738,61 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 		}
 	}
 	return count, nil
+}
+
+// twoaiFetchServingProviders pulls OpenRouter's public providers directory:
+// 100+ inference operators with headquarters country, datacenter regions, and
+// their terms, privacy, and status URLs. Public endpoint, no key. Returns nil
+// on any failure so the page simply keeps yesterday's copy.
+func twoaiFetchServingProviders() map[string]any {
+	resp, err := http.Get("https://openrouter.ai/api/v1/providers")
+	if err != nil {
+		fmt.Printf("twoai_models: providers fetch: %v\n", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		fmt.Printf("twoai_models: providers http %d\n", resp.StatusCode)
+		return nil
+	}
+	var raw struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil || len(raw.Data) == 0 {
+		return nil
+	}
+	var provs []map[string]any
+	for _, p := range raw.Data {
+		row := map[string]any{}
+		for src, dst := range map[string]string{
+			"name": "name", "slug": "slug", "headquarters": "hq",
+			"privacy_policy_url": "privacy", "terms_of_service_url": "terms",
+			"status_page_url": "status",
+		} {
+			if v, ok := p[src].(string); ok && v != "" {
+				row[dst] = v
+			}
+		}
+		if dc, ok := p["datacenters"].([]any); ok && len(dc) > 0 {
+			var out []string
+			for _, d := range dc {
+				if s, ok := d.(string); ok {
+					out = append(out, s)
+				}
+			}
+			if len(out) > 0 {
+				row["datacenters"] = out
+			}
+		}
+		if _, ok := row["name"]; ok {
+			provs = append(provs, row)
+		}
+	}
+	sort.Slice(provs, func(i, j int) bool {
+		return provs[i]["name"].(string) < provs[j]["name"].(string)
+	})
+	return map[string]any{
+		"providers": provs, "total": len(provs),
+		"shape": "serving-providers", "source": "openrouter",
+	}
 }
