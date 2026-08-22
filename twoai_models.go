@@ -144,12 +144,12 @@ func twoaiModelsFetch(db *sql.DB) {
 	// ---- Hugging Face: top models per pipeline tag, by all-time downloads.
 	for section, tags := range twoaiModelSections {
 		for _, tag := range tags {
-			url := "https://huggingface.co/api/models?pipeline_tag=" + tag + "&sort=downloads&direction=-1&limit=50"
+			url := "https://huggingface.co/api/models?pipeline_tag=" + tag + "&sort=downloads&direction=-1&limit=500"
 			if tag == "__slm__" {
-				url = "https://huggingface.co/api/models?pipeline_tag=text-generation&sort=downloads&direction=-1&limit=100&expand[]=safetensors&expand[]=downloads&expand[]=likes&expand[]=createdAt&expand[]=tags&expand[]=pipeline_tag"
+				url = "https://huggingface.co/api/models?pipeline_tag=text-generation&sort=downloads&direction=-1&limit=1000&expand[]=safetensors&expand[]=downloads&expand[]=likes&expand[]=createdAt&expand[]=tags&expand[]=pipeline_tag"
 			} else if strings.Contains(tag, "|") {
 				parts := strings.SplitN(tag, "|", 2)
-				url = "https://huggingface.co/api/models?sort=downloads&direction=-1&limit=50&filter=" + parts[1]
+				url = "https://huggingface.co/api/models?sort=downloads&direction=-1&limit=500&filter=" + parts[1]
 				if parts[0] != "" {
 					url += "&pipeline_tag=" + parts[0]
 				}
