@@ -524,7 +524,11 @@ func twoaiCompanyFacts(db *sql.DB, today string) (int, error) {
 					if prow.Scan(&pid, &title, &date) == nil {
 						x.Recent = append(x.Recent, map[string]any{
 							"id": pid, "title": title, "date": date,
-							"url": "https://patents.google.com/patent/US" + pid,
+							// USPTO Patent Public Search, not Google Patents: Google lags
+							// days-to-weeks on fresh grants (a Tuesday grant 404'd there
+							// four days later, 2026-08-22), while the office that issued
+							// the patent has it immediately - and is the original source.
+							"url": "https://ppubs.uspto.gov/pubwebapp/external.html?q=(" + pid + ").pn.&type=ids",
 						})
 					}
 				}
