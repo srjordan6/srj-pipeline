@@ -151,7 +151,9 @@ func truncate(s string, n int) string {
 func talentPublish(db *sql.DB, today string, upsert func(path, kind string, data any) error) error {
 	labels := map[string]string{}
 	order := []string{}
-	if qr, err := db.Query(`SELECT question_key, label FROM talent_questions WHERE active ORDER BY sort_order`); err == nil {
+	// short_label is the resume-facing category name ("Foundation Models"),
+	// per Stephen 2026-08-22; the full question text stays on the form only.
+	if qr, err := db.Query(`SELECT question_key, COALESCE(NULLIF(short_label,''), label) FROM talent_questions WHERE active ORDER BY sort_order`); err == nil {
 		for qr.Next() {
 			var k, l string
 			if qr.Scan(&k, &l) == nil {
@@ -303,7 +305,7 @@ func talentPublish(db *sql.DB, today string, upsert func(path, kind string, data
 				entry[k] = v
 			}
 		}
-		for _, k := range []string{"jobs", "education_items", "certifications_items",
+		for _, k := range []string{"jobs", "projects_items", "education_items", "certifications_items",
 			"publications_items", "patents_items", "awards_items"} {
 			if v, ok := p[k]; ok {
 				entry[k] = v
