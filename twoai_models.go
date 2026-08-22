@@ -87,7 +87,18 @@ func twoaiModelsEnsure(db *sql.DB) error {
 	// out of a Hugging Face top-50 remains queryable with the data it last
 	// carried. Every live read filters delisted_at IS NULL, so rendered pages
 	// are unchanged; the history simply stops being destroyed.
-	_, err = db.Exec(`ALTER TABLE twoai_model_catalog ADD COLUMN IF NOT EXISTS delisted_at timestamptz`)
+	if _, err = db.Exec(`ALTER TABLE twoai_model_catalog ADD COLUMN IF NOT EXISTS delisted_at timestamptz`); err != nil {
+		return err
+	}
+	// Daily price snapshots per API model, appended once per day the fetch
+	// succeeds. History accumulates forever; the pricing page compares the
+	// newest day against ~30 days back to report real price moves.
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS twoai_model_prices (
+		day date NOT NULL,
+		model_id text NOT NULL,
+		prompt_pm double precision,
+		completion_pm double precision,
+		PRIMARY KEY (day, model_id))`)
 	return err
 }
 
@@ -137,6 +148,67 @@ func twoaiModelsFetch(db *sql.DB) {
 				}
 				if err := tx.Commit(); err == nil {
 					fmt.Printf("twoai_models: openrouter %d models, %d newly delisted\n", n, delisted)
+					// Today's price snapshot, straight from the rows just
+					// written. ON CONFLICT keeps reruns idempotent.
+					if _, err := db.Exec(`INSERT INTO twoai_model_prices (day, model_id, prompt_pm, completion_pm)
+						SELECT current_date, ext_id,
+							NULLIF(data->'pricing'->>'prompt','')::double precision * 1e6,
+							NULLIF(data->'pricing'->>'completion','')::double precision * 1e6
+						FROM twoai_model_catalog
+						WHERE source='openrouter' AND delisted_at IS NULL
+						ON CONFLICT (day, model_id) DO NOTHING`); err != nil {
+						fmt.Fprintf(os.Stderr, "twoai_models: price snapshot: %v\n", err)
+					}
+					// Per-provider endpoints for each model: the same model is
+					// often served by several operators at different prices and
+					// quantizations. One public request per model; failures
+					// leave that model's previous endpoints in place.
+					got := 0
+					for _, id := range current {
+						eraw, err := twoaiJobsGet("https://openrouter.ai/api/v1/models/"+id+"/endpoints", nil)
+						if err != nil {
+							continue
+						}
+						var eb struct {
+							Data struct {
+								Endpoints []map[string]any `json:"endpoints"`
+							} `json:"data"`
+						}
+						if json.Unmarshal(eraw, &eb) != nil || len(eb.Data.Endpoints) == 0 {
+							continue
+						}
+						var eps []map[string]any
+						for _, e := range eb.Data.Endpoints {
+							row := map[string]any{}
+							if v, ok := e["provider_name"].(string); ok {
+								row["provider"] = v
+							}
+							if v, ok := e["quantization"].(string); ok && v != "" && v != "unknown" {
+								row["quantization"] = v
+							}
+							if v, ok := e["context_length"].(float64); ok {
+								row["context"] = int(v)
+							}
+							if p, ok := e["pricing"].(map[string]any); ok {
+								row["prompt_pm"] = round2(perMillion(p, "prompt"))
+								row["completion_pm"] = round2(perMillion(p, "completion"))
+							}
+							if _, ok := row["provider"]; ok {
+								eps = append(eps, row)
+							}
+						}
+						if len(eps) == 0 {
+							continue
+						}
+						ej, _ := json.Marshal(eps)
+						if _, err := db.Exec(`UPDATE twoai_model_catalog
+							SET data = jsonb_set(data, '{endpoints}', $1::jsonb)
+							WHERE source='openrouter' AND ext_id=$2`, string(ej), id); err == nil {
+							got++
+						}
+						time.Sleep(50 * time.Millisecond)
+					}
+					fmt.Printf("twoai_models: endpoints stored for %d models\n", got)
 				}
 			}
 		}
@@ -318,6 +390,7 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 		Expires, Cutoff         string
 	}
 	var api []orModel
+	endpointsByID := map[string][]map[string]any{}
 	rows, err := db.Query(`SELECT data FROM twoai_model_catalog WHERE source='openrouter' AND delisted_at IS NULL`)
 	if err != nil {
 		return 0, err
@@ -350,6 +423,13 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 		}
 		if v, ok := m["knowledge_cutoff"].(string); ok {
 			o.Cutoff = v
+		}
+		if eps, ok := m["endpoints"].([]any); ok {
+			for _, e := range eps {
+				if em, ok := e.(map[string]any); ok {
+					endpointsByID[o.ID] = append(endpointsByID[o.ID], em)
+				}
+			}
 		}
 		if p, ok := m["pricing"].(map[string]any); ok {
 			o.PromptPM = perMillion(p, "prompt")
@@ -709,6 +789,97 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 		sort.Slice(retiring, func(i, j int) bool { return retiring[i]["expires"].(string) < retiring[j]["expires"].(string) })
 		if len(retiring) > 0 {
 			doc["retiring"] = retiring
+		}
+		// Same model, different serving prices: models with two or more
+		// provider endpoints, ranked by input-price spread. The arbitrage
+		// table only OpenRouter's data makes possible.
+		type spreadRow struct {
+			row    map[string]any
+			spread float64
+		}
+		var spreads []spreadRow
+		for i := range api {
+			o := &api[i]
+			eps := endpointsByID[o.ID]
+			if len(eps) < 2 {
+				continue
+			}
+			lo, hi := math.MaxFloat64, 0.0
+			for _, e := range eps {
+				if v, ok := e["prompt_pm"].(float64); ok && v > 0 {
+					if v < lo {
+						lo = v
+					}
+					if v > hi {
+						hi = v
+					}
+				}
+			}
+			if lo == math.MaxFloat64 || hi <= lo {
+				continue
+			}
+			spreads = append(spreads, spreadRow{map[string]any{
+				"name": o.Name, "url": o.URL, "low_pm": round2(lo), "high_pm": round2(hi),
+				"endpoints": eps,
+			}, hi / lo})
+		}
+		sort.Slice(spreads, func(i, j int) bool { return spreads[i].spread > spreads[j].spread })
+		if len(spreads) > 50 {
+			spreads = spreads[:50]
+		}
+		if len(spreads) > 0 {
+			var ms []map[string]any
+			for _, r := range spreads {
+				ms = append(ms, r.row)
+			}
+			doc["multi_serving"] = ms
+		}
+		// Price moves: newest snapshot day against the closest day at least
+		// ~30 days back (or the oldest we have). Needs two days of history,
+		// so this block appears once the snapshots accumulate.
+		if mv, err := db.Query(`
+			WITH latest AS (SELECT max(day) d FROM twoai_model_prices),
+			base AS (
+				SELECT COALESCE(
+					(SELECT max(day) FROM twoai_model_prices WHERE day <= (SELECT d FROM latest) - 30),
+					(SELECT min(day) FROM twoai_model_prices)) d)
+			SELECT a.model_id, a.prompt_pm, b.prompt_pm, (SELECT d FROM base)::text
+			FROM twoai_model_prices a
+			JOIN twoai_model_prices b ON b.model_id = a.model_id AND b.day = (SELECT d FROM base)
+			WHERE a.day = (SELECT d FROM latest) AND (SELECT d FROM base) < (SELECT d FROM latest)
+			  AND a.prompt_pm IS NOT NULL AND b.prompt_pm IS NOT NULL
+			  AND a.prompt_pm <> b.prompt_pm AND b.prompt_pm > 0`); err == nil {
+			byID := map[string]*orModel{}
+			for i := range api {
+				byID[api[i].ID] = &api[i]
+			}
+			var moves []map[string]any
+			for mv.Next() {
+				var id, since string
+				var now, then float64
+				if mv.Scan(&id, &now, &then, &since) != nil {
+					continue
+				}
+				o := byID[id]
+				if o == nil {
+					continue
+				}
+				moves = append(moves, map[string]any{
+					"name": o.Name, "url": o.URL, "provider": o.Provider,
+					"from_pm": round2(then), "to_pm": round2(now), "since": since,
+					"pct": round2((now - then) / then * 100),
+				})
+			}
+			mv.Close()
+			sort.Slice(moves, func(i, j int) bool {
+				return math.Abs(moves[i]["pct"].(float64)) > math.Abs(moves[j]["pct"].(float64))
+			})
+			if len(moves) > 60 {
+				moves = moves[:60]
+			}
+			if len(moves) > 0 {
+				doc["price_moves"] = moves
+			}
 		}
 		if err := write("api-pricing", doc); err != nil {
 			return count, err
