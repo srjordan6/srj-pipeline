@@ -3228,6 +3228,38 @@ func twoaiBuild(db *sql.DB) error {
 				} else {
 					json.Unmarshal([]byte(raw), &opts)
 				}
+			} else if strings.HasPrefix(source, "model_section:") {
+				// One dropdown per model classification, fed by the same
+				// catalog that renders the category pages. Top 100 by
+				// downloads keeps the control usable; Other catches the rest.
+				sec := strings.TrimPrefix(source, "model_section:")
+				mr, err := db.Query(`SELECT name FROM twoai_model_catalog
+					WHERE section=$1 AND delisted_at IS NULL
+					ORDER BY COALESCE((data->>'downloads')::bigint,0) DESC, name LIMIT 100`, sec)
+				if err == nil {
+					for mr.Next() {
+						var v string
+						if mr.Scan(&v) == nil && v != "" {
+							opts = append(opts, v)
+						}
+					}
+					mr.Close()
+				}
+			} else if source == "model_reasoning" {
+				// Reasoning models come from the OpenRouter half of the
+				// catalog, where the reasoning flag lives.
+				mr, err := db.Query(`SELECT name FROM twoai_model_catalog
+					WHERE section='api' AND delisted_at IS NULL AND data->>'reasoning'='true'
+					ORDER BY name LIMIT 100`)
+				if err == nil {
+					for mr.Next() {
+						var v string
+						if mr.Scan(&v) == nil && v != "" {
+							opts = append(opts, v)
+						}
+					}
+					mr.Close()
+				}
 			} else if source == "compliance" {
 				cr, err := db.Query(`SELECT data->>'title' FROM site_content
 					WHERE path LIKE 'governance/%'
