@@ -208,7 +208,10 @@ func talentPublish(db *sql.DB, today string, upsert func(path, kind string, data
 		Label string   `json:"label"`
 		Items []string `json:"items"`
 	}
-	var profiles []map[string]any
+	// Non-nil so zero live profiles marshals as [] rather than null; a null
+	// took down every site build on 2026-08-22 when the pull caught the only
+	// live profile mid-review.
+	profiles := []map[string]any{}
 	for rows.Next() {
 		var taiID, profileRaw, answersRaw, updated string
 		var sharePdf, hasPhoto bool
@@ -284,7 +287,7 @@ func talentPublish(db *sql.DB, today string, upsert func(path, kind string, data
 		if len(hits) > 12 {
 			hits = hits[:12]
 		}
-		var matches []jobRow
+		matches := []jobRow{} // non-nil: zero hits must marshal as [], not null
 		for _, h := range hits {
 			matches = append(matches, h.jobRow)
 		}
