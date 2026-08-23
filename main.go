@@ -88,7 +88,7 @@ func main() {
 		// event, not a daily rhythm. Run `pipeline favicons` at that point. The
 		// stage is unchanged and still idempotent, so running it costs nothing
 		// but the GETs.
-		for _, s := range []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -293,6 +293,14 @@ func main() {
 	if src == "twoai_vendor_feeds" {
 		if err := twoaiVendorFeeds(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_vendor_feeds:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_case_studies" {
+		if err := twoaiCaseStudyHarvest(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_case_studies:", err)
 			os.Exit(1)
 		}
 		return
@@ -879,6 +887,23 @@ func gdelt(db *sql.DB, sourceID int) (fetched, added int, err error) {
 					title = line[j+12 : j+k]
 				}
 			}
+			// THE STORY ITSELF MUST BE ABOUT AI, NOT MERELY TAGGED AI.
+			//
+			// The cheap line-level test above is a prefilter over an 8MB CSV
+			// row, and it matches the THEMES column as readily as the article.
+			// GDELT tags a tourism communique that mentions technology with an
+			// AI theme, the line contains "artificial intelligence", and a
+			// story about the Jaipur Declaration entered this site's AI news.
+			// On 2026-08-23 the daily briefing led with BRICS tourism
+			// ministers and Amber Fort; two of its ten stories were about AI.
+			//
+			// So relevance is now decided on the TITLE, which is the article's
+			// own claim about itself, not on metadata a third party attached.
+			// A record with no title cannot make that claim and is dropped:
+			// this page would rather carry less than carry noise.
+			if !twoaiTitleIsAI(title) {
+				continue
+			}
 			// Full raw line retained per retention policy: everything the
 			// pipeline downloads is kept for future LLM development.
 			meta := map[string]string{"url": docURL, "domain": c[3], "date": c[1],
@@ -919,6 +944,56 @@ func trunc(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// twoaiAIWordRe holds the surface forms an AI story actually uses in its
+// headline. Deliberately concrete: "ai" as a standalone token, the spelled-out
+// phrase, and the named technologies. Broad tech words like "algorithm",
+// "data" or "digital" are excluded because they are what let the tourism and
+// green-computing stories in.
+var twoaiAIWordRe = regexp.MustCompile(`(?i)\b(a\.?i\.?|artificial intelligence|machine learning|deep learning|neural network|large language model|llm|llms|generative ai|genai|chatbot|chatgpt|openai|anthropic|deepmind|copilot|gemini|claude|llama|transformer model|foundation model|agentic|robotaxi|humanoid robot|self-driving|autonomous vehicle|computer vision|speech recognition|deepfake|algorithmic bias)\b`)
+
+// twoaiTitleIsAI reports whether a headline is about AI on its own terms.
+func twoaiTitleIsAI(title string) bool {
+	t := strings.TrimSpace(title)
+	if t == "" {
+		return false
+	}
+	return twoaiAIWordRe.MatchString(t)
+}
+
+// twoaiWireTitle normalises a headline so the same wire item recognises
+// itself across every outlet that republished it.
+//
+// WHY RANKING BY OUTLET COUNT WAS BACKWARDS. Stories rank by how many outlets
+// carried them, which is a fair proxy for importance only when the outlets are
+// independent newsrooms. On 2026-08-23 the top story was carried by 59
+// "separate" domains - britainnews.net, irishsun.com, zimbabwestar.com,
+// middleeaststar.com and 55 more - which is one syndication network wearing 59
+// names. A tourism communique beat every real AI story, and the more
+// mechanically an item was mirrored the higher it ranked.
+//
+// THE TEST IS BEHAVIOURAL, NOT NAME-BASED. The obvious fix, matching domains
+// that look like a farm, is a trap: the pattern that catches zimbabwestar.com
+// also catches nytimes.com and washingtonpost.com, which would merge the New
+// York Times and the LA Times into one "outlet" and undercount exactly the
+// coverage worth trusting. Verified before shipping, and discarded.
+//
+// What actually separates a mirror from a newsroom is the headline. Wire
+// mirrors republish character-identical titles; independent newsrooms write
+// their own. So the unit of coverage is the DISTINCT HEADLINE, and a hundred
+// verbatim copies count once no matter who published them or what they are
+// called. The trailing " - Outlet Name" that syndication platforms append is
+// stripped first, so one paper group's house style does not fake variety.
+var twoaiWirePunctRe = regexp.MustCompile(`[^a-z0-9]+`)
+var twoaiWireTailRe = regexp.MustCompile(`(?i)\s*(&#x2013;|&#8211;|[-\x{2013}\x{2014}|])\s*[^-|\x{2013}\x{2014}]{1,40}$`)
+
+func twoaiWireTitle(title string) string {
+	t := strings.ToLower(strings.TrimSpace(title))
+	// Strip one trailing " - Publication" attribution.
+	t = twoaiWireTailRe.ReplaceAllString(t, "")
+	t = strings.Trim(twoaiWirePunctRe.ReplaceAllString(t, " "), " ")
+	return t
 }
 
 // publishNews clusters the day's gdelt coverage into top stories and
@@ -1020,6 +1095,17 @@ func publishNews(db *sql.DB) error {
 			cls = append(cls, &cluster{arts: []art{a}, tk: tk})
 		}
 	}
+	// Independent coverage, measured in distinct headlines. A wire item
+	// mirrored across fifty domains contributes one, so breadth reflects how
+	// many newsrooms wrote about a story rather than how efficiently a feed
+	// was republished. See twoaiWireTitle.
+	newsrooms := func(c *cluster) int {
+		m := map[string]bool{}
+		for _, a := range c.arts {
+			m[twoaiWireTitle(a.Title)] = true
+		}
+		return len(m)
+	}
 	domains := func(c *cluster) int {
 		m := map[string]bool{}
 		for _, a := range c.arts {
@@ -1028,6 +1114,9 @@ func publishNews(db *sql.DB) error {
 		return len(m)
 	}
 	sort.Slice(cls, func(i, j int) bool {
+		if newsrooms(cls[i]) != newsrooms(cls[j]) {
+			return newsrooms(cls[i]) > newsrooms(cls[j])
+		}
 		if domains(cls[i]) != domains(cls[j]) {
 			return domains(cls[i]) > domains(cls[j])
 		}
@@ -3321,6 +3410,12 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 	_ = vibe
+
+	caseStudies, err := twoaiCaseStudies(db, today, upsert)
+	if err != nil {
+		return err
+	}
+	_ = caseStudies
 
 	companies, err := twoaiCompanies(db, today, upsert)
 	if err != nil {
