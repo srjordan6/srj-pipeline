@@ -778,9 +778,15 @@ func twoaiModels(db *sql.DB, today string) (int, error) {
 		}
 		// Scheduled retirements: expiration dates come straight from the
 		// routing catalog; nobody else publishes a deprecation calendar.
+		// Some providers park a sentinel far-future date (2098-12-31 and the
+		// like) in the expiration field to mean "no end date". Those are not
+		// retirements, and listing them next to a model shutting down next
+		// week would make the calendar useless, so anything more than three
+		// years out is treated as the placeholder it is.
+		cutoff := time.Now().AddDate(3, 0, 0).Format("2006-01-02")
 		var retiring []map[string]any
 		for _, o := range api {
-			if o.Expires != "" {
+			if o.Expires != "" && o.Expires <= cutoff {
 				retiring = append(retiring, map[string]any{
 					"name": o.Name, "url": o.URL, "provider": o.Provider, "expires": o.Expires,
 				})
