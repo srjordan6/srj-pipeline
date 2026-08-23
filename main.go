@@ -1033,13 +1033,35 @@ func publishNews(db *sql.DB) error {
 			drows.Close()
 		}
 	}
+	// THE FILTER RUNS HERE TOO, NOT ONLY AT INGEST.
+	//
+	// Deciding relevance at ingest stops new junk entering, but it cannot
+	// clean the corpus already sitting inside the 36-hour window: 171 of the
+	// 268 records in it on 2026-08-23 arrived under the old rule, so the
+	// briefing kept leading with BRICS tourism ministers after the ingest fix
+	// shipped. Purging those rows was the obvious alternative and was
+	// rejected - archive pages are built from them, and deleting the rows
+	// would delete published URLs, which is the exact failure this project
+	// spent the morning repairing.
+	//
+	// Filtering at publish leaves the corpus intact, keeps every archived page
+	// answering, and means the briefing corrects itself on the next run rather
+	// than waiting a day and a half for bad records to age out.
+	skipped := 0
 	for rows.Next() {
 		var a art
 		var d sql.NullString
 		if rows.Scan(&a.Title, &a.URL, &d, &a.Domain, &a.persons, &a.orgs) == nil {
+			if !twoaiTitleIsAI(a.Title) {
+				skipped++
+				continue
+			}
 			a.Date = d.String
 			arts = append(arts, a)
 		}
+	}
+	if skipped > 0 {
+		fmt.Printf("publishNews: %d non-AI headlines skipped, %d kept\n", skipped, len(arts))
 	}
 
 	stop := map[string]bool{"the": true, "a": true, "an": true, "of": true, "to": true, "in": true, "on": true, "for": true, "and": true, "with": true, "as": true, "at": true, "by": true, "is": true, "its": true, "ai": true, "artificial": true, "intelligence": true, "new": true, "how": true, "what": true, "why": true}
