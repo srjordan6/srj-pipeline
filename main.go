@@ -88,7 +88,7 @@ func main() {
 		// event, not a daily rhythm. Run `pipeline favicons` at that point. The
 		// stage is unchanged and still idempotent, so running it costs nothing
 		// but the GETs.
-		for _, s := range []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"} {
+		for _, s := range []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run() // a failing source must not block the others
@@ -333,6 +333,15 @@ func main() {
 		// the site simply rebuilds from the last successful pull.
 		if err := talentPull(db); err != nil {
 			fmt.Fprintln(os.Stderr, "talent_pull:", err)
+		}
+		return
+	}
+
+	if src == "ask_pull" {
+		// Non-fatal for the same reason talent_pull is: the log mirror is
+		// diagnostics, and a D1 hiccup must not sink the nightly build.
+		if err := askLogPull(db); err != nil {
+			fmt.Fprintln(os.Stderr, "ask_pull:", err)
 		}
 		return
 	}
