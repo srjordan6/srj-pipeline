@@ -84,6 +84,39 @@ func twoaiOAAbstract(inv map[string][]int) string {
 	return s
 }
 
+// twoaiArxivID resolves an arXiv identifier for a work.
+//
+// THE DOI IS AUTHORITATIVE AND THE URL IS NOT. arXiv mints DOIs under the
+// 10.48550 prefix as 10.48550/arXiv.2401.01234, which is exact. Scraping the
+// open-access URL, which is what the first version of this stage did, finds an
+// id only when arXiv happens to be the best OA location AND the URL happens to
+// use the /abs/ form: across the first 29,974 works harvested it produced ONE
+// arxiv_id while 16 works carried arXiv DOIs, and 2,082 more sat behind
+// /pdf/ URLs the /abs/ test never saw. On a corpus about AI, where arXiv is
+// where the field actually publishes, that is not a rounding error. Legacy
+// ids keep their category prefix (quant-ph/9707021), which is correct.
+func twoaiArxivID(doi, oaURL string) string {
+	if doi != "" {
+		low := strings.ToLower(doi)
+		if strings.HasPrefix(low, "10.48550/arxiv.") {
+			return doi[len("10.48550/arXiv."):]
+		}
+	}
+	for _, marker := range []string{"arxiv.org/abs/", "arxiv.org/pdf/"} {
+		if i := strings.Index(oaURL, marker); i >= 0 {
+			id := oaURL[i+len(marker):]
+			id = strings.TrimSuffix(id, ".pdf")
+			if j := strings.IndexAny(id, "?#"); j >= 0 {
+				id = id[:j]
+			}
+			if id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
 func twoaiOpenAlex(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_works (
 		openalex_id text PRIMARY KEY,
@@ -147,7 +180,7 @@ func twoaiOpenAlex(db *sql.DB) error {
 	}
 
 	client := &http.Client{Timeout: 60 * time.Second}
-	saved, pages := 0, 0
+	saved, pages, skippedYear := 0, 0, 0
 	newestUpdate := highWater
 
 	for pages < twoaiOAPagesPerRun && cursor != "" {
@@ -246,14 +279,30 @@ func twoaiOpenAlex(db *sql.DB) error {
 			if title == "" || w.ID == "" {
 				continue
 			}
+			// NO YEAR FLOOR HERE, DELIBERATELY, AND THIS REVERSES THE FIRST
+			// FIX WRITTEN FOR THIS FILE. A 1950 floor was added on the
+			// reasoning that the field does not predate 1950, so the 153
+			// pre-1950 works in the first backfill had to be cataloguing
+			// artefacts. Reading them disproved it. They include Church's
+			// calculi of lambda-conversion, Peirce on the algebra of logic,
+			// Russell on knowledge by acquaintance and Bouton's Nim - the
+			// actual ancestry of the field, and exactly the works a source of
+			// truth on AI should be able to trace a citation back to. The
+			// genuine noise is 14 misclassified geology papers, 0.05% of the
+			// corpus. Discarding Church to remove conchology is a bad trade.
+			//
+			// If pre-modern noise ever matters, TOPIC is the discriminator,
+			// not year: the noise sits under Geochemistry and Geologic
+			// Mapping while the ancestry sits under Logic, Reasoning and
+			// Knowledge. Only the future year is rejected, since a
+			// publication date past next year is always an error.
+			if w.PubYear > time.Now().Year()+1 {
+				skippedYear++
+				continue
+			}
 			oid := strings.TrimPrefix(w.ID, "https://openalex.org/")
 			doi := strings.TrimPrefix(w.DOI, "https://doi.org/")
-			// arXiv id recovered from the OA URL when the work lives there;
-			// good enough for the join, refined later by the arXiv enricher.
-			arxiv := ""
-			if strings.Contains(w.OpenAccess.URL, "arxiv.org/abs/") {
-				arxiv = w.OpenAccess.URL[strings.Index(w.OpenAccess.URL, "arxiv.org/abs/")+len("arxiv.org/abs/"):]
-			}
+			arxiv := twoaiArxivID(doi, w.OpenAccess.URL)
 			pmid := strings.TrimPrefix(w.IDs.PMID, "https://pubmed.ncbi.nlm.nih.gov/")
 			var topic string
 			var score float64
@@ -343,6 +392,7 @@ func twoaiOpenAlex(db *sql.DB) error {
 
 	var total int
 	db.QueryRow(`SELECT count(*) FROM twoai_works`).Scan(&total)
-	fmt.Printf("openalex: mode=%s pages=%d saved=%d works_total=%d\n", mode, pages, saved, total)
+	fmt.Printf("openalex: mode=%s pages=%d saved=%d skipped_year=%d works_total=%d\n",
+		mode, pages, saved, skippedYear, total)
 	return nil
 }
