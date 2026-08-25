@@ -4247,6 +4247,64 @@ func twoaiSources(db *sql.DB, today string, upsert func(path, kind string, v any
 		brows.Close()
 	}
 
+	// CATALOGUE DRIFT. A published volume should carry a Wikidata item and an
+	// Open Library work; both are created by hand and both have been forgotten
+	// before. Volume V went out on 2026-08-03 and its Wikidata item was created
+	// five days later only because someone happened to ask.
+	//
+	// This warns, it does not act. Creating a public catalogue record is
+	// irreversible in practice — an item created in error needs a community
+	// deletion nomination — and the data feeding it has been wrong before: two
+	// ISBNs in the books table turned out to belong to a registrant block SRJ
+	// does not own, and Volume VI carried a null page count for a day after
+	// publication. A cron that published on status change would have pushed each
+	// of those into a public catalogue and reported ok=true.
+	//
+	// Reads book_catalogue_status, NOT the three tables by hand. book_identifiers
+	// keys on books.book_id while press_books keys on book_number, and the two
+	// diverge: The AI Lawyer is books row 7 but book_number 10, so a direct join
+	// on book_number credits its Wikidata item to Volume VII instead. The view
+	// exists to make that mistake unavailable.
+	type gap struct {
+		num     int
+		title   string
+		missing []string
+	}
+	var gaps []gap
+	if grows, err := db.Query(`SELECT book_number, title,
+			wikidata_qid IS NULL, openlibrary_work IS NULL, books_row IS NULL
+		FROM book_catalogue_status
+		WHERE status = 'available'
+		ORDER BY book_number`); err == nil {
+		for grows.Next() {
+			var g gap
+			var noWD, noOL, noRow bool
+			if grows.Scan(&g.num, &g.title, &noWD, &noOL, &noRow) == nil {
+				if noRow {
+					// No books row means no identifier can be attached at all,
+					// so this is the blocker to report rather than the symptom.
+					g.missing = append(g.missing, "books row")
+				} else {
+					if noWD {
+						g.missing = append(g.missing, "wikidata")
+					}
+					if noOL {
+						g.missing = append(g.missing, "openlibrary_work")
+					}
+				}
+				if len(g.missing) > 0 {
+					gaps = append(gaps, g)
+				}
+			}
+		}
+		grows.Close()
+	}
+	for _, g := range gaps {
+		fmt.Printf("twoai_build: CATALOGUE DRIFT: book %d %q is published with no %s. "+
+			"Create the record by hand, then record the id in book_identifiers.\n",
+			g.num, g.title, strings.Join(g.missing, " and no "))
+	}
+
 	if err := upsert("sources/index.json", "sources-hub", map[string]any{
 		"uid":          twoaiUID("section:sources-index"),
 		"sections":     sections,
