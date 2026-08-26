@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -283,6 +284,8 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 		// requires; the per-request pause was standing in for that and cost a
 		// minute a day to do it worse.
 		client := &http.Client{Timeout: 15 * time.Second}
+		skippedBackoff := 0
+		backoffByHost := map[string]int{}
 		var vmu sync.Mutex
 		var vwg sync.WaitGroup
 		vsem := make(chan struct{}, 6)
@@ -294,6 +297,30 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 				defer func() { <-vsem }()
 				if !strings.HasPrefix(x.u, "http") {
 					return // internal cross-links and organizing rows have no external URL to verify
+				}
+				// BACK OFF INSTEAD OF ASKING FOREVER.
+				//
+				// A 403 from a publisher is not a transient error, it is a
+				// decision, and AMD's hardware pages have been refusing this
+				// crawler for thirty-five consecutive days. Asking again
+				// tomorrow will not change their mind. Previously only the
+				// LOGGING was throttled, so the noise went away while the
+				// requests carried on daily for ever - quiet waste, which is
+				// worse than loud waste because nobody sees it.
+				//
+				// Checks now slow down as failures accumulate: daily for the
+				// first three days, since most outages are brief; weekly to a
+				// fortnight; then monthly. Recovery is still caught, just at
+				// the cadence a permanent block deserves. One success resets
+				// everything to daily.
+				if due, fails := twoaiNextCheckDue(db, x.u); !due {
+					vmu.Lock()
+					skippedBackoff++
+					if fails > 0 {
+						backoffByHost[twoaiHostOf(x.u)]++
+					}
+					vmu.Unlock()
+					return
 				}
 				req, _ := http.NewRequest("GET", x.u, nil)
 				req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org link verification; contact: info@srjconsultingservices.com)")
@@ -357,6 +384,21 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 			}(x)
 		}
 		vwg.Wait()
+		if skippedBackoff > 0 {
+			// Said every run: a source we have stopped asking about is a
+			// source whose facts are ageing, and that must stay visible.
+			var hosts []string
+			for h, n := range backoffByHost {
+				hosts = append(hosts, fmt.Sprintf("%s(%d)", h, n))
+			}
+			sort.Strings(hosts)
+			shown := hosts
+			if len(shown) > 6 {
+				shown = shown[:6]
+			}
+			fmt.Printf("twoai_apistatus: %s skipped %d url(s) on backoff: %s\n",
+				table, skippedBackoff, strings.Join(shown, " "))
+		}
 	}
 	reverify("twoai_api_directory", "docs_url", "provider")
 	reverify("twoai_languages", "source_url", "slug")
@@ -488,4 +530,45 @@ func twoaiAPIStatus(db *sql.DB, today string) (int, error) {
 		pages++
 	}
 	return pages, nil
+}
+
+// twoaiNextCheckDue decides whether a URL is worth asking about today, and
+// returns the failure count so the caller can report what it skipped.
+//
+// The schedule is deliberately gentle at first and harsh later: most failures
+// are a bad afternoon, and a few are a permanent decision by the publisher.
+// Days 1-3 daily, then weekly, then every 30 days once a source has refused
+// us for a fortnight. A single success clears consecutive_failures and the
+// URL returns to daily checking, so recovery is never missed, only noticed
+// later than it happened - an acceptable trade for not knocking on a closed
+// door every night for a year.
+func twoaiNextCheckDue(db *sql.DB, url string) (bool, int) {
+	var fails int
+	var checked sql.NullTime
+	err := db.QueryRow(`SELECT consecutive_failures, checked_on
+		FROM twoai_link_verify WHERE url=$1`, url).Scan(&fails, &checked)
+	if err != nil || fails == 0 || !checked.Valid {
+		return true, 0 // never seen, or currently healthy
+	}
+	var interval int
+	switch {
+	case fails <= 3:
+		interval = 1
+	case fails <= 13:
+		interval = 7
+	default:
+		interval = 30
+	}
+	days := int(time.Since(checked.Time).Hours() / 24)
+	return days >= interval, fails
+}
+
+// twoaiHostOf is for log lines only: a bare host reads better than a full URL
+// when six of them share one line.
+func twoaiHostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	return strings.TrimPrefix(u.Host, "www.")
 }
