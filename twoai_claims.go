@@ -46,7 +46,7 @@ import (
 // re-run only what it needs to.
 
 const twoaiClaimModel = "claude-haiku-4-5"
-const twoaiClaimExtractor = "haiku-4-5/claims-v1"
+const twoaiClaimExtractor = "haiku-4-5/claims-v2"
 const twoaiClaimBatch = 120 // works per run; the backfill is a marathon
 
 type twoaiClaim struct {
@@ -58,6 +58,7 @@ type twoaiClaim struct {
 	System    string  `json:"system"`
 	Baseline  string  `json:"baseline"`
 	Direction string  `json:"direction"`
+	Kind      string  `json:"kind"`
 }
 
 // twoaiExtractClaims asks for structured results and nothing else. The prompt
@@ -67,17 +68,26 @@ func twoaiExtractClaims(title, abstract string) ([]twoaiClaim, error) {
 	key := os.Getenv("ANTHROPIC_API_KEY")
 	prompt := "Extract every measured result this abstract CLAIMS. Return a JSON array and nothing else - " +
 		"no prose, no code fence.\n\n" +
-		"Each element: {\"metric\":\"\",\"value\":0,\"unit\":\"\",\"dataset\":\"\",\"task\":\"\",\"system\":\"\",\"baseline\":\"\",\"direction\":\"\"}\n\n" +
+		"Each element: {\"metric\":\"\",\"value\":0,\"unit\":\"\",\"kind\":\"\",\"dataset\":\"\",\"task\":\"\",\"system\":\"\",\"baseline\":\"\",\"direction\":\"\"}\n\n" +
 		"metric: the measure named, lowercase (accuracy, f1, bleu, auc, error rate, perplexity, speedup).\n" +
 		"value: the number as a number.\n" +
 		"unit: %, points, x, ms, or \"\" if bare.\n" +
+		"kind: \"absolute\" if the number is a score the system reached; \"delta\" if it is an " +
+		"improvement, gain, reduction or speedup RELATIVE to something else. " +
+		"\"a gain of 5.0 BLEU over X\" is delta. \"achieves 25.9 BLEU\" is absolute. " +
+		"Getting this wrong makes an improvement look like a score, so decide it explicitly.\n" +
 		"dataset: the named dataset or benchmark, \"\" if none named.\n" +
 		"task: the task in three words or fewer, \"\" if unclear.\n" +
-		"system: the name of the method or model making the claim, \"\" if unnamed.\n" +
+		"system: the name of the method or model making the claim, \"\" if unnamed. " +
+		"Never the word \"baseline\" - if the number belongs to the thing being compared against, skip it.\n" +
 		"baseline: what it is compared against, \"\" if none named.\n" +
 		"direction: higher_better or lower_better.\n\n" +
 		"RULES. Only results this work claims for itself - not numbers quoted about prior work, " +
 		"not dataset sizes, not parameter counts, not years, not funding. " +
+		"NEVER TREAT AN EXPERIMENTAL SETTING AS A RESULT. Fold counts, epochs, layer counts, " +
+		"run counts, sample sizes and repository counts are setup, not measurements: " +
+		"\"ten-fold cross-validation\" is NOT an accuracy of 10, and a number sitting next to the " +
+		"word accuracy is not an accuracy unless the text says the system achieved it. " +
 		"Do not infer a value that is not stated. " +
 		"IF THE ABSTRACT STATES NO MEASURED RESULT, RETURN []. An empty array is a correct and " +
 		"expected answer; do not manufacture a claim to avoid returning nothing.\n\n" +
@@ -150,6 +160,18 @@ func twoaiClaimSane(c twoaiClaim) bool {
 	if c.Value < -1e6 || c.Value > 1e9 {
 		return false
 	}
+	// A row whose system IS the baseline is a comparison artefact, not a
+	// claim this work makes for itself; v1 produced several.
+	low := strings.ToLower(strings.TrimSpace(c.System))
+	if low == "baseline" || low == "baselines" || strings.HasPrefix(low, "best baseline") {
+		return false
+	}
+	// kind must be one of the two known values. An unset kind means the model
+	// did not decide, and an undecided absolute-vs-delta is the defect this
+	// version exists to fix, so it is dropped rather than guessed.
+	if c.Kind != "absolute" && c.Kind != "delta" {
+		return false
+	}
 	return true
 }
 
@@ -165,12 +187,14 @@ func twoaiClaims(db *sql.DB) error {
 		system_name text,
 		baseline text,
 		direction text,
+		kind text NOT NULL DEFAULT 'absolute',
 		extractor text NOT NULL,
 		extracted_on date NOT NULL DEFAULT current_date,
 		license_class text NOT NULL DEFAULT 'derived_fact_trainable',
 		UNIQUE (openalex_id, metric, value, dataset, system_name))`); err != nil {
 		return fmt.Errorf("claims create table: %w", err)
 	}
+	db.Exec(`ALTER TABLE twoai_claims ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'absolute'`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS twoai_claims_metric ON twoai_claims (metric)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS twoai_claims_dataset ON twoai_claims (dataset) WHERE dataset <> ''`)
 	// Attempt ledger: separate from the claims table because "we looked and
@@ -237,11 +261,11 @@ func twoaiClaims(db *sql.DB) error {
 				continue
 			}
 			if _, err := db.Exec(`INSERT INTO twoai_claims
-				(openalex_id, metric, value, unit, dataset, task, system_name, baseline, direction, extractor)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+				(openalex_id, metric, value, unit, dataset, task, system_name, baseline, direction, kind, extractor)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 				ON CONFLICT (openalex_id, metric, value, dataset, system_name) DO NOTHING`,
 				c.id, strings.ToLower(strings.TrimSpace(cl.Metric)), cl.Value, cl.Unit,
-				cl.Dataset, cl.Task, cl.System, cl.Baseline, cl.Direction, twoaiClaimExtractor); err != nil {
+				cl.Dataset, cl.Task, cl.System, cl.Baseline, cl.Direction, cl.Kind, twoaiClaimExtractor); err != nil {
 				fmt.Fprintln(os.Stderr, "twoai_claims insert:", err)
 				continue
 			}
