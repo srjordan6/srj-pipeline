@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"archive/tar"
 	"archive/zip"
 	"bufio"
@@ -29,6 +30,51 @@ import (
 
 	"github.com/lib/pq"
 )
+
+// STAGE DEADLINES: NO SINGLE STAGE MAY HANG THE RUN.
+//
+// Every stage runs as its own subprocess, so a deadline here covers all of
+// them rather than patching one. On 2026-08-26 the intel sweep hit a
+// CourtListener rate limit and never returned; the run sat for over half an
+// hour writing nothing, and the twelve stages behind it - including the claim
+// layer, which had a fixed prompt waiting to be proved - never ran at all. A
+// third-party throttle should not be able to decide what the rest of the
+// pipeline does tonight.
+//
+// A killed stage is not a failure to hide. It prints what it was and how long
+// it got, so a stage that starts timing out regularly is visible in the log
+// rather than showing up as work quietly not happening. Every stage here is
+// either idempotent or cursor-persisted, so being killed mid-flight costs at
+// most the batch in progress.
+var twoaiStageDeadline = map[string]time.Duration{
+	"twoai_build":     45 * time.Minute, // renders every page document
+	"twoai_embed":     45 * time.Minute, // embeds every changed chunk
+	"twoai_vectorize": 30 * time.Minute,
+	"openalex_pull":   25 * time.Minute, // 150 pages plus backoff on 504s
+	"twoai_claims":    25 * time.Minute,
+	"twoai_jobs":      25 * time.Minute,
+	"intel":           10 * time.Minute, // the stage that proved the need
+	"export_corpus":   20 * time.Minute,
+}
+
+const twoaiStageDeadlineDefault = 20 * time.Minute
+
+func runSequence(stages []string) {
+	for _, s := range stages {
+		limit := twoaiStageDeadlineDefault
+		if d, ok := twoaiStageDeadline[s]; ok {
+			limit = d
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), limit)
+		cmd := exec.CommandContext(ctx, os.Args[0], s)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		cmd.Run() // a failing source must not block the others
+		if ctx.Err() == context.DeadlineExceeded {
+			fmt.Fprintf(os.Stderr, "%s: KILLED after %s deadline, continuing the run\n", s, limit)
+		}
+		cancel()
+	}
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -88,11 +134,35 @@ func main() {
 		// event, not a daily rhythm. Run `pipeline favicons` at that point. The
 		// stage is unchanged and still idempotent, so running it costs nothing
 		// but the GETs.
-		for _, s := range []string{"inkbox_pull", "openalex_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "twoai_claims", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"} {
-			cmd := exec.Command(os.Args[0], s)
-			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-			cmd.Run() // a failing source must not block the others
+		seq := []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		// The corpus stages ride along with the daily build UNTIL a dedicated
+		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
+		// the duplication. Leaving them in by default matters: removing them
+		// first and trusting that the other cron gets created is exactly the
+		// silent-degradation failure this pipeline is built to avoid - the
+		// corpus would simply stop growing and nothing would say so.
+		if os.Getenv("CORPUS_CRON") == "" {
+			seq = append(seq[:1], append([]string{"openalex_pull"}, seq[1:]...)...)
+			for i, s := range seq {
+				if s == "twoai_build" {
+					seq = append(seq[:i], append([]string{"twoai_claims"}, seq[i:]...)...)
+					break
+				}
+			}
 		}
+		runSequence(seq)
+		return
+	}
+
+	// `pipeline corpus` is the works spine and the claim layer on their own
+	// schedule. The corpus is a different-shaped job from rendering a site:
+	// it grows by tens of thousands of rows a night, it depends on APIs that
+	// time out, and it must not sit behind thirty stages of page building to
+	// get its turn. A CourtListener rate limit hanging the intel sweep on
+	// 2026-08-26 starved the claim layer of a run entirely, which is what
+	// prompted the split.
+	if src == "corpus" {
+		runSequence([]string{"openalex_pull", "twoai_claims"})
 		return
 	}
 
