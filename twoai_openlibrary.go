@@ -299,20 +299,28 @@ func twoaiBookCatalog(db *sql.DB, today string, upsert func(path, kind string, v
 		groups = append(groups, group{Topic: t, Books: byTopic[t]})
 	}
 
-	uid := twoaiUID("section:ai-book-catalog")
+	// NO uid AND NO tax IN THIS PAYLOAD, DELIBERATELY. The research route
+	// builds a page for every learn/*.json that carries a uid, so omitting it
+	// is what stops this becoming a page of its own. The catalogue was briefly
+	// a separate section and that was the wrong call: "AI Books" and "AI Book
+	// Catalogue" sat next to each other in the same category making adjacent
+	// promises, and the difference between a curated shelf and a reachable one
+	// mattered to the person who built it and to nobody reading it. The
+	// catalogue is now a band inside the Books page, which is where a reader
+	// looking for a book was always going to look first.
 	if err := upsert("learn/book-catalog.json", "book-catalog", map[string]any{
-		"uid": uid, "shape": "book-catalog", "tax": "ai-book-catalog",
-		"name":   "AI Book Catalogue",
-		"blurb":  "Artificial intelligence books you can read or borrow today, from Open Library.",
 		"groups": groups, "total": total, "free": free,
 		"topics": len(groups), "generated": today,
 	}); err != nil {
 		return 0, err
 	}
-	db.Exec(`UPDATE twoai_taxonomy SET status='live', live_path=$1, updated_at=now()
-		WHERE slug='ai-book-catalog'`,
-		"/ai-ecosystem/research-knowledge-and-learning/"+uid+"/")
+	// The taxonomy row is REMOVED, not retired: the status column is
+	// constrained to live|building|planned, and a merged section left as
+	// "planned" would reappear on the coverage roadmap as work still to do.
+	// The 301 in _redirects and the changelog carry the history instead.
+	db.Exec(`DELETE FROM twoai_taxonomy WHERE slug='ai-book-catalog'`)
 
-	fmt.Printf("twoai_build: book catalogue=%d topics=%d free=%d\n", total, len(groups), free)
+	fmt.Printf("twoai_build: book catalogue merged into AI Books: %d titles, %d topics, %d free\n",
+		total, len(groups), free)
 	return 1, nil
 }
