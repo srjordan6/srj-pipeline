@@ -30,13 +30,11 @@ import (
 // and they appear in agency press feeds days or weeks before any Federal
 // Register notice, if one ever comes.
 //
-// FEEDS CHOSEN BY TESTING, NOT BY GUESSING. Checked 2026-08-26: the FTC
-// press-release feed and its consumer-protection feed both answer 200 and
-// carry the personalized-pricing item; SEC returns 25 items; CFPB answers but
-// carries one. EEOC's newsroom feed 404s and HHS OCR's 403s, so neither is
-// listed - a feed that does not exist is not tracked as though it might.
-// Those two agencies stay a manual gap, recorded here rather than pretended
-// away.
+// FEEDS CHOSEN BY TESTING, NOT BY GUESSING. Twenty-nine candidate feeds were
+// probed on 2026-08-26 across federal, state and municipal agencies with an
+// AI enforcement mandate; ten answered with parseable RSS and are listed
+// below, and every failure is recorded beside them. A feed that does not
+// exist is not tracked as though it might.
 //
 // THE SAME RELEVANCE RULE AS THE FEDERAL REGISTER STAGE. An agency publishes
 // constantly and most of it has nothing to do with AI, so a release earns a
@@ -49,12 +47,60 @@ import (
 // action it would have caught.
 var twoaiAgencyAdjacent = regexp.MustCompile(`(?i)\b(personalized pricing|surveillance pricing|dynamic pricing|automated system|dark pattern|facial recognition|biometric|predictive analytic)`)
 
+// EVERY FEED HERE WAS PROBED BEFORE IT WAS ADDED, and the ones that are
+// missing are missing for a reason recorded below. A dead feed in this list
+// would report a quiet zero for ever, which is the failure this file exists
+// to prevent.
+//
+// SELECTION RULE: an agency belongs here if AI enforcement is within its
+// MANDATE, not if it happened to act on AI this week. Probed 2026-08-26,
+// only 1 of 105 items across the six new feeds was AI-relevant - and that is
+// the expected shape. Enforcement is episodic: the FTC opened two AI dockets
+// in six weeks and the DOJ none, which tells you nothing about whether DOJ
+// will bring an algorithmic-discrimination case next month.
 var twoaiAgencyFeeds = []struct{ agency, url string }{
+	// Consumer protection and competition: Section 5 is the main federal
+	// hook for AI claims, deception and algorithmic pricing.
 	{"FTC", "https://www.ftc.gov/feeds/press-release.xml"},
 	{"FTC", "https://www.ftc.gov/feeds/press-release-consumer-protection.xml"},
+	{"FTC", "https://www.ftc.gov/feeds/press-release-competition.xml"},
+	// Securities: AI-washing enforcement against issuers and advisers.
 	{"SEC", "https://www.sec.gov/news/pressreleases.rss"},
+	// Consumer finance: adverse action notices, algorithmic underwriting.
 	{"CFPB", "https://www.consumerfinance.gov/about-us/newsroom/feed/"},
+	// Civil rights and antitrust, including algorithmic price-fixing - the
+	// RealPage matter is a DOJ case, not an FTC one.
+	{"DOJ", "https://www.justice.gov/news/rss?type=press_release"},
+	// Medical devices: AI/ML-enabled device authorisations and recalls.
+	{"FDA", "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml"},
+	// Model risk management for national banks, SR 11-7's OCC counterpart.
+	{"OCC", "https://www.occ.gov/rss/occ_news.xml"},
+	// STATE. Colorado enforces SB 26-189 from 2027-01-01, and New Jersey's
+	// AG issued the algorithmic-discrimination guidance under the LAD.
+	{"Colorado AG", "https://coag.gov/press-releases/feed/"},
+	{"New Jersey AG", "https://www.njoag.gov/feed/"},
 }
+
+// AGENCIES WITH AN AI MANDATE AND NO USABLE FEED, probed 2026-08-26. Recorded
+// so nobody re-adds them hoping, and so the coverage gap is a written fact
+// rather than an assumption:
+//
+//	EEOC        - newsroom.xml and /rss/all both 404. Title VII and the ADA
+//	              applied to automated hiring; a real loss.
+//	HHS OCR     - ocr-rss.xml 403. Section 1557 and HIPAA for clinical AI.
+//	FCC         - headlines and enforcement feeds 403. AI voice cloning
+//	              under the TCPA.
+//	NHTSA, CPSC - 403. Autonomous vehicles and connected products.
+//	DOL         - 403. Workplace AI guidance.
+//	HUD         - 404. Algorithmic tenant screening and fair housing.
+//	CA AG, CA CPPA, NY AG, NY DFS, TX AG, IL AG, MA AG, WA AG, CT AG,
+//	NYC DCWP    - no valid RSS at any tested path. Between them these cover
+//	              the CCPA ADMT rules, TRAIGA, BIPA and Local Law 144, so
+//	              this is the largest hole in state coverage. Scraping their
+//	              newsrooms is the obvious next step and is deliberately not
+//	              done here: a parser against ten bespoke HTML layouts is a
+//	              maintenance burden that should be chosen on purpose, not
+//	              slipped in.
 
 func twoaiAgencyWatch(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_agency_actions (
