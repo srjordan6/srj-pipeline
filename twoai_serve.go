@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -39,7 +40,19 @@ import (
 //     refuse the site's own tracker to the audience it was built for. The
 //     decision to enforce gets made from our own traffic in twoai_answer_guard.
 const (
-	twoaiAnswerModel = "@cf/anthropic/claude-haiku-4.5"
+	// ANSWERING GOES DIRECT TO ANTHROPIC, NOT THROUGH WORKERS AI.
+	//
+	// This file used to name "@cf/anthropic/claude-haiku-4.5" and build a
+	// chat-completions payload with the system prompt inside the messages
+	// array. Both were wrong, and the same pair of mistakes cost the live
+	// Worker weeks: the partner route answers 2021 Invalid User Credentials
+	// until Workers AI unified billing is enabled, and Anthropic's API takes
+	// system as a TOP-LEVEL string, not a message. The Worker was fixed by
+	// dropping the partner route entirely and calling Anthropic with its own
+	// key; this path now matches, so activating it will not re-run that
+	// diagnosis. The guard stays on Workers AI because Llama Guard genuinely
+	// is a Cloudflare model.
+	twoaiAnswerModel = "claude-haiku-4-5"
 	twoaiGuardModel  = "@cf/meta/llama-guard-3-8b"
 	// Below this cosine similarity the site genuinely does not cover the
 	// question. Tuned from the retrieval probe: real hits scored 0.63 to 0.71,
@@ -267,29 +280,14 @@ func twoaiServe(db *sql.DB) error {
 		for i, h := range hits {
 			fmt.Fprintf(&ctx, "[%d] %s (%s)\n%s\n\n", i+1, h.Title, h.URL, h.Body)
 		}
-		out, err := cfRun(twoaiAnswerModel, map[string]any{
-			"max_tokens": 700,
-			"messages": []map[string]string{
-				{"role": "system", "content": twoaiAskSystem},
-				{"role": "user", "content": "Excerpts from theworldofai.org:\n\n" + ctx.String() +
-					"\nQuestion: " + q + "\n\nAnswer using only the excerpts above."},
-			},
-		})
+		answer, err := anthropicAnswer(twoaiAskSystem,
+			"Excerpts from theworldofai.org:\n\n"+ctx.String()+
+				"\nQuestion: "+q+"\n\nAnswer using only the excerpts above.")
 		if err != nil {
 			log.Println("answer:", err)
 			w.WriteHeader(503)
 			json.NewEncoder(w).Encode(map[string]any{"error": "The assistant is unavailable right now."})
 			return
-		}
-		res, _ := out["result"].(map[string]any)
-		answer, _ := res["response"].(string)
-		if answer == "" {
-			// Some model shapes return content blocks rather than a string.
-			if arr, ok := res["content"].([]any); ok && len(arr) > 0 {
-				if m, ok := arr[0].(map[string]any); ok {
-					answer, _ = m["text"].(string)
-				}
-			}
 		}
 
 		// Sources are the pages actually retrieved, deduplicated, in rank order.
@@ -315,4 +313,52 @@ func twoaiServe(db *sql.DB) error {
 	}
 	log.Printf("twoai_serve: listening on :%s, answer model %s", port, twoaiAnswerModel)
 	return http.ListenAndServe(":"+port, mux)
+}
+
+// anthropicAnswer calls the Anthropic Messages API directly.
+//
+// The system prompt is a TOP-LEVEL string. Putting it in the messages array,
+// which is the Workers AI chat-completions shape, is silently accepted as a
+// user turn by some gateways and rejected by others, and it was half of why
+// the live assistant sat on a fallback model for weeks.
+func anthropicAnswer(system, user string) (string, error) {
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		return "", fmt.Errorf("ANTHROPIC_API_KEY not set")
+	}
+	body, _ := json.Marshal(map[string]any{
+		"model":      twoaiAnswerModel,
+		"max_tokens": 700,
+		"system":     system,
+		"messages":   []map[string]string{{"role": "user", "content": user}},
+	})
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("x-api-key", key)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("content-type", "application/json")
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		return "", fmt.Errorf("anthropic %d: %s", resp.StatusCode, b)
+	}
+	var out struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	answer := ""
+	for _, c := range out.Content {
+		answer += c.Text
+	}
+	return answer, nil
 }
