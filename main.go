@@ -5924,6 +5924,38 @@ func urlRegistry(db *sql.DB) error {
 		return err
 	}
 
+	// THE SITEMAP IS NO LONGER THE WHOLE SITE. It was, until vendor news
+	// permalinks were withdrawn from it on 2026-08-26 to stop 2,227 feed
+	// summaries competing for crawl budget against the glossary. Those pages
+	// are live, linked and reachable; they are simply not advertised. Reading
+	// the sitemap alone, this stage promptly reported 6,943 URLs gone and
+	// raised 2,218 for redirect-or-restore, none of which needed either -
+	// which would have buried the handful of genuinely disappeared URLs the
+	// check exists to surface.
+	//
+	// The build now publishes what it withheld, so the registry still learns
+	// the site from the build and cannot disagree with what rendered. Missing
+	// or unreadable, the run continues on the sitemap alone rather than
+	// failing: an incomplete registry is recoverable, and this stage refusing
+	// to run is not.
+	unlisted, uerr := fetchUnlistedURLs("https://theworldofai.org/unlisted-urls.json")
+	if uerr != nil {
+		fmt.Fprintln(os.Stderr, "url_registry: unlisted manifest unavailable, using sitemap only:", uerr)
+	} else {
+		seen := make(map[string]bool, len(urls))
+		for _, u := range urls {
+			seen[u] = true
+		}
+		added := 0
+		for _, u := range unlisted {
+			if !seen[u] {
+				urls = append(urls, u)
+				added++
+			}
+		}
+		fmt.Printf("url_registry: sitemap=%d unlisted=%d combined=%d\n", len(urls)-added, added, len(urls))
+	}
+
 	// Fail closed. A sitemap that came back short is a fetch problem or a
 	// broken build, not the site losing three thousand pages, and marking them
 	// all disappeared would turn a transient failure into a permanent-looking
@@ -6034,6 +6066,26 @@ func urlRegistry(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// fetchUnlistedURLs reads the manifest of live pages the build deliberately
+// keeps out of the sitemap. See astro.config.mjs for why it exists.
+func fetchUnlistedURLs(u string) ([]string, error) {
+	resp, err := http.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("http %d", resp.StatusCode)
+	}
+	var out struct {
+		URLs []string `json:"urls"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.URLs, nil
 }
 
 // fetchSitemapURLs reads a sitemap index and returns every page URL beneath
