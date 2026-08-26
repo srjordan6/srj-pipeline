@@ -7465,6 +7465,52 @@ func syncContent(db *sql.DB) error {
 		fmt.Printf("sync_content: book excerpts refresh skipped: %v\n", err)
 	}
 
+	// books/books.json, regenerated from press_books and press_book_isbns on
+	// every run. The file's own note has always promised that a status, price,
+	// ISBN or page count "can never drift from the database again", and told the
+	// reader to regenerate it by re-running the query. Nothing ever ran it, so
+	// it drifted three times: Book 04's status, Book 01's hardback and ebook
+	// ISBNs transposed (the swap survived the 2026-08-01 barcode correction and
+	// reached the Book/Offer schema Google and Amazon read), and Books 05 and 06
+	// left marked forthcoming with no ISBNs at all, so both published volumes
+	// rendered no specs block and emitted no schema for weeks.
+	//
+	// Every one of those was found by eye. This closes the class: the snapshot
+	// is now derived, so the tables are the only place a book fact is edited.
+	//
+	// Ordering is explicit (book_number, then sort_order within isbns) because
+	// the output is compared for equality before it is written, and a set
+	// returned in a different order each run would rewrite the row daily and
+	// churn the content repo for no reason.
+	if _, err := db.Exec(`INSERT INTO site_content (path, data)
+		SELECT 'books/books.json', jsonb_build_object(
+			'note','Bibliographic facts only. The prose on each book page stays as migrated from WordPress; this file supplies the specs block and the Book/Offer schema, so a status, price, ISBN or page count can never drift from the database again. Regenerated from press_books and press_book_isbns on every pipeline run.',
+			'generated', current_date::text,
+			'books', COALESCE(jsonb_agg(b.entry ORDER BY b.book_number), '[]'::jsonb))
+		FROM (
+			SELECT p.book_number, jsonb_build_object(
+				'book_number', p.book_number,
+				'title', p.title,
+				'subtitle', p.subtitle,
+				'pillar', p.pillar,
+				'status', p.status,
+				'pages', p.pages,
+				'published_on', p.published_on::text,
+				'url_path', p.url_path,
+				'amazon_url', p.amazon_url,
+				'isbns', COALESCE((
+					SELECT jsonb_agg(jsonb_build_object(
+						'isbn', i.isbn, 'format', i.format, 'list_price', i.list_price)
+						ORDER BY i.sort_order)
+					FROM press_book_isbns i WHERE i.book_number = p.book_number), '[]'::jsonb)
+			) AS entry
+			FROM press_books p
+		) b
+		ON CONFLICT (path) DO UPDATE SET data = EXCLUDED.data
+		WHERE site_content.data IS DISTINCT FROM EXCLUDED.data`); err != nil {
+		fmt.Printf("sync_content: books.json refresh skipped: %v\n", err)
+	}
+
 	outOfScope := func(p string) bool {
 		if !strings.HasSuffix(p, ".json") || strings.HasPrefix(p, ".github/") {
 			return true
