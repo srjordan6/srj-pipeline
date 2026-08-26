@@ -181,7 +181,7 @@ func inkboxPull(db *sql.DB) error {
 		return err
 	}
 
-	totalMail, totalTasks, skipped, unreadable := 0, 0, 0, 0
+	totalMail, skipped, unreadable := 0, 0, 0
 
 	for _, id := range ibIdentities {
 		key := ibKey(id.handle)
@@ -233,39 +233,14 @@ func inkboxPull(db *sql.DB) error {
 		}
 
 		// ---- a2a tasks ----
-		raw, err = ibDo(key, "GET", "/identities/"+url.PathEscape(id.handle)+"/a2a/tasks", nil)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "inkbox_pull a2a list:", err)
-			continue
-		}
-		for _, t := range ibItems(raw) {
-			taskID := ibStr(t, "id", "task_id", "taskId")
-			if taskID == "" {
-				if unreadable == 0 {
-					fmt.Fprintf(os.Stderr, "inkbox_pull: a2a item has no id field; keys were: %s\n", ibKeys(t))
-				}
-				unreadable++
-				continue
-			}
-			caller := ibStr(t, "caller.handle", "requester.handle", "caller", "requesterHandle")
-			state := ibStr(t, "state", "status.state")
-			ctx := ibStr(t, "contextId", "context_id")
-			topic := fmt.Sprintf("A2A task from %s", caller)
-			body := fmt.Sprintf("Inkbox A2A task for %s\nFrom: %s\nState: %s\nTask: %s\nContext: %s\n\n"+
-				"Read it with: inkbox a2a sent-task %s -i %s",
-				id.handle, caller, state, taskID, ctx, taskID, id.handle)
-			fresh, err := ibRecord(db, "a2a", taskID, id.project, topic, body)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "inkbox_pull record a2a:", err)
-				continue
-			}
-			if fresh {
-				totalTasks++
-			}
-		}
+		// Removed 2026-08-26 by standing directive: A2A is a direct channel, not a
+		// bridged one. Sessions read and answer their own task inbox through the
+		// Inkbox MCP, so mirroring tasks into project_bridge only produced a stale
+		// copy of state that lives authoritatively in Inkbox. Mail still mirrors,
+		// because inbound customer mail is not inter-project traffic.
 	}
 
-	fmt.Printf("inkbox_pull: mail=%d tasks=%d identities_skipped=%d unreadable=%d\n",
-		totalMail, totalTasks, skipped, unreadable)
+	fmt.Printf("inkbox_pull: mail=%d identities_skipped=%d unreadable=%d\n",
+		totalMail, skipped, unreadable)
 	return nil
 }
