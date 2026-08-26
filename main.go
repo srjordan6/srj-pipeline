@@ -564,6 +564,28 @@ func main() {
 		return
 	}
 
+	if src == "inkbox_outbox" {
+		if err := inkboxOutbox(db); err != nil {
+			fmt.Fprintln(os.Stderr, "inkbox_outbox:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "inkbox_tick" {
+		// The fifteen-minute cron. Receive first, then send, so a reply queued
+		// in response to something that arrived this same tick still goes out
+		// without waiting another quarter hour.
+		if err := inkboxPull(db); err != nil {
+			fmt.Fprintln(os.Stderr, "inkbox_tick: pull:", err)
+		}
+		if err := inkboxOutbox(db); err != nil {
+			fmt.Fprintln(os.Stderr, "inkbox_tick: outbox:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "email_route" {
 		if err := emailRoute(db); err != nil {
 			fmt.Fprintln(os.Stderr, "email_route:", err)
