@@ -159,11 +159,24 @@ func twoaiOrgFacts(db *sql.DB, today string) (int, error) {
 		if len(ofNorm(v.Name)) < 4 {
 			continue
 		}
-		q := url.QueryEscape(`"` + v.Name + `"`)
-		raw, err := twoaiJobsGet("https://efts.sec.gov/LATEST/search-index?q="+q+"&forms=D", nil)
-		time.Sleep(200 * time.Millisecond)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "twoai_orgfacts: formd search %q: %v\n", v.Name, err)
+		// A directory label is not always a registrant name. "TruEra /
+		// Snowflake" records an acquisition, and sending it whole makes SEC
+		// full-text search return 500 - the company is then skipped silently
+		// every run, which is the failure mode that matters: no match looks
+		// identical to never having asked. Search the parts instead, most
+		// specific first; the acquired company is the one that filed.
+		var raw []byte
+		var err error
+		for _, name := range twoaiFormDNames(v.Name) {
+			q := url.QueryEscape(`"` + name + `"`)
+			raw, err = twoaiJobsGet("https://efts.sec.gov/LATEST/search-index?q="+q+"&forms=D", nil)
+			time.Sleep(200 * time.Millisecond)
+			if err == nil {
+				break
+			}
+			fmt.Fprintf(os.Stderr, "twoai_orgfacts: formd search %q: %v\n", name, err)
+		}
+		if err != nil || raw == nil {
 			continue
 		}
 		var res struct {
@@ -426,4 +439,44 @@ func twoaiOrgFacts(db *sql.DB, today string) (int, error) {
 	fmt.Printf("twoai_orgfacts: sections=%d private=%d formd_companies=%d classified=%d\n",
 		count, len(privs), matchedCos, len(classified))
 	return count, nil
+}
+
+// twoaiFormDNames turns a directory label into the names worth asking SEC
+// full-text search about.
+//
+// Company names in this platform are display labels, and some of them encode
+// a relationship rather than an entity: "TruEra / Snowflake" means TruEra was
+// acquired by Snowflake. Passed whole, the slash makes EDGAR full-text search
+// answer 500, and the company is dropped from Form D matching on every run
+// with only a line in stderr to show for it. Splitting is not cosmetic - the
+// acquired company is usually the one that filed the Form D being looked for,
+// so it is tried first.
+//
+// Characters that carry meaning to the query parser are stripped rather than
+// escaped, because they are punctuation in a label, not search syntax.
+func twoaiFormDNames(label string) []string {
+	clean := func(s string) string {
+		s = strings.NewReplacer("/", " ", "\\", " ", "(", " ", ")", " ",
+			"[", " ", "]", " ", "\"", " ", "~", " ", "^", " ", ":", " ").Replace(s)
+		return strings.Join(strings.Fields(s), " ")
+	}
+	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		s = strings.TrimSpace(clean(s))
+		if len(s) < 4 || seen[strings.ToLower(s)] {
+			return
+		}
+		seen[strings.ToLower(s)] = true
+		out = append(out, s)
+	}
+	if strings.Contains(label, "/") {
+		for _, part := range strings.Split(label, "/") {
+			add(part)
+		}
+	}
+	// The cleaned whole label last: if a part matched nothing, the full name
+	// with punctuation removed is still worth one ask.
+	add(label)
+	return out
 }
