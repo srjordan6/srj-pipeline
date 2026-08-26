@@ -134,7 +134,7 @@ func main() {
 		// event, not a daily rhythm. Run `pipeline favicons` at that point. The
 		// stage is unchanged and still idempotent, so running it costs nothing
 		// but the GETs.
-		seq := []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"inkbox_pull", "federal_register", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -162,7 +162,7 @@ func main() {
 	// 2026-08-26 starved the claim layer of a run entirely, which is what
 	// prompted the split.
 	if src == "corpus" {
-		runSequence([]string{"openalex_pull", "twoai_claims"})
+		runSequence([]string{"openalex_pull", "doi_queue", "twoai_claims"})
 		return
 	}
 
@@ -421,6 +421,14 @@ func main() {
 		// growing; a bad API day costs a batch, not a build.
 		if err := twoaiClaims(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_claims:", err)
+		}
+		return
+	}
+
+	if src == "doi_queue" {
+		// Non-fatal: a DOI that will not resolve today stays pending.
+		if err := twoaiDOIQueue(db); err != nil {
+			fmt.Fprintln(os.Stderr, "doi_queue:", err)
 		}
 		return
 	}
@@ -7926,10 +7934,29 @@ func arxivWatch(db *sql.DB) error {
 	var parsed struct {
 		Entries []entry `xml:"entry"`
 	}
-	added := 0
+	added, scanned := 0, 0
+	// THE SAMPLE WAS TOO SMALL FOR THE VOLUME. This fetched the newest 40 per
+	// category, which was reasonable when written and is not now: measured on
+	// 2026-08-26, cs.AI published 155 papers in a single day and cs.LG about
+	// 100, so 40 covered roughly a quarter of one day of one category, and
+	// only whatever happened to be newest at the moment the stage ran.
+	// Anything published between runs beyond that window was missed
+	// permanently, because this stage has no cursor - it always asks for the
+	// newest N.
+	//
+	// 200 per page, two pages, is 400 per category and comfortably covers a
+	// day even on a heavy one. arXiv permits max_results up to 2000 and asks
+	// for a courtesy delay between calls, which is already honoured below.
+	//
+	// WHY THIS MATTERS MORE THAN IT LOOKS: arXiv is the ONLY same-day source
+	// in the platform. OpenAlex, which carries the works spine, had none of
+	// the 15 newest cs.AI papers when checked on 2026-08-26 - preprints take
+	// days to weeks to appear there. If this watch misses a paper, nothing
+	// else catches it that week.
 	for _, cat := range []string{"cs.AI", "cs.CL", "cs.LG"} {
-		u := "https://export.arxiv.org/api/query?search_query=cat:" + cat +
-			"&sortBy=submittedDate&sortOrder=descending&max_results=40"
+		for _, start := range []int{0, 200} {
+			u := fmt.Sprintf("https://export.arxiv.org/api/query?search_query=cat:%s"+
+				"&sortBy=submittedDate&sortOrder=descending&start=%d&max_results=200", cat, start)
 		// arXiv's API is occasionally slow to first byte (Aug 1: cs.AI timed
 		// out at 30s and the whole category skipped for the day). One retry
 		// with a longer timeout keeps a slow response from costing a category.
@@ -7965,6 +7992,7 @@ func arxivWatch(db *sql.DB) error {
 			continue
 		}
 		for _, e := range parsed.Entries {
+			scanned++
 			text := e.Title + " " + e.Summary
 			var hit string
 			for _, o := range orgs {
@@ -7998,7 +8026,8 @@ func arxivWatch(db *sql.DB) error {
 			}
 		}
 		time.Sleep(3 * time.Second) // arXiv API courtesy delay
+		}
 	}
-	fmt.Printf("arxiv_watch: papers_added=%d ok=true\n", added)
+	fmt.Printf("arxiv_watch: papers_added=%d scanned=%d ok=true\n", added, scanned)
 	return nil
 }
