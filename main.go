@@ -55,6 +55,17 @@ var twoaiStageDeadline = map[string]time.Duration{
 	"twoai_jobs":      25 * time.Minute,
 	"intel":           10 * time.Minute, // the stage that proved the need
 	"export_corpus":   20 * time.Minute,
+	// twoai_publish PUTs one file per changed page through the contents API,
+	// sequentially, because GitHub serializes mutations to a single repo anyway.
+	// A normal day changes 70 to 150 files and takes a minute or two. A day that
+	// touches every page - a template change, a new field, an embed model swap -
+	// changes about 2,800 and lands right on the old 20 minute default: it
+	// finished with seconds to spare on 2026-08-24 and was killed on 08-26 and
+	// 08-27. R2 carries the whole set in one request and is the primary path, so
+	// a kill here only degrades the GitHub fallback, quietly, which is exactly
+	// the failure a fallback must not have. If it times out again the real fix is
+	// the git tree API: one commit for the whole set instead of one per file.
+	"twoai_publish": 45 * time.Minute,
 }
 
 const twoaiStageDeadlineDefault = 20 * time.Minute
