@@ -3203,6 +3203,21 @@ func twoaiBuild(db *sql.DB) error {
 		if json.Unmarshal([]byte(glossary), &g) == nil {
 			g["generated"] = today
 
+			// count is a stored copy of a number the array already knows, so it
+			// goes stale the moment a term is added by hand: it read 522 against
+			// 551 real entries on 2026-08-27, wrong since at least the 08-18
+			// additions, and nothing complained because nothing recomputes it.
+			// Derive it here every run. A derived value that is written once and
+			// trusted forever is not data, it is a comment that lies.
+			if ts, ok := g["terms"].([]any); ok {
+				if stored, had := g["count"].(float64); had && int(stored) != len(ts) {
+					fmt.Fprintf(os.Stderr,
+						"twoai_build: glossary count was %d, terms array has %d, using the array\n",
+						int(stored), len(ts))
+				}
+				g["count"] = len(ts)
+			}
+
 			// AUDIENCE LENSES: 2,109 rows across 522 terms, written to explain
 			// each term to a child, a developer, a regulator, a CISO and the
 			// rest. They live in twoai_glossary_lenses, the term page has
