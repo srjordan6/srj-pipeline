@@ -32,6 +32,11 @@ import (
 // been written yet still renders its holding, why AI parties cite it, and
 // where the analogy is weakest, and the page says the full dissection is
 // coming rather than pretending the section does not exist.
+type liveCase struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
 func twoaiCaselaw(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
 	var name, blurb string
 	if err := db.QueryRow(`SELECT name, COALESCE(blurb,'') FROM twoai_taxonomy
@@ -59,6 +64,58 @@ func twoaiCaselaw(db *sql.DB, today string, upsert func(path, kind string, v any
 		VerifiedOn string          `json:"verified_on"`
 		Dissected  string          `json:"dissected_on,omitempty"`
 		Dissection json.RawMessage `json:"dissection,omitempty"`
+		LiveCases  []liveCase      `json:"live_cases,omitempty"`
+		LiveTotal  int             `json:"live_total,omitempty"`
+	}
+
+	// DOCTRINE LANES, NOT QUOTATIONS. Stephen asked which precedents the live
+	// AI cases are quoting in their defenses. The lawsuit rows carry no brief
+	// text, and the district-court orders live in RECAP as PDFs rather than in
+	// the opinion index, so a verified who-quoted-what pass needs a document
+	// harvest this stage does not do. What the tracker does hold, verified, is
+	// each case's claim category. So every precedent page lists the ACTIVE
+	// cases in its doctrine's lane, newest first, labelled as exactly that:
+	// tracker classification, not a citation count. Wrong-but-plausible here
+	// would be claiming Sony is quoted in a docket nobody checked.
+	laneFor := map[string][]string{
+		"Fair use":                            {"copyright"},
+		"Fair use and secondary liability":    {"copyright"},
+		"Fair use and intermediate copying":   {"copyright"},
+		"Copyrightability":                    {"copyright"},
+		"Secondary liability":                 {"copyright"},
+		"DMCA safe harbour":                   {"copyright"},
+		"Computer Fraud and Abuse Act":        {"platform access & scraping"},
+		"Section 230":                         {"product liability & wrongful death"},
+		"Product liability and platform duty": {"product liability & wrongful death"},
+		"Defamation fault standards":          {"product liability & wrongful death"},
+		"Biometric privacy":                   {"biometric privacy"},
+		"Patent eligibility":                  {"patent"},
+		"Authorship and inventorship":         {"patent"},
+	}
+	laneCases := map[string][]liveCase{}
+	laneTotal := map[string]int{}
+	for doctrine, cats := range laneFor {
+		var total int
+		if err := db.QueryRow(`SELECT count(*) FROM ai_lawsuits
+			WHERE is_active AND category = ANY($1)`, pq.Array(cats)).Scan(&total); err != nil || total == 0 {
+			continue
+		}
+		laneTotal[doctrine] = total
+		lr, err := db.Query(`SELECT case_name, slug FROM ai_lawsuits
+			WHERE is_active AND category = ANY($1)
+			ORDER BY filed_date DESC NULLS LAST, slug LIMIT 8`, pq.Array(cats))
+		if err != nil {
+			continue
+		}
+		for lr.Next() {
+			var lc liveCase
+			var slug string
+			if lr.Scan(&lc.Name, &slug) == nil {
+				lc.Path = "/ai-lawsuits/" + slug + "/"
+				laneCases[doctrine] = append(laneCases[doctrine], lc)
+			}
+		}
+		lr.Close()
 	}
 
 	rows, err := db.Query(`SELECT slug, case_name, citation, court,
@@ -86,6 +143,8 @@ func twoaiCaselaw(db *sql.DB, today string, upsert func(path, kind string, v any
 			continue
 		}
 		c.UID = twoaiUID("caselaw:" + c.Slug)
+		c.LiveCases = laneCases[c.Doctrine]
+		c.LiveTotal = laneTotal[c.Doctrine]
 		if len(diss) > 0 {
 			c.Dissection = json.RawMessage(diss)
 		}
@@ -132,7 +191,7 @@ func twoaiCaselaw(db *sql.DB, today string, upsert func(path, kind string, v any
 			"slug": c.Slug, "uid": c.UID, "case_name": c.CaseName,
 			"citation": c.Citation, "court": c.Court, "decided_on": c.Decided,
 			"doctrine": c.Doctrine, "posture": c.Posture, "holding": c.Holding,
-			"dissected": c.Dissection != nil,
+			"dissected": c.Dissection != nil, "live_total": c.LiveTotal,
 		})
 	}
 	if err := upsert("caselaw/index.json", "caselaw-index", map[string]any{
