@@ -54,6 +54,7 @@ var twoaiStageDeadline = map[string]time.Duration{
 	"twoai_claims":    25 * time.Minute,
 	"twoai_jobs":      25 * time.Minute,
 	"intel":           10 * time.Minute, // the stage that proved the need
+	"twoai_recap":     8 * time.Minute,  // RECAP filing harvest, 12 dockets a run
 	"export_corpus":   20 * time.Minute,
 	// twoai_publish PUTs one file per changed page through the contents API,
 	// sequentially, because GitHub serializes mutations to a single repo anyway.
@@ -145,7 +146,7 @@ func main() {
 		// event, not a daily rhythm. Run `pipeline favicons` at that point. The
 		// stage is unchanged and still idempotent, so running it costs nothing
 		// but the GETs.
-		seq := []string{"inkbox_pull", "federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"inkbox_pull", "federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "twoai_recap", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -350,6 +351,14 @@ func main() {
 	if src == "sync_content" {
 		if err := syncContent(db); err != nil {
 			fmt.Fprintln(os.Stderr, "sync_content:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_recap" {
+		if err := twoaiRecapCitations(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_recap:", err)
 			os.Exit(1)
 		}
 		return

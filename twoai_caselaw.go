@@ -37,6 +37,14 @@ type liveCase struct {
 	Path string `json:"path"`
 }
 
+type quotedRef struct {
+	Lawsuit string `json:"lawsuit"`
+	Path    string `json:"path"`
+	By      string `json:"by"`
+	Doc     string `json:"doc,omitempty"`
+	DocURL  string `json:"doc_url,omitempty"`
+}
+
 func twoaiCaselaw(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
 	var name, blurb string
 	if err := db.QueryRow(`SELECT name, COALESCE(blurb,'') FROM twoai_taxonomy
@@ -66,6 +74,8 @@ func twoaiCaselaw(db *sql.DB, today string, upsert func(path, kind string, v any
 		Dissection json.RawMessage `json:"dissection,omitempty"`
 		LiveCases  []liveCase      `json:"live_cases,omitempty"`
 		LiveTotal  int             `json:"live_total,omitempty"`
+		QuotedIn   []quotedRef     `json:"quoted_in,omitempty"`
+		QuotedTot  int             `json:"quoted_total,omitempty"`
 	}
 
 	// DOCTRINE LANES, NOT QUOTATIONS. Stephen asked which precedents the live
@@ -118,6 +128,33 @@ func twoaiCaselaw(db *sql.DB, today string, upsert func(path, kind string, v any
 		lr.Close()
 	}
 
+	// Verified quotations harvested from the docket record by twoai_recap.
+	// Each row is a precedent matched inside the extracted text of a specific
+	// RECAP document, so the page can say quoted and mean it.
+	quoted := map[string][]quotedRef{}
+	quotedTot := map[string]int{}
+	qr, err := db.Query(`SELECT c.precedent_slug, l.case_name, c.lawsuit_slug,
+			c.quoted_by, COALESCE(c.doc_description,''), COALESCE(c.doc_url,'')
+		FROM twoai_precedent_citations c
+		JOIN ai_lawsuits l ON l.slug = c.lawsuit_slug AND l.is_active
+		ORDER BY c.found_on DESC, c.lawsuit_slug, c.recap_doc_id`)
+	if err == nil {
+		for qr.Next() {
+			var pslug string
+			var q quotedRef
+			var lslug string
+			if qr.Scan(&pslug, &q.Lawsuit, &lslug, &q.By, &q.Doc, &q.DocURL) != nil {
+				continue
+			}
+			q.Path = "/ai-lawsuits/" + lslug + "/"
+			quotedTot[pslug]++
+			if len(quoted[pslug]) < 12 {
+				quoted[pslug] = append(quoted[pslug], q)
+			}
+		}
+		qr.Close()
+	}
+
 	rows, err := db.Query(`SELECT slug, case_name, citation, court,
 			to_char(decided_on,'YYYY-MM-DD'), doctrine, posture, holding,
 			why_ai_cites_it, COALESCE(limits,''), cited_in,
@@ -145,6 +182,8 @@ func twoaiCaselaw(db *sql.DB, today string, upsert func(path, kind string, v any
 		c.UID = twoaiUID("caselaw:" + c.Slug)
 		c.LiveCases = laneCases[c.Doctrine]
 		c.LiveTotal = laneTotal[c.Doctrine]
+		c.QuotedIn = quoted[c.Slug]
+		c.QuotedTot = quotedTot[c.Slug]
 		if len(diss) > 0 {
 			c.Dissection = json.RawMessage(diss)
 		}
@@ -191,7 +230,7 @@ func twoaiCaselaw(db *sql.DB, today string, upsert func(path, kind string, v any
 			"slug": c.Slug, "uid": c.UID, "case_name": c.CaseName,
 			"citation": c.Citation, "court": c.Court, "decided_on": c.Decided,
 			"doctrine": c.Doctrine, "posture": c.Posture, "holding": c.Holding,
-			"dissected": c.Dissection != nil, "live_total": c.LiveTotal,
+			"dissected": c.Dissection != nil, "live_total": c.LiveTotal, "quoted_total": c.QuotedTot,
 		})
 	}
 	if err := upsert("caselaw/index.json", "caselaw-index", map[string]any{
