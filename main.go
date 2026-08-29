@@ -3589,6 +3589,10 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	if err := twoaiPaperExplain(db); err != nil {
+		fmt.Println("twoai_paper_explain:", err)
+	}
+
 	research, err := twoaiResearch(db, today, upsert)
 	if err != nil {
 		return err
