@@ -29,6 +29,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"os"
@@ -68,6 +69,38 @@ var twoaiModelSections = map[string][]string{
 	// fetch expands safetensors metadata and keeps models at or under
 	// four billion parameters.
 	"small-language-models": {"__slm__"},
+}
+
+// hfGetPage fetches one Hub API page and returns the rel="next" link from the
+// Link header, which is the Hub's only pagination mechanism. Deeper coverage
+// request, 2026-08-29: single-tag sections were saturated at the 500-per-
+// request ceiling and read as totals.
+func hfGetPage(rawurl string) ([]byte, string, error) {
+	req, err := http.NewRequest("GET", rawurl, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("User-Agent", "theworldofai.org jobs pipeline (contact: stephen@srjconsultingservices.com)")
+	resp, err := twoaiJobsClient.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, "", fmt.Errorf("GET %s: %d", rawurl, resp.StatusCode)
+	}
+	next := ""
+	for _, part := range strings.Split(resp.Header.Get("Link"), ",") {
+		if strings.Contains(part, `rel="next"`) {
+			if i := strings.Index(part, "<"); i >= 0 {
+				if j := strings.Index(part, ">"); j > i {
+					next = part[i+1 : j]
+				}
+			}
+		}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	return body, next, err
 }
 
 func twoaiModelsEnsure(db *sql.DB) error {
@@ -227,14 +260,33 @@ func twoaiModelsFetch(db *sql.DB) {
 					url += "&pipeline_tag=" + parts[0]
 				}
 			}
-			raw, err := twoaiJobsGet(url, nil)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "twoai_models: hf %s fetch failed, rendering last good data: %v\n", tag, err)
-				continue
+			// Single-tag sections go two pages deep (1,000 models); multi-tag
+			// sections already stack to 1,000-1,500 across tags and stay at
+			// one page each. The SLM sweep doubles so the four-billion cut
+			// draws from a deeper pool. A tag with fewer models than the
+			// budget simply runs out of next links and stops.
+			pages := 1
+			if len(tags) == 1 {
+				pages = 2
 			}
 			var models []map[string]any
-			if err := json.Unmarshal(raw, &models); err != nil || len(models) == 0 {
-				fmt.Fprintf(os.Stderr, "twoai_models: hf %s parse failed or empty, rendering last good data\n", tag)
+			fetchURL := url
+			for pg := 0; pg < pages && fetchURL != ""; pg++ {
+				raw, next, err := hfGetPage(fetchURL)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "twoai_models: hf %s page %d fetch failed: %v\n", tag, pg, err)
+					break
+				}
+				var page []map[string]any
+				if err := json.Unmarshal(raw, &page); err != nil || len(page) == 0 {
+					break
+				}
+				models = append(models, page...)
+				fetchURL = next
+				time.Sleep(400 * time.Millisecond)
+			}
+			if len(models) == 0 {
+				fmt.Fprintf(os.Stderr, "twoai_models: hf %s empty, rendering last good data\n", tag)
 				continue
 			}
 			tx, err := db.Begin()
