@@ -3777,6 +3777,13 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_build: graph sections=%d\n", graphPages)
 
+	dcPages, err := twoaiDatacenters(db, today)
+	if err != nil {
+		fmt.Println("twoai_build: datacenters:", err)
+		dcPages = 0
+	}
+	_ = dcPages
+
 	cmPages, err := twoaiCapexMA(db, today)
 	if err != nil {
 		return err

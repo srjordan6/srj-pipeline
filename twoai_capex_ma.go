@@ -40,6 +40,14 @@ var twoaiCapexCompanies = []struct {
 	{"0001326801", "Meta"},
 	{"0000002488", "AMD"},
 	{"0001375365", "Super Micro Computer"},
+	// The data center builders proper, added for the Data Centers section:
+	// the two colocation giants, Oracle whose OCI buildout is capex-visible,
+	// and CoreWeave, the pure-play AI cloud. CIKs verified against EDGAR's
+	// company_tickers.json on 2026-08-29.
+	{"0001101239", "Equinix"},
+	{"0001297996", "Digital Realty"},
+	{"0001341439", "Oracle"},
+	{"0001769628", "CoreWeave"},
 }
 
 var twoaiCapexConcepts = []string{
