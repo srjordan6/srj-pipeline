@@ -3616,6 +3616,12 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	_ = caseStudies
 
+	caselaw, err := twoaiCaselaw(db, today, upsert)
+	if err != nil {
+		return err
+	}
+	_ = caselaw
+
 	bookCatalog, err := twoaiBookCatalog(db, today, upsert)
 	if err != nil {
 		return err
