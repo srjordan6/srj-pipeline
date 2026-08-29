@@ -80,8 +80,20 @@ func twoaiRecapCitations(db *sql.DB) error {
 	rows.Close()
 
 	totalHits, totalDocs, totalText := 0, 0, 0
+	rateLimited := 0 // consecutive rate-limited page fetches across dockets
+	done := 0
 	for _, j := range jobs {
+		if rateLimited >= 2 {
+			// CourtListener is throttling this token right now. Sleeping into
+			// the stage deadline harvests nothing and burns eight minutes of
+			// cron, which is exactly what the first production run did. Stop
+			// cleanly; unscanned dockets keep their place at the front of the
+			// rotation and tomorrow's budget is fresh.
+			fmt.Printf("twoai_recap: rate limited, stopping after %d of %d dockets\n", done, len(jobs))
+			break
+		}
 		seen, withText, hits := 0, 0, 0
+		pagesOK := 0
 		next := "/recap-documents/"
 		params := map[string]string{
 			"docket_entry__docket": j.docket,
@@ -101,8 +113,13 @@ func twoaiRecapCitations(db *sql.DB) error {
 			}
 			if err := clGet(next, params, &out); err != nil {
 				fmt.Println("twoai_recap:", j.slug, "page", page, err)
+				if strings.Contains(err.Error(), "rate limited") {
+					rateLimited++
+				}
 				break
 			}
+			pagesOK++
+			rateLimited = 0
 			// clGet takes path-relative requests; a "next" URL from the API is
 			// absolute, so after page one we pass its path and drop our params.
 			for _, d := range out.Results {
@@ -161,6 +178,14 @@ func twoaiRecapCitations(db *sql.DB) error {
 			}
 			time.Sleep(1200 * time.Millisecond)
 		}
+		if pagesOK == 0 {
+			// Page zero never answered, so nothing about this docket was
+			// learned. Writing a scan row here would send it to the back of a
+			// nine-day rotation as the price of an API hiccup; leaving it
+			// unwritten keeps it first in line tomorrow.
+			continue
+		}
+		done++
 		if _, err := db.Exec(`INSERT INTO twoai_recap_scan
 			(lawsuit_slug, docket_id, scanned_at, docs_seen, docs_with_text, hits)
 			VALUES ($1, $2, now(), $3, $4, $5)
