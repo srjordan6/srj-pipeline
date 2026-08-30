@@ -183,24 +183,57 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		Website  string  `json:"website,omitempty"`
 		Lat      float64 `json:"lat,omitempty"`
 		Lon      float64 `json:"lon,omitempty"`
+		UID      string  `json:"uid,omitempty"`
+		MW       float64 `json:"mw,omitempty"`
+		Sqft     int64   `json:"sqft,omitempty"`
 	}
+	// A row whose profile jsonb carries curated, per-field-sourced spec data
+	// (status=enriched, written by the thin-page scraper or by hand from an
+	// operator's own spec sheet) gets its own page below and a uid here so
+	// the directory line can link to it. The profile passes through raw:
+	// a field added in SQL renders without a Go change.
+	type enrichedFac struct {
+		ID      string
+		UID     string
+		Name    string
+		Op      string
+		City    string
+		State   string
+		Country string
+		Website string
+		MW      float64
+		Profile json.RawMessage
+	}
+	var enriched []enrichedFac
 	byState := map[string][]fac{}
 	byCountry := map[string][]fac{}
+	mwByState := map[string]float64{}
 	var facTotal, facOps int
-	frows2, err := db.Query(`SELECT name, operator, city, COALESCE(state,''), website,
-			COALESCE(lat,0), COALESCE(lon,0), COALESCE(country,'US')
+	var facMW float64
+	frows2, err := db.Query(`SELECT id, name, operator, city, COALESCE(state,''), website,
+			COALESCE(lat,0), COALESCE(lon,0), COALESCE(country,'US'),
+			COALESCE(critical_it_mw,0),
+			COALESCE((profile->>'technical_space_sqft')::bigint,0),
+			CASE WHEN status='enriched' AND profile<>'{}'::jsonb THEN profile ELSE '{}'::jsonb END
 		FROM twoai_dc_facilities ORDER BY country, state, operator, name`)
 	if err == nil {
 		for frows2.Next() {
 			var f fac
-			var st, cc string
-			if frows2.Scan(&f.Name, &f.Operator, &f.City, &st, &f.Website, &f.Lat, &f.Lon, &cc) != nil {
+			var id, st, cc string
+			var prof []byte
+			if frows2.Scan(&id, &f.Name, &f.Operator, &f.City, &st, &f.Website, &f.Lat, &f.Lon, &cc,
+				&f.MW, &f.Sqft, &prof) != nil {
 				continue
 			}
 			facTotal++
 			if f.Operator != "" {
 				facOps++
 			}
+			if len(prof) > 2 { // more than the empty object
+				f.UID = twoaiUID("dc-fac:" + id)
+				enriched = append(enriched, enrichedFac{id, f.UID, f.Name, f.Operator, f.City, st, cc, f.Website, f.MW, json.RawMessage(prof)})
+			}
+			facMW += f.MW
 			if cc != "US" {
 				byCountry[cc] = append(byCountry[cc], f)
 				continue
@@ -208,6 +241,7 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			if st == "" {
 				st = "ZZ"
 			}
+			mwByState[st] += f.MW
 			byState[st] = append(byState[st], f)
 		}
 		frows2.Close()
@@ -229,7 +263,8 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		sdoc := map[string]any{
 			"shape": "dc-state", "uid": u, "tax": "data-centers", "generated": today,
 			"state": st, "count": len(facs), "facilities": facs,
-			"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+			"total_mw": mwByState[st],
+			"parent":   map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
 		}
 		sj, _ := json.Marshal(sdoc)
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
@@ -270,6 +305,40 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		}
 	}
 	sort.Slice(intlPages, func(i, j int) bool { return intlPages[i].Code < intlPages[j].Code })
+
+	// One page per enriched facility: the per-facility profile this file's
+	// registry comment has promised since the section shipped. Keyed on
+	// curated profile data, never on a bare OSM footprint, because a page for
+	// a name and a coordinate pair is exactly the thin content AdSense
+	// flagged once. The 2026-08-30 CyrusOne ingest (25 campuses, 980 MW) is
+	// the first data through this path.
+	facPages := 0
+	for _, ef := range enriched {
+		fpath := "tech/dc-fac-" + ef.UID + ".json"
+		keepPaths[fpath] = true
+		stateUID := ""
+		if ef.Country == "US" && ef.State != "" {
+			stateUID = twoaiUID("dc-state:" + ef.State)
+		} else if ef.Country != "US" {
+			stateUID = twoaiUID("dc-country:" + ef.Country)
+		}
+		fdoc := map[string]any{
+			"shape": "dc-facility", "uid": ef.UID, "tax": "data-centers", "generated": today,
+			"name": ef.Name, "operator": ef.Op, "city": ef.City, "state": ef.State,
+			"country": ef.Country, "website": ef.Website, "mw": ef.MW,
+			"profile": ef.Profile, "facility_id": ef.ID,
+			"state_page": map[string]any{"uid": stateUID, "code": ef.State},
+			"parent":     map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+		}
+		fj, _ := json.Marshal(fdoc)
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ($1,'tech-dc-child',$2::jsonb,'data-centers',1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`,
+			fpath, string(fj)); err == nil {
+			facPages++
+		}
+	}
 
 	// One page per metric and per builder: the section's own reference book,
 	// every page dated and regenerated daily from the same rows as the hub.
@@ -391,6 +460,7 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		"operators":    operators,
 		"metric_pages": metricPages, "builder_pages": builderPages,
 		"state_pages": statePages, "intl_pages": intlPages, "fac_total": facTotal, "fac_ops": facOps,
+		"fac_mw": facMW, "fac_profiled": len(enriched),
 		"smr":  map[string]any{"uid": smrUID, "count": len(smrProjects)},
 		"grid":    map[string]any{"uid": twoaiUID("dc-grid")},
 		"indexes": twoaiDcIndexes(db),
@@ -406,8 +476,8 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		string(j)); err != nil {
 		return 0, err
 	}
-	fmt.Printf("twoai_build: datacenters metrics=%d sources=%d capex_cos=%d filings=%d operators=%d facilities=%d states=%d children=%d\n",
-		len(metrics), len(srcs), len(capex), len(filings), len(operators), facTotal, len(statePages)+len(intlPages), len(keepPaths))
+	fmt.Printf("twoai_build: datacenters metrics=%d sources=%d capex_cos=%d filings=%d operators=%d facilities=%d profiled=%d states=%d children=%d\n",
+		len(metrics), len(srcs), len(capex), len(filings), len(operators), facTotal, facPages, len(statePages)+len(intlPages), len(keepPaths))
 	return 1, nil
 }
 

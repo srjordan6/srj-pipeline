@@ -284,6 +284,15 @@ func main() {
 	}
 	defer db.Close()
 
+	// The thin-page scraper's whole job. Runs on its own Render cron
+	// (srj-thinpage-scraper, daily), split from `all` at Stephen's direction
+	// 2026-08-30: intelligence and scraping must not share a failure, a
+	// deadline, or a restart. See twoai_thinpages.go.
+	if src == "thinpages" {
+		twoaiThinPages(db)
+		return
+	}
+
 	if src == "publish_news" {
 		if err := publishNews(db); err != nil {
 			fmt.Fprintln(os.Stderr, "publish_news:", err)
@@ -5316,6 +5325,14 @@ func twoaiMCP(db *sql.DB, today string, upsert func(path, kind string, v any) er
 		PkgID       string `json:"package_id,omitempty"`
 		PkgRegistry string `json:"package_registry,omitempty"`
 		PkgVersion  string `json:"package_version,omitempty"`
+		// Registry facts read by the thin-page cron (twoai_thinpages.go):
+		// what npm or PyPI states about the package, with the date read.
+		PkgLatest    string `json:"package_latest,omitempty"`
+		PkgLicense   string `json:"package_license,omitempty"`
+		PkgPublished string `json:"package_last_publish,omitempty"`
+		PkgWeeklyDL  int64  `json:"package_weekly_downloads,omitempty"`
+		PkgFactsURL  string `json:"package_facts_source,omitempty"`
+		PkgFactsOn   string `json:"package_facts_on,omitempty"`
 		// Publisher context.
 		Namespace   string   `json:"namespace,omitempty"`
 		CompanyUID  string   `json:"company_uid,omitempty"`
@@ -5414,8 +5431,32 @@ func twoaiMCP(db *sql.DB, today string, upsert func(path, kind string, v any) er
 		cr.Close()
 	}
 
+	// Package facts from the thin-page cron, keyed by registry name. Absent
+	// rows render nothing: the page says what the registry said or stays
+	// quiet, never a placeholder.
+	type pkgFacts struct {
+		latest, lic, pub, src, on string
+		dl                        int64
+	}
+	facts := map[string]pkgFacts{}
+	if fr, err := db.Query(`SELECT name, latest_version, license, COALESCE(last_publish::text,''),
+			COALESCE(weekly_downloads,0), source_url, fetched_on::text FROM twoai_mcp_package_facts`); err == nil {
+		for fr.Next() {
+			var n string
+			var f pkgFacts
+			if fr.Scan(&n, &f.latest, &f.lic, &f.pub, &f.dl, &f.src, &f.on) == nil {
+				facts[n] = f
+			}
+		}
+		fr.Close()
+	}
+
 	for i := range all {
 		s := &all[i]
+		if f, ok := facts[s.Name]; ok {
+			s.PkgLatest, s.PkgLicense, s.PkgPublished = f.latest, f.lic, f.pub
+			s.PkgWeeklyDL, s.PkgFactsURL, s.PkgFactsOn = f.dl, f.src, f.on
+		}
 		if s.Namespace != "" {
 			label := s.Namespace
 			if d := strings.LastIndex(label, "."); d >= 0 {
