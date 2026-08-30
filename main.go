@@ -71,8 +71,68 @@ var twoaiStageDeadline = map[string]time.Duration{
 
 const twoaiStageDeadlineDefault = 20 * time.Minute
 
+// Some stages have nothing to gain from running eight times a day and a
+// real cost to doing so. The cron moved to every three hours on 2026-08-30
+// for the fast-moving sources, news, incidents, the queues; these are the
+// slow ones, and they run once per calendar day whatever the cron does.
+//
+// Each entry is here for a stated reason, not a guess:
+//
+//	legiscan       a metered monthly quota. Three search calls a run today
+//	               because change_hash suppresses hydration, but a busy
+//	               legislative week hydrates up to 300 bills a run and that
+//	               is the burn worth capping.
+//	openalex_pull  saves about 30,000 works a run against a free academic
+//	               API. Eight times a day is not a neighbourly load.
+//	twoai_claims   reads the works queue through the Anthropic API.
+//	twoai_onet     already skips on freshness, but the call still costs.
+//	twoai_openlibrary, twoai_case_studies, twoai_companyfacts, twoai_orgfacts,
+//	               docwatch, arxiv_watch, export_corpus
+//	               sources that publish daily at most, or expensive sweeps
+//	               whose inputs move slower than three hours.
+//
+// Deliberately NOT gated: everything that feeds the daily briefing and the
+// live trackers, because refreshing those is the entire point of the new
+// cadence. twoai_build is not gated either: it is what turns SQL into
+// pages, and a gated build would leave new data unpublished for hours.
+var twoaiDailyOnly = map[string]bool{
+	"legiscan": true, "openalex_pull": true, "twoai_claims": true,
+	"twoai_onet": true, "twoai_openlibrary": true, "twoai_case_studies": true,
+	"twoai_companyfacts": true, "twoai_orgfacts": true, "docwatch": true,
+	"arxiv_watch": true, "export_corpus": true,
+}
+
+// stageDueToday reports whether a once-a-day stage still owes a run today,
+// and claims the slot when it does. A database that cannot be reached is
+// answered with yes: a monitoring table must never be the reason real work
+// stops happening.
+func stageDueToday(stage string) bool {
+	if !twoaiDailyOnly[stage] || os.Getenv("IGNORE_DAILY_GATE") != "" {
+		return true
+	}
+	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
+	if err != nil {
+		return true
+	}
+	defer db.Close()
+	var last string
+	err = db.QueryRow(`SELECT last_run_date::text FROM pipeline_stage_runs WHERE stage=$1`, stage).Scan(&last)
+	today := time.Now().UTC().Format("2006-01-02")
+	if err == nil && last == today {
+		return false
+	}
+	db.Exec(`INSERT INTO pipeline_stage_runs (stage, last_run_date, last_run_at)
+		VALUES ($1, current_date, now())
+		ON CONFLICT (stage) DO UPDATE SET last_run_date=current_date, last_run_at=now()`, stage)
+	return true
+}
+
 func runSequence(stages []string) {
 	for _, s := range stages {
+		if !stageDueToday(s) {
+			fmt.Printf("%s: skipped, already ran today (once-a-day stage)\n", s)
+			continue
+		}
 		limit := twoaiStageDeadlineDefault
 		if d, ok := twoaiStageDeadline[s]; ok {
 			limit = d
