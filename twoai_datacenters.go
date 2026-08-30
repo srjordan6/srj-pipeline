@@ -287,6 +287,60 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			builderPages = append(builderPages, childRef{c.Name, "", u})
 		}
 	}
+	// Nuclear for data centers: the curated SMR project tracker. Every row
+	// carries its own verified primary source and an executed/pending/stated
+	// deal status, because a nonbinding letter of intent must never render
+	// like a signed power purchase agreement.
+	type smrProject struct {
+		Project    string  `json:"project"`
+		Vendor     string  `json:"vendor"`
+		Model      string  `json:"model"`
+		Class      string  `json:"class"`
+		TotalMW    float64 `json:"total_mw,omitempty"`
+		Customer   string  `json:"customer,omitempty"`
+		Site       string  `json:"site,omitempty"`
+		State      string  `json:"state,omitempty"`
+		DealStatus string  `json:"deal_status"`
+		NRCStatus  string  `json:"nrc_status,omitempty"`
+		Fuel       string  `json:"fuel,omitempty"`
+		TargetCOD  string  `json:"target_cod,omitempty"`
+		SourceURL  string  `json:"source_url"`
+		Note       string  `json:"note,omitempty"`
+		Verified   string  `json:"verified"`
+	}
+	var smrProjects []smrProject
+	xrows, err := db.Query(`SELECT project, vendor, reactor_model, reactor_class,
+			COALESCE(total_mw,0), customer, site, state, deal_status, nrc_status,
+			fuel, target_cod, source_url, note, verified_on::text
+		FROM twoai_dc_smr_projects ORDER BY sort`)
+	if err == nil {
+		for xrows.Next() {
+			var x smrProject
+			if xrows.Scan(&x.Project, &x.Vendor, &x.Model, &x.Class, &x.TotalMW,
+				&x.Customer, &x.Site, &x.State, &x.DealStatus, &x.NRCStatus,
+				&x.Fuel, &x.TargetCOD, &x.SourceURL, &x.Note, &x.Verified) == nil {
+				smrProjects = append(smrProjects, x)
+			}
+		}
+		xrows.Close()
+	}
+	smrUID := twoaiUID("dc-smr")
+	if len(smrProjects) > 0 {
+		path := "tech/dc-smr.json"
+		keepPaths[path] = true
+		xdoc := map[string]any{
+			"shape": "dc-smr", "uid": smrUID, "tax": "data-centers", "generated": today,
+			"projects": smrProjects,
+			"parent":   map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+		}
+		xj, _ := json.Marshal(xdoc)
+		db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ($1,'tech-dc-child',$2::jsonb,'data-centers',1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`,
+			path, string(xj))
+	}
+
 	// Kind-scoped prune: a child page whose row was deleted disappears.
 	if len(keepPaths) > 0 {
 		keep := make([]string, 0, len(keepPaths))
@@ -303,6 +357,7 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		"operators":    operators,
 		"metric_pages": metricPages, "builder_pages": builderPages,
 		"state_pages": statePages, "fac_total": facTotal, "fac_ops": facOps,
+		"smr": map[string]any{"uid": smrUID, "count": len(smrProjects)},
 	}
 	j, _ := json.Marshal(doc)
 	if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
