@@ -353,17 +353,19 @@ func thinNpmFacts(client *http.Client, ident string) (latest, lic, repo, pub str
 	var doc struct {
 		DistTags   map[string]string `json:"dist-tags"`
 		License    any               `json:"license"`
-		Time       map[string]string `json:"time"`
-		Repository any               `json:"repository"`
+		// npm's time map is not all strings: an unpublished package carries
+		// an object under "unpublished" (caught on the first cron run).
+		Time       map[string]any `json:"time"`
+		Repository any            `json:"repository"`
 	}
 	if err = json.Unmarshal([]byte(body), &doc); err != nil {
 		return
 	}
 	latest = doc.DistTags["latest"]
 	lic = thinLicenseString(doc.License)
-	if t, ok := doc.Time[latest]; ok && len(t) >= 10 {
+	if t, ok := doc.Time[latest].(string); ok && len(t) >= 10 {
 		pub = t[:10]
-	} else if t, ok := doc.Time["modified"]; ok && len(t) >= 10 {
+	} else if t, ok := doc.Time["modified"].(string); ok && len(t) >= 10 {
 		pub = t[:10]
 	}
 	switch r := doc.Repository.(type) {

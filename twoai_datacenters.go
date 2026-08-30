@@ -348,13 +348,27 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		UID      string `json:"uid"`
 	}
 	var metricPages []childRef
+	// Every metric's uid up front, so each page can list the other metrics in
+	// its category as links: a reader who lands on PUE from a search should
+	// find WUE and the rest without going back to the hub.
+	metricUID := map[string]string{}
 	for _, m := range metrics {
-		u := twoaiUID("dc-metric:" + strings.ToLower(strings.ReplaceAll(m.Metric, " ", "-")))
+		metricUID[m.Metric] = twoaiUID("dc-metric:" + strings.ToLower(strings.ReplaceAll(m.Metric, " ", "-")))
+	}
+	for _, m := range metrics {
+		u := metricUID[m.Metric]
 		path := "tech/dc-metric-" + u + ".json"
 		keepPaths[path] = true
+		var siblings []childRef
+		for _, o := range metrics {
+			if o.Category == m.Category && o.Metric != m.Metric {
+				siblings = append(siblings, childRef{o.Metric, o.Category, metricUID[o.Metric]})
+			}
+		}
 		mdoc := map[string]any{
 			"shape": "dc-metric", "uid": u, "tax": "data-centers", "generated": today,
-			"metric": m, "parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+			"metric": m, "siblings": siblings,
+			"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
 		}
 		mj, _ := json.Marshal(mdoc)
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
@@ -376,9 +390,23 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 				bFilings = append(bFilings, f)
 			}
 		}
+		// The other builders' latest quarters, so the page can rank this one
+		// among its peers from the same filings rather than restating a number
+		// in isolation.
+		type peer struct {
+			Name   string  `json:"name"`
+			Latest float64 `json:"latest"`
+			End    string  `json:"end"`
+			UID    string  `json:"uid"`
+		}
+		var peers []peer
+		for _, o := range capex {
+			peers = append(peers, peer{o.Name, o.Latest, o.End, twoaiUID("dc-builder:" + strings.ToLower(o.Name))})
+		}
+		sort.Slice(peers, func(i, j int) bool { return peers[i].Latest > peers[j].Latest })
 		bdoc := map[string]any{
 			"shape": "dc-builder", "uid": u, "tax": "data-centers", "generated": today,
-			"builder": c, "filings": bFilings,
+			"builder": c, "filings": bFilings, "peers": peers,
 			"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
 		}
 		bj, _ := json.Marshal(bdoc)
