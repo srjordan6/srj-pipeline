@@ -392,7 +392,11 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		"metric_pages": metricPages, "builder_pages": builderPages,
 		"state_pages": statePages, "intl_pages": intlPages, "fac_total": facTotal, "fac_ops": facOps,
 		"smr":  map[string]any{"uid": smrUID, "count": len(smrProjects)},
-		"grid": map[string]any{"uid": twoaiUID("dc-grid")},
+		"grid":    map[string]any{"uid": twoaiUID("dc-grid")},
+		"indexes": twoaiDcIndexes(db),
+		"index_uids": map[string]any{
+			"dc-grid": twoaiUID("dc-grid"), "dc-smr": twoaiUID("dc-smr"),
+		},
 	}
 	j, _ := json.Marshal(doc)
 	if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)

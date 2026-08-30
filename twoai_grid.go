@@ -796,3 +796,126 @@ func twoaiEIAHarvest(db *sql.DB) {
 		total, today, string(dj))
 	fmt.Printf("twoai_grid: eia commercial sales period=%s states=%d total_mwh=%.0f\n", period, len(byState), total)
 }
+
+// ---- the index strip ------------------------------------------------------
+//
+// Stephen's ask: open the Data Centers page with numbers that move, so a
+// reader gets the state of the industry from the top of the page without
+// reading a word of prose.
+//
+// Every index here is a sum of things this site already harvests and can
+// defend: the five interconnection queues, the OSM facility registry, the
+// SEC capex filings, the SMR tracker. Nothing is modelled and nothing is
+// forecast.
+//
+// Movement is measured against our own stored history, not against a claim.
+// twoai_grid_obs keeps a row per source per metric per day and the facility
+// registry stamps first_seen, so a delta appears once there are two
+// observations to compare. Until then the index shows its value and no
+// change, which is the honest state of a series that started today rather
+// than a zero pretending to be one.
+
+type dcIndex struct {
+	Key    string  `json:"key"`
+	Label  string  `json:"label"`
+	Value  float64 `json:"value"`
+	Unit   string  `json:"unit"`
+	Delta  float64 `json:"delta"`
+	HasDel bool    `json:"has_delta"`
+	Note   string  `json:"note"`
+	Link   string  `json:"link,omitempty"`
+}
+
+func twoaiDcIndexes(db *sql.DB) []dcIndex {
+	out := []dcIndex{}
+
+	// 1 and 2. The queues: capacity waiting for a wire, and how many projects
+	// that is. Summed across CAISO, ERCOT, MISO, NYISO and SPP, whose scopes
+	// differ, so this is a reading of the whole pipeline and not a like-for-
+	// like league table.
+	var mwNow, mwPrev, reqNow, reqPrev float64
+	var haveMWPrev, haveReqPrev bool
+	db.QueryRow(`SELECT COALESCE(sum(value),0) FROM twoai_grid_obs o
+		WHERE metric='mw_tracked' AND source<>'eia'
+		  AND as_of = (SELECT max(as_of) FROM twoai_grid_obs WHERE metric='mw_tracked')`).Scan(&mwNow)
+	if db.QueryRow(`SELECT COALESCE(sum(value),0) FROM twoai_grid_obs
+		WHERE metric='mw_tracked' AND source<>'eia'
+		  AND as_of = (SELECT max(as_of) FROM twoai_grid_obs WHERE metric='mw_tracked'
+		               AND as_of < (SELECT max(as_of) FROM twoai_grid_obs WHERE metric='mw_tracked'))`).
+		Scan(&mwPrev); mwPrev > 0 {
+		haveMWPrev = true
+	}
+	db.QueryRow(`SELECT COALESCE(sum(value),0) FROM twoai_grid_obs
+		WHERE metric='requests_tracked'
+		  AND as_of = (SELECT max(as_of) FROM twoai_grid_obs WHERE metric='requests_tracked')`).Scan(&reqNow)
+	if db.QueryRow(`SELECT COALESCE(sum(value),0) FROM twoai_grid_obs
+		WHERE metric='requests_tracked'
+		  AND as_of = (SELECT max(as_of) FROM twoai_grid_obs WHERE metric='requests_tracked'
+		               AND as_of < (SELECT max(as_of) FROM twoai_grid_obs WHERE metric='requests_tracked'))`).
+		Scan(&reqPrev); reqPrev > 0 {
+		haveReqPrev = true
+	}
+	if mwNow > 0 {
+		out = append(out, dcIndex{"queue_gw", "Capacity in the interconnection queues",
+			mwNow / 1000, "GW", (mwNow - mwPrev) / 1000, haveMWPrev,
+			"Generation and storage awaiting a grid connection across five US grid operators, from their own published queues.",
+			"dc-grid"})
+	}
+	if reqNow > 0 {
+		out = append(out, dcIndex{"queue_projects", "Projects waiting in line",
+			reqNow, "projects", reqNow - reqPrev, haveReqPrev,
+			"Individual interconnection requests across the same five operators.", "dc-grid"})
+	}
+
+	// 3. Storage as a share of the queue. The clearest single number for how
+	// the grid is answering data center load: batteries are what makes an
+	// intermittent supply usable by a load that never stops.
+	var storage, total float64
+	db.QueryRow(`SELECT COALESCE(sum((detail->'by_fuel'->>'storage')::numeric),0),
+			COALESCE(sum(value),0)
+		FROM twoai_grid_obs
+		WHERE metric='mw_tracked' AND source<>'eia'
+		  AND as_of = (SELECT max(as_of) FROM twoai_grid_obs WHERE metric='mw_tracked')`).Scan(&storage, &total)
+	if total > 0 && storage > 0 {
+		out = append(out, dcIndex{"storage_share", "Of that queue, battery storage",
+			storage / total * 100, "%", 0, false,
+			"Storage as a share of all capacity queued. Batteries are how an intermittent supply serves a load that never stops.",
+			"dc-grid"})
+	}
+
+	// 4. The registry itself, which grows as the rotation harvests countries.
+	var facs, facsNew float64
+	db.QueryRow(`SELECT count(*) FROM twoai_dc_facilities`).Scan(&facs)
+	db.QueryRow(`SELECT count(*) FROM twoai_dc_facilities WHERE first_seen > now() - interval '7 days'`).Scan(&facsNew)
+	if facs > 0 {
+		out = append(out, dcIndex{"facilities", "Data centers mapped in the registry",
+			facs, "facilities", facsNew, facsNew > 0,
+			"Facilities OpenStreetMap contributors have mapped, harvested daily. Not every data center on earth, and the page says so.",
+			""})
+	}
+
+	// 5. What the builders are actually spending, newest reported quarter
+	// each, straight from the filings.
+	var capex float64
+	db.QueryRow(`SELECT COALESCE(sum(latest),0) FROM (
+			SELECT DISTINCT ON (name) val::numeric AS latest
+			FROM twoai_capex ORDER BY name, end_date DESC) s`).Scan(&capex)
+	if capex > 0 {
+		out = append(out, dcIndex{"capex_q", "Builder capital spending, latest quarter each",
+			capex / 1e9, "$B", 0, false,
+			"Property and equipment purchases from the most recent quarterly filing of each tracked builder, summed. SEC data, not estimates.",
+			""})
+	}
+
+	// 6. Nuclear signed for compute. Announced, not operating, and the label
+	// says so, because that distinction is the whole story of the tracker.
+	var smr float64
+	db.QueryRow(`SELECT COALESCE(sum(total_mw),0) FROM twoai_dc_smr_projects`).Scan(&smr)
+	if smr > 0 {
+		out = append(out, dcIndex{"smr_mw", "Nuclear capacity signed for data centers",
+			smr, "MW", 0, false,
+			"Small modular reactor capacity under contract or agreement. None of it is generating yet; first units are due 2029 onward.",
+			"dc-smr"})
+	}
+	return out
+}
