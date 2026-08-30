@@ -3791,7 +3791,11 @@ func twoaiBuild(db *sql.DB) error {
 	// After the SEC fetch on purpose: the Data Centers page renders this
 	// run's capex rows, not yesterday's. Its first run read the table before
 	// the fetch and showed four builders instead of eight.
+	twoaiGridHarvest(db)
 	dcPages, err := twoaiDatacenters(db, today)
+	if gerr := twoaiGridPage(db, today); gerr != nil {
+		fmt.Println("twoai_grid: page:", gerr)
+	}
 	if err != nil {
 		fmt.Println("twoai_build: datacenters:", err)
 		dcPages = 0
