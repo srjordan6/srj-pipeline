@@ -7975,6 +7975,58 @@ func syncPeople(db *sql.DB) error {
 //
 // A failure here is reported but should never be read as "the data is wrong":
 // the data is published either way, it is the rebuild that did not happen.
+
+// verifyTwoaiDeploy answers the question the deploy hook cannot: did the
+// build actually succeed?
+//
+// A deploy hook returns 200 when Cloudflare ACCEPTS the request, not when the
+// build finishes, so a POST that "worked" tells us nothing about whether a
+// single page rendered. On 2026-08-30 that gap hid nine consecutive failed
+// builds for twelve hours: the pipeline published correct content every run,
+// GitHub Actions went green every push, and the live site served a stale
+// bundle the entire time because one template threw on a missing field.
+//
+// The check is deliberately cheap and external: poll a small public endpoint
+// the build itself produces and read the date the pipeline stamped into it.
+// If that date catches up to today's content, the build ran and shipped. If
+// it does not, the run says so in a line that reads like a problem, which is
+// the whole point. Nothing here fails the run: a stale site is worth shouting
+// about, not worth aborting an otherwise good pipeline over.
+func verifyTwoaiDeploy() {
+	const probe = "https://theworldofai.org/api/sources.json"
+	today := time.Now().UTC().Format("2006-01-02")
+	client := &http.Client{Timeout: 30 * time.Second}
+	// Builds take a few minutes. Give it a reasonable window, checking
+	// occasionally rather than tightly, then report whatever is true.
+	for attempt := 1; attempt <= 10; attempt++ {
+		time.Sleep(60 * time.Second)
+		req, _ := http.NewRequest("GET", probe+"?deploycheck="+today, nil)
+		req.Header.Set("User-Agent", "theworldofai.org deploy verification (srj-pipeline)")
+		req.Header.Set("Cache-Control", "no-cache")
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			continue
+		}
+		var doc struct {
+			Generated string `json:"generated"`
+		}
+		if json.Unmarshal(body, &doc) != nil {
+			continue
+		}
+		if doc.Generated >= today {
+			fmt.Printf("deploy_site: twoai build verified live, generated=%s after %d min\n",
+				doc.Generated, attempt)
+			return
+		}
+	}
+	fmt.Printf("deploy_site: TWOAI BUILD DID NOT SHIP. The deploy hook was accepted but %s still reports an older build after 10 minutes. Check the Cloudflare build log for twoai-site; a failed build leaves the site serving stale content while every other stage reports success.\n", probe)
+}
+
 func deploySite() error {
 	// Preferred path: POST the Cloudflare deploy hook directly. Set
 	// CLOUDFLARE_DEPLOY_HOOK on the Render service (same URL srj-site keeps
@@ -8000,6 +8052,8 @@ func deploySite() error {
 				tr.Body.Close()
 				if tr.StatusCode < 200 || tr.StatusCode > 299 {
 					fmt.Fprintf(os.Stderr, "twoai deploy hook returned %d: %s\n", tr.StatusCode, strings.TrimSpace(string(trb)))
+				} else {
+					verifyTwoaiDeploy()
 				}
 			}
 		}
