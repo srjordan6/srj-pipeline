@@ -4,6 +4,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"time"
 
 	"github.com/lib/pq"
 )
@@ -144,10 +150,159 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		}
 	}
 
+	// Absorb the retired hardware page's curated GPU-cloud operator rows
+	// (AWS through Nebius); apistatus keeps verifying their links because the
+	// rows never left twoai_hardware.
+	type operator struct {
+		Name      string `json:"name"`
+		Maker     string `json:"maker"`
+		Note      string `json:"note"`
+		SourceURL string `json:"source_url"`
+		Verified  string `json:"verified"`
+	}
+	var operators []operator
+	orows, err := db.Query(`SELECT name, maker, note, source_url, COALESCE(verified_on::text,'')
+		FROM twoai_hardware WHERE section_slug='datacenters' ORDER BY slug`)
+	if err == nil {
+		for orows.Next() {
+			var o operator
+			if orows.Scan(&o.Name, &o.Maker, &o.Note, &o.SourceURL, &o.Verified) == nil {
+				operators = append(operators, o)
+			}
+		}
+		orows.Close()
+	}
+
+	// The national facility registry: refresh from OpenStreetMap, geocode a
+	// batch, then render one directory page per state.
+	twoaiDcHarvest(db)
+	type fac struct {
+		Name     string  `json:"name"`
+		Operator string  `json:"operator,omitempty"`
+		City     string  `json:"city,omitempty"`
+		Website  string  `json:"website,omitempty"`
+		Lat      float64 `json:"lat,omitempty"`
+		Lon      float64 `json:"lon,omitempty"`
+	}
+	byState := map[string][]fac{}
+	var facTotal, facOps int
+	frows2, err := db.Query(`SELECT name, operator, city, COALESCE(state,''), website,
+			COALESCE(lat,0), COALESCE(lon,0)
+		FROM twoai_dc_facilities ORDER BY state, operator, name`)
+	if err == nil {
+		for frows2.Next() {
+			var f fac
+			var st string
+			if frows2.Scan(&f.Name, &f.Operator, &f.City, &st, &f.Website, &f.Lat, &f.Lon) != nil {
+				continue
+			}
+			if st == "" {
+				st = "ZZ"
+			}
+			byState[st] = append(byState[st], f)
+			facTotal++
+			if f.Operator != "" {
+				facOps++
+			}
+		}
+		frows2.Close()
+	}
+	type statePage struct {
+		Code  string `json:"code"`
+		UID   string `json:"uid"`
+		Count int    `json:"count"`
+	}
+	var statePages []statePage
+	keepPaths := map[string]bool{}
+	for st, facs := range byState {
+		if st == "ZZ" {
+			continue // not yet geocoded; counted in the total, paged when located
+		}
+		u := twoaiUID("dc-state:" + st)
+		path := "tech/dc-state-" + strings.ToLower(st) + ".json"
+		keepPaths[path] = true
+		sdoc := map[string]any{
+			"shape": "dc-state", "uid": u, "tax": "data-centers", "generated": today,
+			"state": st, "count": len(facs), "facilities": facs,
+			"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+		}
+		sj, _ := json.Marshal(sdoc)
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ($1,'tech-dc-child',$2::jsonb,'data-centers',1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`,
+			path, string(sj)); err == nil {
+			statePages = append(statePages, statePage{st, u, len(facs)})
+		}
+	}
+	sort.Slice(statePages, func(i, j int) bool { return statePages[i].Code < statePages[j].Code })
+
+	// One page per metric and per builder: the section's own reference book,
+	// every page dated and regenerated daily from the same rows as the hub.
+	type childRef struct {
+		Label    string `json:"label"`
+		Category string `json:"category,omitempty"`
+		UID      string `json:"uid"`
+	}
+	var metricPages []childRef
+	for _, m := range metrics {
+		u := twoaiUID("dc-metric:" + strings.ToLower(strings.ReplaceAll(m.Metric, " ", "-")))
+		path := "tech/dc-metric-" + u + ".json"
+		keepPaths[path] = true
+		mdoc := map[string]any{
+			"shape": "dc-metric", "uid": u, "tax": "data-centers", "generated": today,
+			"metric": m, "parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+		}
+		mj, _ := json.Marshal(mdoc)
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ($1,'tech-dc-child',$2::jsonb,'data-centers',1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`,
+			path, string(mj)); err == nil {
+			metricPages = append(metricPages, childRef{m.Metric, m.Category, u})
+		}
+	}
+	var builderPages []childRef
+	for _, c := range capex {
+		u := twoaiUID("dc-builder:" + strings.ToLower(c.Name))
+		path := "tech/dc-builder-" + u + ".json"
+		keepPaths[path] = true
+		var bFilings []filing
+		for _, f := range filings {
+			if f.Company == c.Name {
+				bFilings = append(bFilings, f)
+			}
+		}
+		bdoc := map[string]any{
+			"shape": "dc-builder", "uid": u, "tax": "data-centers", "generated": today,
+			"builder": c, "filings": bFilings,
+			"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+		}
+		bj, _ := json.Marshal(bdoc)
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ($1,'tech-dc-child',$2::jsonb,'data-centers',1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`,
+			path, string(bj)); err == nil {
+			builderPages = append(builderPages, childRef{c.Name, "", u})
+		}
+	}
+	// Kind-scoped prune: a child page whose row was deleted disappears.
+	if len(keepPaths) > 0 {
+		keep := make([]string, 0, len(keepPaths))
+		for p := range keepPaths {
+			keep = append(keep, p)
+		}
+		db.Exec(`DELETE FROM twoai_pages WHERE kind='tech-dc-child' AND NOT (path = ANY($1))`, pq.Array(keep))
+	}
+
 	doc := map[string]any{
 		"shape": "datacenters", "uid": twoaiUID("section:data-centers"),
 		"tax": "data-centers", "generated": today, "name": name, "blurb": blurb,
 		"metrics": metrics, "sources": srcs, "capex": capex, "filings": filings,
+		"operators":    operators,
+		"metric_pages": metricPages, "builder_pages": builderPages,
+		"state_pages": statePages, "fac_total": facTotal, "fac_ops": facOps,
 	}
 	j, _ := json.Marshal(doc)
 	if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
@@ -157,7 +312,145 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		string(j)); err != nil {
 		return 0, err
 	}
-	fmt.Printf("twoai_build: datacenters metrics=%d sources=%d capex_cos=%d filings=%d\n",
-		len(metrics), len(srcs), len(capex), len(filings))
+	fmt.Printf("twoai_build: datacenters metrics=%d sources=%d capex_cos=%d filings=%d operators=%d facilities=%d states=%d children=%d\n",
+		len(metrics), len(srcs), len(capex), len(filings), len(operators), facTotal, len(statePages), len(keepPaths))
 	return 1, nil
+}
+
+// THE FACILITY REGISTRY. Stephen asked for every data center in America with
+// a full facility profile. The honest scope of "every": no free, licensed
+// dataset carries per-facility megawatts, PUE, or tier ratings; those live in
+// commercial databases and on operator spec sheets. What exists licensed is
+// OpenStreetMap, whose contributors have mapped ~1,700 US facilities
+// (telecom=data_center and building=data_center), about 1,100 with named
+// operators, ODbL, attributed on every page it touches; plus a dozen
+// Wikidata items (CC0). This registry ingests both, geocodes to state
+// through the FCC's public census API a batch at a time, and renders a
+// per-state directory. Per-facility profile pages exist only once a
+// facility's profile jsonb carries curated, per-field-sourced spec data
+// (Stephen's five-dimension template); a page for a bare name and a pair of
+// coordinates is exactly the thin content AdSense already flagged once.
+// The registry is excluded from the training-corpus export: ODbL is
+// share-alike at the database level and the corpus is not.
+func twoaiDcHarvest(db *sql.DB) {
+	client := &http.Client{Timeout: 200 * time.Second}
+	q := `[out:json][timeout:180];
+area["ISO3166-1"="US"][admin_level=2]->.us;
+( nwr["telecom"="data_center"](area.us);
+  nwr["building"="data_center"](area.us); );
+out tags center;`
+	req, _ := http.NewRequest("POST", "https://overpass-api.de/api/interpreter",
+		strings.NewReader(url.Values{"data": {q}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "theworldofai.org facility registry (contact: stephen@srjconsultingservices.com)")
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("twoai_build: dc harvest overpass:", err, "(keeping prior registry)")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		fmt.Println("twoai_build: dc harvest overpass status", resp.StatusCode, "(keeping prior registry)")
+		return
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	var out struct {
+		Elements []struct {
+			Type   string                      `json:"type"`
+			ID     int64                       `json:"id"`
+			Lat    float64                     `json:"lat"`
+			Lon    float64                     `json:"lon"`
+			Center *struct{ Lat, Lon float64 } `json:"center"`
+			Tags   map[string]string           `json:"tags"`
+		} `json:"elements"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || len(out.Elements) == 0 {
+		fmt.Println("twoai_build: dc harvest parse failed or empty, keeping prior registry")
+		return
+	}
+	n := 0
+	for _, e := range out.Elements {
+		name := strings.TrimSpace(e.Tags["name"])
+		if name == "" {
+			continue // an unnamed footprint is a shape, not a directory entry
+		}
+		lat, lon := e.Lat, e.Lon
+		if e.Center != nil {
+			lat, lon = e.Center.Lat, e.Center.Lon
+		}
+		id := fmt.Sprintf("osm:%s/%d", e.Type, e.ID)
+		site := e.Tags["website"]
+		if site == "" {
+			site = e.Tags["contact:website"]
+		}
+		tj, _ := json.Marshal(e.Tags)
+		if _, err := db.Exec(`INSERT INTO twoai_dc_facilities
+			(id, src, name, operator, city, state, lat, lon, website, osm_tags)
+			VALUES ($1,'osm',$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+			ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,
+				operator=EXCLUDED.operator,
+				city=CASE WHEN EXCLUDED.city<>'' THEN EXCLUDED.city ELSE twoai_dc_facilities.city END,
+				state=CASE WHEN EXCLUDED.state<>'' THEN EXCLUDED.state ELSE twoai_dc_facilities.state END,
+				lat=EXCLUDED.lat, lon=EXCLUDED.lon,
+				website=CASE WHEN EXCLUDED.website<>'' THEN EXCLUDED.website ELSE twoai_dc_facilities.website END,
+				osm_tags=EXCLUDED.osm_tags, last_seen=current_date`,
+			id, name, strings.TrimSpace(e.Tags["operator"]),
+			strings.TrimSpace(e.Tags["addr:city"]), strings.TrimSpace(e.Tags["addr:state"]),
+			lat, lon, strings.TrimSpace(site), string(tj)); err == nil {
+			n++
+		}
+	}
+	fmt.Printf("twoai_build: dc harvest osm elements=%d upserted=%d\n", len(out.Elements), n)
+
+	// Geocode a batch to state through the FCC census block API, public and
+	// keyless. Two hundred a run clears the backlog in nine runs, then only
+	// newly mapped facilities cost anything.
+	rows, err := db.Query(`SELECT id, lat, lon FROM twoai_dc_facilities
+		WHERE state='' AND lat IS NOT NULL ORDER BY id LIMIT 200`)
+	if err != nil {
+		return
+	}
+	type todo struct {
+		id       string
+		lat, lon float64
+	}
+	var todos []todo
+	for rows.Next() {
+		var t todo
+		if rows.Scan(&t.id, &t.lat, &t.lon) == nil {
+			todos = append(todos, t)
+		}
+	}
+	rows.Close()
+	geo := 0
+	gclient := &http.Client{Timeout: 15 * time.Second}
+	for _, t := range todos {
+		u := fmt.Sprintf("https://geo.fcc.gov/api/census/area?lat=%f&lon=%f&format=json", t.lat, t.lon)
+		greq, _ := http.NewRequest("GET", u, nil)
+		greq.Header.Set("User-Agent", "theworldofai.org facility registry (contact: stephen@srjconsultingservices.com)")
+		gresp, err := gclient.Do(greq)
+		if err != nil {
+			break
+		}
+		var g struct {
+			Results []struct {
+				StateCode  string `json:"state_code"`
+				CountyName string `json:"county_name"`
+			} `json:"results"`
+		}
+		body, _ := io.ReadAll(io.LimitReader(gresp.Body, 1<<20))
+		gresp.Body.Close()
+		if gresp.StatusCode != 200 || json.Unmarshal(body, &g) != nil || len(g.Results) == 0 {
+			continue
+		}
+		if _, err := db.Exec(`UPDATE twoai_dc_facilities SET state=$1,
+			city=CASE WHEN city='' THEN $2 ELSE city END WHERE id=$3`,
+			g.Results[0].StateCode, g.Results[0].CountyName, t.id); err == nil {
+			geo++
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if len(todos) > 0 {
+		fmt.Printf("twoai_build: dc geocode attempted=%d resolved=%d\n", len(todos), geo)
+	}
 }

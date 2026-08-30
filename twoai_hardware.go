@@ -22,7 +22,12 @@ import (
 
 var twoaiHardwareSections = []string{
 	"gpus", "npus-tpus", "chip-fabs", "memory-and-storage",
-	"datacenters", "networking-fabric", "power-and-cooling",
+	// "datacenters" retired 2026-08-29: merged into the Data Centers section
+	// (tech/datacenters.json), which absorbs its curated operator rows from
+	// twoai_hardware directly. The old URL 910155f0 redirects in
+	// public/_redirects. Rows stay in the table so apistatus keeps
+	// verifying their links.
+	"networking-fabric", "power-and-cooling",
 }
 
 const twoaiAmazonTag = "theworldofa0b-20"
