@@ -120,8 +120,13 @@ func main() {
 		//
 		// What made it redundant: the Inkbox gateway now pushes mail into
 		// project_bridge within seconds of arrival, which was this stage's main
-		// job. inkbox_pull stays in the sequence as the daily reconciler that
-		// sweeps up whatever the gateway missed while the PC was down.
+		// job. inkbox_pull rode along as the daily reconciler until 2026-08-26,
+		// when the srj-inkbox-tick cron took over: it runs inkboxPull plus
+		// inkboxOutbox every fifteen minutes from Ohio, which is ninety-six
+		// reconciliations a day against this sequence's one. Stephen flagged
+		// the duplicate on 2026-08-29 and it is retired from `all`; the tick
+		// cron is the reconciler now, and `pipeline inkbox_pull` still runs
+		// on demand.
 		//
 		// What is genuinely lost, stated rather than glossed: nothing now triages
 		// the general srj@srjconsultingservices.com inbox, so deadline, financial
@@ -146,7 +151,7 @@ func main() {
 		// event, not a daily rhythm. Run `pipeline favicons` at that point. The
 		// stage is unchanged and still idempotent, so running it costs nothing
 		// but the GETs.
-		seq := []string{"inkbox_pull", "federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
