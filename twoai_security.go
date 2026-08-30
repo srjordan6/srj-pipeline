@@ -233,6 +233,8 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 		// MITRE ATLAS rides on the hub: poll the manifest, ingest a release
 		// only when it is new, and render the current state either way.
 		twoaiAtlasWatch(db)
+		twoaiAvidWatch(db)
+		twoaiOwaspWatch(db)
 		hub := map[string]any{
 			"uid": twoaiUID("section:ai-security-risk"), "tax": "ai-security-risk",
 			"shape": "security-hub", "name": hn, "blurb": hb, "generated": today,
@@ -240,6 +242,12 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 		}
 		if atlas := twoaiAtlasDoc(db); atlas != nil {
 			hub["atlas"] = atlas
+		}
+		if avid := twoaiAvidDoc(db); avid != nil {
+			hub["avid"] = avid
+		}
+		if owasp := twoaiOwaspDoc(db); owasp != nil {
+			hub["owasp"] = owasp
 		}
 		hj, _ := json.Marshal(hub)
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
