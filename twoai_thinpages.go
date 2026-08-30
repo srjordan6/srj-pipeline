@@ -70,6 +70,7 @@ const thinUA = "theworldofai.org facility registry (contact: stephen@srjconsulti
 func twoaiThinPages(db *sql.DB) {
 	twoaiThinEnsureTables(db)
 	twoaiThinCompanyProfiles(db)
+	twoaiThinAudit(db)
 	twoaiThinDetect(db)
 	twoaiThinFillMCP(db)
 	twoaiThinFillCompany(db)
@@ -214,6 +215,13 @@ func twoaiThinDetect(db *sql.DB) {
 		{"dc-facility", `SELECT 'dc-fac/'||id, id, website, 'no operator profile'
 			FROM twoai_dc_facilities
 			WHERE country='US' AND coalesce(website,'')<>'' AND profile='{}'::jsonb`},
+		// Google's kind of thin: an indexable page whose rendered main content
+		// is under the 300-word floor, measured by the self-audit above. No
+		// automated filler; these are template and editorial work, and the
+		// queue is where that work is counted.
+		{"thin-words", `SELECT 'audit:'||url, url, url,
+			words::text || ' words in main content, below ' || ` + fmt.Sprint(thinAuditWords) + `::text
+			FROM twoai_page_audit WHERE status=200 AND words < ` + fmt.Sprint(thinAuditWords)},
 	}
 	for _, t := range tests {
 		rows, err := db.Query(t.q)
