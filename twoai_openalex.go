@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -271,6 +272,11 @@ func twoaiOAUpsert(db *sql.DB, d twoaiOADoc) (string, error) {
 	return oid, nil
 }
 
+// errOpenAlexBudget marks the one 429 that waiting cannot cure: the daily
+// spend on the metered API is gone until midnight UTC. It stops the whole
+// stage rather than each subfield burning its backoffs in turn.
+var errOpenAlexBudget = errors.New("openalex daily budget spent")
+
 // twoaiOpenAlex harvests every configured subfield, sharing the run's page
 // budget between them so one crowded subfield cannot starve the others.
 func twoaiOpenAlex(db *sql.DB) error {
@@ -284,6 +290,11 @@ func twoaiOpenAlex(db *sql.DB) error {
 	total := 0
 	for _, sf := range twoaiOASubfields {
 		n, err := twoaiOAHarvestSubfield(db, sf.id, sf.name, per)
+		if errors.Is(err, errOpenAlexBudget) {
+			total += n
+			fmt.Printf("openalex: stopping after %s, daily budget spent; cursors are saved and the next run resumes\n", sf.name)
+			break
+		}
 		if err != nil {
 			// One subfield failing must not cost the others their turn.
 			fmt.Fprintf(os.Stderr, "openalex %s: %v\n", sf.name, err)
@@ -416,6 +427,15 @@ func twoaiOAHarvestSubfield(db *sql.DB, subfieldID, subfieldName string, pageBud
 			if resp.StatusCode == 200 {
 				ok = true
 				break
+			}
+			// OpenAlex moved to a metered API: a 429 can mean "too fast",
+			// which backoff fixes, or "your daily budget is spent", which it
+			// cannot. On 2026-08-30 every subfield burned four backoffs, 75
+			// seconds each pass, on a budget that had already reset to zero.
+			// Read the body and stop the whole stage on a budget refusal.
+			if resp.StatusCode == 429 && strings.Contains(string(body), "Insufficient budget") {
+				fmt.Fprintf(os.Stderr, "openalex: daily budget spent, stopping the stage: %s\n", truncate(string(body), 200))
+				return saved, errOpenAlexBudget
 			}
 			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
 				wait := time.Duration(5*(1<<attempt)) * time.Second

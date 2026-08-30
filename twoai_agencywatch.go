@@ -148,6 +148,19 @@ func twoaiAgencyWatch(db *sql.DB) error {
 		dec := xml.NewDecoder(strings.NewReader(string(body)))
 		dec.Strict = false
 		dec.Entity = xml.HTMLEntity
+		// The OCC publishes its feed as Windows-1252 and Go refuses any
+		// declared charset it cannot decode, so that feed failed on every
+		// run with "Decoder.CharsetReader is nil". These feeds are ASCII
+		// with the occasional smart quote, and Windows-1252 maps one byte to
+		// one rune, so decoding it as Latin-1 loses nothing that matters and
+		// never fails. Anything genuinely multi-byte is left to the default.
+		dec.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
+			switch strings.ToLower(charset) {
+			case "windows-1252", "iso-8859-1", "latin1", "us-ascii":
+				return input, nil
+			}
+			return nil, fmt.Errorf("unsupported charset %q", charset)
+		}
 		if err := dec.Decode(&feed); err != nil {
 			failed = append(failed, f.agency+" parse: "+err.Error())
 			continue

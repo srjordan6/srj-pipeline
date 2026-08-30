@@ -54,7 +54,12 @@ func twoaiGridGet(url string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+		// Carry the first slice of the body. EIA answers a bad facet or an
+		// expired key with a 400 and a plain explanation; without it the log
+		// says only "status 400" and the fault cannot be diagnosed from the
+		// cron output, which is where it is read. Caught 2026-08-30.
+		peek, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(peek)))
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 40<<20))
 	if err != nil {

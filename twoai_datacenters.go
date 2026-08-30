@@ -136,9 +136,18 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		cikList = append(cikList, c)
 	}
 	if len(cikList) > 0 {
-		frows, err := db.Query(`SELECT company, to_char(filed,'YYYY-MM-DD'), items, doc_url
+		// filed is a TEXT column holding an ISO date, not a date. to_char on
+		// text has no matching function, so this query errored on every run
+		// and the error was swallowed by `if err == nil`: the hub and every
+		// builder page have shown an empty "material events" section since
+		// the section shipped, with 28 matching filings sitting in the table.
+		// Caught 2026-08-30 by reading the cron log's filings=0.
+		frows, err := db.Query(`SELECT company, left(filed,10), items, doc_url
 			FROM twoai_ma_filings WHERE cik = ANY($1)
 			ORDER BY filed DESC LIMIT 12`, pq.Array(cikList))
+		if err != nil {
+			fmt.Println("twoai_build: datacenters filings query:", err)
+		}
 		if err == nil {
 			for frows.Next() {
 				var f filing
