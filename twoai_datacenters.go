@@ -330,6 +330,14 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			"state_page": map[string]any{"uid": stateUID, "code": ef.State},
 			"parent":     map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
 		}
+		// The reading the thin-page cron wrote for these exact facts, if any:
+		// what the published capacity and certifications mean, model and date
+		// named. Absent, the page carries the facts alone rather than a gap.
+		var rModel, rBody, rDate string
+		if db.QueryRow(`SELECT model, body, generated_on::text FROM twoai_industry_analysis
+			WHERE metric=$1 ORDER BY generated_on DESC LIMIT 1`, "dc-fac-"+ef.ID).Scan(&rModel, &rBody, &rDate) == nil && rBody != "" {
+			fdoc["reading"] = map[string]any{"model": rModel, "body": rBody, "generated_on": rDate}
+		}
 		fj, _ := json.Marshal(fdoc)
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
 			VALUES ($1,'tech-dc-child',$2::jsonb,'data-centers',1)

@@ -4881,6 +4881,38 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 		pr.Close()
 	}
 
+	// Which state's AI bills apply to a company, from the headquarters this
+	// site verified, joined to its own laws tracker: the site's thesis in one
+	// link, and a deterministic reading no model is needed for.
+	type lawRef struct {
+		Code, Name, Slug string
+		Count            int
+	}
+	lawByCode, lawByName := map[string]lawRef{}, map[string]lawRef{}
+	if lr, err := db.Query(`SELECT data->>'code', data->>'name', data->>'slug', COALESCE((data->>'count')::int,0)
+		FROM twoai_pages WHERE kind='state-law'`); err == nil {
+		for lr.Next() {
+			var l lawRef
+			if lr.Scan(&l.Code, &l.Name, &l.Slug, &l.Count) == nil && l.Code != "" {
+				lawByCode[strings.ToUpper(l.Code)] = l
+				lawByName[strings.ToLower(l.Name)] = l
+			}
+		}
+		lr.Close()
+	}
+	lawFor := func(hq string) (lawRef, bool) {
+		for _, tok := range strings.Split(hq, ",") {
+			t := strings.TrimSpace(tok)
+			if l, ok := lawByCode[strings.ToUpper(t)]; ok && len(t) == 2 {
+				return l, true
+			}
+			if l, ok := lawByName[strings.ToLower(t)]; ok {
+				return l, true
+			}
+		}
+		return lawRef{}, false
+	}
+
 	for _, v := range order {
 		c := by[v]
 		// Every tracked company gets a page. The directory was linking entries
@@ -4903,6 +4935,13 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 				enriched["mcp"] = c.MCP
 				enriched["has_page"] = c.Pages
 				enriched["profile"] = p
+				if hq, _ := p["headquarters"].(string); hq != "" {
+					if l, ok := lawFor(hq); ok {
+						enriched["law_exposure"] = map[string]any{
+							"code": l.Code, "name": l.Name, "slug": l.Slug, "count": l.Count,
+						}
+					}
+				}
 				payload["company"] = enriched
 			}
 			if err := upsert("companies/"+c.UID+".json", "company", payload); err != nil {

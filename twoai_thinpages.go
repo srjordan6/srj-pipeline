@@ -94,6 +94,7 @@ func twoaiThinPages(db *sql.DB) {
 		}
 		fmt.Printf("thinpages: %s upserted %d facility rows\n", a.src, n)
 	}
+	twoaiThinSense(db)
 }
 
 // Adapters, one per publisher. Adding an operator is appending a row here;
