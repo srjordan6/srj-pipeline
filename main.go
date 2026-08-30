@@ -1430,11 +1430,22 @@ func publishNews(db *sql.DB) error {
 		}
 	}
 
+	// The AI Incident Database rides along with the briefing: harms from
+	// deployed AI, each linking to the publisher that reported it. Harvest
+	// first so today's feed is in the payload, and never let a nil slice
+	// reach the JSON, which is what the gate below exists to catch.
+	twoaiIncidentsHarvest(db)
+	incidents := twoaiIncidentsRecent(db, 12)
+	if incidents == nil {
+		incidents = []incidentOut{}
+	}
+
 	payload, _ := json.MarshalIndent(map[string]any{
 		"generated":   time.Now().UTC().Format(time.RFC3339),
 		"date":        time.Now().UTC().Format("2006-01-02"),
 		"big_picture": big,
 		"stories":     stories,
+		"incidents":   incidents,
 	}, "", " ")
 
 	// THE GATE.
