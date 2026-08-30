@@ -797,6 +797,7 @@ func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 		return 0, 0, err
 	}
 
+	matched := 0
 	for _, doc := range payload.Results {
 		fetched++
 		title, _ := doc["title"].(string)
@@ -816,6 +817,7 @@ func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 		if !mentionsAI(title) && !mentionsAI(abstract) {
 			continue
 		}
+		matched++
 
 		raw, _ := json.Marshal(doc)
 		h := sha256.Sum256(raw)
@@ -840,6 +842,12 @@ func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 			added++
 		}
 	}
+	// "fetched=100 new=0" reads like a stall. It is usually the subject
+	// filter doing its job on a full-text query: say how many of the hundred
+	// were actually about AI, so a real stall is distinguishable from a quiet
+	// week without a database query. Stephen asked exactly that on 2026-08-30.
+	fmt.Printf("federal_register: of %d full-text hits, %d are about AI by title or abstract, %d new\n",
+		fetched, matched, added)
 	return fetched, added, nil
 }
 
@@ -973,7 +981,42 @@ func govinfo(db *sql.DB, sourceID int) (fetched, added int, err error) {
 
 // aiTerm matches AI as a subject, not AI as a passing mention. The \b on the
 // bare "AI" is what stops it matching inside "said", "chair", or "maintain".
-var aiTerm = regexp.MustCompile(`(?i)\bartificial intelligence\b|\bmachine learning\b|\bA\.?I\.?\b|\bgenerative ai\b|\balgorithmic\b|\bautomated decision\b`)
+//
+// WHY THE VOCABULARY IS WIDER THAN "AI", 2026-08-30. Legislatures do not
+// name the technology; they name the harm. This list held six phrases, and
+// the bill-render filter therefore dropped 84 distinct bills whose titles say
+// what they regulate instead: California's companion-chatbot bills, Alaska's
+// synthetic-media election liability, California SB1111 on digital replicas,
+// New York and Texas deepfake bills. Every one of them was already IN the
+// corpus, because the LegiScan query matches full text and their text says
+// "artificial intelligence"; only the title filter refused them. That is the
+// same failure family as the filings query and the company profile text: the
+// data was there and the read was too narrow.
+//
+// The rule for adding a term: it must name an AI capability or an AI-specific
+// harm, never a generic technology word. "algorithm" alone is out, because a
+// state banking bill about interest-rate algorithms is not AI policy;
+// "algorithmic" as regulators use it is in. "automation" is out for the same
+// reason. Terms that only appear as AI subjects, deepfake, companion chatbot,
+// digital replica, need no qualifier.
+//
+// Plurals are the common form in a bill title ("Customer service chatbots",
+// "Digital replicas"), so every noun carries an optional s.
+var aiTerm = regexp.MustCompile(`(?i)\b(` +
+	// the technology, named directly
+	`artificial intelligence|machine learning|A\.?I\.?|generative ai|genai|` +
+	`large language models?|foundation models?|frontier models?|neural networks?|` +
+	`deep learning|computer vision|natural language processing|` +
+	// the decision systems regulators name
+	`algorithmic|automated decisions?(?:-making)?|automated employment decisions?|` +
+	`predictive policing|risk assessment (?:algorithms?|tools?|instruments?)|` +
+	// the harms legislatures name instead of the technology
+	`deepfakes?|deep fakes?|synthetic media|digital replicas?|` +
+	`(?:companion |customer service |ai )?chatbots?|` +
+	`facial recognition|biometric (?:identification|surveillance)|` +
+	`voice clon(?:e|es|ing)|likeness (?:rights?|misappropriation)|` +
+	`autonomous (?:vehicles?|weapons?|systems?|agents?)` +
+	`)\b`)
 
 func mentionsAI(s string) bool { return s != "" && aiTerm.MatchString(s) }
 
