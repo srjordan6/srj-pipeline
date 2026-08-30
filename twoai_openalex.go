@@ -409,8 +409,21 @@ func twoaiOAHarvestSubfield(db *sql.DB, subfieldID, subfieldName string, pageBud
 	newestUpdate := highWater
 
 	for pages < pageBudget && cursor != "" {
+		// THE BUDGET FAULT, 2026-08-30, and why it was never a bill.
+		// OpenAlex went metered in February 2026. A request with NO api_key
+		// draws on a $0.10/day anonymous allowance; a FREE key, thirty
+		// seconds at openalex.org/settings/api, draws on $1/day. List and
+		// filter calls, which is all this stage makes, cost $0.10 per
+		// thousand. At 150 pages a run and eight runs a day that is 1,200
+		// calls, twelve cents: over the anonymous allowance every day, and
+		// an eighth of what a free key allows. The whole outage was a
+		// missing free key. Set OPENALEX_API_KEY on the cron. Without it the
+		// stage still runs and still stops cleanly when the allowance goes.
 		u := fmt.Sprintf("https://api.openalex.org/works?filter=%s&per-page=200&cursor=%s&select=%s&mailto=%s",
 			url.QueryEscape(filter), url.QueryEscape(cursor), url.QueryEscape(twoaiOASelect), twoaiOAMailto)
+		if k := os.Getenv("OPENALEX_API_KEY"); k != "" {
+			u += "&api_key=" + url.QueryEscape(k)
+		}
 		req, _ := http.NewRequest("GET", u, nil)
 		req.Header.Set("User-Agent", "theworldofai.org works-spine (mailto:"+twoaiOAMailto+")")
 
@@ -434,7 +447,11 @@ func twoaiOAHarvestSubfield(db *sql.DB, subfieldID, subfieldName string, pageBud
 			// seconds each pass, on a budget that had already reset to zero.
 			// Read the body and stop the whole stage on a budget refusal.
 			if resp.StatusCode == 429 && strings.Contains(string(body), "Insufficient budget") {
-				fmt.Fprintf(os.Stderr, "openalex: daily budget spent, stopping the stage: %s\n", truncate(string(body), 200))
+				hint := ""
+				if os.Getenv("OPENALEX_API_KEY") == "" {
+					hint = " (no OPENALEX_API_KEY set: this run used the $0.10/day anonymous allowance, a free key raises it to $1/day)"
+				}
+				fmt.Fprintf(os.Stderr, "openalex: daily budget spent, stopping the stage%s: %s\n", hint, truncate(string(body), 200))
 				return saved, errOpenAlexBudget
 			}
 			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
