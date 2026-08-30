@@ -89,6 +89,13 @@ const twoaiStageDeadlineDefault = 20 * time.Minute
 //	               sources that publish daily at most, or expensive sweeps
 //	               whose inputs move slower than three hours.
 //
+// A name in this map is only honoured if runSequence actually dispatches it.
+// twoai_companyfacts and twoai_orgfacts are sub-steps inside twoai_build, so
+// listing them here was a no-op until they were gated at their own call
+// sites; the 06:00 run on 2026-08-30 proved it by sweeping EDGAR again while
+// every genuine sequence stage reported skipped. Anything added here that is
+// not a top-level stage needs the same treatment.
+//
 // Deliberately NOT gated: everything that feeds the daily briefing and the
 // live trackers, because refreshing those is the entire point of the new
 // cadence. twoai_build is not gated either: it is what turns SQL into
@@ -3807,11 +3814,20 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_build: model sections=%d\n", modelPages)
 
-	factPages, err := twoaiCompanyFacts(db, today)
-	if err != nil {
-		return err
+	// These two are sub-steps of twoai_build, not entries in the sequence, so
+	// runSequence never sees their names and the once-a-day map alone would
+	// not gate them. They are gated here instead. Both sweep SEC EDGAR and
+	// the USPTO across 268 vendors, and the USPTO side already rate limits
+	// at one run a day.
+	if stageDueToday("twoai_companyfacts") {
+		factPages, err := twoaiCompanyFacts(db, today)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("twoai_build: company fact sections=%d\n", factPages)
+	} else {
+		fmt.Println("twoai_companyfacts: skipped, already ran today (once-a-day stage)")
 	}
-	fmt.Printf("twoai_build: company fact sections=%d\n", factPages)
 
 	chPages, err := twoaiCompanyHarvest(db, today)
 	if err != nil {
@@ -3819,11 +3835,15 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_build: company profiles patched=%d\n", chPages)
 
-	orgPages, err := twoaiOrgFacts(db, today)
-	if err != nil {
-		return err
+	if stageDueToday("twoai_orgfacts") {
+		orgPages, err := twoaiOrgFacts(db, today)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("twoai_build: org fact sections=%d\n", orgPages)
+	} else {
+		fmt.Println("twoai_orgfacts: skipped, already ran today (once-a-day stage)")
 	}
-	fmt.Printf("twoai_build: org fact sections=%d\n", orgPages)
 
 	repoPages, err := twoaiRepos(db, today)
 	if err != nil {
