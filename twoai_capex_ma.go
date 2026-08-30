@@ -53,6 +53,12 @@ var twoaiCapexCompanies = []struct {
 var twoaiCapexConcepts = []string{
 	"PaymentsToAcquirePropertyPlantAndEquipment",
 	"PaymentsToAcquireProductiveAssets",
+	// Data center REITs report building spend as development of real estate,
+	// not acquisition of equipment: Digital Realty files 140 quarters of
+	// PaymentsToDevelopRealEstateAssets and nothing current under the two
+	// concepts above (verified against its companyfacts, 2026-08-29). Listed
+	// last so it can never preempt PP&E for an operator that files both.
+	"PaymentsToDevelopRealEstateAssets",
 }
 
 func twoaiCapexMAEnsure(db *sql.DB) error {
