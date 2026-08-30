@@ -230,11 +230,18 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 		db.QueryRow(`SELECT name, COALESCE(blurb,'') FROM twoai_taxonomy WHERE slug='ai-security-risk'`).Scan(&hn, &hb)
 		var topicCount int
 		db.QueryRow(`SELECT count(DISTINCT section_slug) FROM twoai_security_domains`).Scan(&topicCount)
-		hj, _ := json.Marshal(map[string]any{
+		// MITRE ATLAS rides on the hub: poll the manifest, ingest a release
+		// only when it is new, and render the current state either way.
+		twoaiAtlasWatch(db)
+		hub := map[string]any{
 			"uid": twoaiUID("section:ai-security-risk"), "tax": "ai-security-risk",
 			"shape": "security-hub", "name": hn, "blurb": hb, "generated": today,
 			"domains": groups, "topic_count": topicCount,
-		})
+		}
+		if atlas := twoaiAtlasDoc(db); atlas != nil {
+			hub["atlas"] = atlas
+		}
+		hj, _ := json.Marshal(hub)
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
 			VALUES ('security/index.json','security-hub',$1::jsonb,'ai-security-risk',1)
 			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
