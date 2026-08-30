@@ -185,25 +185,30 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		Lon      float64 `json:"lon,omitempty"`
 	}
 	byState := map[string][]fac{}
+	byCountry := map[string][]fac{}
 	var facTotal, facOps int
 	frows2, err := db.Query(`SELECT name, operator, city, COALESCE(state,''), website,
-			COALESCE(lat,0), COALESCE(lon,0)
-		FROM twoai_dc_facilities ORDER BY state, operator, name`)
+			COALESCE(lat,0), COALESCE(lon,0), COALESCE(country,'US')
+		FROM twoai_dc_facilities ORDER BY country, state, operator, name`)
 	if err == nil {
 		for frows2.Next() {
 			var f fac
-			var st string
-			if frows2.Scan(&f.Name, &f.Operator, &f.City, &st, &f.Website, &f.Lat, &f.Lon) != nil {
+			var st, cc string
+			if frows2.Scan(&f.Name, &f.Operator, &f.City, &st, &f.Website, &f.Lat, &f.Lon, &cc) != nil {
+				continue
+			}
+			facTotal++
+			if f.Operator != "" {
+				facOps++
+			}
+			if cc != "US" {
+				byCountry[cc] = append(byCountry[cc], f)
 				continue
 			}
 			if st == "" {
 				st = "ZZ"
 			}
 			byState[st] = append(byState[st], f)
-			facTotal++
-			if f.Operator != "" {
-				facOps++
-			}
 		}
 		frows2.Close()
 	}
@@ -236,6 +241,35 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		}
 	}
 	sort.Slice(statePages, func(i, j int) bool { return statePages[i].Code < statePages[j].Code })
+
+	// Beyond America: one directory per harvested country, reusing the state
+	// page shape with the country name where the state code would sit.
+	var intlPages []statePage
+	for cc, facs := range byCountry {
+		cname := cc
+		for _, c := range twoaiDcCountries {
+			if c.ISO == cc {
+				cname = c.Name
+			}
+		}
+		u := twoaiUID("dc-country:" + cc)
+		path := "tech/dc-country-" + strings.ToLower(cc) + ".json"
+		keepPaths[path] = true
+		sdoc := map[string]any{
+			"shape": "dc-state", "uid": u, "tax": "data-centers", "generated": today,
+			"state": cname, "count": len(facs), "facilities": facs,
+			"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+		}
+		sj, _ := json.Marshal(sdoc)
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ($1,'tech-dc-child',$2::jsonb,'data-centers',1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`,
+			path, string(sj)); err == nil {
+			intlPages = append(intlPages, statePage{cname, u, len(facs)})
+		}
+	}
+	sort.Slice(intlPages, func(i, j int) bool { return intlPages[i].Code < intlPages[j].Code })
 
 	// One page per metric and per builder: the section's own reference book,
 	// every page dated and regenerated daily from the same rows as the hub.
@@ -356,7 +390,7 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		"metrics": metrics, "sources": srcs, "capex": capex, "filings": filings,
 		"operators":    operators,
 		"metric_pages": metricPages, "builder_pages": builderPages,
-		"state_pages": statePages, "fac_total": facTotal, "fac_ops": facOps,
+		"state_pages": statePages, "intl_pages": intlPages, "fac_total": facTotal, "fac_ops": facOps,
 		"smr": map[string]any{"uid": smrUID, "count": len(smrProjects)},
 	}
 	j, _ := json.Marshal(doc)
@@ -368,7 +402,7 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		return 0, err
 	}
 	fmt.Printf("twoai_build: datacenters metrics=%d sources=%d capex_cos=%d filings=%d operators=%d facilities=%d states=%d children=%d\n",
-		len(metrics), len(srcs), len(capex), len(filings), len(operators), facTotal, len(statePages), len(keepPaths))
+		len(metrics), len(srcs), len(capex), len(filings), len(operators), facTotal, len(statePages)+len(intlPages), len(keepPaths))
 	return 1, nil
 }
 
@@ -387,12 +421,31 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 // coordinates is exactly the thin content AdSense already flagged once.
 // The registry is excluded from the training-corpus export: ODbL is
 // share-alike at the database level and the corpus is not.
+// Beyond America: one additional country per run, rotating by day of year,
+// so every pipeline run costs OpenStreetMap exactly two queries. China is on
+// the wheel with eyes open: facility mapping there is sparse and state
+// disclosure minimal, so its directory will be thin and says so.
+var twoaiDcCountries = []struct{ ISO, Name string }{
+	{"CN", "China"}, {"DE", "Germany"}, {"GB", "United Kingdom"},
+	{"FR", "France"}, {"NL", "Netherlands"}, {"IE", "Ireland"},
+	{"SE", "Sweden"}, {"NO", "Norway"}, {"ES", "Spain"}, {"IT", "Italy"},
+	{"PL", "Poland"}, {"FI", "Finland"}, {"DK", "Denmark"},
+}
+
 func twoaiDcHarvest(db *sql.DB) {
+	twoaiDcHarvestCountry(db, "US")
+	c := twoaiDcCountries[time.Now().YearDay()%len(twoaiDcCountries)]
+	twoaiDcHarvestCountry(db, c.ISO)
+
+	twoaiDcGeocodeUS(db)
+}
+
+func twoaiDcHarvestCountry(db *sql.DB, iso string) {
 	client := &http.Client{Timeout: 200 * time.Second}
 	q := `[out:json][timeout:180];
-area["ISO3166-1"="US"][admin_level=2]->.us;
-( nwr["telecom"="data_center"](area.us);
-  nwr["building"="data_center"](area.us); );
+area["ISO3166-1"="` + iso + `"][admin_level=2]->.a;
+( nwr["telecom"="data_center"](area.a);
+  nwr["building"="data_center"](area.a); );
 out tags center;`
 	req, _ := http.NewRequest("POST", "https://overpass-api.de/api/interpreter",
 		strings.NewReader(url.Values{"data": {q}}.Encode()))
@@ -400,12 +453,12 @@ out tags center;`
 	req.Header.Set("User-Agent", "theworldofai.org facility registry (contact: stephen@srjconsultingservices.com)")
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Println("twoai_build: dc harvest overpass:", err, "(keeping prior registry)")
+		fmt.Println("twoai_build: dc harvest", iso, "overpass:", err, "(keeping prior registry)")
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		fmt.Println("twoai_build: dc harvest overpass status", resp.StatusCode, "(keeping prior registry)")
+		fmt.Println("twoai_build: dc harvest", iso, "overpass status", resp.StatusCode, "(keeping prior registry)")
 		return
 	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
@@ -420,7 +473,7 @@ out tags center;`
 		} `json:"elements"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil || len(out.Elements) == 0 {
-		fmt.Println("twoai_build: dc harvest parse failed or empty, keeping prior registry")
+		fmt.Println("twoai_build: dc harvest", iso, "parse failed or empty, keeping prior registry")
 		return
 	}
 	n := 0
@@ -444,8 +497,8 @@ out tags center;`
 		// non-empty the daily OSM refresh may update only osm_tags and
 		// last_seen; identity fields are frozen against the crowd map.
 		if _, err := db.Exec(`INSERT INTO twoai_dc_facilities
-			(id, src, name, operator, city, state, lat, lon, website, osm_tags)
-			VALUES ($1,'osm',$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+			(id, src, name, operator, city, state, lat, lon, website, osm_tags, country)
+			VALUES ($1,'osm',$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
 			ON CONFLICT (id) DO UPDATE SET
 				name=CASE WHEN twoai_dc_facilities.profile='{}'::jsonb THEN EXCLUDED.name ELSE twoai_dc_facilities.name END,
 				operator=CASE WHEN twoai_dc_facilities.profile='{}'::jsonb THEN EXCLUDED.operator ELSE twoai_dc_facilities.operator END,
@@ -457,17 +510,20 @@ out tags center;`
 				osm_tags=EXCLUDED.osm_tags, last_seen=current_date`,
 			id, name, strings.TrimSpace(e.Tags["operator"]),
 			strings.TrimSpace(e.Tags["addr:city"]), strings.TrimSpace(e.Tags["addr:state"]),
-			lat, lon, strings.TrimSpace(site), string(tj)); err == nil {
+			lat, lon, strings.TrimSpace(site), string(tj), iso); err == nil {
 			n++
 		}
 	}
-	fmt.Printf("twoai_build: dc harvest osm elements=%d upserted=%d\n", len(out.Elements), n)
+	fmt.Printf("twoai_build: dc harvest %s osm elements=%d upserted=%d\n", iso, len(out.Elements), n)
+}
 
-	// Geocode a batch to state through the FCC census block API, public and
-	// keyless. Two hundred a run clears the backlog in nine runs, then only
-	// newly mapped facilities cost anything.
+// Geocode a US batch to state through the FCC census block API, public and
+// keyless. Two hundred a run clears the backlog in nine runs, then only
+// newly mapped facilities cost anything. International rows group by
+// country and skip this entirely.
+func twoaiDcGeocodeUS(db *sql.DB) {
 	rows, err := db.Query(`SELECT id, lat, lon FROM twoai_dc_facilities
-		WHERE state='' AND lat IS NOT NULL ORDER BY id LIMIT 200`)
+		WHERE country='US' AND state='' AND lat IS NOT NULL ORDER BY id LIMIT 200`)
 	if err != nil {
 		return
 	}
