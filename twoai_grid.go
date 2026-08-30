@@ -516,11 +516,15 @@ func twoaiGridHarvest(db *sql.DB) int {
 		}
 		fmt.Printf("twoai_grid: %s requests=%d mw=%.0f fuels=%d\n", s.Slug, m.Rows, m.MW, len(m.ByFuel))
 	}
-	if os.Getenv("PJM_API_KEY") == "" {
-		fmt.Println("twoai_grid: pjm skipped, PJM_API_KEY not set (free key, dataminer2 registration)")
-	}
+	// PJM is deliberately absent. Data Miner 2's terms forbid redistribution
+	// of data derived from it without a PJM-issued Redistribution License,
+	// and this site republishes what it harvests. EIA covers Virginia from
+	// the federal side instead. Revisit if that license is ever obtained.
+	_ = os.Getenv("PJM_API_KEY")
 	if os.Getenv("EIA_API_KEY") == "" {
 		fmt.Println("twoai_grid: eia skipped, EIA_API_KEY not set (free key, eia.gov/opendata)")
+	} else {
+		twoaiEIAHarvest(db)
 	}
 	return stored
 }
@@ -569,9 +573,24 @@ func twoaiGridPage(db *sql.DB, today string) error {
 	var seriesDays int
 	db.QueryRow(`SELECT count(DISTINCT as_of) FROM twoai_grid_obs`).Scan(&seriesDays)
 
+	// The federal layer, when EIA has been harvested.
+	eia := map[string]any{}
+	for _, m := range []string{"planned_capacity_mw", "commercial_sales_mwh"} {
+		var val float64
+		var asOf string
+		var dj []byte
+		if db.QueryRow(`SELECT value, as_of::text, detail FROM twoai_grid_obs
+			WHERE source='eia' AND metric=$1 ORDER BY as_of DESC LIMIT 1`, m).Scan(&val, &asOf, &dj) != nil {
+			continue
+		}
+		var det map[string]any
+		json.Unmarshal(dj, &det)
+		eia[m] = map[string]any{"value": val, "as_of": asOf, "detail": det}
+	}
+
 	// Claude interpretation, cached by data hash so it regenerates only when
 	// the numbers move.
-	payload, _ := json.Marshal(map[string]any{"as_of": today, "sources": srcs, "series_days": seriesDays})
+	payload, _ := json.Marshal(map[string]any{"as_of": today, "sources": srcs, "series_days": seriesDays, "eia": eia})
 	h := sha256.Sum256(payload)
 	dataHash := hex.EncodeToString(h[:8])
 	var aModel, aBody, aOn string
@@ -607,7 +626,7 @@ func twoaiGridPage(db *sql.DB, today string) error {
 
 	doc := map[string]any{
 		"shape": "dc-grid", "uid": twoaiUID("dc-grid"), "tax": "data-centers", "generated": today,
-		"sources": srcs, "series_days": seriesDays,
+		"sources": srcs, "series_days": seriesDays, "eia": eia,
 		"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": "Data Centers"},
 	}
 	if aBody != "" {
@@ -622,4 +641,158 @@ func twoaiGridPage(db *sql.DB, today string) error {
 		fmt.Printf("twoai_grid: page sources=%d series_days=%d analysis=%v\n", len(srcs), seriesDays, aBody != "")
 	}
 	return err
+}
+
+// ---- EIA, the federal layer ----------------------------------------------
+//
+// PJM's Data Miner terms forbid redistributing data derived from it without
+// a PJM-issued Redistribution License, so the largest grid region stays off
+// this page until that license exists. EIA fills the gap from the federal
+// side: its data is public domain, it covers every state including Virginia,
+// and it publishes the planned-generator inventory that says what is
+// actually scheduled to be built.
+//
+// Two series, both from api.eia.gov/v2, keyed by EIA_API_KEY:
+//   operating-generator-capacity  the inventory of generators including
+//       planned units and their status, aggregated here to planned MW by
+//       fuel. This is the build pipeline the queues eventually become.
+//   retail-sales                  commercial-sector electricity sales by
+//       state. Data center load lands mostly in the commercial class, so
+//       Virginia's commercial sales are the closest public proxy for the
+//       Northern Virginia cluster that PJM will not let us quote.
+// Both are reported as EIA reports them, with the survey lag stated on the
+// page. Nothing is modeled or extrapolated.
+
+var twoaiEIAStates = []string{"VA", "TX", "CA", "GA", "OH", "AZ", "OR", "IL"}
+
+func eiaGet(path, query string) ([]byte, error) {
+	key := os.Getenv("EIA_API_KEY")
+	if key == "" {
+		return nil, fmt.Errorf("EIA_API_KEY not set")
+	}
+	u := "https://api.eia.gov/v2/" + path + "?api_key=" + key + "&" + query
+	b, err := twoaiGridGet(u)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+type eiaResp struct {
+	Response struct {
+		Total any              `json:"total"`
+		Data  []map[string]any `json:"data"`
+	} `json:"response"`
+}
+
+func eiaNum(v any) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case string:
+		return gridNum(t)
+	}
+	return 0
+}
+
+func eiaStr(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// twoaiEIAHarvest stores two EIA-derived snapshots. Returns silently when no
+// key is configured; the caller already logs that case.
+func twoaiEIAHarvest(db *sql.DB) {
+	if os.Getenv("EIA_API_KEY") == "" {
+		return
+	}
+	today := time.Now().UTC().Format("2006-01-02")
+
+	// 1. Planned generating capacity, from the operable-generator inventory.
+	// statusid values in the planned range are what we want; we read the
+	// status text through rather than hardcoding a meaning onto a code.
+	b, err := eiaGet("electricity/operating-generator-capacity/data",
+		"frequency=monthly&data[0]=nameplate-capacity-mw&facets[statusid][]=P&facets[statusid][]=V&facets[statusid][]=U&facets[statusid][]=T&facets[statusid][]=L&sort[0][column]=period&sort[0][direction]=desc&length=5000")
+	if err != nil {
+		fmt.Println("twoai_grid: eia planned capacity failed:", err)
+	} else {
+		var r eiaResp
+		if err := json.Unmarshal(b, &r); err != nil || len(r.Response.Data) == 0 {
+			fmt.Printf("twoai_grid: eia planned capacity unparsed: %v head=%.180s\n", err, b)
+		} else {
+			period := eiaStr(r.Response.Data[0]["period"])
+			byFuel := map[string]float64{}
+			byStatus := map[string]float64{}
+			total := 0.0
+			rows := 0
+			for _, d := range r.Response.Data {
+				if eiaStr(d["period"]) != period {
+					continue // newest reported month only
+				}
+				mw := eiaNum(d["nameplate-capacity-mw"])
+				total += mw
+				rows++
+				byFuel[fuelBucket(eiaStr(d["energy_source_code"])+" "+eiaStr(d["technology"]))] += mw
+				st := eiaStr(d["statusDescription"])
+				if st == "" {
+					st = eiaStr(d["status"])
+				}
+				byStatus[st] += mw
+			}
+			detail := map[string]any{"by_fuel": byFuel, "by_status": byStatus,
+				"units": rows, "period": period,
+				"scope": "Nameplate capacity of generators reported to EIA as planned, from the inventory of operable generators, newest reported month only. Survey data lags roughly two months."}
+			dj, _ := json.Marshal(detail)
+			db.Exec(`INSERT INTO twoai_grid_obs (source, metric, value, unit, as_of, detail, source_url)
+				VALUES ('eia','planned_capacity_mw',$1,'MW',$2,$3::jsonb,'https://www.eia.gov/opendata/browser/electricity/operating-generator-capacity')
+				ON CONFLICT (source, metric, as_of) DO UPDATE SET value=EXCLUDED.value, detail=EXCLUDED.detail, fetched_at=now()`,
+				total, today, string(dj))
+			fmt.Printf("twoai_grid: eia planned capacity period=%s units=%d mw=%.0f\n", period, rows, total)
+		}
+	}
+
+	// 2. Commercial-sector electricity sales by state, the closest public
+	// proxy for data center load where a grid operator will not let us
+	// republish its own numbers.
+	q := "frequency=monthly&data[0]=sales&data[1]=price&facets[sectorid][]=COM&sort[0][column]=period&sort[0][direction]=desc&length=500"
+	for _, st := range twoaiEIAStates {
+		q += "&facets[stateid][]=" + st
+	}
+	b2, err := eiaGet("electricity/retail-sales/data", q)
+	if err != nil {
+		fmt.Println("twoai_grid: eia retail sales failed:", err)
+		return
+	}
+	var r2 eiaResp
+	if err := json.Unmarshal(b2, &r2); err != nil || len(r2.Response.Data) == 0 {
+		fmt.Printf("twoai_grid: eia retail sales unparsed: %v head=%.180s\n", err, b2)
+		return
+	}
+	period := eiaStr(r2.Response.Data[0]["period"])
+	byState := map[string]float64{}
+	priceByState := map[string]float64{}
+	total := 0.0
+	for _, d := range r2.Response.Data {
+		if eiaStr(d["period"]) != period {
+			continue
+		}
+		st := eiaStr(d["stateid"])
+		if st == "" {
+			continue
+		}
+		sales := eiaNum(d["sales"])
+		byState[st] = sales
+		priceByState[st] = eiaNum(d["price"])
+		total += sales
+	}
+	detail := map[string]any{"by_state": byState, "price_by_state": priceByState, "period": period,
+		"scope": "Commercial-sector electricity sales and average price by state, as reported to EIA. Data centers are billed mostly in the commercial class, so this is a proxy for their load, not a measurement of it."}
+	dj, _ := json.Marshal(detail)
+	db.Exec(`INSERT INTO twoai_grid_obs (source, metric, value, unit, as_of, detail, source_url)
+		VALUES ('eia','commercial_sales_mwh',$1,'MWh',$2,$3::jsonb,'https://www.eia.gov/opendata/browser/electricity/retail-sales')
+		ON CONFLICT (source, metric, as_of) DO UPDATE SET value=EXCLUDED.value, detail=EXCLUDED.detail, fetched_at=now()`,
+		total, today, string(dj))
+	fmt.Printf("twoai_grid: eia commercial sales period=%s states=%d total_mwh=%.0f\n", period, len(byState), total)
 }
