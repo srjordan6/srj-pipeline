@@ -83,6 +83,13 @@ const twoaiStageDeadlineDefault = 20 * time.Minute
 //	               legislative week hydrates up to 300 bills a run and that
 //	               is the burn worth capping.
 //	twoai_claims   reads the works queue through the Anthropic API.
+//	intel, twoai_recap
+//	               both sweep CourtListener, which rate limited them at one
+//	               run a day and cut them short every run after the cadence
+//	               changed. Eight truncated sweeps are worth less than one
+//	               that finishes, and each carries a wall-clock deadline
+//	               (ten and eight minutes) that the run pays whether or not
+//	               the sweep completes.
 //	twoai_onet     already skips on freshness, but the call still costs.
 //	twoai_openlibrary, twoai_case_studies, twoai_companyfacts, twoai_orgfacts,
 //	               docwatch, arxiv_watch, export_corpus
@@ -111,7 +118,7 @@ const twoaiStageDeadlineDefault = 20 * time.Minute
 // same politeness per request, against an API with no monthly quota to
 // exhaust. It runs every time.
 var twoaiDailyOnly = map[string]bool{
-	"legiscan": true, "twoai_claims": true,
+	"legiscan": true, "twoai_claims": true, "intel": true, "twoai_recap": true,
 	"twoai_onet": true, "twoai_openlibrary": true, "twoai_case_studies": true,
 	"twoai_companyfacts": true, "twoai_orgfacts": true, "docwatch": true,
 	"arxiv_watch": true, "export_corpus": true,
