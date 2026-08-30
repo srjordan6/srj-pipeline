@@ -53,6 +53,11 @@ const (
 	twoaiOASelect      = "id,doi,title,display_name,publication_year,publication_date,language,type,ids,primary_topic,open_access,best_oa_location,authorships,cited_by_count,referenced_works_count,abstract_inverted_index,updated_date"
 )
 
+// twoaiOARecentFrom is the boundary between the two backfill phases: works
+// published on or after this date are harvested first, everything earlier is
+// harvested second. It is a running order, not a cutoff.
+var twoaiOARecentFrom = time.Date(2015, 1, 1, 0, 0, 0, 0, time.UTC)
+
 // AI RESEARCH DOES NOT LIVE IN ONE SUBFIELD, AND ASSUMING IT DID COST US.
 //
 // The spine originally harvested primary_topic.subfield 1702, Artificial
@@ -352,13 +357,40 @@ func twoaiOAHarvestSubfield(db *sql.DB, subfieldID, subfieldName string, pageBud
 		return 0, fmt.Errorf("openalex cursor read: %w", err)
 	}
 
+	// BACKFILL IS PHASED BY RECENCY, NOT FILTERED BY IT.
+	//
+	// The five subfields hold about 8.1 million works and the corpus held
+	// 509,374 of them on 2026-08-30, roughly six percent, with every subfield
+	// still in backfill. Walking them in OpenAlex's default order means the
+	// corpus reaches the present last, which is precisely backwards for a
+	// site whose value is being current.
+	//
+	// The fix is ordering, not exclusion. Phase one takes 2015 and later,
+	// about 4.35 million works, which is where the modern field lives. When
+	// that exhausts, phase two takes everything before 2015 and the archive
+	// arrives anyway. Only then does the subfield flip to delta.
+	//
+	// Excluding the old work outright was considered and rejected, for the
+	// reason already recorded below: the pre-1950 rows are Church on
+	// lambda-conversion, Peirce on the algebra of logic, Russell, Bouton on
+	// Nim. An encyclopedia of AI that cannot cite Church to save a few weeks
+	// of harvesting has traded the wrong thing.
+	//
+	// Changing the filter invalidates an in-flight cursor, so a subfield
+	// entering phase one restarts its walk. Upserts make that safe and the
+	// cost is pages, not correctness.
 	base := "primary_topic.subfield.id:subfields/" + subfieldID
 	filter := base
-	if mode == "delta" {
+	switch mode {
+	case "delta":
 		filter = base + ",from_updated_date:" + highWater
 		if cursor == "" {
 			cursor = "*"
 		}
+	case "archive":
+		filter = base + ",to_publication_date:" + twoaiOARecentFrom.AddDate(0, 0, -1).Format("2006-01-02")
+	default: // backfill, phase one
+		filter = base + ",from_publication_date:" + twoaiOARecentFrom.Format("2006-01-02")
 	}
 
 	client := &http.Client{Timeout: 60 * time.Second}
@@ -445,12 +477,19 @@ func twoaiOAHarvestSubfield(db *sql.DB, subfieldID, subfieldName string, pageBud
 		time.Sleep(350 * time.Millisecond)
 	}
 
-	// Backfill exhausted: flip to delta. The high-water date advances only in
-	// delta mode, and conservatively (the newest updated_date actually seen).
+	// Phase one exhausted: walk the archive next, and only after that settle
+	// into delta. The high-water date advances only in delta mode, and
+	// conservatively (the newest updated_date actually seen).
 	if mode == "backfill" && cursor == "" {
+		db.Exec(`UPDATE twoai_harvest_cursors SET mode='archive', cursor='*', updated_at=now()
+			WHERE source=$1`, source)
+		fmt.Printf("openalex %s: recent backfill complete (%s onward), starting archive\n",
+			subfieldName, twoaiOARecentFrom.Format("2006"))
+	}
+	if mode == "archive" && cursor == "" {
 		db.Exec(`UPDATE twoai_harvest_cursors SET mode='delta', cursor='', updated_at=now()
 			WHERE source=$1`, source)
-		fmt.Printf("openalex %s: backfill complete, switching to delta mode\n", subfieldName)
+		fmt.Printf("openalex %s: archive complete, switching to delta mode\n", subfieldName)
 	}
 	if mode == "delta" {
 		db.Exec(`UPDATE twoai_harvest_cursors SET cursor='', high_water=$1, updated_at=now()

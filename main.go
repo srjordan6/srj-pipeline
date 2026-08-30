@@ -82,8 +82,6 @@ const twoaiStageDeadlineDefault = 20 * time.Minute
 //	               because change_hash suppresses hydration, but a busy
 //	               legislative week hydrates up to 300 bills a run and that
 //	               is the burn worth capping.
-//	openalex_pull  saves about 30,000 works a run against a free academic
-//	               API. Eight times a day is not a neighbourly load.
 //	twoai_claims   reads the works queue through the Anthropic API.
 //	twoai_onet     already skips on freshness, but the call still costs.
 //	twoai_openlibrary, twoai_case_studies, twoai_companyfacts, twoai_orgfacts,
@@ -95,8 +93,18 @@ const twoaiStageDeadlineDefault = 20 * time.Minute
 // live trackers, because refreshing those is the entire point of the new
 // cadence. twoai_build is not gated either: it is what turns SQL into
 // pages, and a gated build would leave new data unpublished for hours.
+//
+// openalex_pull was gated here for one day and deliberately is not any more.
+// Gating it was a mistake made on politeness grounds without first checking
+// how far behind the harvest was: the five subfields hold about 8.1 million
+// works and the corpus held 509,374 on 2026-08-30, six percent, with every
+// subfield still in backfill. At 30,000 rows a run, once a day is roughly
+// 253 days of walking. It is cursor-paged, resumable, capped at 150 pages a
+// run and paced at 350ms between pages, so more runs is more corpus at the
+// same politeness per request, against an API with no monthly quota to
+// exhaust. It runs every time.
 var twoaiDailyOnly = map[string]bool{
-	"legiscan": true, "openalex_pull": true, "twoai_claims": true,
+	"legiscan": true, "twoai_claims": true,
 	"twoai_onet": true, "twoai_openlibrary": true, "twoai_case_studies": true,
 	"twoai_companyfacts": true, "twoai_orgfacts": true, "docwatch": true,
 	"arxiv_watch": true, "export_corpus": true,
