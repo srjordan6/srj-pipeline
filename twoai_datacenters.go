@@ -384,15 +384,21 @@ out tags center;`
 			site = e.Tags["contact:website"]
 		}
 		tj, _ := json.Marshal(e.Tags)
+		// Source precedence is deterministic: curated profile data (operator
+		// spec sheets, filings, permits) outranks OSM. Once profile jsonb is
+		// non-empty the daily OSM refresh may update only osm_tags and
+		// last_seen; identity fields are frozen against the crowd map.
 		if _, err := db.Exec(`INSERT INTO twoai_dc_facilities
 			(id, src, name, operator, city, state, lat, lon, website, osm_tags)
 			VALUES ($1,'osm',$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
-			ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,
-				operator=EXCLUDED.operator,
-				city=CASE WHEN EXCLUDED.city<>'' THEN EXCLUDED.city ELSE twoai_dc_facilities.city END,
-				state=CASE WHEN EXCLUDED.state<>'' THEN EXCLUDED.state ELSE twoai_dc_facilities.state END,
-				lat=EXCLUDED.lat, lon=EXCLUDED.lon,
-				website=CASE WHEN EXCLUDED.website<>'' THEN EXCLUDED.website ELSE twoai_dc_facilities.website END,
+			ON CONFLICT (id) DO UPDATE SET
+				name=CASE WHEN twoai_dc_facilities.profile='{}'::jsonb THEN EXCLUDED.name ELSE twoai_dc_facilities.name END,
+				operator=CASE WHEN twoai_dc_facilities.profile='{}'::jsonb THEN EXCLUDED.operator ELSE twoai_dc_facilities.operator END,
+				city=CASE WHEN twoai_dc_facilities.profile='{}'::jsonb AND EXCLUDED.city<>'' THEN EXCLUDED.city ELSE twoai_dc_facilities.city END,
+				state=CASE WHEN twoai_dc_facilities.profile='{}'::jsonb AND EXCLUDED.state<>'' THEN EXCLUDED.state ELSE twoai_dc_facilities.state END,
+				lat=CASE WHEN twoai_dc_facilities.profile='{}'::jsonb THEN EXCLUDED.lat ELSE twoai_dc_facilities.lat END,
+				lon=CASE WHEN twoai_dc_facilities.profile='{}'::jsonb THEN EXCLUDED.lon ELSE twoai_dc_facilities.lon END,
+				website=CASE WHEN twoai_dc_facilities.profile='{}'::jsonb AND EXCLUDED.website<>'' THEN EXCLUDED.website ELSE twoai_dc_facilities.website END,
 				osm_tags=EXCLUDED.osm_tags, last_seen=current_date`,
 			id, name, strings.TrimSpace(e.Tags["operator"]),
 			strings.TrimSpace(e.Tags["addr:city"]), strings.TrimSpace(e.Tags["addr:state"]),
