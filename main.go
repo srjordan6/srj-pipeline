@@ -767,15 +767,31 @@ func main() {
 }
 
 func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
-	url := "https://www.federalregister.gov/api/v1/documents.json" +
-		"?conditions%5Bterm%5D=%22artificial+intelligence%22" +
+	for _, q := range frQueries {
+		f, a, e := federalRegisterQuery(db, sourceID, q.label, q.term)
+		fetched += f
+		added += a
+		if e != nil {
+			// One term failing must not cost the others their turn.
+			fmt.Fprintf(os.Stderr, "federal_register %s: %v\n", q.label, e)
+		}
+		time.Sleep(700 * time.Millisecond)
+	}
+	return fetched, added, nil
+}
+
+func federalRegisterQuery(db *sql.DB, sourceID int, label, term string) (fetched, added int, err error) {
+	// The local variable would shadow net/url, so the escape happens first.
+	esc := url.QueryEscape(term)
+	frURL := "https://www.federalregister.gov/api/v1/documents.json" +
+		"?conditions%5Bterm%5D=" + esc +
 		"&order=newest&per_page=100" +
 		"&fields%5B%5D=document_number&fields%5B%5D=title&fields%5B%5D=type" +
 		"&fields%5B%5D=abstract&fields%5B%5D=publication_date&fields%5B%5D=agencies" +
 		"&fields%5B%5D=html_url&fields%5B%5D=pdf_url&fields%5B%5D=raw_text_url"
 
 	client := &http.Client{Timeout: 60 * time.Second}
-	req, _ := http.NewRequest("GET", url, nil)
+	req, _ := http.NewRequest("GET", frURL, nil)
 	req.Header.Set("User-Agent", "srj-pipeline/1.0 (srjconsultingservices.com)")
 	resp, err := client.Do(req)
 	if err != nil {
@@ -814,7 +830,7 @@ func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 		// filter, then narrow here: a document earns a row only if AI appears in
 		// its TITLE or ABSTRACT, which is the difference between a rule about AI
 		// and a rule that happens to mention it.
-		if !mentionsAI(title) && !mentionsAI(abstract) {
+		if !onSubject(title, abstract) {
 			continue
 		}
 		matched++
@@ -844,10 +860,11 @@ func federalRegister(db *sql.DB, sourceID int) (fetched, added int, err error) {
 	}
 	// "fetched=100 new=0" reads like a stall. It is usually the subject
 	// filter doing its job on a full-text query: say how many of the hundred
-	// were actually about AI, so a real stall is distinguishable from a quiet
-	// week without a database query. Stephen asked exactly that on 2026-08-30.
-	fmt.Printf("federal_register: of %d full-text hits, %d are about AI by title or abstract, %d new\n",
-		fetched, matched, added)
+	// were actually on subject, so a real stall is distinguishable from a
+	// quiet week without a database query. Stephen asked exactly that on
+	// 2026-08-30, and the per-term breakdown is what answers it.
+	fmt.Printf("federal_register [%s]: %d full-text hits, %d on subject by title or abstract, %d new\n",
+		label, fetched, matched, added)
 	return fetched, added, nil
 }
 
@@ -878,8 +895,18 @@ func govinfo(db *sql.DB, sourceID int) (fetched, added int, err error) {
 		return 0, 0, fmt.Errorf("GOVINFO_API_KEY not set")
 	}
 	since := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
+	// Widened 2026-08-30 with the same reasoning as the other sources: a
+	// court that writes about a deepfake or a facial-recognition arrest
+	// rarely writes the phrase "artificial intelligence". govinfo's search
+	// does support OR inside a parenthesised group, unlike the Federal
+	// Register's, so one query carries the vocabulary and one request still
+	// covers the window. If a term ever silently stops matching, the count in
+	// the log line is the tell.
 	body, _ := json.Marshal(map[string]any{
-		"query":      `collection:USCOURTS "artificial intelligence" publishdate:range(` + since + `,)`,
+		"query": `collection:USCOURTS ("artificial intelligence" OR "machine learning" OR ` +
+			`"large language model" OR "facial recognition" OR "algorithmic" OR ` +
+			`"automated decision" OR deepfake OR "synthetic media" OR "data center") ` +
+			`publishdate:range(` + since + `,)`,
 		"pageSize":   100,
 		"offsetMark": "*",
 		"sorts":      []map[string]string{{"field": "publishdate", "sortOrder": "DESC"}},
@@ -1020,6 +1047,69 @@ var aiTerm = regexp.MustCompile(`(?i)\b(` +
 
 func mentionsAI(s string) bool { return s != "" && aiTerm.MatchString(s) }
 
+// dcTerm is the data center vocabulary, kept separate from aiTerm because a
+// data center is not itself AI: it is the layer underneath, and this site's
+// whole thesis is that AI capability is downstream of buildings and power.
+// Both spellings, both words, because sources use all of them.
+//
+// The pairing matters. A bare "data center" full-text search of the Federal
+// Register returns 5,686 documents and one of the newest hundred has the
+// phrase in its title or abstract: every Privacy Act system-of-records notice
+// names the data center its records sit in. So the SOURCE queries pair the
+// phrase with a power or AI term, and this filter then requires the subject
+// to reach the title or abstract. Measured live on 2026-08-30.
+var dcTerm = regexp.MustCompile(`(?i)\b(` +
+	`data cent(?:er|re)s?|datacent(?:er|re)s?|hyperscale|hyperscaler|` +
+	`colocation|interconnection queue|behind-the-meter|large load|` +
+	`speed to power|grid interconnection` +
+	`)\b`)
+
+func mentionsDC(s string) bool { return s != "" && dcTerm.MatchString(s) }
+
+// A document earns a corpus row if its title or abstract is ABOUT one of the
+// two subjects this site covers. Body mentions do not count; that is what the
+// source queries already over-return.
+func onSubject(title, abstract string) bool {
+	return mentionsAI(title) || mentionsAI(abstract) || mentionsDC(title) || mentionsDC(abstract)
+}
+
+// SOURCE QUERIES: WHAT WE ASK FOR, NOT ONLY WHAT WE KEEP.
+//
+// Until 2026-08-30 every source asked for one phrase, "artificial
+// intelligence", so anything a regulator or a court called by its harm was
+// invisible before any filter ran. Live counts of Federal Register documents
+// that the single query never reached: facial recognition 105, automated
+// decision 39, large language model 16, algorithmic discrimination 15,
+// deepfake 11, synthetic media 5.
+//
+// One query per term, never OR. The Federal Register's search returns zero
+// for `"deepfake" OR "synthetic media"` while `deepfake` alone returns
+// eleven, so an OR query silently reports nothing found. AND does work and
+// is used for the data center pairings. Each term is counted separately in
+// the log, so a term that stops returning is visible rather than hidden
+// inside a total.
+//
+// Measured live before landing: this list returns 70 distinct on-subject
+// documents a run against 16 for the single old query.
+var frQueries = []struct{ label, term string }{
+	{"artificial intelligence", `"artificial intelligence"`},
+	{"machine learning", `"machine learning"`},
+	{"large language model", `"large language model"`},
+	{"automated decision", `"automated decision"`},
+	{"algorithmic discrimination", `"algorithmic discrimination"`},
+	{"facial recognition", `"facial recognition"`},
+	{"deepfake", `deepfake`},
+	{"synthetic media", `"synthetic media"`},
+	{"digital replica", `"digital replica"`},
+	// The physical layer. Paired, because the bare phrase is 5,686 documents
+	// of Privacy Act notices.
+	{"datacenter", `datacenter`},
+	{"data center + AI", `"data center" AND "artificial intelligence"`},
+	{"data center + interconnection", `"data center" AND "interconnection"`},
+	{"data center + large load", `"data center" AND "large load"`},
+	{"data center + electricity", `"data center" AND "electricity"`},
+}
+
 // insertDoc appends one document to the corpus with change_hash dedupe.
 func insertDoc(db *sql.DB, sourceID int, extID, hash, url, title string, pub any, raw []byte) (bool, error) {
 	res, err := db.Exec(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, published_at, raw)
@@ -1049,9 +1139,49 @@ func legiscan(db *sql.DB, sourceID int) (fetched, added int, err error) {
 	client := &http.Client{Timeout: 60 * time.Second}
 	const hydrateBudget = 300
 	hydrated := 0
-	for page := 1; page <= 3; page++ {
+	// The same widening as the Federal Register, in LegiScan's syntax. The
+	// hydration budget is shared across every term, so adding terms costs
+	// search calls, which are cheap, not getBill calls, which are the
+	// expensive ones. A term is queried one page deep rather than three,
+	// because the first page is relevance-ranked and a niche term rarely
+	// fills one.
+	for _, q := range legiscanQueries {
+		f, a, e := legiscanQuery(db, sourceID, key, client, q.label, q.term, q.pages, &hydrated, hydrateBudget)
+		fetched += f
+		added += a
+		if e != nil {
+			fmt.Fprintf(os.Stderr, "legiscan %s: %v\n", q.label, e)
+		}
+		if hydrated >= hydrateBudget {
+			fmt.Printf("legiscan: hydration budget of %d spent, remaining terms wait for the next run\n", hydrateBudget)
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fetched, added, nil
+}
+
+// One query per term, the AI phrase deepest because it is the broadest.
+var legiscanQueries = []struct {
+	label, term string
+	pages       int
+}{
+	{"artificial intelligence", "%22artificial+intelligence%22", 3},
+	{"deepfake", "deepfake", 1},
+	{"synthetic media", "%22synthetic+media%22", 1},
+	{"digital replica", "%22digital+replica%22", 1},
+	{"chatbot", "chatbot", 1},
+	{"facial recognition", "%22facial+recognition%22", 1},
+	{"automated decision", "%22automated+decision%22", 1},
+	{"algorithmic", "algorithmic", 1},
+	{"data center", "%22data+center%22", 1},
+}
+
+func legiscanQuery(db *sql.DB, sourceID int, key string, client *http.Client,
+	label, term string, maxPages int, hydrated *int, hydrateBudget int) (fetched, added int, err error) {
+	for page := 1; page <= maxPages; page++ {
 		url := fmt.Sprintf("https://api.legiscan.com/?key=%s&op=getSearchRaw&state=ALL&query=%s&page=%d",
-			key, "%22artificial+intelligence%22", page)
+			key, term, page)
 		resp, e := client.Get(url)
 		if e != nil {
 			return fetched, added, e
@@ -1095,7 +1225,7 @@ func legiscan(db *sql.DB, sourceID int) (fetched, added int, err error) {
 			if exists {
 				continue
 			}
-			if hydrated >= hydrateBudget {
+			if *hydrated >= hydrateBudget {
 				continue // picked up on the next run
 			}
 			bu := fmt.Sprintf("https://api.legiscan.com/?key=%s&op=getBill&id=%d", key, r.BillID)
@@ -1124,7 +1254,7 @@ func legiscan(db *sql.DB, sourceID int) (fetched, added int, err error) {
 				fmt.Fprintln(os.Stderr, "legiscan getBill", r.BillID, ": bad payload")
 				continue
 			}
-			hydrated++
+			*hydrated++
 			var pub any
 			if bp.Bill.StatusDate != "" {
 				pub = bp.Bill.StatusDate
@@ -1144,6 +1274,7 @@ func legiscan(db *sql.DB, sourceID int) (fetched, added int, err error) {
 		}
 		time.Sleep(2 * time.Second)
 	}
+	fmt.Printf("legiscan [%s]: %d results seen, %d new bill rows\n", label, fetched, added)
 	return fetched, added, nil
 }
 
