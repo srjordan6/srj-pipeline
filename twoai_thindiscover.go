@@ -56,15 +56,27 @@ func twoaiSearchWeb(client *http.Client, q string) ([]discoverHit, error) {
 			"https://api.search.brave.com/res/v1/web/search?count=10&q="+url.QueryEscape(q), nil)
 		req.Header.Set("X-Subscription-Token", k)
 		req.Header.Set("Accept", "application/json")
+		// Brave rejects some plans without this, and it costs nothing to send.
+		req.Header.Set("Accept-Encoding", "gzip")
 		resp, err := client.Do(req)
 		if err != nil {
 			return nil, err
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("brave HTTP %d", resp.StatusCode)
-		}
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode != 200 {
+			// THE STATUS ALONE IS NOT ENOUGH HERE. Brave answers 422 both for
+			// a missing token and for an invalid one, so "HTTP 422" leaves a
+			// reader guessing between a bug and a key that was never
+			// activated. The body names which: VALIDATION versus
+			// SUBSCRIPTION_TOKEN_INVALID. Carrying it out means the log says
+			// what to go and fix.
+			snippet := strings.TrimSpace(string(b))
+			if len(snippet) > 220 {
+				snippet = snippet[:220]
+			}
+			return nil, fmt.Errorf("brave HTTP %d: %s", resp.StatusCode, snippet)
+		}
 		var out struct {
 			Web struct {
 				Results []struct {
@@ -183,8 +195,24 @@ func twoaiThinDiscover(db *sql.DB) {
 	}
 	rows.Close()
 
-	found, none := 0, 0
+	// AN ERROR THAT INCREMENTS NOTHING IS AN INVISIBLE ERROR, and this stage
+	// shipped with exactly that. Its first live run printed "0 found, 0 had no
+	// single clear match, of 40 tried" - three numbers that cannot all be true
+	// at once, because every call had failed and the failure path counted
+	// nothing and said nothing. Stephen read it as the stage doing nothing,
+	// which is precisely what it looked like and close enough to the truth.
+	//
+	// Now the reason is carried out to the log, and a run that cannot reach
+	// the provider stops after five consecutive failures instead of spending
+	// forty of them to learn the same thing once.
+	found, none, failed := 0, 0, 0
+	firstErr := ""
+	streak := 0
 	for _, j := range jobs {
+		if streak >= 5 {
+			fmt.Printf("thinpages: discover: stopping after %d consecutive failures, the search API is not answering\n", streak)
+			break
+		}
 		who := j.op
 		if who == "" {
 			who = twoaiRegistrableHost(j.site)
@@ -193,6 +221,19 @@ func twoaiThinDiscover(db *sql.DB) {
 		time.Sleep(1200 * time.Millisecond)
 		hits, err := twoaiSearchWeb(client, q)
 		if err != nil {
+			failed++
+			streak++
+			if firstErr == "" {
+				firstErr = err.Error()
+			}
+			continue
+		}
+		streak = 0
+		if len(hits) == 0 {
+			// A successful call that returned nothing is a different fact from
+			// a call that failed, and worth separating: it means the query was
+			// bad, not the provider.
+			none++
 			continue
 		}
 		u := twoaiPickFacilityURL(hits, j.site)
@@ -209,6 +250,9 @@ func twoaiThinDiscover(db *sql.DB) {
 		db.Exec(`UPDATE twoai_dc_facilities SET website=$2 WHERE id=$1 AND website=$3`, j.ref, u, j.site)
 		found++
 	}
-	fmt.Printf("thinpages: discover: %d facility URLs found on the operator's own domain, %d had no single clear match, of %d tried\n",
-		found, none, len(jobs))
+	fmt.Printf("thinpages: discover: %d facility URLs found on the operator's own domain, %d had no single clear match, %d calls failed, of %d tried\n",
+		found, none, failed, len(jobs))
+	if failed > 0 {
+		fmt.Printf("thinpages: discover: first failure was: %s\n", firstErr)
+	}
 }
