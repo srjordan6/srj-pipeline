@@ -56,6 +56,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -67,6 +68,28 @@ import (
 
 const thinUA = "theworldofai.org facility registry (contact: stephen@srjconsultingservices.com)"
 
+// THE BUDGETS. Stephen, 2026-08-30: it should be able to do all thin pages
+// in a day. The first caps were sized for a stage sharing a cron with
+// thirty-nine others, where a long scrape starved the rest. This cron has
+// nothing else to do, so the budget is now the whole queue.
+//
+// The arithmetic that keeps it polite: 291 package reads at 0.4s is two
+// minutes, 184 company sites at 1.5s is five, 352 facility pages at 1.5s is
+// nine, and the readings are capped by the model call, not the queue. Twenty
+// minutes of a daily cron, spread across hundreds of hosts, no host hit more
+// than a handful of times.
+//
+// Each is overridable by environment variable, so a budget can be cut in one
+// dashboard edit if a source ever objects, without a deploy.
+func thinBudget(name string, def int) int {
+	if v := os.Getenv("THIN_BUDGET_" + name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return def
+}
+
 func twoaiThinPages(db *sql.DB) {
 	twoaiThinEnsureTables(db)
 	twoaiThinCompanyProfiles(db)
@@ -75,6 +98,7 @@ func twoaiThinPages(db *sql.DB) {
 	twoaiThinFillMCP(db)
 	twoaiThinFillCompany(db)
 	twoaiThinFillFacilities(db)
+	defer thinReport(db)
 	for _, a := range thinAdapters {
 		var last sql.NullString
 		db.QueryRow(`SELECT max(last_seen)::text FROM twoai_dc_facilities WHERE src=$1`, a.src).Scan(&last)
@@ -96,6 +120,27 @@ func twoaiThinPages(db *sql.DB) {
 		fmt.Printf("thinpages: %s upserted %d facility rows\n", a.src, n)
 	}
 	twoaiThinSense(db)
+}
+
+// The closing line of every run: what is left, and why. A queue that is not
+// emptying should say so in the log rather than in a database query three
+// days later.
+func thinReport(db *sql.DB) {
+	rows, err := db.Query(`SELECT kind, count(*), count(*) FILTER (WHERE attempts >= 3),
+			count(*) FILTER (WHERE attempts = 0)
+		FROM twoai_thin_queue GROUP BY kind ORDER BY kind`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind string
+		var total, exhausted, untried int
+		if rows.Scan(&kind, &total, &exhausted, &untried) == nil {
+			fmt.Printf("thinpages: queue %s: %d remaining (%d never tried, %d gave up after 3 attempts)\n",
+				kind, total, untried, exhausted)
+		}
+	}
 }
 
 // Adapters, one per publisher. Adding an operator is appending a row here;
@@ -260,9 +305,13 @@ func twoaiThinDetect(db *sql.DB) {
 // Rows the fillers may work on: never more than three attempts, and a week
 // between attempts, so a dead registry entry costs three requests in total.
 func thinDue(db *sql.DB, kind string, limit int) []thinCandidate {
+	// Never attempted comes first, then the retries. A week between retries
+	// is right for a site that was down; it must not delay a page that has
+	// never been read at all, which is what ORDER BY attempts already does,
+	// and the budget is now big enough that the whole queue is one pass.
 	rows, err := db.Query(`SELECT path, ref, source_url, reason FROM twoai_thin_queue
 		WHERE kind=$1 AND attempts < 3
-		  AND (last_attempt IS NULL OR last_attempt < now() - interval '7 days')
+		  AND (last_attempt IS NULL OR last_attempt < now() - interval '2 days')
 		ORDER BY attempts, first_seen LIMIT $2`, kind, limit)
 	if err != nil {
 		return nil
@@ -286,7 +335,7 @@ func thinAttempt(db *sql.DB, path string, errText string) {
 // ---- mcp-server: registry facts ------------------------------------------
 
 func twoaiThinFillMCP(db *sql.DB) {
-	due := thinDue(db, "mcp-server", 150)
+	due := thinDue(db, "mcp-server", thinBudget("MCP", 1000))
 	if len(due) == 0 {
 		return
 	}
@@ -444,7 +493,7 @@ func thinRepoURL(raw string) string {
 // ---- company: the publisher's own JSON-LD -------------------------------
 
 func twoaiThinFillCompany(db *sql.DB) {
-	due := thinDue(db, "company", 40)
+	due := thinDue(db, "company", thinBudget("COMPANY", 400))
 	if len(due) == 0 {
 		return
 	}

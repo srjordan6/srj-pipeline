@@ -38,7 +38,9 @@ import (
 	"time"
 )
 
-const thinFacilityCap = 40 // pages per run; the queue drains over days, politely
+// The whole facility queue in one run: 352 pages at 1.5s is nine minutes,
+// and this cron has nothing else to do. THIN_BUDGET_FACILITY overrides it.
+var thinFacilityCap = thinBudget("FACILITY", 500)
 
 var (
 	tfMWRe     = regexp.MustCompile(`(?i)^([\d,]+(?:\.\d+)?)\s*(?:MW|megawatts?)\b`)

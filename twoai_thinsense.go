@@ -23,7 +23,10 @@ import (
 	"time"
 )
 
-const thinSenseCap = 30 // facility readings per run; the cache makes later runs cheap
+// Readings for every facility that has specifications and no reading yet.
+// The hash cache means a steady state costs nothing; the first run after a
+// big scrape is the expensive one, which is the run that should be.
+var thinSenseCap = thinBudget("SENSE", 400)
 
 const thinFacilitySystem = `You write for The World of AI, a reference site whose thesis is that every AI capability is downstream of compute, compute is downstream of buildings and power, and the grid is now the binding constraint on AI scaling.
 
