@@ -3949,6 +3949,10 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	if _, err := twoaiComputeProviders(db, today, upsert); err != nil {
+		return err
+	}
+
 	downloads, err := twoaiDownloads(db, today, upsert)
 	if err != nil {
 		return err
@@ -4644,6 +4648,105 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 		return count, err
 	}
 	return count + 1, nil
+}
+
+// twoaiComputeProviders renders the GPU compute provider directory at
+// compute/index.json.
+//
+// WHY IT EXISTS. The site tracks who BUILDS data centres, through operator and
+// facility pages, and who SELLS the chips, through the hardware pages. It had
+// nothing on who RENTS the compute, which is the layer most people actually
+// touch: a team that needs eight H100s for a fortnight does not build a hall
+// or buy a chip, it rents by the hour from one of these. The gap existed
+// because every other directory here has an upstream that names its members
+// and this category has none - EDGAR sees only public filers, OpenStreetMap
+// sees only buildings, and a vendor feed needs the list before it can start.
+// So the rows were assembled and verified by hand: every homepage checked for
+// a 200, every pricing link checked, and the two that 404 left empty rather
+// than pointed at a guess.
+//
+// WHAT IT EMITS. One JSON grouped by business model, because the model is what
+// actually decides whether a provider suits a reader: a specialist cloud rents
+// dedicated capacity with a contract, a marketplace resells other people's
+// idle machines at lower prices and lower guarantees, a decentralised network
+// settles on-chain, and a hyperscaler sells compute alongside everything else.
+// Public companies carry their ticker so a reader can check the filings
+// themselves.
+func twoaiComputeProviders(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
+	rows, err := db.Query(`SELECT slug, name, COALESCE(website,''), model,
+			COALESCE(summary,''), COALESCE(public_company,false), COALESCE(ticker,''),
+			COALESCE(pricing_url,''), COALESCE(docs_url,''), COALESCE(status_url,''),
+			COALESCE(source_url,''), COALESCE(verified_on::text,'')
+		FROM twoai_compute_providers ORDER BY name`)
+	if err != nil {
+		return 0, nil
+	}
+	type prov struct {
+		Slug     string `json:"slug"`
+		Name     string `json:"name"`
+		Website  string `json:"website"`
+		Model    string `json:"model"`
+		Summary  string `json:"summary"`
+		Public   bool   `json:"public_company"`
+		Ticker   string `json:"ticker"`
+		Pricing  string `json:"pricing_url"`
+		Docs     string `json:"docs_url"`
+		Status   string `json:"status_url"`
+		Source   string `json:"source_url"`
+		Verified string `json:"verified_on"`
+	}
+	byModel := map[string][]prov{}
+	total := 0
+	for rows.Next() {
+		var p prov
+		if rows.Scan(&p.Slug, &p.Name, &p.Website, &p.Model, &p.Summary, &p.Public,
+			&p.Ticker, &p.Pricing, &p.Docs, &p.Status, &p.Source, &p.Verified) != nil {
+			continue
+		}
+		byModel[p.Model] = append(byModel[p.Model], p)
+		total++
+	}
+	rows.Close()
+	if total == 0 {
+		// An empty table publishes nothing rather than an empty page claiming
+		// the category is covered.
+		return 0, nil
+	}
+
+	// Fixed order, widest commitment to loosest, which is also roughly price
+	// ascending and reliability descending.
+	type group struct {
+		Key       string `json:"key"`
+		Label     string `json:"label"`
+		Reading   string `json:"reading"`
+		Providers []prov `json:"providers"`
+	}
+	order := []struct{ key, label, reading string }{
+		{"hyperscaler", "Hyperscalers",
+			"Compute sold alongside storage, networking and everything else. You pay more per GPU-hour than anywhere below, and you get the contracts, the compliance paperwork and the regions that an enterprise procurement team asks for."},
+		{"specialist-cloud", "Specialist GPU clouds",
+			"Companies whose whole business is renting accelerators. Dedicated capacity, reserved instances, and the interconnect that multi-node training needs. This is where most serious training work goes."},
+		{"marketplace", "Marketplaces",
+			"Other people's idle machines, resold by the hour. The cheapest compute you will find, with the weakest guarantees: a host can reclaim a machine, and hardware varies between listings. Good for experiments, poor for a run you cannot restart."},
+		{"decentralized", "Decentralised networks",
+			"Capacity coordinated by a protocol rather than a company, usually settled in a token. Prices can be very low and availability is uneven. Read the terms carefully, because there is no single counterparty to hold to them."},
+	}
+	var groups []group
+	for _, o := range order {
+		if len(byModel[o.key]) > 0 {
+			groups = append(groups, group{o.key, o.label, o.reading, byModel[o.key]})
+		}
+	}
+	if err := upsert("compute/index.json", "compute-hub", map[string]any{
+		"shape":     "compute-hub",
+		"total":     total,
+		"groups":    groups,
+		"generated": today,
+	}); err != nil {
+		return 0, err
+	}
+	fmt.Printf("twoai_compute: %d providers across %d models\n", total, len(groups))
+	return total, nil
 }
 
 // twoaiSources renders the central sources index at sources/index.json.
