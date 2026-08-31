@@ -25,13 +25,17 @@ package main
 // at all: every row sends the reader to the outlet that did the reporting.
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"html"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -275,4 +279,90 @@ func twoaiIncidentFetchText(u string) (string, error) {
 		txt = txt[:20000]
 	}
 	return txt, nil
+}
+
+// A PAGE PER INCIDENT. Stephen, 2026-08-31: a full page describing the
+// report, with the link to the publisher only at the very bottom, so the
+// reader is reading our content the whole way down.
+//
+// The briefing sends a reader straight out on the headline, which is the
+// opposite of that. An incident already has everything a page needs: the
+// facts AIID catalogues, the summary we write from the reporting, and every
+// outlet that carried it. What it lacked was a reading, so a Sonnet passage
+// says what the incident shows about deployed AI, written from these facts
+// and nothing else and cached on their hash. The publisher links live in a
+// sources block at the foot of the page.
+//
+// Slug is the AIID incident number, which is stable, public and citable:
+// /ai-news/incident/1661/ will always be incident 1661.
+const incidentReadingSystem = `You write for The World of AI, a reference site that catalogues what deployed AI systems actually do in the world.
+
+You are given one incident from the AI Incident Database: its title, the outlets that reported it, their dates, and a summary of the reporting written in our own words. Write what this incident shows, in two or three short paragraphs, for a reader who has just read that summary.
+
+Rules, in order:
+1. Use ONLY the facts given. Never add a company, product, number, date, ruling or consequence that is not in them. If something is unknown, say it is not established.
+2. Do not retell the summary. The reader has it. Say what kind of failure this is, where in a deployment it happened, and what it would have taken to catch it.
+3. Name the failure mode plainly when the facts support it: a model asserting something false as fact, a system deployed without a human check, an impersonation, a system used outside the conditions it was built for. Do not reach for a category the facts do not show.
+4. One sentence on what is NOT established: an allegation is not a finding, a lawsuit is not a verdict, and a report is not proof of intent.
+5. Plain declarative sentences, one idea each. Commas rather than dashes. No speculation about motive, no advice, no moralising.
+Return the paragraphs only, separated by blank lines, no heading, no preamble.`
+
+func twoaiIncidentPages(db *sql.DB, incidents []incidentOut, today string) int {
+	model := os.Getenv("TWOAI_ANALYSIS_MODEL")
+	if model == "" {
+		model = "claude-sonnet-4-6"
+	}
+	built := 0
+	for _, inc := range incidents {
+		if inc.IncidentID == 0 || inc.Title == "" {
+			continue
+		}
+		path := fmt.Sprintf("news/incident-%d.json", inc.IncidentID)
+
+		// The reading, cached on the facts it was written from, so an
+		// incident is interpreted once and again only if its reporting grows.
+		facts, _ := json.MarshalIndent(map[string]any{
+			"title": inc.Title, "incident_id": inc.IncidentID,
+			"summary": inc.Summary, "reports": inc.Reports,
+			"outlet_count": inc.OutletCount,
+		}, "", "  ")
+		h := sha256.Sum256(facts)
+		hash := hex.EncodeToString(h[:8])
+		metric := fmt.Sprintf("incident:%d", inc.IncidentID)
+		var reading, rModel, rOn string
+		db.QueryRow(`SELECT body, model, generated_on::text FROM twoai_industry_analysis
+			WHERE metric=$1 AND data_hash=$2`, metric, hash).Scan(&reading, &rModel, &rOn)
+		if reading == "" && inc.Summary != "" && os.Getenv("ANTHROPIC_API_KEY") != "" {
+			if body, err := twoaiClaudeCall(model, incidentReadingSystem,
+				"The incident:\n"+string(facts)+"\n\nWrite it now."); err == nil && len(body) > 150 {
+				db.Exec(`INSERT INTO twoai_industry_analysis (metric, data_hash, model, body, generated_on)
+					VALUES ($1,$2,$3,$4,current_date) ON CONFLICT (metric, data_hash) DO NOTHING`,
+					metric, hash, model, body)
+				reading, rModel, rOn = body, model, today
+			}
+		}
+
+		doc := map[string]any{
+			"shape": "incident", "incident_id": inc.IncidentID, "title": inc.Title,
+			"summary": inc.Summary, "summary_domain": inc.SummaryDomain,
+			"summary_url": inc.SummaryURL, "reports": inc.Reports,
+			"outlet_count": inc.OutletCount, "published": inc.Published,
+			"cite_url": inc.CiteURL, "generated": today,
+		}
+		if reading != "" {
+			doc["reading"] = map[string]any{"body": reading, "model": rModel, "generated_on": rOn}
+		}
+		j, _ := json.Marshal(doc)
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ($1,'incident',$2::jsonb,NULL,1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+				url_count=1, updated_at=now()`, path, string(j)); err == nil {
+			built++
+		}
+	}
+	// An incident that drops out of the window keeps its page: a URL that has
+	// been published never moves, and the record of a harm should not vanish
+	// because newer ones arrived.
+	fmt.Printf("publish_news: incident pages built=%d\n", built)
+	return built
 }

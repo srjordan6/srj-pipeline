@@ -1716,6 +1716,10 @@ func publishNews(db *sql.DB) error {
 		big = append(big, "Logged harm: "+incidents[0].Title)
 	}
 
+	// One page per incident, so a reader gets the whole account here and
+	// meets the publisher's link only at the foot of it.
+	twoaiIncidentPages(db, incidents, time.Now().UTC().Format("2006-01-02"))
+
 	payload, _ := json.MarshalIndent(map[string]any{
 		"generated":   time.Now().UTC().Format(time.RFC3339),
 		"date":        time.Now().UTC().Format("2006-01-02"),
