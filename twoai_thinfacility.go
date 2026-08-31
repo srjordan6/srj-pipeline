@@ -80,13 +80,19 @@ func twoaiThinFillFacilities(db *sql.DB) {
 		return
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
-	filled, empty := 0, 0
+	filled, empty, index := 0, 0, 0
 	for _, c := range due {
 		// A URL with no path beyond the domain, or one path segment, is an
 		// operator's index, not a facility page. Nothing to read; say so once
 		// rather than fetching sixty hub pages a run.
 		if !tfFacPath.MatchString(c.source) {
-			thinAttempt(db, c.path, "website is an operator index, not a facility page")
+			index++
+			// Three attempts and it stops asking: an index URL will still be
+			// an index URL tomorrow. These need a facility URL from the
+			// operator, which is data work, not another fetch.
+			db.Exec(`UPDATE twoai_thin_queue SET attempts=3, last_attempt=now(),
+				last_error='the website on this row is an operator index, not a facility page; needs a facility URL'
+				WHERE path=$1`, c.path)
 			continue
 		}
 		time.Sleep(1500 * time.Millisecond)
@@ -152,8 +158,8 @@ func twoaiThinFillFacilities(db *sql.DB) {
 		db.Exec(`DELETE FROM twoai_thin_queue WHERE path=$1`, c.path)
 		filled++
 	}
-	fmt.Printf("thinpages: facility pages read: %d enriched, %d published nothing readable, of %d due\n",
-		filled, empty, len(due))
+	fmt.Printf("thinpages: facility pages read: %d enriched, %d published nothing readable, %d were operator index URLs, of %d due\n",
+		filled, empty, index, len(due))
 }
 
 // tfParse reads the stat block whichever way round the operator wrote it.

@@ -82,22 +82,33 @@ func twoaiThinSensePages(db *sql.DB) {
 	}
 	written, cached, skipped, failed := 0, 0, 0, 0
 	for _, c := range due {
-		// The queue holds URLs; the data behind them lives in twoai_pages.
-		// A URL with no row is a static page or a route this cron cannot
-		// improve, and says so rather than being retried forever.
+		// URL to page, without a hardcoded route list. The first version
+		// named six route prefixes and matched 24 of 276 URLs, because this
+		// site has more shapes than that and a route can change. A page's
+		// uid or slug appearing as a path segment is the durable join: it
+		// resolves 190 of the 276 and needs no maintenance when a section
+		// moves.
 		var path, data string
 		err := db.QueryRow(`SELECT path, data::text FROM twoai_pages
-			WHERE $1 IN (
-				'https://theworldofai.org/ai-ecosystem/technology-and-core-infrastructure/' || (data->>'uid') || '/',
-				'https://theworldofai.org/ai-ecosystem/' || (data->>'slug') || '/',
-				'https://theworldofai.org/ai-tools/' || (data->>'slug') || '/',
-				'https://theworldofai.org/ai-glossary/' || (data->>'slug') || '/',
-				'https://theworldofai.org/ai-laws/' || (data->>'slug') || '/',
-				'https://theworldofai.org/companies/' || (data->>'uid') || '/'
-			) LIMIT 1`, c.ref).Scan(&path, &data)
+			WHERE (data ? 'uid'  AND $1 LIKE '%/' || (data->>'uid')  || '/')
+			   OR (data ? 'slug' AND $1 LIKE '%/' || (data->>'slug') || '/')
+			ORDER BY length(data::text) DESC LIMIT 1`, c.ref).Scan(&path, &data)
 		if err != nil {
+			// The rest are entity pages: twoai_entities holds a uid, a name
+			// and aliases, and nothing else. There is no source data to
+			// interpret, and asking a model to write about a name is the
+			// padding this site refuses to publish. They stop cycling and
+			// are counted, because the honest fix is source data, not prose.
+			var isEntity int
+			db.QueryRow(`SELECT 1 FROM twoai_entities WHERE $1 LIKE '%/' || uid || '/' LIMIT 1`, c.ref).Scan(&isEntity)
 			skipped++
-			thinAttempt(db, c.path, "no twoai_pages row resolves to this URL; not a data-driven page")
+			if isEntity == 1 {
+				db.Exec(`UPDATE twoai_thin_queue SET attempts=3, last_attempt=now(),
+					last_error='entity page: a name and its links, no source data to interpret; needs data, not prose'
+					WHERE path=$1`, c.path)
+			} else {
+				thinAttempt(db, c.path, "no page row resolves to this URL; not a data-driven page")
+			}
 			continue
 		}
 		if len(data) > 60000 { // a reading needs the shape, not every row

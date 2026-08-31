@@ -94,11 +94,61 @@ func twoaiThinPages(db *sql.DB) {
 	twoaiThinEnsureTables(db)
 	twoaiThinCompanyProfiles(db)
 	twoaiThinAudit(db)
-	twoaiThinDetect(db)
-	twoaiThinFillMCP(db)
-	twoaiThinFillCompany(db)
-	twoaiThinFillFacilities(db)
 	defer thinReport(db)
+
+	// KEEP GOING UNTIL THE QUEUE STOPS SHRINKING. Stephen, 2026-08-31: I do
+	// not want this cron to stop until all thin pages are filled out.
+	//
+	// One pass was never going to finish it, and not because of the budgets.
+	// A pass fills what it can and leaves the rest, and some of the rest only
+	// becomes fillable AFTER something earlier in the same run: a facility
+	// scraped in pass one has specifications to read in pass two, and a
+	// company that just gained a website has a site to fetch. So the work
+	// repeats until a whole pass changes nothing, which is the only honest
+	// definition of finished.
+	//
+	// Two brakes, because a loop that cannot stop is worse than one that
+	// stops early. A pass that fills nothing new ends the run, and the whole
+	// thing is bounded by a wall clock, default four hours, so the cron can
+	// never run into the next day's. Both are environment-overridable.
+	maxPasses := thinBudget("PASSES", 12)
+	deadline := time.Now().Add(time.Duration(thinBudget("MINUTES", 240)) * time.Minute)
+	prev := -1
+	for pass := 1; pass <= maxPasses; pass++ {
+		if time.Now().After(deadline) {
+			fmt.Printf("thinpages: stopping after pass %d, the run's time budget is spent\n", pass-1)
+			break
+		}
+		fmt.Printf("thinpages: pass %d\n", pass)
+		twoaiThinDetect(db)
+		twoaiThinFillMCP(db)
+		twoaiThinFillCompany(db)
+		twoaiThinFillFacilities(db)
+		twoaiThinAdapters(db)
+		twoaiThinSense(db)
+		twoaiThinSensePages(db)
+
+		// What is left that this cron could still act on: rows it has not
+		// given up on. When that stops falling, another pass would repeat
+		// the same failures against the same sites, which is rude and
+		// pointless.
+		left := 0
+		db.QueryRow(`SELECT count(*) FROM twoai_thin_queue WHERE attempts < 3`).Scan(&left)
+		if left == 0 {
+			fmt.Println("thinpages: queue empty, every page this cron can fill is filled")
+			return
+		}
+		if left == prev {
+			fmt.Printf("thinpages: pass %d changed nothing, %d rows remain that need data or editorial work\n", pass, left)
+			return
+		}
+		prev = left
+	}
+}
+
+// The operator adapters, in their own function so the pass loop can call them
+// alongside the fillers.
+func twoaiThinAdapters(db *sql.DB) {
 	for _, a := range thinAdapters {
 		var last sql.NullString
 		db.QueryRow(`SELECT max(last_seen)::text FROM twoai_dc_facilities WHERE src=$1`, a.src).Scan(&last)
@@ -119,14 +169,17 @@ func twoaiThinPages(db *sql.DB) {
 		}
 		fmt.Printf("thinpages: %s upserted %d facility rows\n", a.src, n)
 	}
-	twoaiThinSense(db)
-	twoaiThinSensePages(db)
 }
 
 // The closing line of every run: what is left, and why. A queue that is not
 // emptying should say so in the log rather than in a database query three
 // days later.
 func thinReport(db *sql.DB) {
+	// Why a row is still here matters more than that it is. A row this cron
+	// gave up on is not a backlog item, it is a finding: an operator index
+	// where a facility URL should be, a company that publishes no structured
+	// facts, a page with a name and no data. Those are reported separately
+	// with the commonest reason, so the log says what is actually needed.
 	rows, err := db.Query(`SELECT kind, count(*), count(*) FILTER (WHERE attempts >= 3),
 			count(*) FILTER (WHERE attempts = 0)
 		FROM twoai_thin_queue GROUP BY kind ORDER BY kind`)
@@ -138,8 +191,16 @@ func thinReport(db *sql.DB) {
 		var kind string
 		var total, exhausted, untried int
 		if rows.Scan(&kind, &total, &exhausted, &untried) == nil {
-			fmt.Printf("thinpages: queue %s: %d remaining (%d never tried, %d gave up after 3 attempts)\n",
+			var reason string
+			db.QueryRow(`SELECT last_error FROM twoai_thin_queue
+				WHERE kind=$1 AND attempts >= 3 AND last_error <> ''
+				GROUP BY last_error ORDER BY count(*) DESC LIMIT 1`, kind).Scan(&reason)
+			line := fmt.Sprintf("thinpages: queue %s: %d remaining (%d never tried, %d need data this cron cannot fetch",
 				kind, total, untried, exhausted)
+			if reason != "" {
+				line += ": " + reason
+			}
+			fmt.Println(line + ")")
 		}
 	}
 }
