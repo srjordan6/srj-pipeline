@@ -339,7 +339,47 @@ func twoaiTaxIndex(db *sql.DB) (map[string]string, []twoaiTaxNode) {
 		}
 	}
 	r.Close()
+
+	// THE SITEMAP ALREADY KNOWS WHERE EVERY PAGE LIVES. twoaiDocURL used to
+	// resolve a document by a hardcoded switch on its path prefix, so a
+	// factory added after that switch was written produced pages the
+	// assistant could not cite and therefore could not see. On 2026-08-31
+	// that was 183 documents: 85 data-centre children, 28 caselaw pages, 12
+	// of the incident pages built that morning, 8 model sections, 6
+	// observatory sections, and four state-law pages, which is the exact
+	// shape of the question Stephen used as the example, "What are the AI
+	// laws in Texas?".
+	//
+	// url_registry is written by the sitemap pass from the built site, so it
+	// is the site's own record of what exists at what address. Reading it
+	// here means a new section is retrievable the day it is published,
+	// without anyone remembering to add a case to a switch.
+	if rr, err := db.Query(`SELECT source_path, url FROM twoai_url_registry
+		WHERE COALESCE(source_path,'') <> '' AND last_seen_at > now() - interval '7 days'`); err == nil {
+		for rr.Next() {
+			var sp, u string
+			if rr.Scan(&sp, &u) != nil {
+				continue
+			}
+			// One source file can render many pages (the glossary renders 523).
+			// Only a file that renders exactly one page can be resolved this
+			// way; multi-page files are already split by their own factory.
+			if prev, seen := idx["src:"+sp]; seen {
+				if prev != u {
+					idx["src:"+sp] = "" // ambiguous, leave it to the switch
+				}
+				continue
+			}
+			idx["src:"+sp] = u
+		}
+		rr.Close()
+	}
 	return idx, nodes
+}
+
+// Hub h1s, verified against the built pages.
+var twoaiHubTitles = map[string]string{
+	"research": "AI Research Library",
 }
 
 // twoaiDocURL resolves ONE document to its page URL. Empty means the document
@@ -357,6 +397,11 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 		}
 	}
 	if u, found := idx["tax:"+name]; found {
+		return u
+	}
+	// The site's own sitemap record, which covers every factory rather than
+	// the thirteen prefixes this switch happens to name.
+	if u, found := idx["src:"+path]; found && u != "" {
 		return u
 	}
 
@@ -413,6 +458,26 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 		return base + "/skills/" + strings.TrimPrefix(name, "occupation-") + "/"
 	case "benchmarks":
 		return base + "/benchmarks/"
+	// Factories added after this switch was first written. Each verified
+	// against the live site before being added here rather than inferred
+	// from the folder name: /ai-news/incident/1108/ and
+	// /ai-ecosystem/technology-and-core-infrastructure/0118f362/ both
+	// answer 200.
+	case "news":
+		if strings.HasPrefix(name, "incident-") {
+			return base + "/ai-news/incident/" + strings.TrimPrefix(name, "incident-") + "/"
+		}
+		return ""
+	case "tech", "models", "observatory", "grid":
+		// These render as uid children of an ecosystem section, and the
+		// taxonomy lookup above resolves them when a taxonomy row exists.
+		// This is the fallback for a document whose section has not been
+		// given a taxonomy row yet, so a new section is retrievable on the
+		// day it publishes rather than whenever someone notices.
+		if uid, ok := doc["uid"].(string); ok && uid != "" {
+			return base + "/ai-ecosystem/technology-and-core-infrastructure/" + uid + "/"
+		}
+		return ""
 	case "week":
 		return base + "/this-week-in-ai/" + name + "/"
 	case "static":
@@ -489,7 +554,7 @@ func twoaiBundleItems(path string, doc map[string]any) []map[string]any {
 // twoaiDocTitle finds the human name of a page, checking where each factory
 // actually puts it. Returns empty when there is none, which is a reason to skip
 // the document rather than to invent a label.
-func twoaiDocTitle(doc map[string]any) string {
+func twoaiDocTitle(path string, doc map[string]any) string {
 	for _, k := range []string{"name", "title", "label", "term", "case_name", "heading"} {
 		if s, ok := doc[k].(string); ok && len(strings.TrimSpace(s)) > 1 {
 			return strings.TrimSpace(s)
@@ -504,6 +569,11 @@ func twoaiDocTitle(doc map[string]any) string {
 	for _, nest := range []string{
 		"company", "person", "tool", "sec", "topic", "item", "week",
 		"server", "paper", "case", "profile", "bench", "occupation", "hub",
+		// "builder" is the data-centre operator documents, 85 of which had
+		// no title at all and were therefore dropped before they could be
+		// retrieved. Checked against the documents, as the note above
+		// insists, not guessed.
+		"builder", "operator", "facility", "incident",
 	} {
 		if m, ok := doc[nest].(map[string]any); ok {
 			for _, k := range []string{"name", "title", "label", "term"} {
@@ -511,6 +581,20 @@ func twoaiDocTitle(doc map[string]any) string {
 					return strings.TrimSpace(s)
 				}
 			}
+		}
+	}
+	// HUB DOCUMENTS. A citation reading "research/index.json" went out in a
+	// live answer on 2026-08-31: the hub file carries counts and lists but no
+	// name, so it had no title, and an older run had embedded it under its
+	// filename. The vector id is md5(path#chunk), so giving the document a
+	// real title overwrites that stale vector on the next push rather than
+	// leaving it to a cleanup that can only see what it recorded pushing.
+	//
+	// Titles are taken from the page's own h1, checked against the built site,
+	// not invented here: /research/ renders "AI Research Library".
+	if strings.HasSuffix(path, "/index.json") {
+		if t, ok := twoaiHubTitles[strings.TrimSuffix(path, "/index.json")]; ok {
+			return t
 		}
 	}
 	return ""
@@ -607,6 +691,7 @@ func twoaiEmbedRun(db *sql.DB) error {
 	}
 	var want []chunkRow
 	skipped := 0
+	skipWhy := map[string]int{}
 
 	// twoaiSubject pulls the one sentence that says what a page is ABOUT, from
 	// wherever the factory puts it. Prefixed to every chunk of that page.
@@ -737,14 +822,23 @@ func twoaiEmbedRun(db *sql.DB) error {
 		// "company", weekly digests use "label", and several factories use
 		// "sec" or "topic". Checked in order, and a document that still has no
 		// human title is skipped rather than cited by filename.
-		title := twoaiDocTitle(doc)
+		// A DROPPED DOCUMENT MUST SAY SO BY NAME. skipped_docs was a bare
+		// count, so 183 documents sat outside the assistant's reach with
+		// nothing in the log to say which or why: 85 data-centre children
+		// with no title, 28 caselaw pages and 12 incident pages whose path
+		// prefix this resolver had never been taught. Stephen found it by
+		// asking whether everything on the site was reachable. A count
+		// cannot be acted on; a prefix and a reason can.
+		title := twoaiDocTitle(path, doc)
 		if title == "" {
 			skipped++
+			skipWhy["no title: "+path[:strings.Index(path, "/")]]++
 			continue
 		}
 		url := twoaiDocURL(path, doc, idx)
 		if url == "" {
 			skipped++
+			skipWhy["no url: "+path[:strings.Index(path, "/")]]++
 			continue
 		}
 		emit(path, url, title, kind, doc, 0)
@@ -911,6 +1005,14 @@ func twoaiEmbedRun(db *sql.DB) error {
 	}
 	wg.Wait()
 
+	if len(skipWhy) > 0 {
+		reasons := make([]string, 0, len(skipWhy))
+		for k, v := range skipWhy {
+			reasons = append(reasons, fmt.Sprintf("%s x%d", k, v))
+		}
+		sort.Strings(reasons)
+		fmt.Printf("twoai_embed: NOT RETRIEVABLE, %s\n", strings.Join(reasons, "; "))
+	}
 	fmt.Printf("twoai_embed: chunks=%d changed=%d stored=%d failed=%d skipped_docs=%d removed=%d model=%s\n",
 		len(want), len(todo), stored, failed, skipped, removed, twoaiEmbedModel)
 	return nil
