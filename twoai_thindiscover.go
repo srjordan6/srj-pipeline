@@ -273,7 +273,13 @@ func twoaiThinDiscover(db *sql.DB) {
 			who = twoaiRegistrableHost(j.site)
 		}
 		q := strings.TrimSpace(who + " " + j.name + " " + j.city + " " + j.state + " data center")
-		time.Sleep(1200 * time.Millisecond)
+		// Firecrawl's free plan allows about ten requests a minute and the
+		// first run spent five of them hitting 429 in a row: "Consumed
+		// (req/min): 11, Remaining: 0". 1.2s between calls is 50 a minute.
+		// Seven seconds keeps us under the ceiling with room to spare, and a
+		// stage that finishes forty rows in five minutes on a daily cron is
+		// not in a hurry.
+		time.Sleep(7 * time.Second)
 		hits, err := twoaiSearchWeb(client, q)
 		if err != nil {
 			failed++
