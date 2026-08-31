@@ -74,6 +74,7 @@ func twoaiThinPages(db *sql.DB) {
 	twoaiThinDetect(db)
 	twoaiThinFillMCP(db)
 	twoaiThinFillCompany(db)
+	twoaiThinFillFacilities(db)
 	for _, a := range thinAdapters {
 		var last sql.NullString
 		db.QueryRow(`SELECT max(last_seen)::text FROM twoai_dc_facilities WHERE src=$1`, a.src).Scan(&last)
