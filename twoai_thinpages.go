@@ -122,6 +122,9 @@ func twoaiThinPages(db *sql.DB) {
 		}
 		fmt.Printf("thinpages: pass %d\n", pass)
 		twoaiThinDetect(db)
+		// Discovery runs FIRST, so a row that gains a real facility URL is
+		// filled by the reader in the same pass rather than waiting a day.
+		twoaiThinDiscover(db)
 		twoaiThinFillMCP(db)
 		twoaiThinFillCompany(db)
 		twoaiThinFillFacilities(db)
