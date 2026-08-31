@@ -127,6 +127,9 @@ func twoaiThinPages(db *sql.DB) {
 		twoaiThinDiscover(db)
 		twoaiThinFillMCP(db)
 		twoaiThinFillCompany(db)
+		// After the company's own site has been tried, because a fact the
+		// company publishes about itself outranks a third-party record of it.
+		twoaiThinFillWikidata(db)
 		twoaiThinFillFacilities(db)
 		twoaiThinAdapters(db)
 		twoaiThinSense(db)
