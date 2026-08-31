@@ -41,7 +41,23 @@ var (
 	auditLinkRe   = regexp.MustCompile(`(?is)<a[^>]+href="(/[^"#]*)`)
 	auditLDRe     = regexp.MustCompile(`(?is)<script[^>]+application/ld\+json[^>]*>(.*?)</script>`)
 	auditTypeRe   = regexp.MustCompile(`"@type"\s*:\s*"([A-Za-z]+)"`)
-	auditDateRe   = regexp.MustCompile(`(?i)(Last verified|Last checked|Last harvested|Last reviewed|Generated|Updated|Retrieved)[:\s]`)
+	// THE WORD LIST DECIDED 437 PAGES WERE UNDATED AND IT WAS WRONG ABOUT
+	// MOST OF THEM. Lawsuit pages render "Filed 2026-08-14 · Verified
+	// 2026-08-31" in plain sight, and the audit counted all 92 as carrying no
+	// date, because the list held "Last verified" but not a bare "Verified".
+	// A stamp a reader can see is a stamp, whatever preposition precedes it.
+	//
+	// So the test is now the SHAPE the standing directive actually asks for:
+	// a date, next to a word that says what the date means. Written, Filed and
+	// Decided count, because those are the stamps the case and news factories
+	// emit and each one tells a reader how fresh the page is.
+	auditDateLbl = `(?i)\b(last verified|last checked|last harvested|last reviewed|generated|updated|retrieved|verified|written|filed|decided|published|reviewed|compiled)\b[:\s]+`
+	auditDateISO = `\d{4}-\d{2}-\d{2}`
+	// The news factory stamps "compiled Sun, 31 Aug 2026 UTC", so a rule that
+	// only accepted ISO would have kept calling 262 news pages undated after
+	// I had already "fixed" the word list. Both forms count.
+	auditDateLong = `(?:[A-Za-z]{3},\s*)?\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}`
+	auditDateRe   = regexp.MustCompile(auditDateLbl + `(?:` + auditDateISO + `|` + auditDateLong + `)`)
 	auditWS       = regexp.MustCompile(`\s+`)
 )
 
