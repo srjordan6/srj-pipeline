@@ -7537,6 +7537,17 @@ func twoaiCompliance(db *sql.DB, today string, upsert func(path, kind string, v 
 		if canon != "" {
 			doc["canonical"] = canon
 		}
+		// CLOSE ANY ANCHOR THE AUTHOR LEFT OPEN. This builder copies HTML it
+		// does not write, and on 2026-08-31 a single
+		// <a href="...">EDM Council</li> with no closing tag left the anchor
+		// open for the rest of the DCAM page, so every paragraph after it
+		// rendered in link colour. Sixty of sixty-five documents carried the
+		// same fault in three shapes, closed by </li>, </p> or </h3>.
+		// Repairing it in SQL fixed what was published; repairing it here
+		// means the next author cannot reintroduce it.
+		if h, ok := doc["body_html"].(string); ok && h != "" {
+			doc["body_html"] = closeOpenAnchors(h)
+		}
 		all = append(all, doc)
 	}
 	rows.Close()

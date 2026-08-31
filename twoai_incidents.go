@@ -281,6 +281,18 @@ func twoaiIncidentFetchText(u string) (string, error) {
 	return txt, nil
 }
 
+// closeOpenAnchors repairs an <a> that an author closed with the wrong tag.
+//
+// The rule is narrow on purpose: an anchor whose text runs straight into a
+// BLOCK closing tag was never closed, because valid markup would have put
+// </a> first. Anything else is left exactly as written. It is a repair, not a
+// sanitiser, and it must never rewrite HTML that is already correct.
+func closeOpenAnchors(h string) string {
+	return anchorLeakRe.ReplaceAllString(h, "$1$2</a>$3")
+}
+
+var anchorLeakRe = regexp.MustCompile(`(?is)(<a [^>]*>)([^<]*)(</(?:li|p|td|th|h[1-6]|div|ul|ol|blockquote)>)`)
+
 // A PAGE PER INCIDENT. Stephen, 2026-08-31: a full page describing the
 // report, with the link to the publisher only at the very bottom, so the
 // reader is reading our content the whole way down.

@@ -91,6 +91,7 @@ func thinBudget(name string, def int) int {
 }
 
 func twoaiThinPages(db *sql.DB) {
+	thinRunStart = time.Now()
 	twoaiThinEnsureTables(db)
 	twoaiThinCompanyProfiles(db)
 	twoaiThinAudit(db)
@@ -195,10 +196,26 @@ func thinReport(db *sql.DB) {
 			db.QueryRow(`SELECT last_error FROM twoai_thin_queue
 				WHERE kind=$1 AND attempts >= 3 AND last_error <> ''
 				GROUP BY last_error ORDER BY count(*) DESC LIMIT 1`, kind).Scan(&reason)
-			line := fmt.Sprintf("thinpages: queue %s: %d remaining (%d never tried, %d need data this cron cannot fetch",
-				kind, total, untried, exhausted)
-			if reason != "" {
-				line += ": " + reason
+			// The three numbers must add up to something a reader can act on.
+			// The old line reported "0 need data this cron cannot fetch"
+			// beside 257 remaining rows, which was true and useless: they
+			// were not exhausted, they had simply been tried once and would
+			// be tried again. Say which is which.
+			var lastErr string
+			db.QueryRow(`SELECT last_error FROM twoai_thin_queue
+				WHERE kind=$1 AND attempts > 0 AND attempts < 3 AND last_error <> ''
+				GROUP BY last_error ORDER BY count(*) DESC LIMIT 1`, kind).Scan(&lastErr)
+			retrying := total - untried - exhausted
+			line := fmt.Sprintf("thinpages: queue %s: %d remaining (%d never tried, %d will retry next run",
+				kind, total, untried, retrying)
+			if lastErr != "" {
+				line += ", commonest failure: " + lastErr
+			}
+			if exhausted > 0 {
+				line += fmt.Sprintf("; %d gave up after 3 runs", exhausted)
+				if reason != "" {
+					line += ": " + reason
+				}
 			}
 			fmt.Println(line + ")")
 		}
@@ -364,17 +381,30 @@ func twoaiThinDetect(db *sql.DB) {
 	}
 }
 
-// Rows the fillers may work on: never more than three attempts, and a week
-// between attempts, so a dead registry entry costs three requests in total.
+// thinRunStart is set once at the top of every run. A row is due when it has
+// not been attempted SINCE THIS RUN BEGAN, which is the fix for the failure
+// Stephen caught on 2026-08-31: the window was a fixed two days, so rows
+// attempted earlier the same day were not due, every filler received an empty
+// list and returned silently, the pass loop saw nothing change and stopped
+// with 489 rows still in the queue. The log showed no filler line at all,
+// which is what an empty due list looks like from the outside.
+//
+// Anchoring on the run instead means every row gets exactly one attempt per
+// run: a new run always retries everything, and later passes within the same
+// run skip what has already been tried, so the loop still terminates. attempts
+// < 3 still retires a row that has failed on three separate runs, because a
+// site that has refused three times on three different days is telling us
+// something.
+var thinRunStart time.Time
+
 func thinDue(db *sql.DB, kind string, limit int) []thinCandidate {
-	// Never attempted comes first, then the retries. A week between retries
-	// is right for a site that was down; it must not delay a page that has
-	// never been read at all, which is what ORDER BY attempts already does,
-	// and the budget is now big enough that the whole queue is one pass.
+	if thinRunStart.IsZero() {
+		thinRunStart = time.Now()
+	}
 	rows, err := db.Query(`SELECT path, ref, source_url, reason FROM twoai_thin_queue
 		WHERE kind=$1 AND attempts < 3
-		  AND (last_attempt IS NULL OR last_attempt < now() - interval '2 days')
-		ORDER BY attempts, first_seen LIMIT $2`, kind, limit)
+		  AND (last_attempt IS NULL OR last_attempt < $3)
+		ORDER BY attempts, first_seen LIMIT $2`, kind, limit, thinRunStart)
 	if err != nil {
 		return nil
 	}

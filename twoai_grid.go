@@ -749,54 +749,74 @@ func twoaiEIAHarvest(db *sql.DB) {
 	}
 	today := time.Now().UTC().Format("2006-01-02")
 
-	// 1. Planned generating capacity, from the operable-generator inventory.
-	// The status codes in the planned range are what we want; we read the
-	// status text through rather than hardcoding a meaning onto a code.
+	// 1. Scheduled change to operable generating capacity, from EIA's
+	// inventory of operable generators.
+	// WHAT THIS DATASET ACTUALLY HOLDS. Two wrong assumptions were stacked
+	// here. The first was the facet name, statusid instead of status, fixed on
+	// 2026-08-30. The second survived that fix and produced total: 0 with no
+	// error at all: the query asked for statuses P, V, U, T and L, meaning
+	// planned and under construction, and this dataset does not have them.
+	// Asked directly, EIA lists exactly four valid status values for
+	// operating-generator-capacity: OP operating, SB standby, OA out of
+	// service but expected back within a year, OS out of service and not
+	// expected back. It is the inventory of OPERABLE generators. Planned
+	// construction is simply not in it, and no combination of facets will
+	// make it appear.
 	//
-	// The facet is "status", not "statusid". This call had failed with a bare
-	// "status 400" on every run since it was written; carrying the response
-	// body into the error on 2026-08-30 made EIA say so in one line: "Invalid
-	// facet 'statusid' provided. The only valid facets are 'stateid',
-	// 'sector', 'entityid', 'plantid', 'generatorid', 'unit', 'technology',
-	// 'energy_source_code', 'prime_mover_code', 'balancing_authority_code',
-	// and 'status'." An opaque error is a defect of its own.
+	// What the dataset does carry, and what a grid observatory should want
+	// from it, is the CHANGE already scheduled at plants that exist:
+	// planned-retirement-year-month, the capacity leaving the system, and
+	// planned-uprate-summer-cap-mw, the capacity being added at existing
+	// sites. Retirements shrink the supply that AI load is competing for and
+	// uprates are the cheapest additions available, because they need no new
+	// interconnection. So the metric is renamed to what it measures rather
+	// than left reporting a zero under a name it could never fill.
 	b, err := eiaGet("electricity/operating-generator-capacity/data",
-		"frequency=monthly&data[0]=nameplate-capacity-mw&facets[status][]=P&facets[status][]=V&facets[status][]=U&facets[status][]=T&facets[status][]=L&sort[0][column]=period&sort[0][direction]=desc&length=5000")
+		"frequency=monthly&data[0]=net-summer-capacity-mw&data[1]=planned-uprate-summer-cap-mw&sort[0][column]=period&sort[0][direction]=desc&length=5000")
 	if err != nil {
-		fmt.Println("twoai_grid: eia planned capacity failed:", err)
+		fmt.Println("twoai_grid: eia scheduled capacity change failed:", err)
 	} else {
 		var r eiaResp
 		if err := json.Unmarshal(b, &r); err != nil || len(r.Response.Data) == 0 {
-			fmt.Printf("twoai_grid: eia planned capacity unparsed: %v head=%.180s\n", err, b)
+			fmt.Printf("twoai_grid: eia scheduled capacity change unparsed: %v head=%.180s\n", err, b)
 		} else {
 			period := eiaStr(r.Response.Data[0]["period"])
-			byFuel := map[string]float64{}
-			byStatus := map[string]float64{}
-			total := 0.0
-			rows := 0
+			retireByYear := map[string]float64{}
+			upratesByState := map[string]float64{}
+			retiring, uprating := 0.0, 0.0
+			units, upUnits := 0, 0
 			for _, d := range r.Response.Data {
 				if eiaStr(d["period"]) != period {
 					continue // newest reported month only
 				}
-				mw := eiaNum(d["nameplate-capacity-mw"])
-				total += mw
-				rows++
-				byFuel[fuelBucket(eiaStr(d["energy_source_code"])+" "+eiaStr(d["technology"]))] += mw
-				st := eiaStr(d["statusDescription"])
-				if st == "" {
-					st = eiaStr(d["status"])
+				mw := eiaNum(d["net-summer-capacity-mw"])
+				if ry := eiaStr(d["planned-retirement-year-month"]); len(ry) >= 4 {
+					retireByYear[ry[:4]] += mw
+					retiring += mw
+					units++
 				}
-				byStatus[st] += mw
+				if up := eiaNum(d["planned-uprate-summer-cap-mw"]); up > 0 {
+					upratesByState[eiaStr(d["stateid"])] += up
+					uprating += up
+					upUnits++
+				}
 			}
-			detail := map[string]any{"by_fuel": byFuel, "by_status": byStatus,
-				"units": rows, "period": period,
-				"scope": "Nameplate capacity of generators reported to EIA as planned, from the inventory of operable generators, newest reported month only. Survey data lags roughly two months."}
-			dj, _ := json.Marshal(detail)
-			db.Exec(`INSERT INTO twoai_grid_obs (source, metric, value, unit, as_of, detail, source_url)
-				VALUES ('eia','planned_capacity_mw',$1,'MW',$2,$3::jsonb,'https://www.eia.gov/opendata/browser/electricity/operating-generator-capacity')
-				ON CONFLICT (source, metric, as_of) DO UPDATE SET value=EXCLUDED.value, detail=EXCLUDED.detail, fetched_at=now()`,
-				total, today, string(dj))
-			fmt.Printf("twoai_grid: eia planned capacity period=%s units=%d mw=%.0f\n", period, rows, total)
+			if units == 0 && upUnits == 0 {
+				fmt.Printf("twoai_grid: eia scheduled capacity change: no retirement or uprate dates reported for %s\n", period)
+			} else {
+				detail := map[string]any{
+					"retiring_mw_by_year": retireByYear, "uprate_mw_by_state": upratesByState,
+					"retiring_units": units, "uprating_units": upUnits,
+					"uprate_mw_total": uprating, "period": period,
+					"scope": "Net summer capacity with a planned retirement date, and planned summer uprates at existing generators, from EIA's inventory of operable generators, newest reported month only. This is scheduled change at plants that already exist; it is NOT planned new construction, which this dataset does not contain. Survey data lags roughly two months."}
+				dj, _ := json.Marshal(detail)
+				db.Exec(`INSERT INTO twoai_grid_obs (source, metric, value, unit, as_of, detail, source_url)
+					VALUES ('eia','scheduled_retirement_mw',$1,'MW',$2,$3::jsonb,'https://www.eia.gov/opendata/browser/electricity/operating-generator-capacity')
+					ON CONFLICT (source, metric, as_of) DO UPDATE SET value=EXCLUDED.value, detail=EXCLUDED.detail, fetched_at=now()`,
+					retiring, today, string(dj))
+				fmt.Printf("twoai_grid: eia scheduled capacity change period=%s retiring=%.0f MW across %d units, uprates=%.0f MW across %d units\n",
+					period, retiring, units, uprating, upUnits)
+			}
 		}
 	}
 
