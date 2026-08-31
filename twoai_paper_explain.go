@@ -130,18 +130,32 @@ func paperAbstract(db *sql.DB, title, doi string, allowAPI bool) (string, string
 			return strings.TrimSpace(a.String), "local"
 		}
 	}
+	// Titles are matched with punctuation and spacing stripped, because the
+	// mirror and the reading list disagree on colons, hyphens and case far
+	// more often than they disagree on the paper. Indexed on the same
+	// expression, so this stays a lookup rather than a scan of 618k rows.
 	if db.QueryRow(`SELECT abstract FROM twoai_works
-		WHERE lower(title)=lower($1) AND COALESCE(abstract,'')<>''
+		WHERE lower(regexp_replace(title, '[^a-zA-Z0-9]', '', 'g')) = lower(regexp_replace($1, '[^a-zA-Z0-9]', '', 'g'))
+		  AND COALESCE(abstract,'')<>''
 		ORDER BY COALESCE(cited_by,0) DESC LIMIT 1`, title).Scan(&a) == nil && a.Valid {
 		return strings.TrimSpace(a.String), "local"
 	}
 	if !allowAPI {
 		return "", ""
 	}
-	// OpenAlex title search, politely identified, abstract rebuilt from the
-	// inverted index they publish.
+	// OpenAlex title search, abstract rebuilt from the inverted index they
+	// publish. THE KEY MATTERS HERE TOO. OpenAlex went metered in February
+	// 2026: an anonymous call draws on a $0.10 daily allowance and a free key
+	// raises it to $1. The nightly works backfill spends the anonymous pot
+	// long before this stage runs, so every call from here was refused and
+	// paperAbstract returned nothing, which is why the log read
+	// written=0 local=0 api=0 skipped=12 on run after run. The backfill was
+	// given the key on 2026-08-30 and this call was missed.
 	u := "https://api.openalex.org/works?per-page=1&mailto=contact@theworldofai.org&filter=title.search:" +
 		url.QueryEscape(sanitizeSearch(title))
+	if k := os.Getenv("OPENALEX_API_KEY"); k != "" {
+		u += "&api_key=" + url.QueryEscape(k)
+	}
 	client := &http.Client{Timeout: 25 * time.Second}
 	resp, err := client.Get(u)
 	if err != nil {

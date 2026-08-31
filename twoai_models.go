@@ -249,6 +249,9 @@ func twoaiModelsFetch(db *sql.DB) {
 
 	// ---- Hugging Face: top models per pipeline tag, by all-time downloads.
 	for section, tags := range twoaiModelSections {
+		// Every model any of this section's tags listed on this run. Delisting
+		// is decided from this, once, after all the tags have run.
+		sectionSeen := map[string]bool{}
 		for _, tag := range tags {
 			url := "https://huggingface.co/api/models?pipeline_tag=" + tag + "&sort=downloads&direction=-1&limit=500"
 			if tag == "__slm__" {
@@ -293,16 +296,24 @@ func twoaiModelsFetch(db *sql.DB) {
 			if err != nil {
 				continue
 			}
-			// Replace only this tag's rows, keyed on the pipeline_tag we
-			// asked for, so one failed tag never wipes a healthy one.
-			// What was here before this run, so the log can report what CHANGED
-			// rather than how many rows we asked for. Every tag printed "50
-			// models" every day because 50 is the API limit, not a finding: the
-			// line reported the ceiling and looked identical forever whether the
-			// top fifty had churned completely or not moved at all.
+			// PRIOR IS THE SECTION, NOT THE TAG. The catalog is keyed on
+			// (source, ext_id, section) with no tag in it, so two tags feeding
+			// one section overwrite each other's pipeline_tag on every shared
+			// model. scientific-models runs |chemistry then |biology, they
+			// share 179 of their top 500, and each run those 179 were
+			// re-tagged by whichever query ran last. Both tags therefore
+			// reported exactly "179 new" every day, for ever, and the log line
+			// Stephen questioned was the two queries fighting over the same
+			// rows rather than either of them finding anything.
+			//
+			// Worse than the noise: 74 rows in that section sit delisted
+			// because each tag delisted the models the other tag owned. Prior
+			// and seen are now section-wide, so a model claimed by either
+			// query counts as present, and delisting happens once per section
+			// after every tag has run.
 			prior := map[string]bool{}
 			if pr, err := tx.Query(`SELECT ext_id FROM twoai_model_catalog
-				WHERE source='huggingface' AND section=$1 AND data->>'pipeline_tag'=$2 AND delisted_at IS NULL`, section, tag); err == nil {
+				WHERE source='huggingface' AND section=$1 AND delisted_at IS NULL`, section); err == nil {
 				for pr.Next() {
 					var id string
 					if pr.Scan(&id) == nil {
@@ -345,35 +356,50 @@ func twoaiModelsFetch(db *sql.DB) {
 					}
 				}
 			}
-			// Rows this run did not see leave the live set but keep their data.
-			if len(seenNow) > 0 {
-				gone := make([]string, 0, 4)
-				for id := range prior {
-					if !seenNow[id] {
-						gone = append(gone, id)
-					}
-				}
-				if len(gone) > 0 {
-					tx.Exec(`UPDATE twoai_model_catalog SET delisted_at=now()
-						WHERE source='huggingface' AND section=$1 AND data->>'pipeline_tag'=$2
-						  AND delisted_at IS NULL AND ext_id = ANY($3)`, section, tag, pq.Array(gone))
-				}
+			// Delisting waits until every tag in the section has run, so one
+			// query can never retire a model another query still lists.
+			for id := range seenNow {
+				sectionSeen[id] = true
 			}
 			if err := tx.Commit(); err == nil {
-				dropped := 0
-				for id := range prior {
-					if !seenNow[id] {
-						dropped++
-					}
-				}
 				// Silent when the top N has not moved, which on all-time-download
 				// rankings is most days. A line now means something happened.
-				if added > 0 || dropped > 0 || len(prior) == 0 {
-					fmt.Printf("twoai_models: hf %s (%s) %d models, %d new, %d dropped\n",
-						tag, section, n, added, dropped)
+				if added > 0 || len(prior) == 0 {
+					fmt.Printf("twoai_models: hf %s (%s) %d models, %d new to the section\n",
+						tag, section, n, added)
 				}
 			}
 			time.Sleep(500 * time.Millisecond)
+		}
+
+		// One delist pass for the whole section, now that every tag has had
+		// its say. A model drops out only when NO query in the section still
+		// lists it, which is the only reading of "gone" that is true. The
+		// guard on an empty set matters: if every tag failed to fetch, this
+		// must not retire the section.
+		if len(sectionSeen) > 0 {
+			ids := make([]string, 0, len(sectionSeen))
+			for id := range sectionSeen {
+				ids = append(ids, id)
+			}
+			var dropped int64
+			if res, err := db.Exec(`UPDATE twoai_model_catalog SET delisted_at=now()
+				WHERE source='huggingface' AND section=$1 AND delisted_at IS NULL
+				  AND NOT (ext_id = ANY($2))`, section, pq.Array(ids)); err == nil {
+				dropped, _ = res.RowsAffected()
+			}
+			// Anything a tag listed again is live again, which is how the 74
+			// rows wrongly retired by the old per-tag delisting come back.
+			var restored int64
+			if res, err := db.Exec(`UPDATE twoai_model_catalog SET delisted_at=NULL
+				WHERE source='huggingface' AND section=$1 AND delisted_at IS NOT NULL
+				  AND ext_id = ANY($2)`, section, pq.Array(ids)); err == nil {
+				restored, _ = res.RowsAffected()
+			}
+			if dropped > 0 || restored > 0 {
+				fmt.Printf("twoai_models: hf section %s: %d live, %d dropped, %d restored\n",
+					section, len(sectionSeen), dropped, restored)
+			}
 		}
 	}
 }
