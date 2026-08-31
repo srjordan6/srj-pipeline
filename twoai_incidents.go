@@ -28,6 +28,9 @@ import (
 	"database/sql"
 	"encoding/xml"
 	"fmt"
+	"html"
+	"io"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -121,6 +124,13 @@ func twoaiIncidentsHarvest(db *sql.DB) {
 		len(f.Items), stored, skipped, total)
 }
 
+type incidentReport struct {
+	Title     string `json:"title"`
+	URL       string `json:"url"`
+	Domain    string `json:"domain"`
+	Published string `json:"published"`
+}
+
 type incidentOut struct {
 	IncidentID int    `json:"incident_id"`
 	Title      string `json:"title"`
@@ -128,6 +138,14 @@ type incidentOut struct {
 	Domain     string `json:"domain"`
 	Published  string `json:"published"`
 	CiteURL    string `json:"cite_url"`
+	// An incident is a story, not a link. These carry the same treatment the
+	// daily briefing gives a news story: an original summary written from the
+	// reporting, and every outlet that carried it.
+	Summary       string           `json:"summary,omitempty"`
+	SummaryDomain string           `json:"summary_domain,omitempty"`
+	SummaryURL    string           `json:"summary_url,omitempty"`
+	Reports       []incidentReport `json:"reports,omitempty"`
+	OutletCount   int              `json:"outlet_count"`
 }
 
 // twoaiIncidentsRecent returns the newest reports for the briefing, one per
@@ -162,5 +180,99 @@ func twoaiIncidentsRecent(db *sql.DB, n int) []incidentOut {
 	if len(out) > n {
 		out = out[:n]
 	}
+	twoaiIncidentsEnrich(db, out)
 	return out
+}
+
+// EVERY OUTLET, AND AN ORIGINAL SUMMARY. Stephen, 2026-08-30: we are just
+// doing links to pages, and the incidents need what the daily news gets.
+//
+// He is right, and the data was already there to do it. AIID catalogues an
+// incident once and links every report of it, so twoai_incidents holds
+// several rows per incident_id, and this section was rendering one row each
+// and discarding the rest. An incident is a story carried by several
+// outlets, exactly like a news story, and it gets the same treatment: a
+// summary written in our own words from the reporting, and every outlet
+// listed.
+//
+// The copyright line is unchanged and is the reason the summary is written
+// rather than copied. AIID's own write-ups are CC BY-SA and the publishers'
+// articles are theirs; we read the reporting, state the facts in our own
+// words, and link out. The summary is cached on the report URL in
+// pipeline.documents, the same store and the same summarizer the daily
+// briefing uses, so an incident is summarised once and never again.
+func twoaiIncidentsEnrich(db *sql.DB, out []incidentOut) {
+	for i := range out {
+		rows, err := db.Query(`SELECT title, url, domain, COALESCE(published::text,'')
+			FROM twoai_incidents WHERE incident_id=$1
+			ORDER BY published DESC NULLS LAST, report_id`, out[i].IncidentID)
+		if err != nil {
+			continue
+		}
+		domains := map[string]bool{}
+		for rows.Next() {
+			var r incidentReport
+			if rows.Scan(&r.Title, &r.URL, &r.Domain, &r.Published) != nil {
+				continue
+			}
+			out[i].Reports = append(out[i].Reports, r)
+			domains[r.Domain] = true
+		}
+		rows.Close()
+		out[i].OutletCount = len(domains)
+
+		// The summary comes from whichever report we can actually read.
+		// A cached summary is reused; a paywalled or unreadable report is
+		// skipped and the next one tried; if none can be read the entry
+		// still publishes with its links, which is what it does today.
+		for _, r := range out[i].Reports {
+			var cached string
+			db.QueryRow(`SELECT COALESCE(summary,'') FROM pipeline.documents WHERE url=$1`, r.URL).Scan(&cached)
+			if cached != "" {
+				out[i].Summary, out[i].SummaryDomain, out[i].SummaryURL = cached, r.Domain, r.URL
+				break
+			}
+			text, err := twoaiIncidentFetchText(r.URL)
+			if err != nil || len(text) < 600 {
+				continue
+			}
+			sum, err := anthropicSummarize(r.Title, text)
+			if err != nil || sum == "" {
+				continue
+			}
+			db.Exec(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, summary)
+				SELECT id, $1, md5($2), $2, $3, $4 FROM pipeline.sources WHERE key='aiid'
+				ON CONFLICT DO NOTHING`, fmt.Sprint("aiid:", out[i].IncidentID), r.URL, r.Title, sum)
+			db.Exec(`UPDATE pipeline.documents SET summary=$1 WHERE url=$2 AND COALESCE(summary,'')=''`, sum, r.URL)
+			out[i].Summary, out[i].SummaryDomain, out[i].SummaryURL = sum, r.Domain, r.URL
+			break
+		}
+	}
+}
+
+// Reads one report page as text. Publisher prose never leaves this function:
+// it goes to the summarizer and is discarded.
+func twoaiIncidentFetchText(u string) (string, error) {
+	client := &http.Client{Timeout: 25 * time.Second}
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("User-Agent", "theworldofai.org incident watch (contact: stephen@srjconsultingservices.com)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 3<<20))
+	if err != nil {
+		return "", err
+	}
+	page := regexp.MustCompile(`(?is)<(script|style|noscript|svg|nav|header|footer|aside)[^>]*>.*?</(script|style|noscript|svg|nav|header|footer|aside)>`).ReplaceAllString(string(b), " ")
+	txt := html.UnescapeString(regexp.MustCompile(`(?s)<[^>]+>`).ReplaceAllString(page, " "))
+	txt = strings.TrimSpace(regexp.MustCompile(`\s+`).ReplaceAllString(txt, " "))
+	if len(txt) > 20000 {
+		txt = txt[:20000]
+	}
+	return txt, nil
 }

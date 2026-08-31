@@ -1706,6 +1706,16 @@ func publishNews(db *sql.DB) error {
 		incidents = []incidentOut{}
 	}
 
+	// The big picture is the day in four headlines, and until now all four
+	// came from press coverage. What AI cost belongs in the same list as what
+	// AI did, so the newest incident joins them: Stephen, 2026-08-30, on the
+	// briefing rendering harms as a footnote of links. It is added rather
+	// than substituted, so the story headlines are never crowded out, and it
+	// is labelled so a reader knows which kind of item it is.
+	if len(incidents) > 0 && incidents[0].Title != "" {
+		big = append(big, "Logged harm: "+incidents[0].Title)
+	}
+
 	payload, _ := json.MarshalIndent(map[string]any{
 		"generated":   time.Now().UTC().Format(time.RFC3339),
 		"date":        time.Now().UTC().Format("2006-01-02"),
