@@ -147,9 +147,17 @@ func twoaiThinFillFacilities(db *sql.DB) {
 			profile["address"] = r.address
 		}
 		pj, _ := json.Marshal(profile)
+		// $3 IS A DECIMAL AND POSTGRES WAS INFERRING IT AS AN INTEGER. The
+		// comparison "$3 > 0" against an untyped 0 made the driver resolve the
+		// parameter to integer, so every facility that published a fractional
+		// capacity - 1.2 MW, 3.75 MW, 238.7 MW - failed on insert with
+		// "invalid input syntax for type integer" and was retired after three
+		// runs as unfillable. It was not unfillable. Those 46 pages published
+		// exactly what we asked for and we threw it away at the last step,
+		// then logged the loss as a property of their websites.
 		if _, err := db.Exec(`UPDATE twoai_dc_facilities
 			SET profile=$2::jsonb, status='enriched',
-			    critical_it_mw = CASE WHEN $3 > 0 THEN $3 ELSE critical_it_mw END,
+			    critical_it_mw = CASE WHEN $3::numeric > 0 THEN $3::numeric ELSE critical_it_mw END,
 			    last_seen=current_date
 			WHERE id=$1`, c.ref, string(pj), r.mw); err != nil {
 			thinAttempt(db, c.path, "db: "+err.Error())
