@@ -216,6 +216,19 @@ func twoaiThinFillFacilities(db *sql.DB) {
 // the campus, not to the one building whose page it happens to sit on.
 var tfCampusRe = regexp.MustCompile(`(?i)\b(campus|portfolio|market|metro|total capacity of the|across (our|the)|combined|region)\b`)
 
+// Phrases that pin a figure to ONE building, which beat the campus words when
+// both appear. Stephen pointed at the Dallas metro page, where all three
+// scopes sit within a few sentences of each other: "the Dallas-Fort Worth
+// data center market at 1,840 MW", "a substation with the ability to deliver
+// up to 100 MW", and "features 69,867 square feet of raised floor space,
+// 6.75 MW of IT load". Only the last is this building's number, and a campus
+// rule reading nearby lines would have thrown it away with the other two.
+//
+// "IT load", "critical load" and "raised floor" are what an operator writes
+// when describing the space a tenant actually rents. A substation rating is
+// what the campus can draw. The distinction is the whole point of the field.
+var tfFacilityRe = regexp.MustCompile(`(?i)\b(IT load|critical load|critical power|raised floor|white space|this facility|this building|the suite)\b`)
+
 // tfParse reads the stat block whichever way round the operator wrote it.
 func tfParse(page string) (tfResult, bool) {
 	var r tfResult
@@ -303,10 +316,10 @@ func tfParse(page string) (tfResult, bool) {
 	// market is kept, labelled as campus scope, and NOT written to
 	// critical_it_mw. The reader gets a true sentence about the campus
 	// instead of a false one about the building.
-	if r.mw > 0 && tfCampusRe.MatchString(r.mwLine) {
+	if r.mw > 0 && tfCampusRe.MatchString(r.mwLine) && !tfFacilityRe.MatchString(r.mwLine) {
 		r.campusMW, r.mw = r.mw, 0
 	}
-	if r.sqft > 0 && tfCampusRe.MatchString(r.sqftLine) {
+	if r.sqft > 0 && tfCampusRe.MatchString(r.sqftLine) && !tfFacilityRe.MatchString(r.sqftLine) {
 		r.campusSqft, r.sqft = r.sqft, 0
 	}
 	// Sanity: a campus under a tenth of a megawatt or over a gigawatt, or a
