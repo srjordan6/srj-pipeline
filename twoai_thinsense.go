@@ -18,6 +18,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"fmt"
 	"os"
 	"time"
@@ -93,6 +94,31 @@ func twoaiThinSensePages(db *sql.DB) {
 			WHERE (data ? 'uid'  AND $1 LIKE '%/' || (data->>'uid')  || '/')
 			   OR (data ? 'slug' AND $1 LIKE '%/' || (data->>'slug') || '/')
 			ORDER BY length(data::text) DESC LIMIT 1`, c.ref).Scan(&path, &data)
+		if err != nil {
+			// THE DATA IS ONE LEVEL DOWN. The query above matches a URL
+			// against the uid or slug of a TOP-LEVEL page row, and several
+			// factories do not write one row per page: the glossary is 552
+			// terms inside a single glossary.json, the lawsuit tracker is
+			// every case inside one lawsuits.json, and the news items live in
+			// archive.json. Nothing at the top level carries their slug, so
+			// the lookup could never match however much data we hold.
+			//
+			// Stephen sent a page of sources for one of them, an enacted
+			// California bill, to make the point that the material plainly
+			// exists. It does, and we already had it: the same bill appears
+			// in three of our own files. The page was not undeserving of a
+			// reading, it was unreachable by a resolver that only looked at
+			// the outer object.
+			//
+			// twoaiBundleItems already splits these bundles for the embedding
+			// index, which is where the per-item URLs come from in the first
+			// place. Reusing it here means the reading is written against the
+			// ONE term or case the page shows, rather than against a 552-term
+			// file, which is both correct and far cheaper.
+			if bp, bd := thinBundleItem(db, c.ref); bp != "" {
+				path, data, err = bp, bd, nil
+			}
+		}
 		if err != nil {
 			// The rest are entity pages: twoai_entities holds a uid, a name
 			// and aliases, and nothing else. There is no source data to
@@ -229,4 +255,43 @@ func twoaiThinSense(db *sql.DB) {
 	}
 	fmt.Printf("thinpages: sense: facility readings written=%d cached=%d failed=%d of %d enriched\n",
 		written, cached, failed, len(facs))
+}
+
+// thinBundleItem finds the one item inside a bundle file that a URL points at,
+// and returns a synthetic page path and that item's own JSON.
+//
+// The path it returns names the item, not the file: "glossary/glossary.json
+// #/ai-glossary/rag-triad/" rather than "glossary/glossary.json". Readings are
+// keyed on that path, so without the suffix all 552 glossary terms would share
+// one cache key and overwrite each other's reading on every run.
+func thinBundleItem(db *sql.DB, url string) (string, string) {
+	rows, err := db.Query(`SELECT path, data::text FROM twoai_pages
+		WHERE path IN ('glossary/glossary.json','lawsuits/lawsuits.json',
+		               'news/archive.json','news/vendor.json')`)
+	if err != nil {
+		return "", ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p, raw string
+		if rows.Scan(&p, &raw) != nil {
+			continue
+		}
+		var doc map[string]any
+		if json.Unmarshal([]byte(raw), &doc) != nil {
+			continue
+		}
+		for _, it := range twoaiBundleItems(p, doc) {
+			u, _ := it["__url"].(string)
+			if u != url {
+				continue
+			}
+			j, err := json.Marshal(it["item"])
+			if err != nil {
+				return "", ""
+			}
+			return p + "#" + strings.TrimPrefix(url, "https://theworldofai.org"), string(j)
+		}
+	}
+	return "", ""
 }
