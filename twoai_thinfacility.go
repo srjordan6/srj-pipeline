@@ -101,15 +101,29 @@ func twoaiThinFillFacilities(db *sql.DB) {
 			thinAttempt(db, c.path, "page publishes no capacity or floor area we can read")
 			continue
 		}
+		// Most OSM rows carry no operator tag, and a facility page that says
+		// "published by  on its own facility page" is worse than one that
+		// names nobody. The host of the operator's own page is a fact we
+		// have, so it becomes the publisher when the tag is missing: a page
+		// on datafoundry.com is published by datafoundry.com, which is true
+		// without claiming a corporate name the data never gave us.
 		var operator string
 		db.QueryRow(`SELECT COALESCE(operator,'') FROM twoai_dc_facilities WHERE id=$1`, c.ref).Scan(&operator)
+		publisher := operator
+		if publisher == "" {
+			if m := regexp.MustCompile(`^https?://(?:www\.)?([^/]+)`).FindStringSubmatch(c.source); m != nil {
+				publisher = m[1]
+			}
+		}
 		profile := map[string]any{
-			"operator": operator,
 			"source": map[string]any{
-				"publisher": operator, "page": c.source,
+				"publisher": publisher, "page": c.source,
 				"retrieved": time.Now().UTC().Format("2006-01-02"),
 				"basis":     "Operator facility page; structured facts only, no operator prose reproduced.",
 			},
+		}
+		if operator != "" {
+			profile["operator"] = operator
 		}
 		if r.mw > 0 {
 			profile["it_capacity_mw"] = r.mw
