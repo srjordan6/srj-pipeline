@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -76,6 +77,7 @@ func twoaiThinAudit(db *sql.DB) {
 		status, words, h2, qh2  int
 		faq, dated              bool
 		links                   int
+		targets                 []string // internal hrefs this page points at
 	}
 	results := make(chan row, len(urls))
 	var wg sync.WaitGroup
@@ -140,13 +142,24 @@ func twoaiThinAudit(db *sql.DB) {
 				links[m[1]] = true
 			}
 			r.links = len(links)
+			for t := range links {
+				r.targets = append(r.targets, t)
+			}
 			results <- r
 		}(u)
 	}
 	wg.Wait()
 	close(results)
 	n, thin, failed := 0, 0, 0
+	// Where each internal link points, and one page that points there, so a
+	// broken target names a page to fix rather than a bare path.
+	linkFrom := map[string]string{}
 	for r := range results {
+		for _, t := range r.targets {
+			if _, seen := linkFrom[t]; !seen {
+				linkFrom[t] = r.url
+			}
+		}
 		if r.status != 200 {
 			failed++
 		} else if r.words < thinAuditWords {
@@ -166,6 +179,114 @@ func twoaiThinAudit(db *sql.DB) {
 	// A URL that left the sitemap leaves the audit; the queue follows.
 	db.Exec(`DELETE FROM twoai_page_audit WHERE audited_on < current_date - 3`)
 	fmt.Printf("thinpages: audit: %d urls, %d recorded, %d under %d words, %d not 200\n", len(urls), n, thin, thinAuditWords, failed)
+	twoaiThinLinkAudit(db, client, urls, linkFrom)
+}
+
+// WHERE THE LINKS ACTUALLY GO. Added 2026-08-31, after Stephen's crawler
+// reported /industries/ returning 404 from the case studies page and a
+// one-off sweep of the build found 68 more of the same kind.
+//
+// The page audit above measures pages that EXIST. This measures links to
+// pages that do not, which is a different fault and invisible to the other
+// check: a page can be perfect and still send every reader to a dead end.
+//
+// Only targets the page audit has not already proved are fetched. Everything
+// in the sitemap was just crawled and answered 200, so a link there needs no
+// second request; what is left is a few hundred paths, and each is asked for
+// once. A redirect is recorded, not counted as broken, because a 301 to a
+// live page is a working link that costs a hop, and knowing which links cost
+// a hop is worth having separately from knowing which are dead.
+func twoaiThinLinkAudit(db *sql.DB, client *http.Client, audited []string, linkFrom map[string]string) {
+	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_link_audit (
+		target text PRIMARY KEY,
+		status int NOT NULL,
+		final_status int NOT NULL DEFAULT 0,
+		final_url text NOT NULL DEFAULT '',
+		linked_from text NOT NULL DEFAULT '',
+		checked_on date NOT NULL DEFAULT current_date)`)
+
+	known := map[string]bool{}
+	for _, u := range audited {
+		known[strings.TrimPrefix(u, "https://theworldofai.org")] = true
+	}
+	var todo []string
+	for t := range linkFrom {
+		if !known[t] {
+			todo = append(todo, t)
+		}
+	}
+	if len(todo) == 0 {
+		return
+	}
+	sort.Strings(todo)
+
+	type res struct {
+		target, finalURL, from string
+		status, final          int
+	}
+	out := make(chan res, len(todo))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for _, t := range todo {
+		wg.Add(1)
+		go func(t string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			r := res{target: t, from: linkFrom[t]}
+			// The first response tells us whether the link is direct, a
+			// redirect, or dead; the followed one tells us where it lands.
+			noRedirect := &http.Client{
+				Timeout: 20 * time.Second,
+				CheckRedirect: func(*http.Request, []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+			}
+			req, _ := http.NewRequest("GET", "https://theworldofai.org"+t, nil)
+			req.Header.Set("User-Agent", "theworldofai.org link audit (contact: stephen@srjconsultingservices.com)")
+			if resp, err := noRedirect.Do(req); err == nil {
+				r.status = resp.StatusCode
+				r.finalURL = resp.Header.Get("Location")
+				resp.Body.Close()
+			}
+			if r.status >= 300 && r.status < 400 {
+				freq, _ := http.NewRequest("GET", "https://theworldofai.org"+t, nil)
+				freq.Header.Set("User-Agent", "theworldofai.org link audit (contact: stephen@srjconsultingservices.com)")
+				if fresp, err := client.Do(freq); err == nil {
+					r.final = fresp.StatusCode
+					r.finalURL = fresp.Request.URL.String()
+					fresp.Body.Close()
+				}
+			}
+			out <- r
+		}(t)
+	}
+	wg.Wait()
+	close(out)
+
+	broken, hops := 0, 0
+	var worst []string
+	for r := range out {
+		if r.status == 0 || r.status >= 400 || (r.final >= 400) {
+			broken++
+			if len(worst) < 10 {
+				worst = append(worst, fmt.Sprintf("%s (from %s)", r.target, r.from))
+			}
+		} else if r.status >= 300 && r.status < 400 {
+			hops++
+		}
+		db.Exec(`INSERT INTO twoai_link_audit (target, status, final_status, final_url, linked_from, checked_on)
+			VALUES ($1,$2,$3,$4,$5,current_date)
+			ON CONFLICT (target) DO UPDATE SET status=EXCLUDED.status, final_status=EXCLUDED.final_status,
+				final_url=EXCLUDED.final_url, linked_from=EXCLUDED.linked_from, checked_on=current_date`,
+			r.target, r.status, r.final, r.finalURL, r.from)
+	}
+	db.Exec(`DELETE FROM twoai_link_audit WHERE checked_on < current_date - 7`)
+	fmt.Printf("thinpages: link audit: %d off-sitemap targets checked, %d broken, %d redirect (a working link that costs a hop)\n",
+		len(todo), broken, hops)
+	for _, w := range worst {
+		fmt.Println("thinpages: broken link ->", w)
+	}
 }
 
 func thinSitemapLocs(client *http.Client, u string) []string {
