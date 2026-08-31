@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lib/pq"
@@ -2340,7 +2341,41 @@ func putToRepoTok(tok, repo, path, message string, payload []byte) error {
 // srj_intel_log. COURTLISTENER_TOKEN is required for docket-detail reads
 // (search works anonymously); without it the refresh job logs and moves on.
 
+// THE STAGE-DEADLINE BURN, caught 2026-08-30. Each clGet retried a 429 three
+// times, honouring Retry-After up to ninety seconds, so one call could sleep
+// four and a half minutes and two calls could exceed the stage's whole
+// deadline. That is what happened: twoai_recap was KILLED after 8m and intel
+// after 10m, eighteen minutes of cron spent sleeping, with nothing harvested.
+//
+// Retrying is right for a brief throttle and wrong for a spent quota, and the
+// difference is knowable: once CourtListener has told us to wait, every other
+// call in this run will be told the same. The first long wait therefore sets
+// a latch, and every later call fails immediately instead of sleeping. The
+// stages already stop cleanly on a rate-limited error, so they now stop in
+// seconds and leave their unscanned work at the front of tomorrow's rotation.
+var (
+	clThrottleMu     sync.Mutex
+	clThrottledUntil time.Time
+)
+
+func clThrottled() bool {
+	clThrottleMu.Lock()
+	defer clThrottleMu.Unlock()
+	return time.Now().Before(clThrottledUntil)
+}
+
+func clSetThrottled(d time.Duration) {
+	clThrottleMu.Lock()
+	defer clThrottleMu.Unlock()
+	if until := time.Now().Add(d); until.After(clThrottledUntil) {
+		clThrottledUntil = until
+	}
+}
+
 func clGet(path string, params map[string]string, out any) error {
+	if clThrottled() {
+		return fmt.Errorf("courtlistener rate limited: %s (quota window still open, not waiting)", path)
+	}
 	req, err := http.NewRequest("GET", "https://www.courtlistener.com/api/rest/v4"+path, nil)
 	if err != nil {
 		return err
@@ -2376,6 +2411,12 @@ func clGet(path string, params map[string]string, out any) error {
 				}
 			}
 			resp.Body.Close()
+			// A wait this long means the quota window, not a burst. Latch it
+			// so the rest of the run fails fast rather than sleeping.
+			if wait >= 30*time.Second {
+				clSetThrottled(wait)
+				return fmt.Errorf("courtlistener rate limited: %s (waiting %s would exceed the stage budget)", path, wait)
+			}
 			time.Sleep(wait)
 			continue
 		}
@@ -2385,6 +2426,7 @@ func clGet(path string, params map[string]string, out any) error {
 		}
 		return json.NewDecoder(resp.Body).Decode(out)
 	}
+	clSetThrottled(2 * time.Minute)
 	return fmt.Errorf("courtlistener rate limited: %s", path)
 }
 

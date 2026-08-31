@@ -383,10 +383,44 @@ func gridMISO() (*gridMetrics, error) {
 	if len(arr) == 0 {
 		return nil, fmt.Errorf("empty project list")
 	}
-	// Autodetect the MW and fuel keys from the first records, and log them,
-	// rather than guessing field names we have never seen.
-	mwKey, fuelKey := "", ""
+	// THE RANDOM HEADLINE NUMBER, caught 2026-08-30. This picked the MW
+	// field by ranging over a Go map, and Go randomises map iteration order
+	// deliberately. MISO publishes several MW columns per project, so the
+	// queue total on the Grid Observatory changed with the coin toss: one run
+	// reported 695,647 MW from the capacity column, the next 87,678 MW from
+	// dp2NrisMw, on the identical 3,827 requests. A published figure that
+	// changes without the data changing is worse than no figure.
+	//
+	// Two changes make it deterministic. The preference list names the field
+	// we actually want, in order, because these columns mean different
+	// things: MISO's interconnection request is sized by its requested
+	// capacity, not by a study-phase network resource value. Anything not on
+	// the list falls back to the alphabetically first matching key, so a
+	// renamed column still yields a number, and the same number every time.
+	// The chosen field is already recorded in mw_field, which is how this was
+	// diagnosed; it is now stable enough to compare across runs.
+	mwPreference := []string{
+		"summerMw", "summerMW", "requestedMw", "capacityMw", "maxSummerMw",
+		"nameplateMw", "mw", "dp1ErisMw", "dp2ErisMw", "dp1NrisMw", "dp2NrisMw",
+	}
+	keys := make([]string, 0, len(arr[0]))
 	for k := range arr[0] {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	mwKey, fuelKey := "", ""
+	for _, want := range mwPreference {
+		for _, k := range keys {
+			if strings.EqualFold(k, want) {
+				mwKey = k
+				break
+			}
+		}
+		if mwKey != "" {
+			break
+		}
+	}
+	for _, k := range keys {
 		lk := strings.ToLower(k)
 		if mwKey == "" && strings.Contains(lk, "mw") {
 			mwKey = k
@@ -716,10 +750,18 @@ func twoaiEIAHarvest(db *sql.DB) {
 	today := time.Now().UTC().Format("2006-01-02")
 
 	// 1. Planned generating capacity, from the operable-generator inventory.
-	// statusid values in the planned range are what we want; we read the
+	// The status codes in the planned range are what we want; we read the
 	// status text through rather than hardcoding a meaning onto a code.
+	//
+	// The facet is "status", not "statusid". This call had failed with a bare
+	// "status 400" on every run since it was written; carrying the response
+	// body into the error on 2026-08-30 made EIA say so in one line: "Invalid
+	// facet 'statusid' provided. The only valid facets are 'stateid',
+	// 'sector', 'entityid', 'plantid', 'generatorid', 'unit', 'technology',
+	// 'energy_source_code', 'prime_mover_code', 'balancing_authority_code',
+	// and 'status'." An opaque error is a defect of its own.
 	b, err := eiaGet("electricity/operating-generator-capacity/data",
-		"frequency=monthly&data[0]=nameplate-capacity-mw&facets[statusid][]=P&facets[statusid][]=V&facets[statusid][]=U&facets[statusid][]=T&facets[statusid][]=L&sort[0][column]=period&sort[0][direction]=desc&length=5000")
+		"frequency=monthly&data[0]=nameplate-capacity-mw&facets[status][]=P&facets[status][]=V&facets[status][]=U&facets[status][]=T&facets[status][]=L&sort[0][column]=period&sort[0][direction]=desc&length=5000")
 	if err != nil {
 		fmt.Println("twoai_grid: eia planned capacity failed:", err)
 	} else {
