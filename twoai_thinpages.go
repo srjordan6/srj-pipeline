@@ -120,6 +120,7 @@ func twoaiThinPages(db *sql.DB) {
 		fmt.Printf("thinpages: %s upserted %d facility rows\n", a.src, n)
 	}
 	twoaiThinSense(db)
+	twoaiThinSensePages(db)
 }
 
 // The closing line of every run: what is left, and why. A queue that is not

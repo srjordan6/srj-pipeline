@@ -4308,7 +4308,23 @@ func twoaiPublishR2(db *sql.DB) error {
 		return fmt.Errorf("not configured, missing: %s", strings.Join(missing, ", "))
 	}
 
-	rows, err := db.Query(`SELECT path, data::text FROM twoai_pages ORDER BY path`)
+	// READINGS ARE MERGED AT PUBLISH, not at build. Every page kind has its
+	// own builder, and threading a reading through all of them would be
+	// forty edits and forty chances to forget one. Both publishers read this
+	// one query, so the merge happens here and any kind of page can carry a
+	// reading the moment the thin-page cron writes one. See twoai_thinsense.go.
+	rows, err := db.Query(`SELECT p.path,
+			CASE WHEN a.body IS NULL THEN p.data::text
+			     ELSE (p.data || jsonb_build_object('reading',
+			       jsonb_build_object('model', a.model, 'body', a.body,
+			                          'generated_on', a.generated_on::text)))::text
+			END
+		FROM twoai_pages p
+		LEFT JOIN LATERAL (
+			SELECT model, body, generated_on FROM twoai_industry_analysis
+			WHERE metric = 'page:' || p.path ORDER BY generated_on DESC LIMIT 1
+		) a ON true
+		ORDER BY p.path`)
 	if err != nil {
 		return err
 	}
@@ -7863,7 +7879,20 @@ func twoaiPublish(db *sql.DB) error {
 			}
 		}
 	}
-	rows, err := db.Query(`SELECT path, jsonb_pretty(data) FROM twoai_pages ORDER BY path`)
+	// Same merge as the R2 publisher: a reading written by the thin-page cron
+	// travels with its page whatever kind the page is.
+	rows, err := db.Query(`SELECT p.path, jsonb_pretty(
+			CASE WHEN a.body IS NULL THEN p.data
+			     ELSE p.data || jsonb_build_object('reading',
+			       jsonb_build_object('model', a.model, 'body', a.body,
+			                          'generated_on', a.generated_on::text))
+			END)
+		FROM twoai_pages p
+		LEFT JOIN LATERAL (
+			SELECT model, body, generated_on FROM twoai_industry_analysis
+			WHERE metric = 'page:' || p.path ORDER BY generated_on DESC LIMIT 1
+		) a ON true
+		ORDER BY p.path`)
 	if err != nil {
 		return err
 	}
