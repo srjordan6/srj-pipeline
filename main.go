@@ -6113,14 +6113,33 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 		return 0, err
 	}
 
-	rows, err := db.Query(`SELECT DISTINCT ON (url) vendor, name, url,
-			to_char(discovered_at at time zone 'UTC','YYYY-MM-DD'),
-			CASE WHEN length(trim(coalesce(summary,''))) >= 40 THEN summary ELSE '' END
-		FROM ai_intel_candidates
-		WHERE url IS NOT NULL AND url <> '' AND url NOT LIKE '%news.google%'
-		  AND discovered_at > now() - ($1 || ' days')::interval
-		  AND vendor = ANY($2)
-		ORDER BY url, discovered_at DESC`, windowDays, pq.Array(allowed))
+	// FALSE ATTRIBUTION, caught 2026-08-30 on the /ai-news/ hub, where
+	// "KinyaEmbed: Contrastive Sentence Embeddings for Kinyarwanda" was
+	// published under OpenAI's name with an arxiv.org link.
+	//
+	// ai_intel_candidates is a DISCOVERY layer: the arXiv watch tags a paper
+	// with the vendor its abstract mentions, which is right for discovery and
+	// wrong for a page whose promise is "what the builders said themselves".
+	// A third-party academic paper about OpenAI is not an OpenAI
+	// announcement. 248 candidates carried an arxiv.org URL under a vendor's
+	// name, 19 of them already published.
+	//
+	// The gate is the vendor's own domain, not its name, the same rule the
+	// MCP attribution fix landed: a post is the vendor's word only when it
+	// sits on the host the vendor's own feed sits on. Anything else stays in
+	// discovery, where it belongs, and appears in the research watch under
+	// its actual authors.
+	rows, err := db.Query(`SELECT DISTINCT ON (c.url) c.vendor, c.name, c.url,
+			to_char(c.discovered_at at time zone 'UTC','YYYY-MM-DD'),
+			CASE WHEN length(trim(coalesce(c.summary,''))) >= 40 THEN c.summary ELSE '' END
+		FROM ai_intel_candidates c
+		JOIN twoai_vendor_feeds f ON f.vendor = c.vendor
+		WHERE c.url IS NOT NULL AND c.url <> '' AND c.url NOT LIKE '%news.google%'
+		  AND c.discovered_at > now() - ($1 || ' days')::interval
+		  AND c.vendor = ANY($2)
+		  AND regexp_replace(c.url,   '^https?://(www\.)?([^/]+).*$', '\2')
+		    = regexp_replace(f.feed_url, '^https?://(www\.)?([^/]+).*$', '\2')
+		ORDER BY c.url, c.discovered_at DESC`, windowDays, pq.Array(allowed))
 	if err != nil {
 		return 0, err
 	}
