@@ -339,6 +339,14 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			"state_page": map[string]any{"uid": stateUID, "code": ef.State},
 			"parent":     map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
 		}
+		// WHY A NUMBER IS MISSING IS ITSELF A FACT. A facility page with no
+		// capacity used to look identical whether nobody publishes one, the
+		// operator blocks us, or the figure on that page belongs to the whole
+		// campus. The reader could not tell "not known" from "not looked up",
+		// which is the difference between a reference and a gap.
+		if r := twoaiUnfillable(db, "dc-fac/"+ef.ID); r != "" {
+			fdoc["capacity_absent_because"] = r
+		}
 		// The reading the thin-page cron wrote for these exact facts, if any:
 		// what the published capacity and certifications mean, model and date
 		// named. Absent, the page carries the facts alone rather than a gap.

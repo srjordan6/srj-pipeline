@@ -424,6 +424,38 @@ func thinAttempt(db *sql.DB, path string, errText string) {
 	db.Exec(`UPDATE twoai_thin_queue SET attempts=attempts+1, last_attempt=now(), last_error=$2 WHERE path=$1`, path, errText)
 }
 
+// thinPermanent retires a row for a reason that will not change by trying
+// again, and records that reason in words a reader can be shown.
+//
+// The queue only ever knew "not yet". A page whose source will never carry the
+// fact was treated exactly like one whose server happened to be down: three
+// attempts, then silence, and a log line saying it "gave up" as though the
+// next run might do better. It will not. The operator does not publish a
+// per-building capacity, or the page belongs to a campus, or the site returns
+// 403 to everything that is not a browser.
+//
+// Saying so is better than an empty field on both counts. The crawler stops
+// spending requests on a known dead end, and the reader learns something true:
+// that the number is missing because nobody publishes it, not because we did
+// not look. attempts is set high enough that thinDue will never pick it up
+// again without a deliberate requeue.
+func thinPermanent(db *sql.DB, path, reason string) {
+	db.Exec(`UPDATE twoai_thin_queue
+		SET attempts=99, last_attempt=now(), last_error=$2, unfillable_reason=$2
+		WHERE path=$1`, path, reason)
+}
+
+// twoaiUnfillable returns the reader-facing reason a queued fact will never
+// arrive, or empty when the row is still being tried.
+func twoaiUnfillable(db *sql.DB, path string) string {
+	var r sql.NullString
+	db.QueryRow(`SELECT unfillable_reason FROM twoai_thin_queue WHERE path=$1`, path).Scan(&r)
+	if r.Valid {
+		return strings.TrimSpace(r.String)
+	}
+	return ""
+}
+
 // ---- mcp-server: registry facts ------------------------------------------
 
 func twoaiThinFillMCP(db *sql.DB) {

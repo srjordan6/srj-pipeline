@@ -67,9 +67,15 @@ var tfCerts = []struct{ name, pat string }{
 }
 
 type tfResult struct {
-	mw      float64
-	sqft    int64
-	certs   []string
+	mw   float64
+	sqft int64
+	// Figures the page publishes about the whole campus rather than this
+	// building, kept apart so they are never attributed to one facility.
+	campusMW   float64
+	campusSqft int64
+	mwLine     string
+	sqftLine   string
+	certs      []string
 	postal  string
 	address []string
 }
@@ -98,14 +104,39 @@ func twoaiThinFillFacilities(db *sql.DB) {
 		time.Sleep(1500 * time.Millisecond)
 		body, err := thinGet(client, c.source)
 		if err != nil {
-			thinAttempt(db, c.path, err.Error())
+			// A 403 or 404 from the same URL on three separate runs is a
+			// standing answer, not a bad day: the operator blocks non-browser
+			// clients, or the page has moved and this row holds a dead link.
+			// Retrying it forever spends requests to learn nothing.
+			e := err.Error()
+			switch {
+			case strings.Contains(e, "HTTP 403"):
+				thinPermanent(db, c.path, "the operator's site refuses automated requests, so its published figures cannot be read here")
+			case strings.Contains(e, "HTTP 404"):
+				thinPermanent(db, c.path, "the operator has moved or withdrawn this facility page; the link we hold is dead")
+			case strings.Contains(e, "certificate"):
+				thinPermanent(db, c.path, "the operator's site serves an invalid TLS certificate, so it cannot be read safely")
+			default:
+				thinAttempt(db, c.path, e)
+			}
 			continue
 		}
 		r, ok := tfParse(body)
 		if !ok {
 			empty++
+			// "No capacity published" and "capacity published for the campus,
+			// not this building" are different findings with different fixes,
+			// and reporting them as one sent a whole afternoon looking for a
+			// scraper bug that did not exist.
 			thinAttempt(db, c.path, "page publishes no capacity or floor area we can read")
 			continue
+		}
+		if r.mw == 0 && r.sqft == 0 {
+			// Campus figures only. Stored below for the operator, but this
+			// facility still has no number of its own and never will from
+			// this page, so it retires with a reason a reader could be shown.
+			thinPermanent(db, c.path,
+				"this page publishes capacity for the whole campus, not for this building")
 		}
 		// Most OSM rows carry no operator tag, and a facility page that says
 		// "published by  on its own facility page" is worse than one that
@@ -136,6 +167,17 @@ func twoaiThinFillFacilities(db *sql.DB) {
 		}
 		if r.sqft > 0 {
 			profile["technical_space_sqft"] = r.sqft
+		}
+		// Campus figures are published under their own names so a template
+		// can say "the operator's campus is 230 MW" and never imply the
+		// building is.
+		if r.campusMW > 0 {
+			profile["campus_mw"] = r.campusMW
+			profile["campus_mw_context"] = strings.TrimSpace(r.mwLine)
+		}
+		if r.campusSqft > 0 {
+			profile["campus_sqft"] = r.campusSqft
+			profile["campus_sqft_context"] = strings.TrimSpace(r.sqftLine)
 		}
 		if len(r.certs) > 0 {
 			profile["certifications"] = r.certs
@@ -170,6 +212,10 @@ func twoaiThinFillFacilities(db *sql.DB) {
 		filled, empty, index, len(due))
 }
 
+// A figure in a sentence about a campus, a portfolio or a market belongs to
+// the campus, not to the one building whose page it happens to sit on.
+var tfCampusRe = regexp.MustCompile(`(?i)\b(campus|portfolio|market|metro|total capacity of the|across (our|the)|combined|region)\b`)
+
 // tfParse reads the stat block whichever way round the operator wrote it.
 func tfParse(page string) (tfResult, bool) {
 	var r tfResult
@@ -196,20 +242,20 @@ func tfParse(page string) (tfResult, bool) {
 		// square foot" and "40+ data centers" are numbers on these pages too.
 		if r.mw == 0 {
 			if m := tfMWRe.FindStringSubmatch(l); m != nil && tfPwrLblRe.MatchString(near(i)) {
-				r.mw = tfNum(m[1])
+				r.mw, r.mwLine = tfNum(m[1]), near(i)
 			} else if m := tfMWAnyRe.FindStringSubmatch(l); m != nil && tfPwrLblRe.MatchString(l) {
-				r.mw = tfNum(m[1])
+				r.mw, r.mwLine = tfNum(m[1]), l
 			}
 		}
 		// Floor area, value and label in either order.
 		if r.sqft == 0 {
 			if m := tfSqInRe.FindStringSubmatch(l); m != nil {
-				r.sqft = int64(tfNum(m[1]))
+				r.sqft, r.sqftLine = int64(tfNum(m[1])), near(i)
 			} else if m := tfNumRe.FindStringSubmatch(l); m != nil {
 				if i+1 < len(L) && tfSqLblRe.MatchString(L[i+1]) {
-					r.sqft = int64(tfNum(m[1]))
+					r.sqft, r.sqftLine = int64(tfNum(m[1])), near(i)
 				} else if i > 0 && tfSqLblRe.MatchString(L[i-1]) {
-					r.sqft = int64(tfNum(m[1]))
+					r.sqft, r.sqftLine = int64(tfNum(m[1])), near(i)
 				}
 			}
 		}
@@ -245,6 +291,24 @@ func tfParse(page string) (tfResult, bool) {
 			break
 		}
 	}
+	// WHOSE NUMBER IS IT. Stephen checked digitalrealty.com and found the
+	// pages perfectly readable, which they are: IAD12 says "the Ashburn
+	// campus is powered by 80 MW" and "brings the total capacity of the
+	// Digital Ashburn campus to 230MW", and CH1 gives 1,100,000 square feet.
+	// Those are CAMPUS figures sitting in prose, and writing 230 MW onto one
+	// building's page would be a fabricated fact of exactly the kind this
+	// site exists not to produce.
+	//
+	// So a figure whose sentence talks about a campus, a portfolio or a
+	// market is kept, labelled as campus scope, and NOT written to
+	// critical_it_mw. The reader gets a true sentence about the campus
+	// instead of a false one about the building.
+	if r.mw > 0 && tfCampusRe.MatchString(r.mwLine) {
+		r.campusMW, r.mw = r.mw, 0
+	}
+	if r.sqft > 0 && tfCampusRe.MatchString(r.sqftLine) {
+		r.campusSqft, r.sqft = r.sqft, 0
+	}
 	// Sanity: a campus under a tenth of a megawatt or over a gigawatt, or a
 	// footprint under a thousand feet, is a misread, not a small building.
 	if r.mw > 0 && (r.mw < 0.1 || r.mw > 1000) {
@@ -253,7 +317,7 @@ func tfParse(page string) (tfResult, bool) {
 	if r.sqft > 0 && r.sqft < 1000 {
 		r.sqft = 0
 	}
-	return r, r.mw > 0 || r.sqft > 0
+	return r, r.mw > 0 || r.sqft > 0 || r.campusMW > 0 || r.campusSqft > 0
 }
 
 func tfNum(s string) float64 {
