@@ -81,6 +81,9 @@ type tfResult struct {
 }
 
 func twoaiThinFillFacilities(db *sql.DB) {
+	// One fetch per metro page per run, shared by every facility under it.
+	metroCache := map[string][]tfMetroBlock{}
+	metroFilled := 0
 	due := thinDue(db, "dc-facility", thinFacilityCap)
 	if len(due) == 0 {
 		return
@@ -132,9 +135,35 @@ func twoaiThinFillFacilities(db *sql.DB) {
 			continue
 		}
 		if r.mw == 0 && r.sqft == 0 {
-			// Campus figures only. Stored below for the operator, but this
-			// facility still has no number of its own and never will from
-			// this page, so it retires with a reason a reader could be shown.
+			// The facility's own page gave only campus figures. Before
+			// retiring it, try the operator's metro page, which on Digital
+			// Realty carries per-building numbers the building pages omit.
+			// Fetched once per metro per run, and only used when the block
+			// identifies its building beyond doubt.
+			if mu := tfMetroURL(c.source); mu != "" {
+				blocks, seen := metroCache[mu]
+				if !seen {
+					time.Sleep(1500 * time.Millisecond)
+					if mb, err := thinGet(client, mu); err == nil {
+						blocks = tfParseMetro(mb)
+					}
+					metroCache[mu] = blocks
+				}
+				var lat, lon float64
+				var house, street string
+				db.QueryRow(`SELECT COALESCE(lat,0), COALESCE(lon,0),
+						COALESCE(osm_tags->>'addr:housenumber',''),
+						COALESCE(osm_tags->>'addr:street','')
+					FROM twoai_dc_facilities WHERE id=$1`, c.ref).Scan(&lat, &lon, &house, &street)
+				if hit := tfMetroMatch(blocks, lat, lon, house, street); hit != nil {
+					r.mw, r.sqft = hit.mw, hit.sqft
+					metroFilled++
+				}
+			}
+		}
+		if r.mw == 0 && r.sqft == 0 {
+			// Campus figures only, and the metro page could not identify this
+			// building either. It retires with a reason a reader can be shown.
 			thinPermanent(db, c.path,
 				"this page publishes capacity for the whole campus, not for this building")
 		}
@@ -208,8 +237,8 @@ func twoaiThinFillFacilities(db *sql.DB) {
 		db.Exec(`DELETE FROM twoai_thin_queue WHERE path=$1`, c.path)
 		filled++
 	}
-	fmt.Printf("thinpages: facility pages read: %d enriched, %d published nothing readable, %d were operator index URLs, of %d due\n",
-		filled, empty, index, len(due))
+	fmt.Printf("thinpages: facility pages read: %d enriched (%d of them from the operator's metro page), %d published nothing readable, %d were operator index URLs, of %d due\n",
+		filled, metroFilled, empty, index, len(due))
 }
 
 // A figure in a sentence about a campus, a portfolio or a market belongs to
