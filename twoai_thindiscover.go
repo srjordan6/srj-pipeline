@@ -51,6 +51,61 @@ type discoverHit struct {
 // twoaiSearchWeb queries whichever licensed search API is configured. Absent a
 // key the stage does nothing at all rather than falling back to scraping.
 func twoaiSearchWeb(client *http.Client, q string) ([]discoverHit, error) {
+	// Firecrawl first, because Brave withdrew its card-free tier in February
+	// 2026 and now meters every query past a $5 credit with NO SPENDING CAP.
+	// I recommended Brave on a free allowance that had not existed for six
+	// months, which is what comes of quoting pricing from memory. Firecrawl's
+	// free plan is 1,000 monthly credits, a search costs 2, and our whole
+	// backlog is about 250 queries.
+	if k := os.Getenv("FIRECRAWL_API_KEY"); k != "" {
+		body := strings.NewReader(`{"query":` + strconvQuote(q) + `,"limit":10}`)
+		req, _ := http.NewRequest("POST", "https://api.firecrawl.dev/v2/search", body)
+		req.Header.Set("Authorization", "Bearer "+k)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if resp.StatusCode != 200 {
+			snippet := strings.TrimSpace(string(b))
+			if len(snippet) > 220 {
+				snippet = snippet[:220]
+			}
+			return nil, fmt.Errorf("firecrawl HTTP %d: %s", resp.StatusCode, snippet)
+		}
+		// The shape has moved between versions: results have appeared both as
+		// a bare array under "data" and nested under "data"."web". Checked
+		// against the live endpoint, which today returns the nested form, but
+		// both are read rather than betting on one: a silent empty list here
+		// would look exactly like a search that found nothing.
+		var out struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if json.Unmarshal(b, &out) != nil {
+			return nil, fmt.Errorf("firecrawl: unreadable response")
+		}
+		type fcItem struct {
+			URL   string `json:"url"`
+			Title string `json:"title"`
+		}
+		var flat []fcItem
+		if json.Unmarshal(out.Data, &flat) != nil {
+			var nested struct {
+				Web []fcItem `json:"web"`
+			}
+			if json.Unmarshal(out.Data, &nested) != nil {
+				return nil, fmt.Errorf("firecrawl: unrecognised result shape")
+			}
+			flat = nested.Web
+		}
+		var hits []discoverHit
+		for _, r := range flat {
+			hits = append(hits, discoverHit{r.URL, r.Title})
+		}
+		return hits, nil
+	}
 	if k := os.Getenv("BRAVE_SEARCH_KEY"); k != "" {
 		req, _ := http.NewRequest("GET",
 			"https://api.search.brave.com/res/v1/web/search?count=10&q="+url.QueryEscape(q), nil)
@@ -170,7 +225,7 @@ func twoaiPickFacilityURL(hits []discoverHit, operatorURL string) string {
 // hold is an operator index. The picking and matching above are pure functions
 // so they stay testable without a database or a network.
 func twoaiThinDiscover(db *sql.DB) {
-	if os.Getenv("BRAVE_SEARCH_KEY") == "" &&
+	if os.Getenv("FIRECRAWL_API_KEY") == "" && os.Getenv("BRAVE_SEARCH_KEY") == "" &&
 		(os.Getenv("GOOGLE_CSE_KEY") == "" || os.Getenv("GOOGLE_CSE_CX") == "") {
 		fmt.Println("thinpages: discover: no search API key set, skipped")
 		return
@@ -255,4 +310,12 @@ func twoaiThinDiscover(db *sql.DB) {
 	if failed > 0 {
 		fmt.Printf("thinpages: discover: first failure was: %s\n", firstErr)
 	}
+}
+
+// strconvQuote JSON-quotes one string. The query is operator and facility
+// names, which routinely carry quotes and ampersands, and a hand-built body
+// would break on the first "H5 Data Centers, Inc." it met.
+func strconvQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
