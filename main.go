@@ -6159,16 +6159,45 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 	// sits on the host the vendor's own feed sits on. Anything else stays in
 	// discovery, where it belongs, and appears in the research watch under
 	// its actual authors.
-	rows, err := db.Query(`SELECT DISTINCT ON (c.url) c.vendor, c.name, c.url,
+	// THE GATE, CORRECTED. The first version INNER JOINed twoai_vendor_feeds
+	// and required the post host to equal the feed host. That stopped the
+	// false attributions it was written for, and it also deleted 82 posts
+	// that were entirely correct: Gemini 3.1, MedGemma, Stable Audio 3, the
+	// EU Commission's own AI Act guidance. The reason is that the join is
+	// only as good as the feed table, and Google DeepMind, Stability AI,
+	// Anthropic and European Commission AI have no row in it, so every one
+	// of their posts failed the join regardless of where it was published.
+	// Stephen's url_registry line caught it: 82 URLs gone, none of them
+	// arxiv.
+	//
+	// The rule now matches the intent rather than the table. A vendor's own
+	// hosts are whatever we actually know about it: the host of its feed
+	// when it has one, plus the host of its website in the company profiles.
+	// If we know at least one host, the post must be on it. If we know none,
+	// the post is kept, because deleting verified-good content to guard
+	// against a risk we cannot even evaluate is the worse error, and the
+	// specific harm that started this, a preprint server credited to a lab,
+	// is excluded by name.
+	rows, err := db.Query(`WITH vendor_hosts AS (
+			SELECT vendor, regexp_replace(feed_url, '^https?://(www\.)?([^/]+).*$', '\2') AS host
+			FROM twoai_vendor_feeds WHERE COALESCE(feed_url,'') <> ''
+			UNION
+			SELECT name, regexp_replace(website, '^https?://(www\.)?([^/]+).*$', '\2')
+			FROM twoai_company_profiles WHERE COALESCE(website,'') <> ''
+		)
+		SELECT DISTINCT ON (c.url) c.vendor, c.name, c.url,
 			to_char(c.discovered_at at time zone 'UTC','YYYY-MM-DD'),
 			CASE WHEN length(trim(coalesce(c.summary,''))) >= 40 THEN c.summary ELSE '' END
 		FROM ai_intel_candidates c
-		JOIN twoai_vendor_feeds f ON f.vendor = c.vendor
 		WHERE c.url IS NOT NULL AND c.url <> '' AND c.url NOT LIKE '%news.google%'
 		  AND c.discovered_at > now() - ($1 || ' days')::interval
 		  AND c.vendor = ANY($2)
-		  AND regexp_replace(c.url,   '^https?://(www\.)?([^/]+).*$', '\2')
-		    = regexp_replace(f.feed_url, '^https?://(www\.)?([^/]+).*$', '\2')
+		  AND c.url NOT LIKE '%arxiv.org%'
+		  AND (
+		    EXISTS (SELECT 1 FROM vendor_hosts h WHERE h.vendor = c.vendor
+		            AND h.host = regexp_replace(c.url, '^https?://(www\.)?([^/]+).*$', '\2'))
+		    OR NOT EXISTS (SELECT 1 FROM vendor_hosts h WHERE h.vendor = c.vendor)
+		  )
 		ORDER BY c.url, c.discovered_at DESC`, windowDays, pq.Array(allowed))
 	if err != nil {
 		return 0, err
