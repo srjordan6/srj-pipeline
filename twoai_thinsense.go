@@ -89,11 +89,32 @@ func twoaiThinSensePages(db *sql.DB) {
 		// uid or slug appearing as a path segment is the durable join: it
 		// resolves 190 of the 276 and needs no maintenance when a section
 		// moves.
+		// The nested lookups are the same lesson as the bundle fallback
+		// below, one level shallower. A caselaw document keeps its uid under
+		// "case", not at the top level, so twelve live pages - Naruto v.
+		// Slater among them - matched nothing and retired as "not a
+		// data-driven page". They are court decisions with a holding, a
+		// citation and a source URL: about as data-driven as this site gets.
+		//
+		// EQUALITY, NOT LIKE. The previous version asked "does this URL end
+		// with the row's uid", which puts the URL on the left of a LIKE and
+		// the column inside a concatenation, so no index can ever be used and
+		// every lookup scans twoai_pages. Measured at 24 seconds for a single
+		// question against the live table. Taking the last path segment in Go
+		// and comparing it for equality is the same test, indexable, and
+		// instant.
+		seg := c.ref
+		if i := strings.LastIndex(strings.TrimSuffix(seg, "/"), "/"); i >= 0 {
+			seg = strings.TrimSuffix(seg, "/")[i+1:]
+		}
 		var path, data string
 		err := db.QueryRow(`SELECT path, data::text FROM twoai_pages
-			WHERE (data ? 'uid'  AND $1 LIKE '%/' || (data->>'uid')  || '/')
-			   OR (data ? 'slug' AND $1 LIKE '%/' || (data->>'slug') || '/')
-			ORDER BY length(data::text) DESC LIMIT 1`, c.ref).Scan(&path, &data)
+			WHERE data->>'uid' = $1 OR data->>'slug' = $1
+			   OR data->'case'->>'uid' = $1 OR data->'case'->>'slug' = $1
+			   OR data->'builder'->>'uid' = $1
+			   OR data->'company'->>'uid' = $1
+			   OR data->'person'->>'uid' = $1
+			ORDER BY length(data::text) DESC LIMIT 1`, seg).Scan(&path, &data)
 		if err != nil {
 			// THE DATA IS ONE LEVEL DOWN. The query above matches a URL
 			// against the uid or slug of a TOP-LEVEL page row, and several
