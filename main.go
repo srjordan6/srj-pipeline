@@ -4332,16 +4332,43 @@ func twoaiPublishR2(db *sql.DB) error {
 	// one query, so the merge happens here and any kind of page can carry a
 	// reading the moment the thin-page cron writes one. See twoai_thinsense.go.
 	rows, err := db.Query(`SELECT p.path,
-			CASE WHEN a.body IS NULL THEN p.data::text
-			     ELSE (p.data || jsonb_build_object('reading',
-			       jsonb_build_object('model', a.model, 'body', a.body,
-			                          'generated_on', a.generated_on::text)))::text
-			END
+			(CASE WHEN a.body IS NULL THEN p.data
+			      ELSE p.data || jsonb_build_object('reading',
+			        jsonb_build_object('model', a.model, 'body', a.body,
+			                           'generated_on', a.generated_on::text))
+			 END
+			 || CASE WHEN b.m IS NULL THEN '{}'::jsonb
+			         ELSE jsonb_build_object('readings', b.m) END)::text
 		FROM twoai_pages p
 		LEFT JOIN LATERAL (
 			SELECT model, body, generated_on FROM twoai_industry_analysis
 			WHERE metric = 'page:' || p.path ORDER BY generated_on DESC LIMIT 1
 		) a ON true
+		LEFT JOIN LATERAL (
+			-- BUNDLE READINGS, WHICH THE JOIN ABOVE COULD NEVER SEE.
+			--
+			-- twoaiThinSensePages resolves a thin URL belonging to a bundle (the
+			-- glossary is 552 terms inside one glossary.json, the tracker every
+			-- case inside one lawsuits.json) through thinBundleItem, and caches
+			-- the result under metric 'page:<bundle path>#<url path>' so there is
+			-- one reading per ITEM rather than one per file. The join above tests
+			-- metric = 'page:' || p.path, which no such key can ever equal, so on
+			-- 2026-09-01 there were 17 glossary and 14 lawsuit readings written,
+			-- paid for, and dropped on the floor at publish time.
+			--
+			-- They travel as a readings object keyed by the item's URL path, so
+			-- a template looks up its own URL. DISTINCT ON keeps the newest row
+			-- per item, which is the LIMIT 1 above applied per key.
+			SELECT jsonb_object_agg(k, v) AS m FROM (
+				SELECT DISTINCT ON (metric)
+				       split_part(metric, '#', 2) AS k,
+				       jsonb_build_object('model', model, 'body', body,
+				                          'generated_on', generated_on::text) AS v
+				FROM twoai_industry_analysis
+				WHERE metric LIKE 'page:' || p.path || '#%'
+				ORDER BY metric, generated_on DESC
+			) z
+		) b ON true
 		ORDER BY p.path`)
 	if err != nil {
 		return err
@@ -5387,6 +5414,10 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		Title    string   `json:"title,omitempty"`
 		Profiled bool     `json:"profiled"`
 		Cats     []string `json:"cats,omitempty"`
+		// Where the profile renders: the primary section page, anchored on this
+		// person's uid. Empty for a roster-only entry, which has no profile to
+		// point at and is listed on the hub as tracked and unwritten.
+		Path string `json:"path,omitempty"`
 	}
 	var list []idx
 	var docs []map[string]any
@@ -5524,14 +5555,30 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 	// taxonomy sections (Stephen's 2026-08 request) and publish as hub pages
 	// below the category identifier path; the rest render as plain labels on a
 	// profile until a section exists for them. A person can hold several.
+	// EVERY CATEGORY A PERSON CAN HOLD NEEDS A PAGE, because from 2026-09-01
+	// the category page is where the person's profile actually lives. Seven of
+	// the sixteen had taxonomy sections and the other nine rendered as plain
+	// text on a profile: "Technology Leaders" was a dead label on 23 people,
+	// the largest category on the site, pointing nowhere. Folding profiles into
+	// sections turns that from an annoyance into a hole in the directory, so
+	// the map is complete and twoai_taxonomy carries all sixteen rows.
 	catTax := map[string]string{
-		"researchers":                   "people-researchers",
-		"founders-and-executives":       "people-founders",
-		"investors":                     "people-investors",
-		"open-source-maintainers":       "people-maintainers",
-		"professors-and-academics":      "people-academics",
-		"government-and-policy-leaders": "people-government",
-		"authors-and-communicators":     "people-authors",
+		"researchers":                     "people-researchers",
+		"founders-and-executives":         "people-founders",
+		"investors":                       "people-investors",
+		"open-source-maintainers":         "people-maintainers",
+		"professors-and-academics":        "people-academics",
+		"government-and-policy-leaders":   "people-government",
+		"authors-and-communicators":       "people-authors",
+		"technology-leaders":              "people-technology-leaders",
+		"governance-risk-and-privacy":     "people-governance-risk-privacy",
+		"health-and-life-sciences":        "people-health-life-sciences",
+		"advocates-and-public-voices":     "people-advocates",
+		"pioneers-and-historical-figures": "people-pioneers",
+		"economists-and-labor":            "people-economists-labor",
+		"robotics-and-autonomy":           "people-robotics-autonomy",
+		"safety-and-alignment":            "people-safety-alignment",
+		"security-leaders":                "people-security-leaders",
 	}
 	type catRef struct {
 		Key  string `json:"key"`
@@ -5540,14 +5587,25 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 	}
 	catName := map[string]string{}
 	catsByUID := map[string][]catRef{}
-	if crows, err := db.Query(`SELECT pc.slug, pc.category, c.name
+	// is_primary decides WHICH section page carries the full profile. It is
+	// already set, exactly one row per person across all 58 profiled people, so
+	// the choice is stored data rather than a rule invented at render time.
+	// That matters here more than usual: the primary category is now an
+	// address, not a label, and a rule that reshuffled itself between runs
+	// would move published URLs.
+	primaryCat := map[string]string{}
+	if crows, err := db.Query(`SELECT pc.slug, pc.category, c.name, COALESCE(pc.is_primary,false)
 		FROM twoai_person_category pc
 		JOIN twoai_people_categories c ON c.key = pc.category
 		ORDER BY pc.slug, c.name`); err == nil {
 		for crows.Next() {
 			var slug, key, name string
-			if crows.Scan(&slug, &key, &name) != nil {
+			var isPrimary bool
+			if crows.Scan(&slug, &key, &name, &isPrimary) != nil {
 				continue
+			}
+			if isPrimary {
+				primaryCat[slug] = key
 			}
 			catName[key] = name
 			uid := uidBySlug[slug]
@@ -5577,15 +5635,47 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		}
 	}
 
+	// PROFILES MOVED ONTO THEIR SECTION PAGE, 2026-09-01, at Stephen's
+	// direction: a human entity is found in the AI People Directory or in one
+	// of its sub categories, and nowhere else. Each profile is now a section of
+	// its primary category's page, anchored on the person's uid, and the 64
+	// per-person URLs 301 to that anchor (public/_redirects in twoai-site).
+	//
+	// The uid is unchanged and still the address, which is the whole reason the
+	// 2026-08-03 identifier rule exists: the profile moved, the identity did
+	// not, and every citation of the form .../{catUid}/#{uid} survives a rename
+	// exactly as .../{uid}/ used to.
+	//
+	// docsByUID feeds the section builder below. slugByUID lets it ask which
+	// person a category row is about, because twoai_person_category keys on the
+	// site_people slug while everything downstream keys on the uid.
 	count := 0
-	keep := make([]string, 0, len(docs))
+	docsByUID := make(map[string]map[string]any, len(docs))
 	for _, d := range docs {
-		uid, _ := d["uid"].(string)
-		if err := upsert("people/"+uid+".json", "person", d); err != nil {
-			return count, err
+		if uid, _ := d["uid"].(string); uid != "" {
+			docsByUID[uid] = d
 		}
-		keep = append(keep, "people/"+uid+".json")
-		count++
+	}
+	slugByUID := make(map[string]string, len(uidBySlug))
+	for slug, uid := range uidBySlug {
+		slugByUID[uid] = slug
+	}
+	// Where each person's profile now renders, so the hub and the roster link
+	// to the anchor rather than to a page that no longer exists.
+	homeOf := func(uid string) string {
+		key := primaryCat[slugByUID[uid]]
+		if key == "" {
+			return ""
+		}
+		tax := catTax[key]
+		if tax == "" {
+			return ""
+		}
+		return "/ai-ecosystem/ecosystem-entities-market-and-operations/" +
+			twoaiUID("section:"+tax) + "/#" + uid
+	}
+	for i := range list {
+		list[i].Path = homeOf(list[i].UID)
 	}
 
 	// Reap person rows that this run did not write.
@@ -5602,14 +5692,20 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 	// Deleting what this run did not write is the only version of this that
 	// stays correct when the rule changes again. It is guarded by len(docs) > 0
 	// above, so a run that read nothing deletes nothing.
-	if _, err := db.Exec(`DELETE FROM twoai_pages
-		WHERE kind = 'person' AND NOT (path = ANY($1))`, pq.Array(keep)); err != nil {
+	// The reaper now removes ALL of them, because this run writes none. It was
+	// already the mechanism that cleaned up a uid whose derivation had changed
+	// (Tim O'Reilly published under two for a week); retiring the whole kind is
+	// the same statement with an empty keep list. The rows are a derived cache
+	// rebuilt from site_people on every run, so this is the DELETE that
+	// AGENTS.md rule 8 permits, not the one it forbids: nothing here is source
+	// data, and site_people is untouched.
+	if _, err := db.Exec(`DELETE FROM twoai_pages WHERE kind = 'person'`); err != nil {
 		return count, err
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	if err := upsert("people/index.json", "person-hub", map[string]any{
 		"uid": twoaiUID("section:ai-people-directory"), "people": list,
-		"total": len(list), "profiled": count - tracked, "tracked_only": tracked,
+		"total": len(list), "profiled": len(docs) - tracked, "tracked_only": tracked,
 		"generated": today,
 	}); err != nil {
 		return count, err
@@ -5633,28 +5729,67 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		if name == "" {
 			name = catName[key]
 		}
-		type member struct {
+		// TWO LISTS, AND THE DIFFERENCE IS THE POINT.
+		//
+		// `profiles` are the people whose PRIMARY category is this one. Their
+		// full record travels here, because this page is now where that profile
+		// is published: quote, quick facts, achievements, timeline, sources,
+		// everything site_people holds. One person appears in full on exactly
+		// one page, so nothing is duplicated across sections and no two URLs
+		// compete to be the canonical account of the same human.
+		//
+		// `also` are the people who hold this category but are profiled under a
+		// different primary. Andrew Ng is a Researcher, a Professor, an Author
+		// and a Founder; his record belongs on one of those and a cross
+		// reference belongs on the other three. They carry a name, a hook and
+		// the path to where the profile actually renders.
+		type crossRef struct {
 			UID     string `json:"uid"`
 			Name    string `json:"name"`
 			Moniker string `json:"moniker,omitempty"`
 			Hook    string `json:"hook,omitempty"`
+			Path    string `json:"path,omitempty"`
 		}
-		members := []member{}
+		profiles := []map[string]any{}
+		also := []crossRef{}
 		for _, e := range list {
+			held := false
 			for _, k := range e.Cats {
 				if k == key {
-					members = append(members, member{UID: e.UID, Name: e.Name, Moniker: e.Moniker, Hook: e.Hook})
+					held = true
 					break
 				}
 			}
+			if !held {
+				continue
+			}
+			if primaryCat[slugByUID[e.UID]] == key {
+				if d := docsByUID[e.UID]; d != nil {
+					profiles = append(profiles, d)
+					continue
+				}
+			}
+			also = append(also, crossRef{UID: e.UID, Name: e.Name, Moniker: e.Moniker,
+				Hook: e.Hook, Path: e.Path})
 		}
+		sort.Slice(profiles, func(i, j int) bool {
+			a, _ := profiles[i]["name"].(string)
+			b, _ := profiles[j]["name"].(string)
+			return a < b
+		})
+		sort.Slice(also, func(i, j int) bool { return also[i].Name < also[j].Name })
 		doc := map[string]any{
 			"uid": twoaiUID("section:" + tax), "key": key, "tax": tax,
-			"name": name, "blurb": blurb, "members": members,
-			"total": len(members), "generated": today,
+			"name": name, "blurb": blurb,
+			"profiles": profiles, "also": also,
+			"total": len(profiles) + len(also), "profiled": len(profiles),
+			"generated": today,
 		}
 		j, _ := json.Marshal(doc)
 		path := "people/cat-" + tax + ".json"
+		// Still one URL. url_count records URLs, not sections, and inflating it
+		// by the profile count would overstate the site exactly as counting the
+		// glossary as one page understated it.
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
 			VALUES ($1,'person-category',$2::jsonb,$3,1)
 			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
@@ -8039,16 +8174,43 @@ func twoaiPublish(db *sql.DB) error {
 	// Same merge as the R2 publisher: a reading written by the thin-page cron
 	// travels with its page whatever kind the page is.
 	rows, err := db.Query(`SELECT p.path, jsonb_pretty(
-			CASE WHEN a.body IS NULL THEN p.data
-			     ELSE p.data || jsonb_build_object('reading',
-			       jsonb_build_object('model', a.model, 'body', a.body,
-			                          'generated_on', a.generated_on::text))
-			END)
+			(CASE WHEN a.body IS NULL THEN p.data
+			      ELSE p.data || jsonb_build_object('reading',
+			        jsonb_build_object('model', a.model, 'body', a.body,
+			                           'generated_on', a.generated_on::text))
+			 END
+			 || CASE WHEN b.m IS NULL THEN '{}'::jsonb
+			         ELSE jsonb_build_object('readings', b.m) END))
 		FROM twoai_pages p
 		LEFT JOIN LATERAL (
 			SELECT model, body, generated_on FROM twoai_industry_analysis
 			WHERE metric = 'page:' || p.path ORDER BY generated_on DESC LIMIT 1
 		) a ON true
+		LEFT JOIN LATERAL (
+			-- BUNDLE READINGS, WHICH THE JOIN ABOVE COULD NEVER SEE.
+			--
+			-- twoaiThinSensePages resolves a thin URL belonging to a bundle (the
+			-- glossary is 552 terms inside one glossary.json, the tracker every
+			-- case inside one lawsuits.json) through thinBundleItem, and caches
+			-- the result under metric 'page:<bundle path>#<url path>' so there is
+			-- one reading per ITEM rather than one per file. The join above tests
+			-- metric = 'page:' || p.path, which no such key can ever equal, so on
+			-- 2026-09-01 there were 17 glossary and 14 lawsuit readings written,
+			-- paid for, and dropped on the floor at publish time.
+			--
+			-- They travel as a readings object keyed by the item's URL path, so
+			-- a template looks up its own URL. DISTINCT ON keeps the newest row
+			-- per item, which is the LIMIT 1 above applied per key.
+			SELECT jsonb_object_agg(k, v) AS m FROM (
+				SELECT DISTINCT ON (metric)
+				       split_part(metric, '#', 2) AS k,
+				       jsonb_build_object('model', model, 'body', body,
+				                          'generated_on', generated_on::text) AS v
+				FROM twoai_industry_analysis
+				WHERE metric LIKE 'page:' || p.path || '#%'
+				ORDER BY metric, generated_on DESC
+			) z
+		) b ON true
 		ORDER BY p.path`)
 	if err != nil {
 		return err

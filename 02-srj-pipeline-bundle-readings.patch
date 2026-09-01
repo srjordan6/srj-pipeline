@@ -1,0 +1,102 @@
+diff --git a/main.go b/main.go
+index a42af11..9387e41 100644
+--- a/main.go
++++ b/main.go
+@@ -4332,16 +4332,43 @@ func twoaiPublishR2(db *sql.DB) error {
+ 	// one query, so the merge happens here and any kind of page can carry a
+ 	// reading the moment the thin-page cron writes one. See twoai_thinsense.go.
+ 	rows, err := db.Query(`SELECT p.path,
+-			CASE WHEN a.body IS NULL THEN p.data::text
+-			     ELSE (p.data || jsonb_build_object('reading',
+-			       jsonb_build_object('model', a.model, 'body', a.body,
+-			                          'generated_on', a.generated_on::text)))::text
+-			END
++			(CASE WHEN a.body IS NULL THEN p.data
++			      ELSE p.data || jsonb_build_object('reading',
++			        jsonb_build_object('model', a.model, 'body', a.body,
++			                           'generated_on', a.generated_on::text))
++			 END
++			 || CASE WHEN b.m IS NULL THEN '{}'::jsonb
++			         ELSE jsonb_build_object('readings', b.m) END)::text
+ 		FROM twoai_pages p
+ 		LEFT JOIN LATERAL (
+ 			SELECT model, body, generated_on FROM twoai_industry_analysis
+ 			WHERE metric = 'page:' || p.path ORDER BY generated_on DESC LIMIT 1
+ 		) a ON true
++		LEFT JOIN LATERAL (
++			-- BUNDLE READINGS, WHICH THE JOIN ABOVE COULD NEVER SEE.
++			--
++			-- twoaiThinSensePages resolves a thin URL belonging to a bundle (the
++			-- glossary is 552 terms inside one glossary.json, the tracker every
++			-- case inside one lawsuits.json) through thinBundleItem, and caches
++			-- the result under metric 'page:<bundle path>#<url path>' so there is
++			-- one reading per ITEM rather than one per file. The join above tests
++			-- metric = 'page:' || p.path, which no such key can ever equal, so on
++			-- 2026-09-01 there were 17 glossary and 14 lawsuit readings written,
++			-- paid for, and dropped on the floor at publish time.
++			--
++			-- They travel as a readings object keyed by the item's URL path, so
++			-- a template looks up its own URL. DISTINCT ON keeps the newest row
++			-- per item, which is the LIMIT 1 above applied per key.
++			SELECT jsonb_object_agg(k, v) AS m FROM (
++				SELECT DISTINCT ON (metric)
++				       split_part(metric, '#', 2) AS k,
++				       jsonb_build_object('model', model, 'body', body,
++				                          'generated_on', generated_on::text) AS v
++				FROM twoai_industry_analysis
++				WHERE metric LIKE 'page:' || p.path || '#%'
++				ORDER BY metric, generated_on DESC
++			) z
++		) b ON true
+ 		ORDER BY p.path`)
+ 	if err != nil {
+ 		return err
+@@ -8039,16 +8066,43 @@ func twoaiPublish(db *sql.DB) error {
+ 	// Same merge as the R2 publisher: a reading written by the thin-page cron
+ 	// travels with its page whatever kind the page is.
+ 	rows, err := db.Query(`SELECT p.path, jsonb_pretty(
+-			CASE WHEN a.body IS NULL THEN p.data
+-			     ELSE p.data || jsonb_build_object('reading',
+-			       jsonb_build_object('model', a.model, 'body', a.body,
+-			                          'generated_on', a.generated_on::text))
+-			END)
++			(CASE WHEN a.body IS NULL THEN p.data
++			      ELSE p.data || jsonb_build_object('reading',
++			        jsonb_build_object('model', a.model, 'body', a.body,
++			                           'generated_on', a.generated_on::text))
++			 END
++			 || CASE WHEN b.m IS NULL THEN '{}'::jsonb
++			         ELSE jsonb_build_object('readings', b.m) END))
+ 		FROM twoai_pages p
+ 		LEFT JOIN LATERAL (
+ 			SELECT model, body, generated_on FROM twoai_industry_analysis
+ 			WHERE metric = 'page:' || p.path ORDER BY generated_on DESC LIMIT 1
+ 		) a ON true
++		LEFT JOIN LATERAL (
++			-- BUNDLE READINGS, WHICH THE JOIN ABOVE COULD NEVER SEE.
++			--
++			-- twoaiThinSensePages resolves a thin URL belonging to a bundle (the
++			-- glossary is 552 terms inside one glossary.json, the tracker every
++			-- case inside one lawsuits.json) through thinBundleItem, and caches
++			-- the result under metric 'page:<bundle path>#<url path>' so there is
++			-- one reading per ITEM rather than one per file. The join above tests
++			-- metric = 'page:' || p.path, which no such key can ever equal, so on
++			-- 2026-09-01 there were 17 glossary and 14 lawsuit readings written,
++			-- paid for, and dropped on the floor at publish time.
++			--
++			-- They travel as a readings object keyed by the item's URL path, so
++			-- a template looks up its own URL. DISTINCT ON keeps the newest row
++			-- per item, which is the LIMIT 1 above applied per key.
++			SELECT jsonb_object_agg(k, v) AS m FROM (
++				SELECT DISTINCT ON (metric)
++				       split_part(metric, '#', 2) AS k,
++				       jsonb_build_object('model', model, 'body', body,
++				                          'generated_on', generated_on::text) AS v
++				FROM twoai_industry_analysis
++				WHERE metric LIKE 'page:' || p.path || '#%'
++				ORDER BY metric, generated_on DESC
++			) z
++		) b ON true
+ 		ORDER BY p.path`)
+ 	if err != nil {
+ 		return err
