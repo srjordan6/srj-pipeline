@@ -117,7 +117,7 @@ func auditSync(db *sql.DB) error {
 	}
 	var gw struct {
 		Terms []struct {
-			Term, Definition, Example, Category string
+			Term, Definition, Example, Category, Slug string
 		} `json:"terms"`
 	}
 	if err := json.Unmarshal([]byte(glossJSON), &gw); err != nil {
@@ -138,13 +138,25 @@ func auditSync(db *sql.DB) error {
 			if t.Term == "" {
 				continue
 			}
+			// SLUG IS CARRIED, NOT DERIVED. The audit platform asked for this
+			// after testing the alternative: it derived slugs from the 552 term
+			// names and diffed them against the sitemap. 529 matched, 23 did
+			// not, and about ten of those no transform can ever produce -
+			// "Autonomy Levels (Agentic AI)" publishes as agentic-autonomy-levels,
+			// "NEYR (Net Efficiency Yield Ratio)" as neyr, "Faithfulness /
+			// Groundedness" as faithfulness. A derived slug would 404 on those
+			// and would drift silently as terms are added or renamed, which is
+			// the same failure the /ai-governance/ flattening already caused
+			// once. The source row has carried a slug all along; this stage
+			// simply was not reading it.
 			if _, err := db.Exec(`INSERT INTO synced_glossary_terms
-				(term, definition, example, category, is_active, synced_at)
-				VALUES ($1,$2,$3,$4,TRUE,NOW())
+				(term, definition, example, category, slug, is_active, synced_at)
+				VALUES ($1,$2,$3,$4,$5,TRUE,NOW())
 				ON CONFLICT (term) DO UPDATE SET
 				  definition=EXCLUDED.definition, example=EXCLUDED.example,
-				  category=EXCLUDED.category, is_active=TRUE, synced_at=NOW()`,
-				t.Term, t.Definition, t.Example, t.Category); err != nil {
+				  category=EXCLUDED.category, slug=EXCLUDED.slug,
+				  is_active=TRUE, synced_at=NOW()`,
+				t.Term, t.Definition, t.Example, t.Category, t.Slug); err != nil {
 				return fmt.Errorf("glossary upsert %q: %w", t.Term, err)
 			}
 		}

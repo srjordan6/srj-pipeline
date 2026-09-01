@@ -576,13 +576,51 @@ func twoaiDocTitle(path string, doc map[string]any) string {
 		"builder", "operator", "facility", "incident",
 	} {
 		if m, ok := doc[nest].(map[string]any); ok {
-			for _, k := range []string{"name", "title", "label", "term"} {
+			for _, k := range []string{"name", "title", "label", "term", "case_name", "metric", "heading"} {
 				if s, ok := m[k].(string); ok && len(strings.TrimSpace(s)) > 1 {
 					return strings.TrimSpace(s)
 				}
 			}
 		}
 	}
+	// SHAPE-COMPOSED TITLES. 129 documents a run reached this point with no
+	// title and were dropped from the index entirely - 78 under tech/ and 28
+	// caselaw among them - so the ask box could not retrieve, rank or cite them
+	// for any question. Checked against the live documents, 2026-09-01, not
+	// guessed:
+	//
+	//   caselaw-case  nests under "case" and names itself case_name, which was
+	//                 on the TOP-LEVEL key list but missing from the nested one
+	//                 above. Sony Corp. of America v. Universal City Studios,
+	//                 Inc. was in the database and out of the index.
+	//   dc-state (51) carries a two-letter state code and a facility count, and
+	//                 no name at all.
+	//   dc-metric (25) nests under "metric" and names itself "metric", e.g.
+	//                 "WUE, Water Usage Effectiveness".
+	//   dc-builder (8), dc-grid, dc-smr similarly carry data and no label.
+	//
+	// A composed title uses only the document's own fields, the same rule the
+	// sparse-composer follows. Inventing a label would be worse than skipping;
+	// naming a page from its own state code is not invention.
+	if shape, _ := doc["shape"].(string); shape != "" {
+		switch shape {
+		case "dc-state":
+			if st, ok := doc["state"].(string); ok && st != "" {
+				return "Data Centers in " + strings.ToUpper(st)
+			}
+		case "dc-metric":
+			if m, ok := doc["metric"].(map[string]any); ok {
+				if s, ok := m["metric"].(string); ok && len(s) > 1 {
+					return strings.TrimSpace(s)
+				}
+			}
+		case "dc-grid":
+			return "Data Center Grid and Interconnection"
+		case "dc-smr":
+			return "Small Modular Reactors for Data Centers"
+		}
+	}
+
 	// HUB DOCUMENTS. A citation reading "research/index.json" went out in a
 	// live answer on 2026-08-31: the hub file carries counts and lists but no
 	// name, so it had no title, and an older run had embedded it under its
