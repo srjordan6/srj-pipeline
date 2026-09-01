@@ -348,9 +348,11 @@ func twoaiThinDetect(db *sql.DB) {
 			FROM twoai_dc_facilities
 			WHERE country='US' AND coalesce(website,'')<>'' AND profile='{}'::jsonb`},
 		// Google's kind of thin: an indexable page whose rendered main content
-		// is under the 300-word floor, measured by the self-audit above. No
-		// automated filler; these are template and editorial work, and the
-		// queue is where that work is counted.
+		// is under the word floor, measured by the self-audit above. Filled by
+		// twoaiThinSensePages: one reading first, and a second layer of
+		// grounded questions and answers when a published reading has
+		// measurably not been enough. What neither layer can lift is data
+		// work, and the queue is where that is counted.
 		{"thin-words", `SELECT 'audit:'||url, url, url,
 			words::text || ' words in main content, below ' || ` + fmt.Sprint(thinAuditWords) + `::text
 			FROM twoai_page_audit WHERE status=200 AND words < ` + fmt.Sprint(thinAuditWords)},
@@ -373,9 +375,19 @@ func twoaiThinDetect(db *sql.DB) {
 		paths := make([]string, 0, len(cands))
 		for _, c := range cands {
 			paths = append(paths, c.path)
+			// A ROW THAT GAVE UP IS NOT GIVEN UP ON FOREVER. attempts=3 stops a
+			// row cycling against the same failure. But the reason text carries
+			// the measured word count and the floor, so when either changes -
+			// the page grew, or the floor moved, as it did from 300 to 500 on
+			// 2026-09-01 - the situation is new and the row earns fresh
+			// attempts. Without this, the 24 thin-words rows that gave up under
+			// the old floor would have sat untouched under the new one.
 			db.Exec(`INSERT INTO twoai_thin_queue (path, kind, ref, source_url, reason)
 				VALUES ($1,$2,$3,$4,$5)
-				ON CONFLICT (path) DO UPDATE SET source_url=EXCLUDED.source_url, reason=EXCLUDED.reason`,
+				ON CONFLICT (path) DO UPDATE SET source_url=EXCLUDED.source_url, reason=EXCLUDED.reason,
+				  attempts = CASE WHEN twoai_thin_queue.reason IS DISTINCT FROM EXCLUDED.reason
+				                  AND twoai_thin_queue.attempts < 99
+				             THEN 0 ELSE twoai_thin_queue.attempts END`,
 				c.path, c.kind, c.ref, c.source, c.reason)
 		}
 		res, _ := db.Exec(`DELETE FROM twoai_thin_queue WHERE kind=$1 AND NOT (path = ANY($2))`, t.kind, pq.Array(paths))

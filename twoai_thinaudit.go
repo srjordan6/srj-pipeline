@@ -30,7 +30,16 @@ import (
 	"time"
 )
 
-const thinAuditWords = 300 // the Yoast/AEO floor Stephen set on 2026-08-30
+// THE FLOOR IS NOW 500. Stephen, 2026-09-01: I do not want any thin pages
+// now or in the future. The 300-word floor he set on 2026-08-30 was the
+// Yoast/AEO line and the sweep cleared it completely: 0 of 2,102 sitemap
+// URLs under 300 on the live site. AdSense reviewers work from a different
+// line - no published number, but they typically flag under 500 and
+// recommend 800 to 1,200 - and against 500 the same crawl found 732 pages
+// short, 367 of them glossary terms and 224 entity pages. Raising this one
+// constant is what puts those 732 into the thin-words queue, where the
+// sense stage fills them and re-fills them whenever the data changes.
+const thinAuditWords = 500
 
 var (
 	auditChromeRe = regexp.MustCompile(`(?is)<(script|style|noscript|svg|nav|header|footer|aside)[^>]*>.*?</(script|style|noscript|svg|nav|header|footer|aside)>`)

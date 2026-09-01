@@ -54,6 +54,22 @@ Rules, in order:
 5. Never describe the page or the site. Do not write "this page shows" or "this section lists". Write about the subject.
 Return the paragraphs only, separated by blank lines, no heading, no preamble.`
 
+// THE SECOND LAYER. A reading was written, published, measured, and the page
+// is still under the floor. One reading was not enough for this page, so the
+// model now writes the questions a reader arrives with and answers each from
+// the data. Same guardrails as the first layer, stricter on padding, because
+// this is exactly the point at which a lesser system starts inventing.
+const thinDeepSystem = `You write for The World of AI, a reference site whose thesis is that every AI capability is downstream of compute, compute is downstream of buildings and power, and the grid is now the binding constraint on AI scaling.
+
+You are given the DATA behind one page of that site, as JSON, the URL it publishes at, and the reading already published on it. The page renders the facts and that reading, and readers still leave without what they came for. Your job is the second layer: the questions a reader most plausibly arrived with, answered from the data.
+
+Rules, in order:
+1. Use ONLY the data given. Never add a company, number, date, law, or event that is not in it. Where the data cannot answer a natural question, say so in one sentence and move on. That sentence is more valuable than a guess.
+2. Open with two or three short paragraphs that go a level deeper than the published reading: the mechanism behind the pattern, the comparison the data supports, the practical consequence. Do not restate the reading.
+3. Then write four to six questions in the exact form a reader would type, each on its own line ending in a question mark, each followed by its answer in one to three plain sentences. Answers come from the data or state plainly that the data does not hold it.
+4. Plain declarative sentences, one idea each. Commas rather than dashes. No marketing language, no superlatives you cannot derive from the data, no filler. Never describe the page or the site.
+Return the paragraphs, then the questions and answers, separated by blank lines, no heading, no preamble.`
+
 // THE GENERIC READING. Stephen, 2026-08-30: Sonnet is supposed to take care
 // of this. He is right, and the thin-words queue had no filler at all.
 //
@@ -167,8 +183,63 @@ func twoaiThinSensePages(db *sql.DB) {
 		var exists int
 		db.QueryRow(`SELECT 1 FROM twoai_industry_analysis WHERE metric=$1 AND data_hash=$2`, metric, hash).Scan(&exists)
 		if exists == 1 {
-			cached++
+			// A READING EXISTS. Was it enough? The queue put this page here
+			// because the audit measured it under the floor, and the audit reads
+			// the LIVE site. If the reading was generated on a day strictly
+			// before the audit, it has been published and rendered and the page
+			// is still thin, so a second layer is due. If the reading is from
+			// today, it simply has not shipped yet and the queue entry clears as
+			// before. Strictly-before is deliberate: it costs one extra day per
+			// layer and never deepens a page whose first reading is still in
+			// flight, which would spend a Sonnet call to answer a question the
+			// publish stage was about to answer for free.
+			var due int
+			db.QueryRow(`SELECT 1 FROM twoai_industry_analysis ia
+				JOIN twoai_page_audit pa ON pa.url = $3
+				WHERE ia.metric=$1 AND ia.data_hash=$2
+				  AND pa.words < $4 AND pa.audited_on > ia.generated_on`,
+				metric, hash, c.ref, thinAuditWords).Scan(&due)
+			var deepExists int
+			db.QueryRow(`SELECT 1 FROM twoai_industry_analysis WHERE metric=$1 AND data_hash=$2`,
+				metric, hash+"-deep").Scan(&deepExists)
+			if due != 1 || deepExists == 1 {
+				if deepExists == 1 && due == 1 {
+					// Two layers published and still under the floor. That is a
+					// page whose DATA is thin, and the honest fix is data, not a
+					// third paragraph. It stops cycling and stays visible.
+					db.Exec(`UPDATE twoai_thin_queue SET attempts=3, last_attempt=now(),
+						last_error='two readings published and still under the floor; needs data, not prose'
+						WHERE path=$1`, c.path)
+					skipped++
+					continue
+				}
+				cached++
+				db.Exec(`DELETE FROM twoai_thin_queue WHERE path=$1`, c.path)
+				continue
+			}
+			var prior string
+			db.QueryRow(`SELECT body FROM twoai_industry_analysis WHERE metric=$1 AND data_hash=$2`, metric, hash).Scan(&prior)
+			body, err := twoaiClaudeCall(model, thinDeepSystem,
+				"The page publishes at "+c.ref+"\n\nIts data:\n"+data+
+					"\n\nThe reading already published on it:\n"+prior+"\n\nWrite the second layer now.")
+			if err != nil || len(body) < 400 {
+				failed++
+				thinAttempt(db, c.path, fmt.Sprintf("deep reading failed: %v (len %d)", err, len(body)))
+				continue
+			}
+			// The deep layer is the first reading plus the second, stored as one
+			// body under a marked hash. The publishers take the newest row per
+			// metric, so this supersedes the first without any template change,
+			// and the first is retained rather than deleted.
+			if _, err := db.Exec(`INSERT INTO twoai_industry_analysis (metric, data_hash, model, body, generated_on)
+				VALUES ($1,$2,$3,$4,current_date) ON CONFLICT (metric, data_hash) DO NOTHING`,
+				metric, hash+"-deep", model, prior+"\n\n"+body); err != nil {
+				thinAttempt(db, c.path, "db: "+err.Error())
+				continue
+			}
 			db.Exec(`DELETE FROM twoai_thin_queue WHERE path=$1`, c.path)
+			written++
+			time.Sleep(1200 * time.Millisecond)
 			continue
 		}
 		body, err := twoaiClaudeCall(model, thinPageSystem,
