@@ -480,6 +480,28 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 		return ""
 	case "week":
 		return base + "/this-week-in-ai/" + name + "/"
+	case "caselaw":
+		// Caselaw cases have no page of their own. They render inside their
+		// section page under doctrine headings (Fair use, Section 230, DMCA
+		// safe harbour...), and the document carries the section it belongs
+		// to under section.uid. Resolving the 28 titles on 2026-09-01 exposed
+		// this as the next gap: the run log went from "no title: caselaw x28"
+		// to "no url: caselaw x28". Verified against the live site: the
+		// section 0f4d5d33 renders at
+		// /ai-ecosystem/enterprise-applications-governance-and-tools/0f4d5d33/
+		// and contains the case names. Twenty-eight documents sharing one URL
+		// is the honest address; the worker's per-page cap means at most two
+		// of them surface for any one question, which is still twenty-eight
+		// more than none.
+		if sec, ok := doc["section"].(map[string]any); ok {
+			if uid, ok := sec["uid"].(string); ok && uid != "" {
+				if u, found := idx["uid:"+uid]; found {
+					return u
+				}
+				return base + "/ai-ecosystem/enterprise-applications-governance-and-tools/" + uid + "/"
+			}
+		}
+		return ""
 	case "static":
 		return base + "/" + name + "/"
 	}

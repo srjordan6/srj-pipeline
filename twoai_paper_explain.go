@@ -43,12 +43,26 @@ func twoaiPaperExplain(db *sql.DB) error {
 		fmt.Println("twoai_paper_explain: ANTHROPIC_API_KEY not set, skipped")
 		return nil
 	}
-	rows, err := db.Query(`SELECT uid, title, COALESCE(authors,''), COALESCE(year,0),
-			COALESCE(journal,''), COALESCE(our_note,''), COALESCE(doi,'')
-		FROM twoai_research_papers
-		WHERE COALESCE(explain_beginner,'')='' AND COALESCE(explain_practitioner,'')=''
-			AND COALESCE(explain_business,'')=''
-		ORDER BY COALESCE(citations,0) DESC, uid
+	// THE SAME TWELVE, FOREVER. This query took the twelve most-cited
+	// pending papers every run. When none of those twelve had an abstract in
+	// the local mirror and the API pot was already spent by the nightly
+	// backfill, all twelve were skipped, and the next run chose the same
+	// twelve, and the log read written=0 skipped=12 pending=87 on run after
+	// run while 18 of the 87 had a DOI hit with an abstract sitting in
+	// twoai_works the whole time. Verified 2026-09-02. Two changes: papers
+	// whose DOI is already in the local mirror with an abstract are taken
+	// FIRST, because they cost no API call and cannot fail on lookup; and a
+	// paper that was tried and skipped is not retried for seven days, so the
+	// queue rotates through all 87 instead of wearing a groove in the top.
+	rows, err := db.Query(`SELECT p.uid, p.title, COALESCE(p.authors,''), COALESCE(p.year,0),
+			COALESCE(p.journal,''), COALESCE(p.our_note,''), COALESCE(p.doi,'')
+		FROM twoai_research_papers p
+		WHERE COALESCE(p.explain_beginner,'')='' AND COALESCE(p.explain_practitioner,'')=''
+			AND COALESCE(p.explain_business,'')=''
+			AND (p.explain_last_try IS NULL OR p.explain_last_try < current_date - 7)
+		ORDER BY (COALESCE(p.doi,'') <> '' AND EXISTS (
+				SELECT 1 FROM twoai_works w WHERE w.doi = lower(p.doi) AND COALESCE(w.abstract,'') <> '')) DESC,
+			COALESCE(p.citations,0) DESC, p.uid
 		LIMIT 12`)
 	if err != nil {
 		return err
@@ -82,6 +96,7 @@ func twoaiPaperExplain(db *sql.DB) error {
 		}
 		if abstract == "" {
 			skipped++
+			db.Exec(`UPDATE twoai_research_papers SET explain_last_try=current_date WHERE uid=$1`, p.uid)
 			continue
 		}
 		if src == "local" {
@@ -93,6 +108,7 @@ func twoaiPaperExplain(db *sql.DB) error {
 		if err != nil {
 			fmt.Println("twoai_paper_explain:", p.uid, err)
 			skipped++
+			db.Exec(`UPDATE twoai_research_papers SET explain_last_try=current_date WHERE uid=$1`, p.uid)
 			continue
 		}
 		// A model that copied the abstract instead of explaining it does not
@@ -100,6 +116,7 @@ func twoaiPaperExplain(db *sql.DB) error {
 		if sharedRun(beg+" "+prac+" "+biz, abstract) >= 12 {
 			fmt.Println("twoai_paper_explain:", p.uid, "output too close to abstract, skipped")
 			skipped++
+			db.Exec(`UPDATE twoai_research_papers SET explain_last_try=current_date WHERE uid=$1`, p.uid)
 			continue
 		}
 		if _, err := db.Exec(`UPDATE twoai_research_papers
@@ -124,8 +141,13 @@ func twoaiPaperExplain(db *sql.DB) error {
 func paperAbstract(db *sql.DB, title, doi string, allowAPI bool) (string, string) {
 	var a sql.NullString
 	if doi != "" {
+		// doi = lower($1), NOT lower(doi) = lower($1). The stored DOIs are
+		// already lowercase (checked across 200,000 rows: zero mixed case) and
+		// twoai_works_doi is a plain btree on the column. Wrapping the column
+		// in lower() throws the index away and scans 1.1 million rows per
+		// paper - 133 seconds for one probe, measured 2026-09-02.
 		if db.QueryRow(`SELECT abstract FROM twoai_works
-			WHERE lower(doi)=lower($1) AND COALESCE(abstract,'')<>'' LIMIT 1`,
+			WHERE doi = $1 AND COALESCE(abstract,'')<>'' LIMIT 1`,
 			strings.ToLower(doi)).Scan(&a) == nil && a.Valid {
 			return strings.TrimSpace(a.String), "local"
 		}

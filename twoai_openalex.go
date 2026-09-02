@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // THE WORKS SPINE, PHASE 1: EVERY AI PAPER OPENALEX KNOWS, AS METADATA.
@@ -154,10 +155,21 @@ func twoaiOAAbstract(inv map[string][]int) string {
 		words = append(words, x.w)
 	}
 	s := strings.Join(words, " ")
+	// Cut on a rune boundary, never a byte. s[:6000] slices BYTES, and a
+	// Greek or Cyrillic abstract that happens to straddle byte 6000 gets cut
+	// mid-character, which Postgres refuses as an invalid UTF-8 sequence -
+	// seven such refusals in the 2026-09-02 run, all 0xce, 0xcf, 0xd0 lead
+	// bytes, all two-byte scripts. The whole work was lost for one byte. This
+	// walks back to the last complete rune and also strips any stray
+	// invalid sequences the source itself carried, so the row lands.
 	if len(s) > 6000 {
-		s = s[:6000]
+		cut := 6000
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut]
 	}
-	return s
+	return strings.ToValidUTF8(s, "")
 }
 
 // twoaiArxivID resolves an arXiv identifier for a work.
