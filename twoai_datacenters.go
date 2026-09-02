@@ -214,6 +214,18 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		Profile json.RawMessage
 	}
 	var enriched []enrichedFac
+	// Every facility by operator name, for the operator pages below. A facility
+	// appears on its operator's page whether or not it earned a page of its
+	// own; the operator page is where the bare rows finally have somewhere to
+	// be listed with their coordinates, which is more than the state directory
+	// gave them.
+	type opFac struct {
+		fac
+		State   string
+		Country string
+		ID      string
+	}
+	facsByOp := map[string][]opFac{}
 	byState := map[string][]fac{}
 	byCountry := map[string][]fac{}
 	mwByState := map[string]float64{}
@@ -223,7 +235,19 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			COALESCE(lat,0), COALESCE(lon,0), COALESCE(country,'US'),
 			COALESCE(critical_it_mw,0),
 			COALESCE((profile->>'technical_space_sqft')::bigint,0),
-			CASE WHEN status='enriched' AND profile<>'{}'::jsonb THEN profile ELSE '{}'::jsonb END
+			-- THE GATE, WIDENED 2026-09-02. It used to be status='enriched' only,
+			-- which kept a bare OSM footprint from becoming a thin page. Then a
+			-- research pass wrote readings into 1,380 rows and addresses into 501
+			-- without ever setting status, and none of it rendered: data written,
+			-- renderer never told, the same shape as the glossary lenses. A row
+			-- now earns a page on what it HOLDS - a reading, an address, a
+			-- capacity, a campus - and the thin-page audit, not this gate, is
+			-- what enforces the word floor.
+			CASE WHEN profile<>'{}'::jsonb AND (status='enriched'
+				OR profile ? 'reading' OR profile ? 'address' OR profile ? 'campus'
+				OR profile ? 'facility_codes' OR profile ? 'it_capacity_mw'
+				OR profile ? 'planned_it_capacity_mw' OR critical_it_mw IS NOT NULL)
+				THEN profile ELSE '{}'::jsonb END
 		FROM twoai_dc_facilities ORDER BY country, state, operator, name`)
 	if err == nil {
 		for frows2.Next() {
@@ -241,6 +265,9 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			if len(prof) > 2 { // more than the empty object
 				f.UID = twoaiUID("dc-fac:" + id)
 				enriched = append(enriched, enrichedFac{id, f.UID, f.Name, f.Operator, f.City, st, cc, f.Website, f.MW, json.RawMessage(prof)})
+			}
+			if f.Operator != "" {
+				facsByOp[f.Operator] = append(facsByOp[f.Operator], opFac{f, st, cc, id})
 			}
 			facMW += f.MW
 			if cc != "US" {
@@ -497,14 +524,101 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			path, string(xj))
 	}
 
-	// Kind-scoped prune: a child page whose row was deleted disappears.
-	if len(keepPaths) > 0 {
-		keep := make([]string, 0, len(keepPaths))
-		for p := range keepPaths {
-			keep = append(keep, p)
-		}
-		db.Exec(`DELETE FROM twoai_pages WHERE kind='tech-dc-child' AND NOT (path = ANY($1))`, pq.Array(keep))
+	// ONE PAGE PER OPERATOR. Stephen, 2026-09-01: a complete page on each
+	// company that operates data centres, listing every facility it controls
+	// with as much technical data as can be sourced, no links in the body,
+	// one link at the end. twoai_dc_operators carries 157 researched rows -
+	// readings, sources, type, headquarters - and until this block existed not
+	// one line of the pipeline read that table. Facilities are grouped by
+	// state and carry their own profile so the template can render address,
+	// codes and capacity per row without a second query.
+	type opPageRef struct {
+		Name       string `json:"name"`
+		UID        string `json:"uid"`
+		Facilities int    `json:"facilities"`
+		Type       string `json:"type,omitempty"`
 	}
+	var operatorPages []opPageRef
+	facProfile := map[string]json.RawMessage{}
+	facUID := map[string]string{}
+	for _, ef := range enriched {
+		facProfile[ef.ID] = ef.Profile
+		facUID[ef.ID] = ef.UID
+	}
+	oprows, err := db.Query(`SELECT uid, name, COALESCE(operator_type,''), COALESCE(website,''),
+			COALESCE(headquarters,''), COALESCE(reading,''), COALESCE(sources,'[]'::jsonb)::text,
+			COALESCE(profile,'{}'::jsonb)::text, COALESCE(company_uid,''), COALESCE(total_it_mw,0)
+		FROM twoai_dc_operators WHERE retired_at IS NULL AND facility_count > 0
+		ORDER BY facility_count DESC, name`)
+	if err == nil {
+		for oprows.Next() {
+			var uid, oname, otype, osite, ohq, oread, osrc, oprof, ocuid string
+			var omw float64
+			if oprows.Scan(&uid, &oname, &otype, &osite, &ohq, &oread, &osrc, &oprof, &ocuid, &omw) != nil {
+				continue
+			}
+			facs := facsByOp[oname]
+			if len(facs) == 0 {
+				continue
+			}
+			// Group by state, US first alphabetically, then other countries.
+			grouped := map[string][]map[string]any{}
+			var order []string
+			seen := map[string]bool{}
+			for _, f := range facs {
+				key := f.State
+				if f.Country != "US" {
+					key = f.Country
+				} else if key == "" {
+					key = "Unlocated"
+				}
+				row := map[string]any{
+					"name": f.Name, "city": f.City, "state": f.State, "country": f.Country,
+					"lat": f.Lat, "lon": f.Lon, "mw": f.MW, "sqft": f.Sqft, "facility_id": f.ID,
+				}
+				if p, ok := facProfile[f.ID]; ok {
+					row["profile"] = p
+					row["uid"] = facUID[f.ID]
+				}
+				if !seen[key] {
+					seen[key] = true
+					order = append(order, key)
+				}
+				grouped[key] = append(grouped[key], row)
+			}
+			sort.Strings(order)
+			var groups []map[string]any
+			for _, k := range order {
+				groups = append(groups, map[string]any{"state": k, "count": len(grouped[k]), "facilities": grouped[k]})
+			}
+			path := "tech/dc-op-" + uid + ".json"
+			keepPaths[path] = true
+			odoc := map[string]any{
+				"shape": "dc-operator", "uid": uid, "tax": "data-centers", "generated": today,
+				"name": oname, "operator_type": otype, "website": osite, "headquarters": ohq,
+				"reading": oread, "sources": json.RawMessage(osrc), "profile": json.RawMessage(oprof),
+				"company_uid": ocuid, "known_mw": omw,
+				"facility_count": len(facs), "groups": groups,
+				"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+			}
+			oj, _ := json.Marshal(odoc)
+			if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+				VALUES ($1,'tech-dc-child',$2::jsonb,'data-centers',1)
+				ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+					taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`,
+				path, string(oj)); err == nil {
+				operatorPages = append(operatorPages, opPageRef{oname, uid, len(facs), otype})
+			}
+		}
+		oprows.Close()
+	}
+
+	// NO PRUNE. This used to DELETE every tech-dc-child row not built this
+	// run, which is a 404 for any facility whose profile went quiet - the
+	// exact thing Stephen's never-removed rule forbids. A published page
+	// stays published; a stale one is still a page. Left here as a note so
+	// nobody puts the delete back.
+	_ = keepPaths
 
 	doc := map[string]any{
 		"shape": "datacenters", "uid": twoaiUID("section:data-centers"),
@@ -512,6 +626,7 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		"metrics": metrics, "sources": srcs, "capex": capex, "filings": filings,
 		"operators":    operators,
 		"metric_pages": metricPages, "builder_pages": builderPages,
+		"operator_pages": operatorPages,
 		"state_pages": statePages, "intl_pages": intlPages, "fac_total": facTotal, "fac_ops": facOps,
 		"fac_mw": facMW, "fac_profiled": len(enriched),
 		"smr":  map[string]any{"uid": smrUID, "count": len(smrProjects)},
