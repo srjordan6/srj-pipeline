@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -747,6 +748,15 @@ func main() {
 		fetched, added, runErr = legiscan(db, sourceID)
 	case "gdelt":
 		fetched, added, runErr = gdelt(db, sourceID)
+		// The policy-news intake rides on the GDELT run and writes under the
+		// same source, so the daily briefing clusters both without knowing.
+		// Its own failure never fails the GDELT run.
+		if pf, pa, perr := twoaiPolicyNews(db); perr != nil {
+			fmt.Fprintln(os.Stderr, "twoai_policy_news:", perr)
+		} else {
+			fetched += pf
+			added += pa
+		}
 	case "govinfo":
 		fetched, added, runErr = govinfo(db, sourceID)
 	default:
@@ -1577,9 +1587,41 @@ func publishNews(db *sql.DB) error {
 		}
 		return len(m)
 	}
+	// A STORY IS NOT SMALL BECAUSE FEW OUTLETS REACHED THIS FEED. On
+	// 2026-09-02 New York City banned generative AI in its public schools
+	// through eighth grade - the broadest such policy in the country - and the
+	// day's briefing did not carry it. GDELT had captured the story once, from
+	// a press-release aggregator, so it ranked below every wire item that ten
+	// mirrors had copied. Outlet count measures how far a story was copied,
+	// not what it is. So a cluster now also scores its SUBJECT: a headline
+	// about a government, a school system, a court, a regulator or a law
+	// earns a weight that lets one authoritative capture stand beside a story
+	// that five newsrooms rewrote. The weight is a fixed table of words, not
+	// a model, and it is deliberately modest: it lifts a policy story into
+	// the ten, it does not make it the lead.
+	authority := func(c *cluster) int {
+		w := 0
+		for _, a := range c.arts {
+			t := strings.ToLower(a.Title)
+			for _, k := range []string{"ban", "bans", "law", "act", "bill", "court", "ruling", "regulator", "regulation",
+				"schools", "school district", "public schools", "governor", "senate", "congress", "commission",
+				"executive order", "attorney general", "lawsuit", "fine", "fined", "mandate", "moratorium"} {
+				if strings.Contains(t, k) {
+					w++
+					break
+				}
+			}
+			d := strings.ToLower(a.Domain)
+			if strings.HasSuffix(d, ".gov") || strings.HasSuffix(d, ".edu") || strings.HasSuffix(d, ".gov.uk") {
+				w += 2
+			}
+		}
+		return w
+	}
+	score := func(c *cluster) int { return newsrooms(c)*2 + authority(c) }
 	sort.Slice(cls, func(i, j int) bool {
-		if newsrooms(cls[i]) != newsrooms(cls[j]) {
-			return newsrooms(cls[i]) > newsrooms(cls[j])
+		if score(cls[i]) != score(cls[j]) {
+			return score(cls[i]) > score(cls[j])
 		}
 		if domains(cls[i]) != domains(cls[j]) {
 			return domains(cls[i]) > domains(cls[j])
@@ -1651,7 +1693,12 @@ func publishNews(db *sql.DB) error {
 	big := []string{}
 	seen := map[string]bool{}
 	for _, c := range cls {
-		h := c.arts[0].Title
+		// GDELT hands over titles with HTML entities intact, so a dash arrives
+		// as &#x2013; and, until 2026-09-03, went out that way in the headline
+		// AND the slug ("...stocks-to-watch-today-x2013-september-2nd"). The
+		// headline is decoded here, before the slug is cut from it, so neither
+		// carries an entity again. Slugs already published keep their URL.
+		h := html.UnescapeString(c.arts[0].Title)
 		sl := slugify(h)
 		if sl == "" || seen[sl] {
 			continue
