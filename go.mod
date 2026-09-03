@@ -4,10 +4,14 @@ go 1.25
 
 require (
 	github.com/lib/pq v1.10.9
+	github.com/paulmach/osm v0.9.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
-	github.com/kr/pretty v0.1.0 // indirect
-	gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127 // indirect
+	github.com/DataDog/czlib v0.0.0-20240814115052-86a9592b3985 // indirect
+	github.com/paulmach/orb v0.12.0 // indirect
+	github.com/paulmach/protoscan v0.2.1 // indirect
+	go.mongodb.org/mongo-driver v1.17.4 // indirect
+	google.golang.org/protobuf v1.36.10 // indirect
 )

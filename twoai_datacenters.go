@@ -747,7 +747,16 @@ var twoaiDcCountries = []struct{ ISO, Name string }{
 func twoaiDcHarvest(db *sql.DB) {
 	twoaiDcHarvestCountry(db, "US")
 	c := twoaiDcCountries[time.Now().YearDay()%len(twoaiDcCountries)]
-	twoaiDcHarvestCountry(db, c.ISO)
+	// The rotation country comes from a downloaded Geofabrik extract first,
+	// so a day when Overpass is refusing everyone - as it did for hours on
+	// 2026-09-02 - no longer costs that country its turn. Overpass is the
+	// fallback only when the download itself cannot be opened.
+	if seen, n, err := twoaiDcHarvestExtract(db, c.ISO); err != nil {
+		fmt.Println("twoai_build: dc harvest", c.ISO, "extract:", err, "(falling back to overpass)")
+		twoaiDcHarvestCountry(db, c.ISO)
+	} else {
+		fmt.Printf("twoai_build: dc harvest %s extract elements=%d upserted=%d\n", c.ISO, seen, n)
+	}
 
 	twoaiDcGeocodeUS(db)
 }
