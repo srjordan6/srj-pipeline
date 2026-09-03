@@ -193,12 +193,26 @@ func twoaiThinSensePages(db *sql.DB) {
 			// layer and never deepens a page whose first reading is still in
 			// flight, which would spend a Sonnet call to answer a question the
 			// publish stage was about to answer for free.
+			// SAME-DAY DEEPENING WHEN THE RENDER IS PROVEN. Strictly-before cost
+			// a full day per layer, and on 2026-09-03 that left 1,556 facility
+			// pages sitting at 350 to 450 words with a first reading that had
+			// published at 08:00 and been audited thin at 18:00 the same day.
+			// The reading being rendered is what the date test was standing in
+			// for, and the published document says so directly: twoai_pages
+			// carries the reading it shipped with, generated_on and all. So a
+			// second layer is also due when the page's published document
+			// carries THIS reading and shipped more than two hours before now,
+			// which is longer than any publish-to-live lag this site has seen.
 			var due int
 			db.QueryRow(`SELECT 1 FROM twoai_industry_analysis ia
 				JOIN twoai_page_audit pa ON pa.url = $3
+				LEFT JOIN twoai_pages p ON p.path = $5
 				WHERE ia.metric=$1 AND ia.data_hash=$2
-				  AND pa.words < $4 AND pa.audited_on > ia.generated_on`,
-				metric, hash, c.ref, thinAuditWords).Scan(&due)
+				  AND pa.words < $4
+				  AND (pa.audited_on > ia.generated_on
+				       OR (p.data->'reading'->>'generated_on' = ia.generated_on::text
+				           AND p.updated_at < now() - interval '2 hours'))`,
+				metric, hash, c.ref, thinAuditWords, path).Scan(&due)
 			var deepExists int
 			db.QueryRow(`SELECT 1 FROM twoai_industry_analysis WHERE metric=$1 AND data_hash=$2`,
 				metric, hash+"-deep").Scan(&deepExists)
