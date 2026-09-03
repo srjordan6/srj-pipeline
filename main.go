@@ -7849,6 +7849,12 @@ func twoaiCompliance(db *sql.DB, today string, upsert func(path, kind string, v 
 	}); err != nil {
 		return count, err
 	}
+	// The What changed block on the hub, regenerated from the bill tracker,
+	// the agency watch and the explainer revision dates every run - it was
+	// hand-written once and never updated until this line existed.
+	if err := twoaiComplianceDigest(db, today, upsert); err != nil {
+		fmt.Println("twoai_compliance_digest:", err)
+	}
 	return count + 1, nil
 }
 
@@ -7903,7 +7909,8 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 					THEN max(NULLIF(p.data->>'total','')::int)
 				ELSE COALESCE(sum(p.url_count),0) END
 			 FROM twoai_pages p WHERE p.taxonomy_slug = t.slug)
-		FROM twoai_taxonomy t WHERE t.level IN (1,2,3) ORDER BY t.level, t.sort`)
+		FROM twoai_taxonomy t WHERE t.level IN (1,2,3) AND COALESCE(t.status,'') <> 'retired'
+		ORDER BY t.level, t.sort`)
 	if err != nil {
 		return 0, err
 	}
