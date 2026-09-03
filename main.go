@@ -6880,6 +6880,43 @@ func urlRegistry(db *sql.DB) error {
 	}
 
 	fmt.Printf("url_registry: live=%d gone=%d unresolved=%d\n", len(urls), gone, unresolved)
+
+	// LEFT THE LISTS BUT STILL SERVED IS NOT A LOSS. Stephen's rule is that a
+	// published page is never removed; the lists are how the site advertises,
+	// not whether it serves. So before naming a URL as overdue, ask the site.
+	// A HEAD that answers 200 resolves the row as 'served': the page exists,
+	// it is simply not advertised, and the registry stops reporting it as
+	// gone. Only a real 404 stays unresolved and gets named. Capped per run so
+	// a large prune does not turn into a thousand requests at once.
+	if len(overdue) > 0 {
+		client := &http.Client{Timeout: 15 * time.Second}
+		served := 0
+		var still []string
+		for i, u := range overdue {
+			if i >= 150 {
+				still = append(still, overdue[i:]...)
+				break
+			}
+			req, _ := http.NewRequest("HEAD", u, nil)
+			req.Header.Set("User-Agent", "theworldofai.org url registry")
+			resp, err := client.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode == 200 {
+					db.Exec(`UPDATE twoai_url_registry SET resolution='served', resolved_at=now(),
+						resolution_note='off the sitemap and the unlisted manifest, but the page answers 200; never removed'
+						WHERE url=$1 AND resolution IS NULL`, u)
+					served++
+					continue
+				}
+			}
+			still = append(still, u)
+		}
+		if served > 0 {
+			fmt.Printf("url_registry: %d overdue url(s) still answer 200 and were resolved as served\n", served)
+		}
+		overdue = still
+	}
 	if len(overdue) > 0 {
 		fmt.Fprintf(os.Stderr, "url_registry: %d url(s) have been out of the sitemap for over 48 hours "+
 			"with no resolution recorded. Redirect or restore each, then set resolution "+

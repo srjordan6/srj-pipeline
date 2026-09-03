@@ -125,25 +125,53 @@ func twoaiWikidataCompany(client *http.Client, name, website string) (wdFacts, e
 			continue
 		}
 		f.qid, f.website = id, site
-		if t, ok := wdClaimValue(claims, "P571").(map[string]any); ok {
-			if ts, ok := t["time"].(string); ok && len(ts) >= 5 {
-				// "+2019-00-00T00:00:00Z"; the year is the only part these
-				// items reliably carry, and a fabricated month would read as
-				// precision we do not have.
-				y := 0
-				fmt.Sscanf(ts[1:5], "%d", &y)
-				if y > 1800 && y <= time.Now().Year() {
-					f.founded = y
-				}
-			}
-		}
-		if hq, ok := wdClaimValue(claims, "P159").(map[string]any); ok {
-			if q, ok := hq["id"].(string); ok {
-				f.hqQID = q
-			}
-		}
+		wdFactsFromClaims(claims, &f)
 		return f, nil
 	}
+	return f, nil
+}
+
+// wdFactsFromClaims reads founding year and headquarters item from a claims
+// map into f. Shared by the name-then-domain matcher and the by-QID path.
+func wdFactsFromClaims(claims map[string]any, f *wdFacts) {
+	if t, ok := wdClaimValue(claims, "P571").(map[string]any); ok {
+		if ts, ok := t["time"].(string); ok && len(ts) >= 5 {
+			// "+2019-00-00T00:00:00Z"; the year is the only part these
+			// items reliably carry, and a fabricated month would read as
+			// precision we do not have.
+			y := 0
+			fmt.Sscanf(ts[1:5], "%d", &y)
+			if y > 1800 && y <= time.Now().Year() {
+				f.founded = y
+			}
+		}
+	}
+	if hq, ok := wdClaimValue(claims, "P159").(map[string]any); ok {
+		if q, ok := hq["id"].(string); ok {
+			f.hqQID = q
+		}
+	}
+}
+
+// twoaiWikidataByQID reads facts straight from a known item. No search, no
+// domain test: the QID was verified by domain equality when it was stored
+// (2026-09-01 bootstrap, 122 of 269 profiles), so it is the hard identifier.
+func twoaiWikidataByQID(client *http.Client, qid string) (wdFacts, error) {
+	var f wdFacts
+	er, err := wdGet(client, "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json"+
+		"&props=claims&ids="+url.QueryEscape(qid))
+	if err != nil {
+		return f, err
+	}
+	ents, _ := er["entities"].(map[string]any)
+	e, _ := ents[qid].(map[string]any)
+	claims, _ := e["claims"].(map[string]any)
+	if claims == nil {
+		return f, nil
+	}
+	f.qid = qid
+	f.website, _ = wdClaimValue(claims, "P856").(string)
+	wdFactsFromClaims(claims, &f)
 	return f, nil
 }
 
@@ -168,21 +196,29 @@ func wdLabel(client *http.Client, qid string) string {
 // twoaiThinFillWikidata fills founding year and headquarters for companies
 // whose own sites carry no structured data.
 func twoaiThinFillWikidata(db *sql.DB) {
-	rows, err := db.Query(`SELECT q.path, q.ref, c.name, COALESCE(c.website,'')
+	// QID FIRST, COMPANY DOMAIN SECOND, PRODUCT URL NEVER. This stage logged
+	// "0 of 60 matched" on every run for a week because it matched on the
+	// profile's website column, which for the companies that matter holds the
+	// PRODUCT: Anthropic is claude.ai, OpenAI is chatgpt.com, Vercel is v0.dev.
+	// No Wikidata item has those as its official website, so the domain test
+	// failed by design. Since 2026-09-01 the profiles carry company_domain
+	// (260 of 269) and wikidata_qid (122, each verified by domain equality).
+	// A known QID is read directly - no search, no guessing; otherwise the
+	// name search is decided by the company domain, as before.
+	rows, err := db.Query(`SELECT q.path, q.ref, c.name, COALESCE(c.company_domain,''), COALESCE(c.wikidata_qid,'')
 		FROM twoai_thin_queue q JOIN twoai_company_profiles c ON c.uid = q.ref
 		WHERE q.kind='company'
-		  AND COALESCE(c.website,'') <> ''
+		  AND (COALESCE(c.company_domain,'') <> '' OR COALESCE(c.wikidata_qid,'') <> '')
 		  AND (COALESCE(c.founded::text,'')='' OR COALESCE(c.headquarters,'')='')
-		  AND COALESCE(c.wikidata_qid,'') = ''
-		ORDER BY q.path LIMIT 60`)
+		ORDER BY (COALESCE(c.wikidata_qid,'') <> '') DESC, q.path LIMIT 60`)
 	if err != nil {
 		return
 	}
-	type job struct{ path, uid, name, site string }
+	type job struct{ path, uid, name, site, qid string }
 	var jobs []job
 	for rows.Next() {
 		var j job
-		if rows.Scan(&j.path, &j.uid, &j.name, &j.site) == nil {
+		if rows.Scan(&j.path, &j.uid, &j.name, &j.site, &j.qid) == nil {
 			jobs = append(jobs, j)
 		}
 	}
@@ -195,7 +231,13 @@ func twoaiThinFillWikidata(db *sql.DB) {
 	matched, filled, unmatched := 0, 0, 0
 	for _, j := range jobs {
 		time.Sleep(700 * time.Millisecond) // courteous against a free service
-		f, err := twoaiWikidataCompany(client, j.name, j.site)
+		var f wdFacts
+		var err error
+		if j.qid != "" {
+			f, err = twoaiWikidataByQID(client, j.qid)
+		} else {
+			f, err = twoaiWikidataCompany(client, j.name, "https://"+j.site)
+		}
 		if err != nil {
 			continue
 		}
@@ -230,6 +272,6 @@ func twoaiThinFillWikidata(db *sql.DB) {
 				"neither this company's own site nor its Wikidata item publishes a founding date or headquarters")
 		}
 	}
-	fmt.Printf("thinpages: wikidata: %d companies matched on their own domain, %d gained a founding date or headquarters, %d had no matching item, of %d tried\n",
+	fmt.Printf("thinpages: wikidata: %d companies matched on QID or company domain, %d gained a founding date or headquarters, %d had no matching item, of %d tried\n",
 		matched, filled, unmatched, len(jobs))
 }
