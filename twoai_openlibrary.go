@@ -314,11 +314,11 @@ func twoaiBookCatalog(db *sql.DB, today string, upsert func(path, kind string, v
 	}); err != nil {
 		return 0, err
 	}
-	// The taxonomy row is REMOVED, not retired: the status column is
-	// constrained to live|building|planned, and a merged section left as
-	// "planned" would reappear on the coverage roadmap as work still to do.
-	// The 301 in _redirects and the changelog carry the history instead.
-	db.Exec(`DELETE FROM twoai_taxonomy WHERE slug='ai-book-catalog'`)
+	// The catalogue's former taxonomy row is RETIRED, not deleted. This used
+	// to DELETE it every run because the status column only allowed
+	// live|building|planned; since 2026-09-03 it allows retired, the listing
+	// skips retired rows, and nothing in the taxonomy is deleted any more.
+	db.Exec(`UPDATE twoai_taxonomy SET status='retired' WHERE slug='ai-book-catalog' AND status<>'retired'`)
 
 	fmt.Printf("twoai_build: book catalogue merged into AI Books: %d titles, %d topics, %d free\n",
 		total, len(groups), free)
