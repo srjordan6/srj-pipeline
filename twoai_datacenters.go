@@ -620,6 +620,73 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 	// nobody puts the delete back.
 	_ = keepPaths
 
+	// TWO DIRECTORY PAGES OF THEIR OWN. Stephen, 2026-09-02: the operator list
+	// and the state list were buried at the foot of a very long hub, and each
+	// deserves its own address. Both are real URLs now, each citable on its
+	// own, and the hub links to them near the top instead of carrying them.
+	// The operator index groups by type, because 157 names in a dotted line
+	// sorted by count is a wall: nine hyperscalers, then colocation, then the
+	// rest, and single-facility operators folded under their own heading.
+	type opIdxRow struct {
+		Name       string   `json:"name"`
+		UID        string   `json:"uid"`
+		Type       string   `json:"type"`
+		Facilities int      `json:"facilities"`
+		States     []string `json:"states"`
+		MW         float64  `json:"known_mw"`
+		HQ         string   `json:"headquarters"`
+	}
+	var opIdx []opIdxRow
+	idxRows, err := db.Query(`SELECT uid, name, COALESCE(operator_type,'other'), COALESCE(headquarters,''),
+			COALESCE(total_it_mw,0), COALESCE(states,'{}')
+		FROM twoai_dc_operators WHERE retired_at IS NULL ORDER BY name`)
+	if err == nil {
+		for idxRows.Next() {
+			var r opIdxRow
+			var states []string
+			if idxRows.Scan(&r.UID, &r.Name, &r.Type, &r.HQ, &r.MW, pq.Array(&states)) != nil {
+				continue
+			}
+			r.Facilities = len(facsByOp[r.Name])
+			if r.Facilities == 0 {
+				continue
+			}
+			r.States = states
+			opIdx = append(opIdx, r)
+		}
+		idxRows.Close()
+	}
+	sort.Slice(opIdx, func(i, j int) bool {
+		if opIdx[i].Facilities != opIdx[j].Facilities {
+			return opIdx[i].Facilities > opIdx[j].Facilities
+		}
+		return opIdx[i].Name < opIdx[j].Name
+	})
+	opIdxDoc := map[string]any{
+		"shape": "dc-operators-index", "uid": twoaiUID("dc-operators-index"), "tax": "data-centers",
+		"generated": today, "name": "Data centers by operator",
+		"operators": opIdx, "operator_count": len(opIdx), "facility_count": facTotal,
+		"states_index_uid": twoaiUID("dc-states-index"),
+		"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+	}
+	if oj, err := json.Marshal(opIdxDoc); err == nil {
+		db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ('tech/dc-operators-index.json','tech-dc-child',$1::jsonb,'data-centers',1)
+			ON CONFLICT (path) DO UPDATE SET data=EXCLUDED.data, url_count=1, updated_at=now()`, string(oj))
+	}
+	stIdxDoc := map[string]any{
+		"shape": "dc-states-index", "uid": twoaiUID("dc-states-index"), "tax": "data-centers",
+		"generated": today, "name": "Data centers by state",
+		"state_pages": statePages, "intl_pages": intlPages, "facility_count": facTotal,
+		"operators_index_uid": twoaiUID("dc-operators-index"),
+		"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+	}
+	if sj, err := json.Marshal(stIdxDoc); err == nil {
+		db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+			VALUES ('tech/dc-states-index.json','tech-dc-child',$1::jsonb,'data-centers',1)
+			ON CONFLICT (path) DO UPDATE SET data=EXCLUDED.data, url_count=1, updated_at=now()`, string(sj))
+	}
+
 	doc := map[string]any{
 		"shape": "datacenters", "uid": twoaiUID("section:data-centers"),
 		"tax": "data-centers", "generated": today, "name": name, "blurb": blurb,
@@ -627,6 +694,8 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		"operators":    operators,
 		"metric_pages": metricPages, "builder_pages": builderPages,
 		"operator_pages": operatorPages,
+		"operators_index_uid": twoaiUID("dc-operators-index"),
+		"states_index_uid":    twoaiUID("dc-states-index"),
 		"state_pages": statePages, "intl_pages": intlPages, "fac_total": facTotal, "fac_ops": facOps,
 		"fac_mw": facMW, "fac_profiled": len(enriched),
 		"smr":  map[string]any{"uid": smrUID, "count": len(smrProjects)},
