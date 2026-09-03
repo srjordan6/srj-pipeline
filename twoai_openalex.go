@@ -259,14 +259,32 @@ func twoaiOAUpsert(db *sql.DB, d twoaiOADoc) (string, error) {
 	if d.PubDate != "" {
 		pubDate = d.PubDate
 	}
+	// ONE LIVE ROW PER DOI. Since 2026-09-03 the partial unique index
+	// twoai_works_doi_canonical_uq refuses a second live row for a DOI, and
+	// OpenAlex does ship the same DOI under more than one work id - 1,982 of
+	// them were found on the day the index went in, and the first run after
+	// logged forty-five refusals. A refused row is a lost record. So before
+	// inserting, ask whether another live row already carries this DOI; if
+	// so, this one arrives MARKED duplicate_of that row, which keeps it out of
+	// the live set the index guards and keeps every fact it carries. The
+	// keeper is whichever row got there first; the audit view and
+	// twoai_works_dup_groups can re-elect a better keeper later without
+	// touching the ingest path.
+	dupOf := ""
+	if doi != "" {
+		db.QueryRow(`SELECT openalex_id FROM twoai_works
+			WHERE doi = $1 AND duplicate_of IS NULL AND openalex_id <> $2 LIMIT 1`,
+			doi, oid).Scan(&dupOf)
+	}
 	if _, err := db.Exec(`INSERT INTO twoai_works
 		(openalex_id, doi, arxiv_id, pmid, title, abstract, pub_date, pub_year,
 		 work_type, language, oa_status, oa_url, license, cited_by, referenced,
-		 topic, topic_score, authors, institutions, source_updated)
+		 topic, topic_score, authors, institutions, source_updated, duplicate_of)
 		VALUES ($1,NULLIF($2,''),NULLIF($3,''),NULLIF($4,''),$5,NULLIF($6,''),$7,$8,
-		 $9,$10,$11,$12,NULLIF($13,''),$14,$15,$16,$17,$18::jsonb,$19::jsonb,NULLIF($20,'')::date)
+		 $9,$10,$11,$12,NULLIF($13,''),$14,$15,$16,$17,$18::jsonb,$19::jsonb,NULLIF($20,'')::date,NULLIF($21,''))
 		ON CONFLICT (openalex_id) DO UPDATE SET
 			doi=EXCLUDED.doi, arxiv_id=COALESCE(EXCLUDED.arxiv_id, twoai_works.arxiv_id),
+			duplicate_of=COALESCE(twoai_works.duplicate_of, EXCLUDED.duplicate_of),
 			pmid=COALESCE(EXCLUDED.pmid, twoai_works.pmid),
 			title=EXCLUDED.title,
 			abstract=COALESCE(EXCLUDED.abstract, twoai_works.abstract),
@@ -278,7 +296,7 @@ func twoaiOAUpsert(db *sql.DB, d twoaiOADoc) (string, error) {
 			source_updated=EXCLUDED.source_updated, last_seen=now()`,
 		oid, doi, arxiv, pmid, title, twoaiOAAbstract(d.AbstractII), pubDate, d.PubYear,
 		d.Type, d.Language, d.OpenAccess.Status, d.OpenAccess.URL, license,
-		d.CitedBy, d.Referenced, topic, score, string(aj), string(ij), d.Updated); err != nil {
+		d.CitedBy, d.Referenced, topic, score, string(aj), string(ij), d.Updated, dupOf); err != nil {
 		return "", err
 	}
 	return oid, nil
