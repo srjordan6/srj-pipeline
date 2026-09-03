@@ -3935,6 +3935,12 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	// Reader demand becomes shelf rows before the explanations run, so a
+	// paper the ask box cited last night gets its three explanations on the
+	// same run that gives it a page.
+	if err := twoaiDemandPages(db); err != nil {
+		fmt.Println("twoai_demand_pages:", err)
+	}
 	if err := twoaiPaperExplain(db); err != nil {
 		fmt.Println("twoai_paper_explain:", err)
 	}
@@ -4581,6 +4587,7 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 	}
 
 	label := map[string]string{
+		"asked-by-readers":        "Asked by Readers",
 		"capabilities-and-limits": "Capabilities and Limits",
 		"reasoning":               "Reasoning",
 		"architectures":           "Architectures",
