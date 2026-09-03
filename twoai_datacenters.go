@@ -212,8 +212,28 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		Website string
 		MW      float64
 		Profile json.RawMessage
+		Lat     float64
+		Lon     float64
 	}
 	var enriched []enrichedFac
+	// The fact box on every facility page (Stephen, 2026-09-03) needs the
+	// nearest airport and a link to the operator's own page. Airports load
+	// once per run from the public-domain OurAirports list; operator uids
+	// are the same sha256 scheme twoai_dc_operators was seeded with.
+	airports := twoaiLoadAirports()
+	if airports == nil {
+		fmt.Println("twoai_build: airports list unavailable this run; fact boxes will omit distance")
+	}
+	operatorUIDs := map[string]string{}
+	if orows, err := db.Query(`SELECT uid, name FROM twoai_dc_operators WHERE retired_at IS NULL`); err == nil {
+		for orows.Next() {
+			var u, n string
+			if orows.Scan(&u, &n) == nil {
+				operatorUIDs[n] = u
+			}
+		}
+		orows.Close()
+	}
 	// Every facility by operator name, for the operator pages below. A facility
 	// appears on its operator's page whether or not it earned a page of its
 	// own; the operator page is where the bare rows finally have somewhere to
@@ -264,7 +284,7 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			}
 			if len(prof) > 2 { // more than the empty object
 				f.UID = twoaiUID("dc-fac:" + id)
-				enriched = append(enriched, enrichedFac{id, f.UID, f.Name, f.Operator, f.City, st, cc, f.Website, f.MW, json.RawMessage(prof)})
+				enriched = append(enriched, enrichedFac{id, f.UID, f.Name, f.Operator, f.City, st, cc, f.Website, f.MW, json.RawMessage(prof), f.Lat, f.Lon})
 			}
 			if f.Operator != "" {
 				facsByOp[f.Operator] = append(facsByOp[f.Operator], opFac{f, st, cc, id})
@@ -363,6 +383,9 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			"name": ef.Name, "operator": ef.Op, "city": ef.City, "state": ef.State,
 			"country": ef.Country, "website": ef.Website, "mw": ef.MW,
 			"profile": ef.Profile, "facility_id": ef.ID,
+			"lat": ef.Lat, "lon": ef.Lon,
+			"nearest_airport": twoaiNearestAirport(airports, ef.Lat, ef.Lon),
+			"operator_uid":    operatorUIDs[ef.Op],
 			"state_page": map[string]any{"uid": stateUID, "code": ef.State},
 			"parent":     map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
 		}
