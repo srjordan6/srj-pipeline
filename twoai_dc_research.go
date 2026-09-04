@@ -143,58 +143,84 @@ func twoaiDcResearch(db *sql.DB) error {
 }
 
 // twoaiResearchAsk runs one Haiku call with web search and returns the
-// proposed facts. Anything not parseable is dropped.
+// proposed facts. The first pass on 2026-09-04 tried 40 CyrusOne facilities
+// - an operator that publishes a spec page per site - and got two facts
+// back in total, so the call itself was not doing what it looked like it
+// was doing. Two things this version does that the first did not: it
+// continues the turn when the API answers stop_reason "pause_turn", which
+// is what a multi-search turn returns and which left the first version
+// with no text at all; and it reports, per facility, the stop reason, how
+// many searches ran, and how many facts came back, so the next log says
+// why rather than only how many.
 func twoaiResearchAsk(client *http.Client, key, name, op, city, st, addr, codes string) []twoaiResearchFact {
 	q := fmt.Sprintf("%s (operator %s) data center, %s %s %s %s", name, op, addr, city, st, codes)
 	prompt := "Find the PUBLISHED specifications for this data center facility: " + q + ".\n" +
 		"Search the operator's own site first (spec sheets, campus pages), then SEC filings, county records, utility or regulatory filings, and local news. " +
 		"Do NOT rely on directory or listing sites (datacenters.com, datacentermap, datacenterhawk, baxtel, godatacenters, ocolo, inflect); they are not sources.\n" +
-		"Return ONLY a JSON array, no prose. Each element: {\"field\": one of it_capacity_mw | planned_it_capacity_mw | power_density_kw_rack | technical_space_sqft | building_sqft | year_opened | phone | certifications, " +
+		"When you have finished searching, reply with ONLY a JSON array, no prose before or after it. Each element: {\"field\": one of it_capacity_mw | planned_it_capacity_mw | power_density_kw_rack | technical_space_sqft | building_sqft | year_opened | phone | certifications, " +
 		"\"value\": the figure as a plain number or string, \"unit\": unit or empty, \"url\": the exact page the figure appears on, \"quote\": the exact short phrase from that page containing the figure (under 20 words)}.\n" +
-		"Only include a field if you found it on a page you can cite. If nothing is published, return []."
-	body, _ := json.Marshal(map[string]any{
-		"model":      "claude-haiku-4-5",
-		"max_tokens": 1200,
-		"tools":      []map[string]any{{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}},
-		"messages":   []map[string]any{{"role": "user", "content": prompt}},
-	})
-	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("content-type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if resp.StatusCode != 200 {
-		fmt.Fprintln(os.Stderr, "twoai_dc_research: api", resp.StatusCode, string(raw[:min(len(raw), 200)]))
-		return nil
-	}
-	var out struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if json.Unmarshal(raw, &out) != nil {
-		return nil
-	}
+		"Only include a field if you found it on a page you can cite. If nothing is published, reply []."
+	messages := []map[string]any{{"role": "user", "content": prompt}}
 	var text string
-	for _, c := range out.Content {
-		if c.Type == "text" {
-			text += c.Text
+	stop, searches := "", 0
+	for turn := 0; turn < 4; turn++ {
+		body, _ := json.Marshal(map[string]any{
+			"model":      "claude-haiku-4-5",
+			"max_tokens": 3000,
+			"tools":      []map[string]any{{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}},
+			"messages":   messages,
+		})
+		req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+		req.Header.Set("x-api-key", key)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("content-type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_dc_research:", name, "request:", err)
+			return nil
 		}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			fmt.Fprintln(os.Stderr, "twoai_dc_research: api", resp.StatusCode, string(raw[:min(len(raw), 300)]))
+			return nil
+		}
+		var out struct {
+			StopReason string            `json:"stop_reason"`
+			Content    []json.RawMessage `json:"content"`
+		}
+		if json.Unmarshal(raw, &out) != nil {
+			return nil
+		}
+		stop = out.StopReason
+		for _, c := range out.Content {
+			var blk struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if json.Unmarshal(c, &blk) != nil {
+				continue
+			}
+			switch blk.Type {
+			case "text":
+				text += blk.Text
+			case "server_tool_use":
+				searches++
+			}
+		}
+		if stop != "pause_turn" {
+			break
+		}
+		// The turn paused mid-search: hand the assistant content back and let
+		// it continue, per the API contract for server tools.
+		messages = append(messages, map[string]any{"role": "assistant", "content": out.Content})
 	}
 	i, j := strings.Index(text, "["), strings.LastIndex(text, "]")
-	if i < 0 || j <= i {
-		return nil
-	}
 	var facts []twoaiResearchFact
-	if json.Unmarshal([]byte(text[i:j+1]), &facts) != nil {
-		return nil
+	if i >= 0 && j > i {
+		json.Unmarshal([]byte(text[i:j+1]), &facts)
 	}
+	fmt.Fprintf(os.Stderr, "twoai_dc_research: %s: stop=%s searches=%d text=%d proposed=%d\n", name, stop, searches, len(text), len(facts))
 	return facts
 }
 
