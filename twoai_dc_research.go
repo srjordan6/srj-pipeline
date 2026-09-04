@@ -79,7 +79,10 @@ func twoaiDcResearch(db *sql.DB) error {
 		  AND NOT (profile ? 'it_capacity_mw' AND profile ? 'power_density_kw_rack')
 		  AND (research_tried_at IS NULL OR research_tried_at < now() - interval '30 days')
 		  AND COALESCE(profile->>'unresolvable','') <> 'true'
-		ORDER BY (name <> operator) DESC, (profile ? 'facility_codes') DESC, id
+		ORDER BY CASE (SELECT operator_type FROM twoai_dc_operators o WHERE o.name = twoai_dc_facilities.operator)
+		           WHEN 'colocation' THEN 0 WHEN 'colocation_reit' THEN 0 WHEN 'network_carrier' THEN 1
+		           WHEN 'enterprise_private' THEN 2 WHEN 'hyperscaler' THEN 4 ELSE 3 END,
+		         (name <> operator) DESC, (profile ? 'facility_codes') DESC, id
 		LIMIT $1`, budget)
 	if err != nil {
 		return err
@@ -107,8 +110,9 @@ func twoaiDcResearch(db *sql.DB) error {
 		var sources []map[string]string
 		seenSrc := map[string]bool{}
 		for _, fa := range facts {
-			if !twoaiResearchVerify(fa) {
+			if ok, why := twoaiResearchVerify(fa); !ok {
 				discarded++
+				fmt.Fprintf(os.Stderr, "twoai_dc_research: %s: discarded %s=%q %s (%s)\n", f.name, fa.Field, fa.Value, why, publisherFromURL(fa.URL))
 				continue
 			}
 			k, v := twoaiResearchNormalize(fa)
@@ -220,33 +224,40 @@ func twoaiResearchAsk(client *http.Client, key, name, op, city, st, addr, codes 
 	if i >= 0 && j > i {
 		json.Unmarshal([]byte(text[i:j+1]), &facts)
 	}
-	fmt.Fprintf(os.Stderr, "twoai_dc_research: %s: stop=%s searches=%d text=%d proposed=%d\n", name, stop, searches, len(text), len(facts))
+	sample := ""
+	if len(facts) == 0 && len(text) > 0 {
+		sample = " | " + strings.ReplaceAll(text[:min(len(text), 140)], "\n", " ")
+	}
+	fmt.Fprintf(os.Stderr, "twoai_dc_research: %s: stop=%s searches=%d text=%d proposed=%d%s\n", name, stop, searches, len(text), len(facts), sample)
 	return facts
 }
 
 // twoaiResearchVerify fetches the cited page and requires the figure to be
 // on it. Aggregators are refused before the fetch.
-func twoaiResearchVerify(f twoaiResearchFact) bool {
+func twoaiResearchVerify(f twoaiResearchFact) (bool, string) {
 	u := strings.TrimSpace(f.URL)
 	if !strings.HasPrefix(u, "http") || f.Value == "" {
-		return false
+		return false, "no url"
 	}
 	lu := strings.ToLower(u)
 	for _, a := range twoaiResearchAggregators {
 		if strings.Contains(lu, a) {
-			return false
+			return false, "aggregator"
 		}
 	}
 	page := twoaiResearchFetch(u)
 	if page == "" {
-		return false
+		return false, "page unreadable"
 	}
 	text := strings.ToLower(regexp.MustCompile(`\s+`).ReplaceAllString(page, " "))
 	// The figure itself must be present, in any of the ways a page writes
 	// a number: 74,981 / 74981 / 74.981 / 12.0 / 12.
 	digits := regexp.MustCompile(`[^0-9.]`).ReplaceAllString(f.Value, "")
 	if digits == "" {
-		return strings.Contains(text, strings.ToLower(f.Value))
+		if strings.Contains(text, strings.ToLower(f.Value)) {
+			return true, ""
+		}
+		return false, "text not on page"
 	}
 	candidates := []string{digits, strings.TrimSuffix(digits, ".0")}
 	if len(digits) > 3 && !strings.Contains(digits, ".") {
@@ -282,10 +293,17 @@ func twoaiResearchVerify(f twoaiResearchFact) bool {
 			continue
 		}
 		if regexp.MustCompile(`(^|[^0-9.,])` + regexp.QuoteMeta(c) + unit).MatchString(text) {
-			return true
+			return true, ""
 		}
 	}
-	return false
+	// Distinguish "number nowhere on the page" from "number present without
+	// its unit", because they call for different fixes.
+	for _, c := range candidates {
+		if c != "" && strings.Contains(text, c) {
+			return false, "number on page but not with its unit"
+		}
+	}
+	return false, "figure not on page"
 }
 
 func twoaiResearchNormalize(f twoaiResearchFact) (string, any) {
