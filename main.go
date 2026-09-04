@@ -4005,6 +4005,12 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	// The links this site sends readers to, fifty a run, oldest first. Never
+	// fatal: a checker that stops the build is worse than a dead link.
+	if err := twoaiLinkCheck(db); err != nil {
+		fmt.Println("twoai_link_check:", err)
+	}
+
 	// Reader demand becomes shelf rows before the explanations run, so a
 	// paper the ask box cited last night gets its three explanations on the
 	// same run that gives it a page.
