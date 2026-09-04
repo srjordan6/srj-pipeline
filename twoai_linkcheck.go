@@ -55,7 +55,18 @@ func twoaiLinkCheck(db *sql.DB) error {
 			UNION ALL
 			SELECT url, 'research-paper' FROM twoai_research_papers WHERE coalesce(url,'') <> ''
 			UNION ALL
-			SELECT s->>'url', 'facility-source' FROM twoai_dc_facilities, jsonb_array_elements(coalesce(profile->'sources','[]'::jsonb)) s
+			-- sources is an array on most rows and JSON null on a couple, and
+			-- jsonb_array_elements on the null form aborts the whole statement:
+			-- "cannot extract elements from a scalar", which is exactly how this
+			-- stage collected nothing on its first run at 21:13 on 2026-09-04.
+			-- coalesce does not help, because JSON null is not SQL NULL.
+			-- Normalise to an array before expanding.
+			SELECT s->>'url', 'facility-source' FROM twoai_dc_facilities,
+			  jsonb_array_elements(
+			    CASE jsonb_typeof(profile->'sources')
+			      WHEN 'array'  THEN profile->'sources'
+			      WHEN 'object' THEN jsonb_build_array(profile->'sources')
+			      ELSE '[]'::jsonb END) s
 			  WHERE coalesce(s->>'url','') <> ''
 		) x WHERE u LIKE 'http%'
 		ON CONFLICT (url) DO NOTHING`); err != nil {
