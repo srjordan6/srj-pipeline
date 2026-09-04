@@ -8759,7 +8759,11 @@ func verifyTwoaiDeploy() {
 	client := &http.Client{Timeout: 30 * time.Second}
 	// Builds take a few minutes. Give it a reasonable window, checking
 	// occasionally rather than tightly, then report whatever is true.
-	for attempt := 1; attempt <= 10; attempt++ {
+	// 25 minutes, not 10. The build crossed 11,700 pages on 2026-09-04 and
+	// took sixteen minutes from hook to deploy; the ten-minute window then
+	// reported DID NOT SHIP on a build that shipped. The window follows the
+	// site, and the site has grown.
+	for attempt := 1; attempt <= 25; attempt++ {
 		time.Sleep(60 * time.Second)
 		req, _ := http.NewRequest("GET", probe+"?deploycheck="+today, nil)
 		req.Header.Set("User-Agent", "theworldofai.org deploy verification (srj-pipeline)")
@@ -8785,7 +8789,7 @@ func verifyTwoaiDeploy() {
 			return
 		}
 	}
-	fmt.Printf("deploy_site: TWOAI BUILD DID NOT SHIP. The deploy hook was accepted but %s still reports an older build after 10 minutes. Check the Cloudflare build log for twoai-site; a failed build leaves the site serving stale content while every other stage reports success.\n", probe)
+	fmt.Printf("deploy_site: TWOAI BUILD DID NOT SHIP. The deploy hook was accepted but %s still reports an older build after 25 minutes. Check the Cloudflare build log for twoai-site; a failed build leaves the site serving stale content while every other stage reports success.\n", probe)
 }
 
 func deploySite() error {
