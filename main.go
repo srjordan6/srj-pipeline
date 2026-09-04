@@ -2491,11 +2491,33 @@ func clGet(path string, params map[string]string, out any) error {
 	return fmt.Errorf("courtlistener rate limited: %s", path)
 }
 
+// twoaiCourtListenerURL returns the docket URL a reader can actually open.
+// On 2026-09-04 Stephen found three lawsuit pages linking to
+// courtlistener.com/docket/<id>/ where every one answered 404: CourtListener
+// canonicalises a docket as /docket/<id>/<slug>/ and refuses the bare form.
+// The search API returns the correct path in docket_absolute_url, so that is
+// used whenever it is present, and the bare form only as a last resort -
+// which the link checker then catches rather than a reader.
+func twoaiCourtListenerURL(absoluteURL string, docketID int64) string {
+	if u := strings.TrimSpace(absoluteURL); u != "" {
+		if strings.HasPrefix(u, "http") {
+			return u
+		}
+		return "https://www.courtlistener.com" + u
+	}
+	return fmt.Sprintf("https://www.courtlistener.com/docket/%d/", docketID)
+}
+
 type clSearch struct {
 	Results []struct {
 		CaseName     string `json:"caseName"`
 		DocketNumber string `json:"docketNumber"`
 		DocketID     int64  `json:"docket_id"`
+		// CourtListener's canonical docket path includes a slug; a bare
+		// /docket/<id>/ answers 404. The API gives the real path here and
+		// this must be used rather than one built from the id - see
+		// twoaiCourtListenerURL.
+		AbsoluteURL  string `json:"docket_absolute_url"`
 		Court        string `json:"court"`
 		DateFiled    string `json:"dateFiled"`
 		Snippet      string `json:"snippet"`
@@ -2681,7 +2703,7 @@ func intelResolve(db *sql.DB) (resolved int, err error) {
 				!strings.Contains(strings.ToLower(h.CaseName), surname) {
 				continue
 			}
-			clURL := fmt.Sprintf("https://www.courtlistener.com/docket/%d/", h.DocketID)
+			clURL := twoaiCourtListenerURL(h.AbsoluteURL, h.DocketID)
 			if _, err := db.Exec(`UPDATE ai_lawsuits SET docket=$1, courtlistener_url=$2, updated_at=now() WHERE id=$3`,
 				h.DocketNumber, clURL, p.id); err == nil {
 				resolved++
@@ -2750,6 +2772,7 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 		CaseName     string `json:"caseName"`
 		DocketNumber string `json:"docketNumber"`
 		DocketID     int64  `json:"docket_id"`
+		AbsoluteURL  string `json:"docket_absolute_url"`
 		Court        string `json:"court"`
 		DateFiled    string `json:"dateFiled"`
 		Snippet      string `json:"snippet"`
@@ -2781,7 +2804,7 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 			VALUES ('courtlistener', $1, $2, $3, $4, NULLIF($5,'')::date, $6, $7, $8)
 			ON CONFLICT (source_id) DO NOTHING`,
 			fmt.Sprintf("cl-docket-%d", h.DocketID), h.CaseName, h.Court, h.DocketNumber,
-			h.DateFiled, fmt.Sprintf("https://www.courtlistener.com/docket/%d/", h.DocketID),
+			h.DateFiled, twoaiCourtListenerURL(h.AbsoluteURL, h.DocketID),
 			trunc(h.Snippet, 500), score)
 		if e != nil {
 			return
