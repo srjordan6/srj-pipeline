@@ -99,6 +99,8 @@ func twoaiCapexMA(db *sql.DB, today string) (int, error) {
 
 	// ---- Capex: per company, resolve the concept that is currently in use
 	// and store quarterly-duration facts. Failures keep prior rows.
+	capexCos, capexFacts := 0, 0
+	capexLatest := ""
 	for _, c := range twoaiCapexCompanies {
 		type fact struct {
 			Start string  `json:"start"`
@@ -159,8 +161,17 @@ func twoaiCapexMA(db *sql.DB, today string) (int, error) {
 				c.CIK, c.Name, bestConcept, f.Start, f.End, f.Val, f.Form)
 			kept++
 		}
-		fmt.Printf("twoai_capex: %s concept=%s quarterly_facts=%d latest=%s\n", c.Name, bestConcept, kept, bestEnd)
+		// One line per company said the same eleven things every run and
+		// buried the lines that change. The run summary below carries the
+		// totals; a company that resolves NO capex concept still warns on
+		// stderr above, because that is the case worth reading.
+		capexCos++
+		capexFacts += kept
+		if bestEnd > capexLatest {
+			capexLatest = bestEnd
+		}
 	}
+	fmt.Printf("twoai_capex: companies=%d quarterly_facts=%d latest=%s\n", capexCos, capexFacts, capexLatest)
 
 	// ---- M&A: 8-K items sweep across tracked registrants + the capex seven.
 	ciks := map[string]string{}
