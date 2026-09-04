@@ -185,6 +185,13 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 	// The national facility registry: refresh from OpenStreetMap, geocode a
 	// batch, then render one directory page per state.
 	twoaiDcHarvest(db)
+	// After the map is refreshed, the research pass fills what the map cannot:
+	// published capacity, density, space, year, certifications, found by
+	// search and verified against the cited page before storing. Budgeted per
+	// run; never fatal.
+	if err := twoaiDcResearch(db); err != nil {
+		fmt.Println("twoai_dc_research:", err)
+	}
 	type fac struct {
 		Name     string  `json:"name"`
 		Operator string  `json:"operator,omitempty"`
