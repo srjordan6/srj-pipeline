@@ -18,21 +18,31 @@ import (
 // defaulting to a number that goes down when data is missing.
 //
 // Components, each 0 to 1, with weights:
-//   capacity   0.35  published IT capacity, MW, log-scaled so that 1 MW is
+//   capacity   0.45  published IT capacity, MW, log-scaled so that 1 MW is
 //                    near 0, 20 MW is about half, 300 MW and above is 1.
-//   density    0.30  published cabinet density, kW or kVA per rack. This is
-//                    the figure that decides whether accelerators can be
-//                    racked at all: under 5 is office-era, 10 to 20 is
-//                    air-cooled GPU, 30 and above needs liquid.
-//   planned    0.15  announced expansion, MW, same log scale as capacity.
-//   operator   0.20  what kind of operator runs the building, from the
+//   planned    0.20  announced expansion, MW, same log scale as capacity.
+//   operator   0.35  what kind of operator runs the building, from the
 //                    registry's own classification: a hyperscaler builds
 //                    for its own accelerators, a colocation REIT builds for
 //                    tenants who do, an enterprise or academic hall was
 //                    built for something else.
 //
+// DENSITY WAS A SCORED INPUT UNTIL 2026-09-04 AND IS NOW A DISPLAYED FACT.
+// Rack density is the figure that decides whether accelerators can be racked
+// at all, so it belonged in the formula on the merits. In practice operators
+// almost never publish it: after a full research pass across every
+// colocation operator in the registry, 11 of 1,386 US facilities had a
+// density figure, and requiring three of four inputs left EIGHT facilities
+// scorable. An index that refuses to score 99 percent of the registry is
+// measuring disclosure, not facilities. Density still renders in the fact
+// box, where a reader can see it and see how rare it is; it no longer
+// decides whether a page gets a number.
+//
 // The score is the weighted mean of the components present, scaled to 100.
-// Three components minimum. What was used is written beside the number.
+// TWO components minimum, one of which must be published or planned
+// capacity: operator type alone is a category, not a measurement, and must
+// never produce a score by itself. What was used is written beside the
+// number.
 
 type twoaiSuitability struct {
 	Score      int      `json:"score"`
@@ -103,6 +113,7 @@ func twoaiComputeSuitability(profile json.RawMessage, mw float64, operatorType s
 	}
 	planned := num("planned_it_capacity_mw")
 	opScale, opKnown := twoaiOperatorTypeScale[strings.ToLower(operatorType)]
+	_ = density // read for the note below, no longer scored
 
 	type comp struct {
 		name   string
@@ -111,10 +122,9 @@ func twoaiComputeSuitability(profile json.RawMessage, mw float64, operatorType s
 		ok     bool
 	}
 	comps := []comp{
-		{"published IT capacity", 0.35, twoaiLogScale(cap, 300), cap > 0},
-		{"published rack density", 0.30, twoaiDensityScale(density), density > 0},
-		{"announced expansion", 0.15, twoaiLogScale(planned, 300), planned > 0},
-		{"operator type", 0.20, opScale, opKnown && operatorType != ""},
+		{"published IT capacity", 0.45, twoaiLogScale(cap, 300), cap > 0},
+		{"announced expansion", 0.20, twoaiLogScale(planned, 300), planned > 0},
+		{"operator type", 0.35, opScale, opKnown && operatorType != ""},
 	}
 	var used, missing []string
 	var num1, den float64
@@ -127,12 +137,16 @@ func twoaiComputeSuitability(profile json.RawMessage, mw float64, operatorType s
 			missing = append(missing, c.name)
 		}
 	}
-	if len(used) < 3 || den == 0 {
+	// Two inputs minimum, and a capacity figure must be one of them.
+	if len(used) < 2 || den == 0 || (cap <= 0 && planned <= 0) {
 		return nil
 	}
 	score := int(math.Round(100 * num1 / den))
+	basis := "weighted mean of the published inputs named here, scaled to 100; formula on the methodology page"
+	if density > 0 {
+		basis += ". Published rack density is shown above but is not scored: too few operators publish it for it to rank facilities fairly"
+	}
 	return &twoaiSuitability{
-		Score: score, Components: used, Missing: missing,
-		Basis: "weighted mean of the published inputs named here, scaled to 100; formula on the methodology page",
+		Score: score, Components: used, Missing: missing, Basis: basis,
 	}
 }
