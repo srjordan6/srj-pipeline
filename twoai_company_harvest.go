@@ -343,7 +343,7 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 	if len(jobs) > 0 {
 		model := os.Getenv("TWOAI_ANALYSIS_MODEL")
 		if model == "" {
-			model = "claude-sonnet-4-6"
+			model = "claude-haiku-4-5"
 		}
 		system := "You write company profiles for theworldofai.org, a sourced AI reference site. " +
 			"You are given JSON: the text this site's pipeline harvested from the company's own " +

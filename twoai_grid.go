@@ -645,7 +645,7 @@ func twoaiGridPage(db *sql.DB, today string) error {
 		if model, body, err := func() (string, string, error) {
 			model := os.Getenv("TWOAI_ANALYSIS_MODEL")
 			if model == "" {
-				model = "claude-sonnet-4-6"
+				model = "claude-haiku-4-5"
 			}
 			b, err := twoaiClaudeCall(model, system, "The data:\n"+string(payload)+"\n\nWrite the interpretation now.")
 			return model, b, err

@@ -322,7 +322,7 @@ Return the paragraphs only, separated by blank lines, no heading, no preamble.`
 func twoaiIncidentPages(db *sql.DB, incidents []incidentOut, today string) int {
 	model := os.Getenv("TWOAI_ANALYSIS_MODEL")
 	if model == "" {
-		model = "claude-sonnet-4-6"
+		model = "claude-haiku-4-5"
 	}
 	built := 0
 	for _, inc := range incidents {

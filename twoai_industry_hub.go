@@ -15,7 +15,7 @@ package main
 //
 //  2. INTERPRET: when ANTHROPIC_API_KEY is configured and the data hash
 //     has changed since the last analysis, ask Claude (default
-//     claude-sonnet-4-6, override with TWOAI_ANALYSIS_MODEL) what the
+//     claude-haiku-4-5, override with TWOAI_ANALYSIS_MODEL) what the
 //     numbers mean for the AI industry. The prompt contains ONLY the
 //     fetched payload and forbids outside facts. The reply is validated
 //     mechanically: every percentage figure in the analysis must appear
@@ -410,7 +410,7 @@ func twoaiClaudeAnalyze(payload string) (model, body string, err error) {
 	}
 	model = os.Getenv("TWOAI_ANALYSIS_MODEL")
 	if model == "" {
-		model = "claude-sonnet-4-6"
+		model = "claude-haiku-4-5"
 	}
 	system := twoaiNationalSystem
 	body, err = twoaiClaudeCall(model, system, "The data:\n"+payload+"\n\nWrite the analysis now.")
@@ -424,7 +424,7 @@ func twoaiClaudeAnalyzeExtra(payload, extra string) (model, body string, err err
 	}
 	model = os.Getenv("TWOAI_ANALYSIS_MODEL")
 	if model == "" {
-		model = "claude-sonnet-4-6"
+		model = "claude-haiku-4-5"
 	}
 	system := twoaiNationalSystem
 	body, err = twoaiClaudeCall(model, system, "The data:\n"+payload+"\n\nWrite the analysis now."+extra)
@@ -438,7 +438,7 @@ func twoaiClaudeAnalyzeSectorExtra(sector, payload, extra string) (model, body s
 	}
 	model = os.Getenv("TWOAI_ANALYSIS_MODEL")
 	if model == "" {
-		model = "claude-sonnet-4-6"
+		model = "claude-haiku-4-5"
 	}
 	system := twoaiSectorSystem
 	body, err = twoaiClaudeCall(model, system, "Sector: "+sector+"\nThe data:\n"+payload+"\n\nWrite the analysis now."+extra)
@@ -452,7 +452,7 @@ func twoaiClaudeAnalyzeSector(sector, payload string) (model, body string, err e
 	}
 	model = os.Getenv("TWOAI_ANALYSIS_MODEL")
 	if model == "" {
-		model = "claude-sonnet-4-6"
+		model = "claude-haiku-4-5"
 	}
 	system := twoaiSectorSystem
 	body, err = twoaiClaudeCall(model, system, "Sector: "+sector+"\nThe data:\n"+payload+"\n\nWrite the analysis now.")

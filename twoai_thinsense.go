@@ -89,9 +89,16 @@ func twoaiThinSensePages(db *sql.DB) {
 		fmt.Println("thinpages: page readings: ANTHROPIC_API_KEY not set, skipped")
 		return
 	}
+	// HAIKU IS THE DEFAULT, SONNET IS A CHOICE. Until 2026-09-04 an unset
+	// TWOAI_ANALYSIS_MODEL fell back to Sonnet in nine places. The scraper
+	// cron sets the variable; the pipeline cron does not, so every stage it
+	// runs - company profiles, incident readings, grid and sector analysis -
+	// billed at Sonnet rates unnoticed: 3,201 calls between 2026-08-15 and
+	// today. The fallback is now Haiku everywhere, and Sonnet is reached only
+	// by setting the variable on purpose.
 	model := os.Getenv("TWOAI_ANALYSIS_MODEL")
 	if model == "" {
-		model = "claude-sonnet-4-6"
+		model = "claude-haiku-4-5"
 	}
 	due := thinDue(db, "thin-words", thinBudget("PAGEREAD", 400))
 	if len(due) == 0 {
@@ -284,7 +291,7 @@ func twoaiThinSense(db *sql.DB) {
 	}
 	model := os.Getenv("TWOAI_ANALYSIS_MODEL")
 	if model == "" {
-		model = "claude-sonnet-4-6"
+		model = "claude-haiku-4-5"
 	}
 	rows, err := db.Query(`SELECT id, name, operator, city, COALESCE(state,''), COALESCE(country,'US'),
 			COALESCE(critical_it_mw,0), profile::text
