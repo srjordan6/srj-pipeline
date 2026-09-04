@@ -233,8 +233,29 @@ func twoaiResearchVerify(f twoaiResearchFact) bool {
 		}
 		candidates = append(candidates, withCommas, strings.ReplaceAll(withCommas, ",", "."))
 	}
+	// THE NUMBER MUST APPEAR WITH ITS UNIT. A bare "15" verified against
+	// Equinix's SV1 page in testing because the page links to SV15; a bare
+	// "2000" would verify against any page with a year on it. So a capacity
+	// figure must be followed within a few characters by MW or megawatt, an
+	// area by sq ft / square feet / ft² / SF / m², a density by kW or kVA, and
+	// a year must stand alone as a four-digit token. Phone and certification
+	// values are matched as text.
+	unit := map[string]string{
+		"it_capacity_mw":         `\s*(mw|megawatt)`,
+		"planned_it_capacity_mw": `\s*(mw|megawatt)`,
+		"power_density_kw_rack":  `\s*(kw|kva|kilowatt)`,
+		"technical_space_sqft":   `\s*(sq\.? ?ft|square feet|square foot|ft²|ft2|sf\b|m²|m2|square met)`,
+		"building_sqft":          `\s*(sq\.? ?ft|square feet|square foot|ft²|ft2|sf\b|m²|m2|square met)`,
+		"year_opened":            `(?:[^0-9]|$)`,
+	}[f.Field]
+	if unit == "" {
+		unit = `([^0-9]|$)`
+	}
 	for _, c := range candidates {
-		if c != "" && strings.Contains(text, c) {
+		if c == "" {
+			continue
+		}
+		if regexp.MustCompile(`(^|[^0-9.,])` + regexp.QuoteMeta(c) + unit).MatchString(text) {
 			return true
 		}
 	}
@@ -294,9 +315,14 @@ func twoaiResearchNormalize(f twoaiResearchFact) (string, any) {
 
 // twoaiResearchFetch reads the cited page. Operator sites often refuse a
 // plain fetch (equinix.com answers 403 to anything without a browser), so a
-// refusal falls through to Firecrawl's scrape endpoint, which renders the
-// page as a browser would and returns its text. A page that neither path
-// can read verifies nothing, and the figure is not stored.
+// refusal falls through a chain of renderers: Firecrawl while its monthly
+// quota lasts (the first 402 or 429 of a run stops further attempts, since
+// the quota ran out on 2026-09-04 and every retry was a wasted call), then
+// Jina Reader, a free rendering proxy that needs no key and returned the
+// Equinix SV1 page with its square footage intact when Firecrawl could not.
+// A page no path can read verifies nothing, and the figure is not stored.
+var twoaiFirecrawlExhausted bool
+
 func twoaiResearchFetch(u string) string {
 	req, _ := http.NewRequest("GET", u, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org facility registry; verification fetch)")
@@ -307,28 +333,45 @@ func twoaiResearchFetch(u string) string {
 			return string(b)
 		}
 	}
-	k := os.Getenv("FIRECRAWL_API_KEY")
-	if k == "" {
-		return ""
+	if k := os.Getenv("FIRECRAWL_API_KEY"); k != "" && !twoaiFirecrawlExhausted {
+		body, _ := json.Marshal(map[string]any{"url": u, "formats": []string{"markdown"}, "onlyMainContent": false})
+		req, _ = http.NewRequest("POST", "https://api.firecrawl.dev/v2/scrape", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+k)
+		req.Header.Set("Content-Type", "application/json")
+		if resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req); err == nil {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+			resp.Body.Close()
+			if resp.StatusCode == 402 || resp.StatusCode == 429 {
+				twoaiFirecrawlExhausted = true
+				fmt.Fprintln(os.Stderr, "twoai_dc_research: firecrawl quota exhausted, using jina reader for the rest of the run")
+			} else if resp.StatusCode == 200 {
+				var out struct {
+					Data struct {
+						Markdown string `json:"markdown"`
+					} `json:"data"`
+				}
+				if json.Unmarshal(raw, &out) == nil && len(out.Data.Markdown) > 200 {
+					time.Sleep(1200 * time.Millisecond)
+					return out.Data.Markdown
+				}
+			}
+		}
 	}
-	body, _ := json.Marshal(map[string]any{"url": u, "formats": []string{"markdown"}, "onlyMainContent": false})
-	req, _ = http.NewRequest("POST", "https://api.firecrawl.dev/v2/scrape", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+k)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
-	if err != nil {
-		return ""
+	// Jina Reader: prefix the URL, get the rendered page as text. Free tier
+	// is rate-limited by IP, so one request every few seconds.
+	req, _ = http.NewRequest("GET", "https://r.jina.ai/"+u, nil)
+	req.Header.Set("User-Agent", "theworldofai.org facility registry verification")
+	req.Header.Set("Accept", "text/plain")
+	if k := os.Getenv("JINA_API_KEY"); k != "" {
+		req.Header.Set("Authorization", "Bearer "+k)
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	var out struct {
-		Data struct {
-			Markdown string `json:"markdown"`
-		} `json:"data"`
+	if resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req); err == nil {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		time.Sleep(3 * time.Second)
+		if resp.StatusCode == 200 && len(b) > 200 {
+			return string(b)
+		}
 	}
-	if json.Unmarshal(raw, &out) != nil {
-		return ""
-	}
-	time.Sleep(1200 * time.Millisecond) // Firecrawl free tier: 10 requests a minute
-	return out.Data.Markdown
+	return ""
 }
