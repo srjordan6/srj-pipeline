@@ -225,11 +225,13 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		fmt.Println("twoai_build: airports list unavailable this run; fact boxes will omit distance")
 	}
 	operatorUIDs := map[string]string{}
-	if orows, err := db.Query(`SELECT uid, name FROM twoai_dc_operators WHERE retired_at IS NULL`); err == nil {
+	operatorTypes := map[string]string{}
+	if orows, err := db.Query(`SELECT uid, name, COALESCE(operator_type,'') FROM twoai_dc_operators WHERE retired_at IS NULL`); err == nil {
 		for orows.Next() {
-			var u, n string
-			if orows.Scan(&u, &n) == nil {
+			var u, n, t string
+			if orows.Scan(&u, &n, &t) == nil {
 				operatorUIDs[n] = u
+				operatorTypes[n] = t
 			}
 		}
 		orows.Close()
@@ -386,6 +388,7 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			"lat": ef.Lat, "lon": ef.Lon,
 			"nearest_airport": twoaiNearestAirport(airports, ef.Lat, ef.Lon),
 			"operator_uid":    operatorUIDs[ef.Op],
+			"suitability":     twoaiComputeSuitability(ef.Profile, ef.MW, operatorTypes[ef.Op]),
 			"state_page": map[string]any{"uid": stateUID, "code": ef.State},
 			"parent":     map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
 		}
