@@ -4019,6 +4019,12 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	// Siting and moratorium news, routed from the policy intake to the siting
+	// page and to a queue Cowork works. Never fatal.
+	if err := twoaiSitingWatch(db); err != nil {
+		fmt.Println("twoai_siting_watch:", err)
+	}
+
 	// The links this site sends readers to, fifty a run, oldest first. Never
 	// fatal: a checker that stops the build is worse than a dead link.
 	if err := twoaiLinkCheck(db); err != nil {
@@ -7956,10 +7962,29 @@ func twoaiCompliance(db *sql.DB, today string, upsert func(path, kind string, v 
 		return 0, nil
 	}
 
+	// The siting page carries the watch list, so a moratorium reported today
+	// shows there tomorrow rather than whenever the page is next edited.
+	var sitingWatch []map[string]any
+	if wr, err := db.Query(`SELECT title, COALESCE(publisher,''), COALESCE(published_on::text,''),
+			COALESCE(jurisdiction,''), COALESCE(kind,''), url
+		FROM twoai_siting_watch ORDER BY published_on DESC NULLS LAST, first_seen DESC LIMIT 24`); err == nil {
+		for wr.Next() {
+			var t, p, d, j, k, u string
+			if wr.Scan(&t, &p, &d, &j, &k, &u) == nil {
+				sitingWatch = append(sitingWatch, map[string]any{
+					"title": t, "publisher": p, "date": d, "jurisdiction": j, "kind": k, "url": u})
+			}
+		}
+		wr.Close()
+	}
+
 	count := 0
 	index := []entry{}
 	for _, doc := range all {
 		slug, _ := doc["slug"].(string)
+		if slug == "datacenter-siting-and-power" && len(sitingWatch) > 0 {
+			doc["siting_watch"] = sitingWatch
+		}
 		if err := upsert("compliance/"+slug+".json", "compliance", doc); err != nil {
 			return count, err
 		}
