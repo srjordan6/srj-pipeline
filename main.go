@@ -3826,9 +3826,23 @@ func twoaiBuild(db *sql.DB) error {
 				b, _ := list[j]["name"].(string)
 				return strings.ToLower(a) < strings.ToLower(b)
 			})
-			if err := upsert("tools/cat-"+cslug+".json", "tool-category", map[string]any{
-				"name": name, "slug": cslug, "generated": today, "tools": list,
-			}); err != nil {
+			// A category page listed its tools and said nothing about the
+			// category. There was nowhere for that prose to live - the
+			// document carried four keys and no table fed it - so the work
+			// could not be done by anyone, which is why eleven of these sat
+			// under 500 words. twoai_tool_category_intros is that table.
+			doc := map[string]any{"name": name, "slug": cslug, "generated": today, "tools": list}
+			var intro, csrc, cupd string
+			if db.QueryRow(`SELECT intro, COALESCE(sources::text,'[]'), updated_on::text
+				FROM twoai_tool_category_intros WHERE slug = $1`, cslug).Scan(&intro, &csrc, &cupd) == nil && intro != "" {
+				doc["intro"] = intro
+				doc["intro_updated_on"] = cupd
+				var cs []map[string]any
+				if json.Unmarshal([]byte(csrc), &cs) == nil && len(cs) > 0 {
+					doc["intro_sources"] = cs
+				}
+			}
+			if err := upsert("tools/cat-"+cslug+".json", "tool-category", doc); err != nil {
 				return err
 			}
 			catIdx = append(catIdx, map[string]any{"name": name, "slug": cslug, "count": len(list)})
