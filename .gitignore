@@ -8,3 +8,5 @@ pipeline
 # Windows-built local binary (from testing inkbox_pull on the PC)
 pipeline.exe
 *.exe
+
+pipeline.exe
