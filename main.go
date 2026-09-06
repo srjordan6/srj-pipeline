@@ -5794,17 +5794,19 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 	}
 	// Where each person's profile now renders, so the hub and the roster link
 	// to the anchor rather than to a page that no longer exists.
+	// EVERY PROFILED PERSON HAS THEIR OWN PAGE. Stephen, 2026-09-06: the
+	// category page had become one long scroll carrying every profile in the
+	// section, so a person could not be linked, shared or cited on their own.
+	// A person is an entity; an entity gets a page at its own uid. The
+	// category page keeps every uid as an anchor on its list entry, so the
+	// anchor links published between 2026-09-01 and today still land on the
+	// right row, and the 58 redirects written for the old per-person URLs are
+	// removed in the same change - those URLs are pages again.
 	homeOf := func(uid string) string {
-		key := primaryCat[slugByUID[uid]]
-		if key == "" {
+		if uid == "" {
 			return ""
 		}
-		tax := catTax[key]
-		if tax == "" {
-			return ""
-		}
-		return "/ai-ecosystem/ecosystem-entities-market-and-operations/" +
-			twoaiUID("section:"+tax) + "/#" + uid
+		return "/ai-ecosystem/ecosystem-entities-market-and-operations/" + uid + "/"
 	}
 	for i := range list {
 		list[i].Path = homeOf(list[i].UID)
@@ -5835,8 +5837,76 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		return count, err
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	// One page per profiled person, at their own uid. The route in twoai-site
+	// has carried the renderer since 2026-09-01 waiting for these files to
+	// come back; writing them is all that was needed.
+	keepPeople := make([]string, 0, len(docsByUID))
+	for uid, d := range docsByUID {
+		if uid == "" || d == nil {
+			continue
+		}
+		d["uid"] = uid
+		d["generated"] = today
+		d["path"] = homeOf(uid)
+		if slug := slugByUID[uid]; slug != "" {
+			d["slug"] = slug
+			if key := primaryCat[slug]; key != "" {
+				d["category"] = catName[key]
+				d["category_path"] = "/ai-ecosystem/ecosystem-entities-market-and-operations/" +
+					twoaiUID("section:"+catTax[key]) + "/"
+			}
+		}
+		if err := upsert("people/"+uid+".json", "person", d); err != nil {
+			return count, err
+		}
+		keepPeople = append(keepPeople, "people/"+uid+".json")
+		count++
+	}
+	if len(keepPeople) > 0 {
+		if _, err := db.Exec(`DELETE FROM twoai_pages
+			WHERE kind = 'person' AND NOT (path = ANY($1))`, pq.Array(keepPeople)); err != nil {
+			return count, err
+		}
+	}
+
+	// A to Z. Stephen asked for it on the hub: 160 people is past the point
+	// where a reader scans a list, and an alphabet is how a directory is
+	// entered. Grouped on the surname where there is one, because that is how
+	// a reader looks a person up, and the group label is the letter itself.
+	azOrder := func(n string) string {
+		parts := strings.Fields(n)
+		if len(parts) > 1 {
+			return strings.ToUpper(parts[len(parts)-1]) + " " + n
+		}
+		return strings.ToUpper(n)
+	}
+	az := map[string][]map[string]string{}
+	for _, e := range list {
+		if e.Name == "" {
+			continue
+		}
+		k := azOrder(e.Name)
+		letter := "#"
+		if k != "" && k[0] >= 'A' && k[0] <= 'Z' {
+			letter = string(k[0])
+		}
+		az[letter] = append(az[letter], map[string]string{
+			"uid": e.UID, "name": e.Name, "sort": k, "moniker": e.Moniker,
+			"path": e.Path, "profiled": map[bool]string{true: "yes", false: "no"}[e.Profiled],
+		})
+	}
+	azList := make([]map[string]any, 0, 27)
+	for _, l := range []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+		"N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "#"} {
+		if len(az[l]) == 0 {
+			continue
+		}
+		sort.Slice(az[l], func(i, j int) bool { return az[l][i]["sort"] < az[l][j]["sort"] })
+		azList = append(azList, map[string]any{"letter": l, "count": len(az[l]), "people": az[l]})
+	}
+
 	if err := upsert("people/index.json", "person-hub", map[string]any{
-		"uid": twoaiUID("section:ai-people-directory"), "people": list,
+		"uid": twoaiUID("section:ai-people-directory"), "people": list, "az": azList,
 		"total": len(list), "profiled": len(docs) - tracked, "tracked_only": tracked,
 		"generated": today,
 	}); err != nil {
@@ -5895,9 +5965,17 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 			if !held {
 				continue
 			}
+			// The profile itself lives on the person's own page now. What the
+			// category carries is the entry: name, moniker, hook, fields and
+			// the link. Enough to choose from, not a wall to scroll past.
 			if primaryCat[slugByUID[e.UID]] == key {
 				if d := docsByUID[e.UID]; d != nil {
-					profiles = append(profiles, d)
+					entry := map[string]any{
+						"uid": e.UID, "name": e.Name, "moniker": e.Moniker,
+						"hook": e.Hook, "fields": e.Fields, "path": homeOf(e.UID),
+						"sources": d["sources"],
+					}
+					profiles = append(profiles, entry)
 					continue
 				}
 			}
