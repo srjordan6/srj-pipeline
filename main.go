@@ -4711,6 +4711,15 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 		return 0, nil
 	}
 
+	// A shelf with one or two papers reads thin at the topic page's own
+	// word count even though a full explanation exists one click away on
+	// the paper itself. area_note gives the small shelves a sentence about
+	// what the whole line of research asks, not just this one paper -
+	// rendered by the template only when the shelf is small, so a large
+	// shelf is not padded with a note it does not need.
+	areaNote := map[string]string{
+		"asked-by-readers": "This shelf collects papers a reader's question on this site actually drew on. Each one earned its place by answering something asked here, not by fitting a category in advance, so the shelf grows one reader at a time rather than by a fixed research programme.",
+	}
 	label := map[string]string{
 		"asked-by-readers":        "Asked by Readers",
 		"capabilities-and-limits": "Capabilities and Limits",
@@ -4762,10 +4771,14 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 		// on every link. The uid is still included in the payload so the
 		// hub template can key on it.
 		uid := twoaiUID("research-topic:" + t)
-		if err := upsert("research/"+t+".json", "research-topic", map[string]any{
+		doc := map[string]any{
 			"uid": uid, "topic": t, "slug": t, "name": name, "papers": byTopic[t],
 			"total": len(byTopic[t]), "generated": today, "last_added": latest,
-		}); err != nil {
+		}
+		if note := areaNote[t]; note != "" {
+			doc["area_note"] = note
+		}
+		if err := upsert("research/"+t+".json", "research-topic", doc); err != nil {
 			return count, err
 		}
 		count++
