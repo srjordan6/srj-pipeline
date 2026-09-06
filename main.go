@@ -3552,6 +3552,29 @@ func twoaiBuild(db *sql.DB) error {
 			path, kind, string(j), twoaiTaxonomyFor(kind))
 		return err
 	}
+	// Hand-written context, joined at render time. Cowork wrote a narrative
+	// into twoai_pages.data for these rows on 2026-09-05 and this stage
+	// destroyed it the same afternoon: the generator rewrites the whole data
+	// jsonb every run, so any key it does not itself produce is discarded.
+	// Prose for a regenerated kind has to live in a side table. Same shape as
+	// twoai_tool_category_intros.
+	stateCtx := map[string]map[string]any{}
+	if cr, err := db.Query(`SELECT slug, context, COALESCE(sources::text,'[]'), updated_on::text
+		FROM twoai_state_law_context`); err == nil {
+		for cr.Next() {
+			var slug, ctx, src, upd string
+			if cr.Scan(&slug, &ctx, &src, &upd) == nil && strings.TrimSpace(ctx) != "" {
+				e := map[string]any{"context": ctx, "context_updated_on": upd}
+				var ss []map[string]any
+				if json.Unmarshal([]byte(src), &ss) == nil && len(ss) > 0 {
+					e["context_sources"] = ss
+				}
+				stateCtx[slug] = e
+			}
+		}
+		cr.Close()
+	}
+
 	for code, name := range twoaiStates {
 		bills := byState[code]
 		if bills == nil {
@@ -3561,17 +3584,23 @@ func twoaiBuild(db *sql.DB) error {
 		total += len(bills)
 		slug := twoaiSlug(name)
 		index = append(index, stateIdx{code, name, slug, len(bills)})
-		if err := upsert("laws/"+slug+".json", "state-law", map[string]any{
+		stateDoc := map[string]any{
 			"code": code, "name": name, "slug": slug, "count": len(bills),
 			"bills": bills, "generated": today,
-		}); err != nil {
+		}
+		for k, v := range stateCtx[slug] {
+			stateDoc[k] = v
+		}
+		if err := upsert("laws/"+slug+".json", "state-law", stateDoc); err != nil {
 			return err
 		}
 	}
 	sort.Slice(index, func(i, j int) bool { return index[i].Name < index[j].Name })
-	if err := upsert("laws/index.json", "hub", map[string]any{
-		"states": index, "total": total, "generated": today,
-	}); err != nil {
+	hubDoc := map[string]any{"states": index, "total": total, "generated": today}
+	for k, v := range stateCtx["index"] {
+		hubDoc[k] = v
+	}
+	if err := upsert("laws/index.json", "hub", hubDoc); err != nil {
 		return err
 	}
 
