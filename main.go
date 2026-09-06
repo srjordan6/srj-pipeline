@@ -682,7 +682,21 @@ func main() {
 		return
 	}
 
+	if src == "twoai_buildwatch" {
+		if err := twoaiBuildWatch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_buildwatch:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "inkbox_outbox" {
+		// The build watch rides the same five-minute tick and queues into the
+		// outbox this stage drains, so an alert is sent in the tick it is raised.
+		// Its own failure is logged and never stops the outbox: mail must go.
+		if err := twoaiBuildWatch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_buildwatch:", err)
+		}
 		if err := inkboxOutbox(db); err != nil {
 			fmt.Fprintln(os.Stderr, "inkbox_outbox:", err)
 			os.Exit(1)
