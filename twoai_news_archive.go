@@ -136,6 +136,18 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 		// whenever this archive was last written.
 		s["ArchivedDate"] = pub
 		s["ArchivedGenerated"] = first
+		// EVERY STORY IS AN ENTITY AND CARRIES ITS OWN UID. Stephen looked at
+		// a story permalink on 2026-09-06 and found no identifier on it. Each
+		// story is an element inside news/archive.json rather than a page row,
+		// so the archive's own page_uid is the only one the template could
+		// have shown - and labelling a Zuckerberg story with the identifier of
+		// the whole archive is worse than showing nothing. The slug is the
+		// story's stable natural key, so the uid is minted from it on the same
+		// scheme as everything else, and the graph's mentioned_in edges can
+		// key on this instead of the doc:<id> form they use today.
+		if slug, _ := s["Slug"].(string); slug != "" {
+			s["uid"] = twoaiUID("story:" + slug)
+		}
 		stories = append(stories, s)
 	}
 	if err := rows.Err(); err != nil {

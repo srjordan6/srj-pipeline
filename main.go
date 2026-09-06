@@ -3543,8 +3543,43 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	var index []stateIdx
 	total := 0
+	// EVERY PAGE CARRIES A DATE, A TIME AND A UID. Stephen's standing rule of
+	// 2026-09-06: wherever a piece of data appears, a reader can see when it
+	// was made and which record it is. This is the one place to enforce it in
+	// the pipeline, because every builder writes through this closure - and a
+	// BEFORE trigger on twoai_pages covers the 32 sites in 15 files that write
+	// directly, plus any stage written after today.
+	//
+	// built_at is the moment this run wrote the row, in RFC3339 with the zone,
+	// so a reader in another timezone can convert it and a machine can parse
+	// it. generated stays a plain date because dozens of templates already
+	// render it and it reads better on a page; built_at is the precise one.
+	//
+	// page_uid is the identifier for the PAGE. Where the document already
+	// carries a uid - an entity's own identifier, minted by twoaiEntityID and
+	// living in the URL - that one is authoritative and is left untouched;
+	// page_uid then simply equals it. Where a page is a hub, an index or some
+	// other structural page that is not a real-world thing, it gets a uid
+	// derived from its path, so the rule holds for all 65 kinds rather than
+	// only the ones that happen to describe an entity.
+	buildStamp := time.Now().Format(time.RFC3339)
 	upsert := func(path, kind string, v any) error {
 		j, _ := json.Marshal(v)
+		var m map[string]any
+		if json.Unmarshal(j, &m) == nil && m != nil {
+			m["built_at"] = buildStamp
+			if _, ok := m["generated"]; !ok {
+				m["generated"] = today
+			}
+			uid, _ := m["uid"].(string)
+			if uid == "" {
+				uid = twoaiUID("page:" + path)
+			}
+			m["page_uid"] = uid
+			if b, err := json.Marshal(m); err == nil {
+				j = b
+			}
+		}
 		_, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug)
 			VALUES ($1,$2,$3::jsonb,$4)
 			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
@@ -4552,8 +4587,17 @@ func twoaiPublishR2(db *sql.DB) error {
 		return err
 	}
 	fmt.Printf("twoai_publish_r2: files=%d bytes=%d bundle=%s ok=true\n", files, len(body), bundleKey)
+	// The verifier needs to know which bundle THIS run published, so it can
+	// ask the live site what it was built from. See verifyTwoaiDeploy.
+	twoaiPublishedSHA = hash
 	return nil
 }
+
+// twoaiPublishedSHA is the sha256 of the bundle the current run wrote to R2,
+// set by twoai_publish_r2 and read by verifyTwoaiDeploy. Empty when the
+// publish stage did not run, in which case the verifier falls back to the
+// date check and says so.
+var twoaiPublishedSHA string
 
 // r2Put signs and sends one object with AWS Signature Version 4, which is what
 // R2's S3-compatible API expects. Written out rather than pulling in the AWS
@@ -8942,17 +8986,40 @@ func syncPeople(db *sql.DB) error {
 // the whole point. Nothing here fails the run: a stale site is worth shouting
 // about, not worth aborting an otherwise good pipeline over.
 func verifyTwoaiDeploy() {
-	const probe = "https://theworldofai.org/api/sources.json"
+	// THE HASH, NOT THE DATE. Until 2026-09-06 this compared the site's
+	// published DATE against today and called a match "verified live". The
+	// cutover to Stephen's PC moved the pipeline to Central time, so at 21:32
+	// Central its today was still the previous day - which the stale site was
+	// already reporting. Five consecutive Cloudflare builds failed while this
+	// function announced success on every one, and the site served content
+	// twelve hours old with every stage green. The failure it was written to
+	// catch was the exact failure it hid.
+	//
+	// A date is a coincidence. A hash is proof: the bundle sha256 is unique to
+	// one publish, this run knows the one it just wrote, and the build writes
+	// what it built from into /api/build.json. If the live site reports a
+	// different hash, the build did not ship, whatever the clock says.
+	const buildProbe = "https://theworldofai.org/api/build.json"
+	const dateProbe = "https://theworldofai.org/api/sources.json"
+	want := twoaiPublishedSHA
 	today := time.Now().UTC().Format("2006-01-02")
 	client := &http.Client{Timeout: 30 * time.Second}
+	if want == "" {
+		fmt.Println("deploy_site: no bundle hash from this run, falling back to the date check, which cannot prove a build shipped")
+	}
 	// Builds take a few minutes. Give it a reasonable window, checking
 	// occasionally rather than tightly, then report whatever is true.
 	// 25 minutes, not 10. The build crossed 11,700 pages on 2026-09-04 and
 	// took sixteen minutes from hook to deploy; the ten-minute window then
 	// reported DID NOT SHIP on a build that shipped. The window follows the
 	// site, and the site has grown.
+	var sawSHA string
 	for attempt := 1; attempt <= 25; attempt++ {
 		time.Sleep(60 * time.Second)
+		probe := buildProbe
+		if want == "" {
+			probe = dateProbe
+		}
 		req, _ := http.NewRequest("GET", probe+"?deploycheck="+today, nil)
 		req.Header.Set("User-Agent", "theworldofai.org deploy verification (srj-pipeline)")
 		req.Header.Set("Cache-Control", "no-cache")
@@ -8967,17 +9034,40 @@ func verifyTwoaiDeploy() {
 		}
 		var doc struct {
 			Generated string `json:"generated"`
+			SHA256    string `json:"sha256"`
+			Bundle    string `json:"bundle"`
+			BuiltAt   string `json:"built_at"`
 		}
 		if json.Unmarshal(body, &doc) != nil {
 			continue
 		}
+		if want != "" {
+			sawSHA = doc.SHA256
+			if doc.SHA256 == want {
+				fmt.Printf("deploy_site: twoai build verified live, bundle %s built at %s after %d min\n",
+					doc.Bundle, doc.BuiltAt, attempt)
+				return
+			}
+			continue
+		}
 		if doc.Generated >= today {
-			fmt.Printf("deploy_site: twoai build verified live, generated=%s after %d min\n",
+			fmt.Printf("deploy_site: twoai site answered with generated=%s after %d min. This is a DATE match, not proof the build shipped; set up /api/build.json to verify by hash.\n",
 				doc.Generated, attempt)
 			return
 		}
 	}
-	fmt.Printf("deploy_site: TWOAI BUILD DID NOT SHIP. The deploy hook was accepted but %s still reports an older build after 25 minutes. Check the Cloudflare build log for twoai-site; a failed build leaves the site serving stale content while every other stage reports success.\n", probe)
+	if want != "" {
+		saw := sawSHA
+		if saw == "" {
+			saw = "nothing (no /api/build.json yet - expected until the first build carrying it)"
+		} else {
+			saw = saw[:16] + " (an older bundle)"
+		}
+		fmt.Printf("deploy_site: TWOAI BUILD DID NOT SHIP. This run published bundle %s and after 25 minutes the live site still reports %s. The deploy hook was accepted, so the fault is the build itself: check the Cloudflare build log for twoai-site. A failed build leaves the site serving stale content while every other stage reports success.\n",
+			want[:16], saw)
+		return
+	}
+	fmt.Printf("deploy_site: TWOAI BUILD DID NOT SHIP. The deploy hook was accepted but %s still reports an older build after 25 minutes. Check the Cloudflare build log for twoai-site; a failed build leaves the site serving stale content while every other stage reports success.\n", dateProbe)
 }
 
 func deploySite() error {

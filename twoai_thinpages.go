@@ -95,6 +95,21 @@ func twoaiThinPages(db *sql.DB) {
 	twoaiThinEnsureTables(db)
 	twoaiThinCompanyProfiles(db)
 	twoaiThinAudit(db)
+
+	// The hard sites Cowork could not read, worked with Firecrawl's heavier
+	// tiers. Escalation rather than duplication: Cowork reads with a plain
+	// fetch, and when a site defeats it - JavaScript-rendered figures, a bot
+	// wall answering 403, a spec behind a cookie banner - it queues the URL
+	// here and this stage brings the text back.
+	twoaiScrapeEscalations(db)
+
+	// The page that does not exist is the thinnest page of all. The audit
+	// above measures pages that EXIST and are underfilled; this finds the
+	// entities the site's own content names repeatedly and cannot link.
+	// Added 2026-09-06 after Stephen found that the richest man in the world
+	// had no page - 29 of 34 obvious names were absent, and no test the
+	// scraper ran could have seen it.
+	twoaiThinMissingEntities(db)
 	defer thinReport(db)
 
 	// KEEP GOING UNTIL THE QUEUE STOPS SHRINKING. Stephen, 2026-08-31: I do
