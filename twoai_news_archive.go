@@ -45,6 +45,26 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 		last_seen timestamptz NOT NULL DEFAULT now())`); err != nil {
 		return 0, err
 	}
+	// EVERY STORY IS AN ENTITY. No data without a uid: the uid is minted from
+	// the slug on the same scheme as every other kind, STORED on the row, and
+	// registered in twoai_entities as kind 'story'. Until 2026-09-06 it was
+	// computed only at archive-render time below, so 389 published stories
+	// had no row in the entity register and nothing else could key on them.
+	// The column is added here rather than by hand because this stage's role
+	// owns the table; the 389 existing rows are filled in the same statement
+	// pattern the graph uses, sha256('story:'||slug) hex prefix.
+	if _, err := db.Exec(`ALTER TABLE twoai_news_stories ADD COLUMN IF NOT EXISTS uid text`); err != nil {
+		return 0, err
+	}
+	if _, err := db.Exec(`UPDATE twoai_news_stories
+		SET uid = substr(encode(sha256(('story:'||slug)::bytea),'hex'),1,8) WHERE uid IS NULL`); err != nil {
+		return 0, err
+	}
+	if _, err := db.Exec(`INSERT INTO twoai_entities (uid, kind, name, normalized, first_seen, last_seen)
+		SELECT uid, 'story', headline, slug, first_published, last_seen FROM twoai_news_stories
+		WHERE uid IS NOT NULL ON CONFLICT (uid) DO NOTHING`); err != nil {
+		return 0, err
+	}
 
 	// ---- One-shot backfill of pre-archive orphans.
 	//
@@ -82,9 +102,18 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 			for _, s := range doc.Stories {
 				slug, _ := s["Slug"].(string)
 				headline, _ := s["Headline"].(string)
+				// Six archived stories carry the key as lowercase slug/headline.
+				// Both spellings are the same field; read either.
+				if slug == "" {
+					slug, _ = s["slug"].(string)
+				}
+				if headline == "" {
+					headline, _ = s["headline"].(string)
+				}
 				if slug == "" || headline == "" {
 					continue
 				}
+				s["uid"] = twoaiUID("story:" + slug)
 				if arts, ok := s["Articles"].([]any); ok && len(arts) > twoaiNewsArchiveMaxArticles {
 					s["Articles"] = arts[:twoaiNewsArchiveMaxArticles]
 				}
@@ -103,12 +132,19 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 				// first_published and published_on are written once. A
 				// permalink's date must not drift.
 				if _, err := db.Exec(`INSERT INTO twoai_news_stories
-					(slug, headline, story, published_on)
-					VALUES ($1,$2,$3::jsonb,$4::date)
+					(slug, headline, story, published_on, uid)
+					VALUES ($1,$2,$3::jsonb,$4::date,$5)
 					ON CONFLICT (slug) DO UPDATE SET
-						headline=EXCLUDED.headline, story=EXCLUDED.story, last_seen=now()`,
-					slug, headline, string(raw), pub); err != nil {
+						headline=EXCLUDED.headline, story=EXCLUDED.story, last_seen=now(),
+						uid=COALESCE(twoai_news_stories.uid, EXCLUDED.uid)`,
+					slug, headline, string(raw), pub, twoaiUID("story:"+slug)); err != nil {
 					fmt.Fprintln(os.Stderr, "twoai_build: news story upsert:", err)
+				}
+				if _, err := db.Exec(`INSERT INTO twoai_entities (uid, kind, name, normalized)
+					VALUES ($1,'story',$2,$3)
+					ON CONFLICT (uid) DO UPDATE SET name=EXCLUDED.name, last_seen=now()`,
+					twoaiUID("story:"+slug), headline, slug); err != nil {
+					fmt.Fprintln(os.Stderr, "twoai_build: news story entity:", err)
 				}
 			}
 		}
@@ -145,7 +181,11 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 		// story's stable natural key, so the uid is minted from it on the same
 		// scheme as everything else, and the graph's mentioned_in edges can
 		// key on this instead of the doc:<id> form they use today.
-		if slug, _ := s["Slug"].(string); slug != "" {
+		slug, _ := s["Slug"].(string)
+		if slug == "" {
+			slug, _ = s["slug"].(string)
+		}
+		if slug != "" {
 			s["uid"] = twoaiUID("story:" + slug)
 		}
 		stories = append(stories, s)
