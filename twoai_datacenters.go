@@ -192,6 +192,11 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 	if err := twoaiDcResearch(db); err != nil {
 		fmt.Println("twoai_dc_research:", err)
 	}
+	// Announcements in the news intake become press: facility rows with
+	// exactly what the report states. Never fatal.
+	if err := twoaiDcAnnouncements(db); err != nil {
+		fmt.Println("twoai_dc_announcements:", err)
+	}
 	type fac struct {
 		Name     string  `json:"name"`
 		Operator string  `json:"operator,omitempty"`
