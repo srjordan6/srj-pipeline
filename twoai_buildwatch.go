@@ -129,11 +129,20 @@ func twoaiBuildWatch(db *sql.DB) error {
 	}
 
 	// Rule 1: a commit on main that has not shipped.
-	shipped := live.Commit != "" && live.Commit == head.SHA
+	// live.Commit must LOOK like a commit before it is treated as evidence.
+	// Build cb5075c7 published commit "main" from WORKERS_CI_COMMIT_SHA, which
+	// is a branch name; comparing that to a SHA would have alerted on every
+	// tick forever. Anything that is not 40 hex characters means "cannot tell",
+	// and rule 2 still covers a site that has stopped building altogether.
+	liveSHA := live.Commit
+	if !bwIsSHA(liveSHA) {
+		liveSHA = ""
+	}
+	shipped := liveSHA != "" && liveSHA == head.SHA
 	// Until the first build after 2026-09-06 lands, build.json has no commit.
 	// A missing commit is "cannot tell", not "failed"; only a present, different
 	// commit is evidence. Rule 2 still covers a site that has stopped building.
-	if !shipped && live.Commit != "" && now.Sub(pushedAt) > bwGrace && get("alerted_sha") != head.SHA {
+	if !shipped && liveSHA != "" && now.Sub(pushedAt) > bwGrace && get("alerted_sha") != head.SHA {
 		set("alerted_sha", head.SHA)
 		queue(fmt.Sprintf("theworldofai.org build did not ship: %s", short),
 			fmt.Sprintf(`The newest commit on twoai-site main has not reached the live site.
@@ -154,7 +163,7 @@ This message is sent once per unshipped commit by the buildwatch stage in
 srj-pipeline, every five minutes from the inkbox tick. You will get one more
 when it ships.`,
 				head.SHA, subject, pushedAt.Format("2006-01-02 15:04"), int(now.Sub(pushedAt).Minutes()),
-				builtAt.Format("2006-01-02 15:04"), firstN(live.Commit, 7), int(now.Sub(pushedAt).Minutes())))
+				builtAt.Format("2006-01-02 15:04"), firstN(liveSHA, 7), int(now.Sub(pushedAt).Minutes())))
 	}
 
 	// Recovery: the commit we alerted on is now live.
@@ -176,8 +185,21 @@ build or the deploy has been failing since then. Bundle on the site: %s.`,
 	}
 
 	fmt.Printf("buildwatch: head=%s pushed=%s live=%s built=%s shipped=%v\n",
-		short, pushedAt.Format("15:04"), firstN(live.Commit, 7), builtAt.Format("01-02 15:04"), shipped)
+		short, pushedAt.Format("15:04"), firstN(liveSHA, 7), builtAt.Format("01-02 15:04"), shipped)
 	return nil
+}
+
+// bwIsSHA reports whether s is a full 40-character hex commit hash.
+func bwIsSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func firstN(s string, n int) string {
