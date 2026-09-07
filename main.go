@@ -691,12 +691,6 @@ func main() {
 	}
 
 	if src == "inkbox_outbox" {
-		// The build watch rides the same five-minute tick and queues into the
-		// outbox this stage drains, so an alert is sent in the tick it is raised.
-		// Its own failure is logged and never stops the outbox: mail must go.
-		if err := twoaiBuildWatch(db); err != nil {
-			fmt.Fprintln(os.Stderr, "twoai_buildwatch:", err)
-		}
 		if err := inkboxOutbox(db); err != nil {
 			fmt.Fprintln(os.Stderr, "inkbox_outbox:", err)
 			os.Exit(1)
@@ -705,9 +699,18 @@ func main() {
 	}
 
 	if src == "inkbox_tick" {
-		// The fifteen-minute cron. Receive first, then send, so a reply queued
+		// The five-minute cron. Receive first, then send, so a reply queued
 		// in response to something that arrived this same tick still goes out
-		// without waiting another quarter hour.
+		// without waiting another five minutes.
+		//
+		// BUILDWATCH RIDES HERE, not on inkbox_outbox. It was wired into the
+		// inkbox_outbox branch when it shipped, and Task Scheduler does not run
+		// that stage - it runs inkbox_tick. The alarm would never have fired.
+		// It is placed before the send so an alert raised this tick leaves in
+		// the same tick, and its own failure is logged and never stops the mail.
+		if err := twoaiBuildWatch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_buildwatch:", err)
+		}
 		if err := inkboxPull(db); err != nil {
 			fmt.Fprintln(os.Stderr, "inkbox_tick: pull:", err)
 		}
