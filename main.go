@@ -1745,8 +1745,29 @@ func publishNews(db *sql.DB) error {
 					fmt.Fprintln(os.Stderr, "publish_news summarize:", serr)
 					continue
 				}
+				// A MODEL DECLINING TO WRITE A SUMMARY IS NOT A SUMMARY.
+				// On 2026-09-06 the briefing published, as the summary of a
+				// story about New York City's school AI ban: "I appreciate you
+				// sharing this, but I'm unable to complete your request." Four
+				// such rows were in pipeline.documents. The model was right to
+				// refuse every time - the fetched text was navigation markup or
+				// JavaScript, not an article - and the fault is entirely here,
+				// for storing the refusal as though it were prose and printing
+				// it under a headline.
+				//
+				// A refusal is neither cached nor used. The loop moves to the
+				// next article in the cluster, which usually has real text, so
+				// one unreadable page no longer costs the story its summary.
+				if isRefusal(s2) {
+					fmt.Fprintf(os.Stderr, "publish_news: refusal not stored, trying next article: %s\n", a.URL)
+					continue
+				}
 				dt.summary = s2
 				db.Exec(`UPDATE pipeline.documents SET summary=$1 WHERE url=$2`, s2, a.URL)
+			} else if isRefusal(dt.summary) {
+				// Already cached from an earlier run, before this guard existed.
+				fmt.Fprintf(os.Stderr, "publish_news: cached refusal skipped: %s\n", a.URL)
+				continue
 			}
 			summary, sumURL, sumDomain = dt.summary, a.URL, a.Domain
 			break
