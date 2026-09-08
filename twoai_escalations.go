@@ -104,16 +104,31 @@ func twoaiScrapeEscalations(db *sql.DB) {
 		return
 	}
 
-	q := func(s string) string { b, _ := json.Marshal(s); return string(b) }
+	// The whole payload is marshalled as a struct rather than concatenated
+	// around a quoted value. json.Marshal on the value alone was safe, but
+	// hand-assembled JSON is the pattern CodeQL rightly flags (go/unsafe-
+	// quoting): the day someone adds a field by string edit, the escaping
+	// guarantee silently stops covering it. Marshalling the object makes the
+	// unsafe edit inexpressible.
+	type fcScrape struct {
+		URL             string   `json:"url"`
+		Formats         []string `json:"formats"`
+		OnlyMainContent bool     `json:"onlyMainContent"`
+		BlockAds        bool     `json:"blockAds"`
+		WaitFor         int      `json:"waitFor,omitempty"`
+		Proxy           string   `json:"proxy,omitempty"`
+		Timeout         int      `json:"timeout"`
+	}
+	mk := func(p fcScrape) string { b, _ := json.Marshal(p); return string(b) }
 	tiers := []escTier{
 		{"basic", func(u string) string {
-			return `{"url":` + q(u) + `,"formats":["markdown"],"onlyMainContent":true,"blockAds":true,"timeout":45000}`
+			return mk(fcScrape{URL: u, Formats: []string{"markdown"}, OnlyMainContent: true, BlockAds: true, Timeout: 45000})
 		}, 1},
 		{"wait", func(u string) string {
-			return `{"url":` + q(u) + `,"formats":["markdown"],"onlyMainContent":true,"blockAds":true,"waitFor":5000,"timeout":60000}`
+			return mk(fcScrape{URL: u, Formats: []string{"markdown"}, OnlyMainContent: true, BlockAds: true, WaitFor: 5000, Timeout: 60000})
 		}, 1},
 		{"enhanced", func(u string) string {
-			return `{"url":` + q(u) + `,"formats":["markdown"],"onlyMainContent":true,"blockAds":true,"waitFor":5000,"proxy":"enhanced","timeout":90000}`
+			return mk(fcScrape{URL: u, Formats: []string{"markdown"}, OnlyMainContent: true, BlockAds: true, WaitFor: 5000, Proxy: "enhanced", Timeout: 90000})
 		}, 5},
 	}
 

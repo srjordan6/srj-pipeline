@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -58,8 +59,14 @@ func twoaiSearchWeb(client *http.Client, q string) ([]discoverHit, error) {
 	// free plan is 1,000 monthly credits, a search costs 2, and our whole
 	// backlog is about 250 queries.
 	if k := os.Getenv("FIRECRAWL_API_KEY"); k != "" {
-		body := strings.NewReader(`{"query":` + strconvQuote(q) + `,"limit":10}`)
-		req, _ := http.NewRequest("POST", "https://api.firecrawl.dev/v2/search", body)
+		// Marshal the whole payload, not a quoted value spliced into a
+		// template. The old form was the go/unsafe-quoting pattern; this one
+		// cannot be edited into an injection.
+		qb, _ := json.Marshal(struct {
+			Query string `json:"query"`
+			Limit int    `json:"limit"`
+		}{Query: q, Limit: 10})
+		req, _ := http.NewRequest("POST", "https://api.firecrawl.dev/v2/search", bytes.NewReader(qb))
 		req.Header.Set("Authorization", "Bearer "+k)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := client.Do(req)
@@ -318,9 +325,9 @@ func twoaiThinDiscover(db *sql.DB) {
 	}
 }
 
-// strconvQuote JSON-quotes one string. The query is operator and facility
-// names, which routinely carry quotes and ampersands, and a hand-built body
-// would break on the first "H5 Data Centers, Inc." it met.
+// strconvQuote JSON-quotes one string via json.Marshal. No longer used by the
+// search body (the whole payload is marshalled now); kept because the name may
+// be referenced elsewhere and an unused func costs nothing in Go.
 func strconvQuote(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
