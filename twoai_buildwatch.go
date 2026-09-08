@@ -139,6 +139,31 @@ func twoaiBuildWatch(db *sql.DB) error {
 		liveSHA = ""
 	}
 	shipped := liveSHA != "" && liveSHA == head.SHA
+
+	// A COMMIT THAT CANNOT CHANGE THE SITE IS NOT A FAILED BUILD.
+	//
+	// First live catch, 2026-09-07: twoai-site 0079813 added four lines to
+	// .github/workflows/security-scan.yml. Cloudflare ran no build, correctly,
+	// because nothing in the published output could differ. The watch saw a
+	// head that was not live, waited its twenty minutes and emailed. True in
+	// letter, false in substance, and worse than useless: no build is coming,
+	// so that alert would have stayed open until some unrelated commit shipped.
+	// With Dependabot now open on both repositories, every merge touching only
+	// .github or a lockfile would do the same, which is exactly the crying-wolf
+	// failure 22a9adf was written to prevent, arriving by another door.
+	//
+	// So before alerting, ask GitHub what actually changed between the live
+	// commit and head. If every changed path is CI configuration, editor
+	// settings or documentation, the site is already current and there is
+	// nothing to report. If the comparison cannot be made, alert anyway:
+	// silence is the worse failure, and this is a safety net, not a filter.
+	if !shipped && liveSHA != "" {
+		if only, err := bwOnlyNonBuildPaths(liveSHA, head.SHA, hdr); err == nil && only {
+			set("alerted_sha", head.SHA) // treat as handled so it never reopens
+			fmt.Printf("buildwatch: head=%s changes nothing the build publishes, no alert\n", short)
+			shipped = true
+		}
+	}
 	// Until the first build after 2026-09-06 lands, build.json has no commit.
 	// A missing commit is "cannot tell", not "failed"; only a present, different
 	// commit is evidence. Rule 2 still covers a site that has stopped building.
@@ -200,6 +225,47 @@ func bwIsSHA(s string) bool {
 		}
 	}
 	return true
+}
+
+// bwOnlyNonBuildPaths reports whether every file changed between two commits is
+// one the published site cannot depend on. Compares via the GitHub API, which
+// returns the file list for a range directly.
+//
+// The list is deliberately short and deliberately conservative. .github is CI
+// and never reaches the bundle. Editor and lint configuration, licences and
+// loose markdown at the repository root are the same. EVERYTHING ELSE COUNTS,
+// including package.json and lockfiles, because a dependency bump does change
+// what is published even when the source does not. When in doubt the answer is
+// "this could have changed the site", so the alert fires.
+func bwOnlyNonBuildPaths(base, head string, hdr map[string]string) (bool, error) {
+	body, err := twoaiJobsGet("https://api.github.com/repos/"+bwRepo+"/compare/"+base+"..."+head, hdr)
+	if err != nil {
+		return false, err
+	}
+	var cmp struct {
+		Files []struct {
+			Filename string `json:"filename"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(body, &cmp); err != nil {
+		return false, err
+	}
+	if len(cmp.Files) == 0 {
+		return false, fmt.Errorf("no files in comparison")
+	}
+	for _, f := range cmp.Files {
+		n := strings.ToLower(f.Filename)
+		switch {
+		case strings.HasPrefix(n, ".github/"),
+			strings.HasPrefix(n, ".vscode/"),
+			n == ".gitignore", n == ".gitattributes", n == ".editorconfig",
+			n == "license", n == "licence",
+			(strings.HasSuffix(n, ".md") && !strings.Contains(n, "/")):
+			continue
+		}
+		return false, nil
+	}
+	return true, nil
 }
 
 func firstN(s string, n int) string {
