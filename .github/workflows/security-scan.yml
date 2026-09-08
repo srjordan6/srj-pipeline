@@ -39,7 +39,7 @@ jobs:
     container:
       image: semgrep/semgrep
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run Semgrep
         run: semgrep scan --config=auto --sarif --output=semgrep.sarif || true
       - name: Upload results
@@ -54,7 +54,7 @@ jobs:
     if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run Trivy
         uses: aquasecurity/trivy-action@master
         with:
@@ -76,7 +76,7 @@ jobs:
     if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Run Gitleaks
@@ -93,7 +93,7 @@ jobs:
       matrix:
         language: [go]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Initialise CodeQL
         uses: github/codeql-action/init@v3
         with:
