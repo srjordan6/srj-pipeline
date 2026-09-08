@@ -58,17 +58,17 @@ var twoaiStageDeadline = map[string]time.Duration{
 	"intel":           10 * time.Minute, // the stage that proved the need
 	"twoai_recap":     8 * time.Minute,  // RECAP filing harvest, 12 dockets a run
 	"export_corpus":   20 * time.Minute,
-	// twoai_publish PUTs one file per changed page through the contents API,
-	// sequentially, because GitHub serializes mutations to a single repo anyway.
-	// A normal day changes 70 to 150 files and takes a minute or two. A day that
-	// touches every page - a template change, a new field, an embed model swap -
-	// changes about 2,800 and lands right on the old 20 minute default: it
-	// finished with seconds to spare on 2026-08-24 and was killed on 08-26 and
-	// 08-27. R2 carries the whole set in one request and is the primary path, so
-	// a kill here only degrades the GitHub fallback, quietly, which is exactly
-	// the failure a fallback must not have. If it times out again the real fix is
-	// the git tree API: one commit for the whole set instead of one per file.
-	"twoai_publish": 45 * time.Minute,
+	// twoai_publish pushes the whole changed set as ONE commit through the git
+	// data API: read the ref, build trees from it, commit, move the ref. About
+	// nine requests whatever the day looks like, so it finishes in seconds.
+	//
+	// It used to PUT one file at a time through the contents API and needed 45
+	// minutes, which it then exceeded: on 2026-09-08 it was killed at the
+	// deadline having spent two thirds of a 69-minute run, with files failing
+	// "does not match <sha>" as the tree moved underneath it. Ten minutes is
+	// generous for the new shape and short enough that a hang is visible the
+	// same day rather than eating the run.
+	"twoai_publish": 10 * time.Minute,
 }
 
 const twoaiStageDeadlineDefault = 20 * time.Minute
@@ -8585,6 +8585,30 @@ func twoaiPublish(db *sql.DB) error {
 	}
 	defer rows.Close()
 	exported, unchanged, failed := 0, 0, 0
+	// COLLECT FIRST, PUSH ONCE.
+	//
+	// This used to PUT one file per changed page through the contents API,
+	// sequentially, because GitHub serialises mutations to a single repo. Two
+	// things followed and both got worse over time. It created ONE COMMIT PER
+	// FILE - thousands a day across 2,244 MCP servers and 5,235 pages - and on
+	// a private repository each of those pushes started four security-scan jobs
+	// on metered runners, which is what drained September's GitHub Actions
+	// allowance and stopped the site deploying. And it could not finish: on
+	// 2026-09-08 it burned its whole 45-minute deadline and was killed, two
+	// thirds of a 69-minute pipeline run, with files failing "does not match
+	// <sha>" because the tree SHA read at the start had gone stale by the time
+	// their turn came - a failure that compounds, since a killed run leaves the
+	// tree half-updated and the next run starts with more stale SHAs.
+	//
+	// The git data API does the whole set as one commit: build trees from the
+	// current head, create one commit, move the ref once. Roughly nine requests
+	// instead of 2,800, no read-modify-write per file so no SHA races, and
+	// twoai-content gets one commit a run instead of thousands.
+	type change struct {
+		path    string
+		payload []byte
+	}
+	var changed []change
 	for rows.Next() {
 		var path, pretty string
 		if err := rows.Scan(&path, &pretty); err != nil {
@@ -8595,54 +8619,146 @@ func twoaiPublish(db *sql.DB) error {
 			unchanged++
 			continue
 		}
-		put := map[string]any{
-			"message": fmt.Sprintf("twoai: %s from twoai_pages %s", path, time.Now().UTC().Format("2006-01-02")),
-			"content": base64.StdEncoding.EncodeToString(payload),
-		}
-		if sha := repoSha[path]; sha != "" {
-			put["sha"] = sha
-		}
-		pb, _ := json.Marshal(put)
-		req, _ := http.NewRequest("PUT", "https://api.github.com/repos/srjordan6/twoai-content/contents/"+path, bytes.NewReader(pb))
+		changed = append(changed, change{path, payload})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(changed) == 0 {
+		fmt.Printf("twoai_publish: exported=0 unchanged=%d failed=0 ok=true (nothing changed)\n", unchanged)
+		return nil
+	}
+
+	post := func(url string, body any) ([]byte, int, error) {
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest("POST", url, bytes.NewReader(b))
 		req.Header.Set("Authorization", "Bearer "+tok)
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("User-Agent", "srj-pipeline/1.0")
-		pr, err := client.Do(req)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer resp.Body.Close()
+		rb, _ := io.ReadAll(resp.Body)
+		return rb, resp.StatusCode, nil
+	}
+
+	const repo = "https://api.github.com/repos/srjordan6/twoai-content"
+
+	// Where main points now. The ref is read here rather than reused from the
+	// recursive tree fetch above, because the commit must be parented on the
+	// real head or the push is rejected as a non-fast-forward.
+	refBody, code, err := get(repo + "/git/ref/heads/main")
+	if err != nil {
+		return err
+	}
+	if code != 200 {
+		return fmt.Errorf("twoai_publish: read ref %d: %.200s", code, refBody)
+	}
+	var ref struct {
+		Object struct {
+			Sha string `json:"sha"`
+		} `json:"object"`
+	}
+	if err := json.Unmarshal(refBody, &ref); err != nil {
+		return err
+	}
+	headSha := ref.Object.Sha
+
+	commitBody, code, err := get(repo + "/git/commits/" + headSha)
+	if err != nil {
+		return err
+	}
+	if code != 200 {
+		return fmt.Errorf("twoai_publish: read head commit %d: %.200s", code, commitBody)
+	}
+	var headCommit struct {
+		Tree struct {
+			Sha string `json:"sha"`
+		} `json:"tree"`
+	}
+	if err := json.Unmarshal(commitBody, &headCommit); err != nil {
+		return err
+	}
+	treeSha := headCommit.Tree.Sha
+
+	// Trees are built in chunks with each one based on the last, so a
+	// full-rebuild day that touches every page does not put ten megabytes in a
+	// single request. Content is inlined rather than uploaded as separate
+	// blobs: GitHub creates the blob, which halves the request count.
+	const chunk = 400
+	for i := 0; i < len(changed); i += chunk {
+		end := i + chunk
+		if end > len(changed) {
+			end = len(changed)
+		}
+		entries := make([]map[string]string, 0, end-i)
+		for _, c := range changed[i:end] {
+			entries = append(entries, map[string]string{
+				"path": c.path, "mode": "100644", "type": "blob",
+				"content": string(c.payload),
+			})
+		}
+		tb, code, err := post(repo+"/git/trees", map[string]any{
+			"base_tree": treeSha, "tree": entries,
+		})
 		if err != nil {
 			return err
 		}
-		prb, _ := io.ReadAll(pr.Body)
-		pr.Body.Close()
-		if pr.StatusCode != 200 && pr.StatusCode != 201 {
-			// One transient GitHub 500 used to abort the whole export here,
-			// leaving every path that sorts after the failing file unpublished
-			// (2026-08-22: a 500 on an mcp/ file kept talent/ out of the repo
-			// and 404'd the first live talent page). Retry once, then log and
-			// move on; the daily diff republishes anything still missing.
-			time.Sleep(2 * time.Second)
-			r2, _ := http.NewRequest("PUT", "https://api.github.com/repos/srjordan6/twoai-content/contents/"+path, bytes.NewReader(pb))
-			r2.Header.Set("Authorization", "Bearer "+tok)
-			r2.Header.Set("Accept", "application/vnd.github+json")
-			r2.Header.Set("User-Agent", "srj-pipeline/1.0")
-			if pr2, err2 := client.Do(r2); err2 == nil {
-				prb2, _ := io.ReadAll(pr2.Body)
-				pr2.Body.Close()
-				if pr2.StatusCode == 200 || pr2.StatusCode == 201 {
-					exported++
-					continue
-				}
-				prb = prb2
-			}
-			failed++
-			fmt.Fprintf(os.Stderr, "twoai_publish: github PUT %s failed twice (skipped): %.200s\n", path, prb)
-			continue
+		if code != 200 && code != 201 {
+			return fmt.Errorf("twoai_publish: create tree %d: %.300s", code, tb)
 		}
-		exported++
+		var tr struct {
+			Sha string `json:"sha"`
+		}
+		if err := json.Unmarshal(tb, &tr); err != nil || tr.Sha == "" {
+			return fmt.Errorf("twoai_publish: tree response had no sha: %.300s", tb)
+		}
+		treeSha = tr.Sha
 	}
-	fmt.Printf("twoai_publish: exported=%d unchanged=%d failed=%d ok=%v\n", exported, unchanged, failed, failed == 0)
-	if failed > 20 {
-		return fmt.Errorf("twoai_publish: %d PUTs failed, likely systemic", failed)
+
+	msg := fmt.Sprintf("twoai: %d page documents from twoai_pages %s",
+		len(changed), time.Now().UTC().Format("2006-01-02"))
+	cb, code, err := post(repo+"/git/commits", map[string]any{
+		"message": msg, "tree": treeSha, "parents": []string{headSha},
+	})
+	if err != nil {
+		return err
 	}
+	if code != 200 && code != 201 {
+		return fmt.Errorf("twoai_publish: create commit %d: %.300s", code, cb)
+	}
+	var newCommit struct {
+		Sha string `json:"sha"`
+	}
+	if err := json.Unmarshal(cb, &newCommit); err != nil || newCommit.Sha == "" {
+		return fmt.Errorf("twoai_publish: commit response had no sha: %.300s", cb)
+	}
+
+	// Move the ref. No force: if something else pushed while this ran, the
+	// update is refused and the next run rebases on the new head rather than
+	// overwriting whatever arrived.
+	pb, _ := json.Marshal(map[string]any{"sha": newCommit.Sha, "force": false})
+	preq, _ := http.NewRequest("PATCH", repo+"/git/refs/heads/main", bytes.NewReader(pb))
+	preq.Header.Set("Authorization", "Bearer "+tok)
+	preq.Header.Set("Accept", "application/vnd.github+json")
+	preq.Header.Set("User-Agent", "srj-pipeline/1.0")
+	preq.Header.Set("Content-Type", "application/json")
+	presp, err := client.Do(preq)
+	if err != nil {
+		return err
+	}
+	prb, _ := io.ReadAll(presp.Body)
+	presp.Body.Close()
+	if presp.StatusCode != 200 && presp.StatusCode != 201 {
+		failed = len(changed)
+		return fmt.Errorf("twoai_publish: update ref %d: %.300s", presp.StatusCode, prb)
+	}
+	exported = len(changed)
+	fmt.Printf("twoai_publish: exported=%d unchanged=%d failed=%d ok=true commit=%s\n",
+		exported, unchanged, failed, newCommit.Sha[:7])
 	return nil
 }
 
