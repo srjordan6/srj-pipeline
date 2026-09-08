@@ -2,10 +2,23 @@ name: Security Scan
 
 # Managed centrally - see SECURITY.md. Four scanners, all free on public repos.
 # Results appear under Security -> Code scanning.
+#
+# NO PUSH TRIGGER. These repositories are PRIVATE, where Actions minutes are
+# metered: GitHub Free includes 2,000 a month. Four scanners on every push,
+# CodeQL among them, consumed the whole September allowance in six days -
+# $43.07 of metered usage, fully covered by the included discount so nothing
+# was billed, but once the allowance is gone a $0 spending limit stops EVERY
+# workflow in the account. That included Deploy to Cloudflare, so the site
+# could not ship a security fix that this very scan had found.
+#
+# Scanning on pull requests and once a week catches the same problems a few
+# hours later and costs a fraction of the minutes. A scanner that stops you
+# deploying the fix it asked for is not protecting anything.
+#
+# If these repositories are ever made public, standard runners become free and
+# unlimited and the push trigger can come back.
 
 on:
-  push:
-    branches: [main, master]
   pull_request:
     branches: [main, master]
   schedule:
