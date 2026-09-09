@@ -3618,10 +3618,37 @@ func twoaiBuild(db *sql.DB) error {
 				j = b
 			}
 		}
+		// WRITE ONLY WHAT CHANGED, IGNORING THE PER-RUN TIMESTAMP.
+		//
+		// twoai_pages took 15,737 updates in a few hours against 5,235 rows, and
+		// 0.0 percent of them were HOT: 6 out of 15,737. Two expression indexes
+		// over data (twoai_pages_uid_idx and twoai_pages_case_uid_idx) mean
+		// PostgreSQL cannot prove the indexed expression is unchanged when data is
+		// rewritten, so it disqualifies HOT and every update rewrites every index
+		// entry. Lowering fillfactor to 70 did nothing here for that reason, and
+		// dropping the indexes is not available - case_uid_idx is in use.
+		//
+		// So make the writes not happen instead of making them cheaper.
+		//
+		// built_at is EXCLUDED from the comparison and this is the whole trick.
+		// It is stamped with the moment of the run - 2026-09-08T21:32:23-05:00 -
+		// so every page's JSON differs on every run whether or not a word of it
+		// changed. A naive IS DISTINCT FROM on data would have been true every
+		// time and saved nothing. generated is a DATE and is deliberately kept in
+		// the comparison: an unchanged page is still rewritten once a day when the
+		// date rolls, so the visible date stamp a reader uses to judge staleness
+		// stays honest rather than freezing at whenever the content last moved.
+		//
+		// The row keeps its old built_at when nothing else changed, which is
+		// correct: that field records when the document was last actually built,
+		// and a no-op is not a build.
 		_, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug)
 			VALUES ($1,$2,$3::jsonb,$4)
 			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
-				taxonomy_slug=EXCLUDED.taxonomy_slug, updated_at=now()`,
+				taxonomy_slug=EXCLUDED.taxonomy_slug, updated_at=now()
+			WHERE (twoai_pages.data - 'built_at') IS DISTINCT FROM (EXCLUDED.data - 'built_at')
+			   OR twoai_pages.kind IS DISTINCT FROM EXCLUDED.kind
+			   OR twoai_pages.taxonomy_slug IS DISTINCT FROM EXCLUDED.taxonomy_slug`,
 			path, kind, string(j), twoaiTaxonomyFor(kind))
 		return err
 	}
