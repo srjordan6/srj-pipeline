@@ -1539,6 +1539,19 @@ func publishNews(db *sql.DB) error {
 		w := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !('a' <= r && r <= 'z' || '0' <= r && r <= '9') })
 		for _, x := range w {
 			if len(x) > 2 && !stop[x] {
+				// LIGHT STEMMING. "enacts", "enacted" and "enacting" are one
+				// token. Without this, California's auditing laws ran as two
+				// stories on 2026-09-10 - "California Enacts..." and
+				// "California enacted the first..." - because the two headlines
+				// shared only "california" and "laws" as written. A suffix
+				// strip is crude and is enough: this compares headlines about
+				// the same event, not prose.
+				for _, suf := range []string{"ing", "ed", "es", "s"} {
+					if len(x) > len(suf)+3 && strings.HasSuffix(x, suf) {
+						x = strings.TrimSuffix(x, suf)
+						break
+					}
+				}
 				m[x] = true
 			}
 		}
@@ -1584,6 +1597,64 @@ func publishNews(db *sql.DB) error {
 		}
 		if !placed {
 			cls = append(cls, &cluster{arts: []art{a}, tk: tk})
+		}
+	}
+
+	// SECOND PASS: MERGE CLUSTERS THAT ARE THE SAME EVENT.
+	//
+	// Headline overlap misses two shapes. Headlines written days apart about
+	// one event use different words: "Indian-origin couple gets AI college
+	// named after them", "Indian engineer couple who studied at Venkateswara
+	// University", "NRIs Anuradha and Vikas Sinha donate $20 million" - one
+	// donation, three stories on 2026-09-10. And a cluster that absorbed a few
+	// members has a token set broad enough to match a sibling cluster that
+	// could not match any single headline. Stephen: we must not duplicate
+	// news items.
+	//
+	// Two merge tests, either one suffices. Shared named PEOPLE: two clusters
+	// naming the same two or more persons are one story, because a name is far
+	// more specific than a word and GDELT already extracted them. Cluster
+	// token overlap at 0.5: below the 0.6 a single headline needs, because a
+	// cluster's union of tokens is a more forgiving comparison than one title.
+	// Repeat until nothing merges, since a merge widens the survivor.
+	personSet := func(c *cluster) map[string]bool {
+		m := map[string]bool{}
+		for _, a := range c.arts {
+			for _, p := range strings.Split(a.persons, ";") {
+				p = strings.TrimSpace(strings.ToLower(p))
+				if strings.Contains(p, " ") { // first and last name, not a bare surname
+					m[p] = true
+				}
+			}
+		}
+		return m
+	}
+	sharedPersons := func(a, b map[string]bool) int {
+		n := 0
+		for p := range a {
+			if b[p] {
+				n++
+			}
+		}
+		return n
+	}
+	for merged := true; merged; {
+		merged = false
+		for i := 0; i < len(cls) && !merged; i++ {
+			pi := personSet(cls[i])
+			for j := i + 1; j < len(cls); j++ {
+				same := sim(cls[i].tk, cls[j].tk) >= 0.5 || sharedPersons(pi, personSet(cls[j])) >= 2
+				if !same {
+					continue
+				}
+				cls[i].arts = append(cls[i].arts, cls[j].arts...)
+				for k := range cls[j].tk {
+					cls[i].tk[k] = true
+				}
+				cls = append(cls[:j], cls[j+1:]...)
+				merged = true
+				break
+			}
 		}
 	}
 	// Independent coverage, measured in distinct headlines. A wire item
