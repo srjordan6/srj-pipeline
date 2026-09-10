@@ -391,6 +391,28 @@ func twoaiBillPageReviews(db *sql.DB) (int, error) {
 	}
 	var open int
 	db.QueryRow(`SELECT count(*) FROM twoai_page_reviews WHERE cleared_on IS NULL`).Scan(&open)
+
+	// AUTO-CLEAR. A review item lifts itself the moment the page's prose is
+	// changed after the trigger. The prose lives in site_content, keyed
+	// governance/{slug}.json, and its updated_at is the one date on this system
+	// that means "a person changed the guidance" - the compliance page's own
+	// generated field is the build date and moves every run. So the human step
+	// is only the one that cannot be automated, updating the words; the flag
+	// appears and disappears on its own. Cleared rows are kept with the reason.
+	cleared, err := db.Exec(`UPDATE twoai_page_reviews r
+		SET cleared_on = current_date,
+		    cleared_note = 'guidance updated on '||c.updated_at::date||', after the trigger'
+		FROM site_content c
+		WHERE r.cleared_on IS NULL
+		  AND c.path = replace(r.page_path, 'compliance/', 'governance/')
+		  AND c.updated_at::date > r.trigger_date`)
+	if err != nil {
+		return opened, err
+	}
+	if n, _ := cleared.RowsAffected(); n > 0 {
+		fmt.Printf("twoai_bill_events: page reviews auto-cleared=%d (guidance updated after trigger)\n", n)
+		open -= int(n)
+	}
 	fmt.Printf("twoai_bill_events: page reviews opened=%d open_total=%d\n", opened, open)
 	return opened, nil
 }
@@ -475,8 +497,28 @@ func twoaiBillEventsPublish(db *sql.DB, today string, upsert func(path, kind str
 		})
 	}
 	rrows.Close()
+
+	// The date the GUIDANCE last changed, for every governance page, so the
+	// compliance template can show it. This is the honest freshness stamp.
+	// Each page's generated field is the build date and reads "verified today"
+	// on prose nobody has touched for weeks - California's page said
+	// 2026-09-10 on guidance last edited 2026-08-19, three weeks before SB 813
+	// was signed. A reader deciding whether to trust a page needs the date the
+	// words changed, not the date the server ran.
+	prows, err := db.Query(`SELECT replace(replace(path,'governance/',''),'.json','') AS slug, updated_at::date::text FROM site_content WHERE path LIKE 'governance/%.json'`)
+	if err != nil {
+		return 0, err
+	}
+	reviewed := map[string]string{}
+	for prows.Next() {
+		var slug, date string
+		if prows.Scan(&slug, &date) == nil {
+			reviewed[slug] = date
+		}
+	}
+	prows.Close()
 	if err := upsert("compliance/page-reviews.json", "compliance-reviews", map[string]any{
-		"generated": today, "pages": len(reviews), "reviews": reviews,
+		"generated": today, "pages": len(reviews), "reviews": reviews, "reviewed": reviewed,
 	}); err != nil {
 		return 0, err
 	}
