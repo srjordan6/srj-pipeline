@@ -39,10 +39,28 @@ import (
 
 // LegiScan status codes. 4 and 5 are the terminal outcomes worth announcing;
 // a bill that passed one chamber is not news to a compliance audience.
+//
+// 7 is ours, not LegiScan's: PRESENTED TO THE GOVERNOR, detected from the
+// history array. See twoaiBillHistoryEvents for why the history is read at
+// all - the short version is that LegiScan's status code lagged California
+// SB 813's signing by days, the history did not, and the compliance page for
+// California learned nothing from either.
 var twoaiBillStatusLabel = map[int]string{
 	1: "Introduced", 2: "Engrossed", 3: "Enrolled",
 	4: "Passed", 5: "Vetoed", 6: "Failed",
+	7: "Presented to Governor",
 }
+
+// Governor-stage actions as they appear in LegiScan history entries, across
+// the phrasings the states use. "Signed" produces a status-4 event straight
+// from the history so the enacted page, the news story, the social draft and
+// the alert all fire the day the record shows it, not the day LegiScan's
+// summary code catches up. "Presented" is the early warning: a bill on the
+// governor's desk is days from being law, and the compliance page for that
+// state should already be flagged for review.
+var twoaiGovSignedRe = regexp.MustCompile(`(?i)(approved by (the )?governor|signed by (the )?governor|governor signed|signed into law|became law without|chaptered|chapter(ed)? (no\.? ?)?\d+|filed with (the )?secretary of state|act no\.? ?\d+)`)
+var twoaiGovPresentedRe = regexp.MustCompile(`(?i)(presented to (the )?governor|enrolled and presented|sent to (the )?governor|transmitted to (the )?governor|delivered to (the )?governor|to governor)`)
+var twoaiGovVetoedRe = regexp.MustCompile(`(?i)(vetoed by (the )?governor|governor veto|veto(ed)? by)`)
 
 // Relevance gate. The AI corpus is keyword-matched at ingest, so it contains
 // general appropriations acts and budget technical corrections that mention
@@ -142,7 +160,239 @@ func twoaiBillEvents(db *sql.DB, today string) (int, error) {
 
 	fmt.Printf("twoai_bill_events: scanned=%d new=%d relevant_new=%d pending pub=%d news=%d social=%d notify=%d\n",
 		len(evs), newEvents, relevantNew, pendingPub, pendingNews, pendingSocial, pendingNotify)
+
+	// Second detector, reading the history instead of the status code.
+	hist, err := twoaiBillHistoryEvents(db)
+	if err != nil {
+		return newEvents, err
+	}
+	newEvents += hist
+
+	// Route every relevant governor-stage event to the state's compliance
+	// page as an open review item.
+	if _, err := twoaiBillPageReviews(db); err != nil {
+		return newEvents, err
+	}
 	return newEvents, nil
+}
+
+// twoaiBillHistoryEvents reads the HISTORY array of each bill's latest
+// snapshot and fires on governor-stage actions.
+//
+// Why this exists. On 2026-09-09 California's governor signed SB 813 and AB
+// 1405, the first state AI auditing regime. The pipeline had ten hydrated
+// snapshots of SB 813, the newest fetched hours after the signing, and its
+// history array's top entry read "Enrolled and presented to the Governor at 4
+// p.m." But LegiScan's summary status code still said 3, Engrossed, dated
+// 2026-08-30, because their code lags their history by days. The detector
+// above only reads the code, so a law the database already knew about
+// produced no event, no news story, no alert, and no change to the California
+// compliance page. Stephen found out from teleSUR.
+//
+// The history is where the truth arrives first, and it was already in the
+// database. This reads it. A signing produces a status-4 event with the
+// history date, so every existing output fires; "presented to the Governor"
+// produces status 7, which reaches the alert and the page review but not the
+// news or the social feed, because a bill on the desk is not yet a law.
+//
+// Idempotent on the same primary key as the status detector: if LegiScan's
+// code later catches up and offers status 4 with its own date, ON CONFLICT
+// keeps ours, which is the earlier and more accurate one.
+func twoaiBillHistoryEvents(db *sql.DB) (int, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT ON (raw->'bill'->>'state', raw->'bill'->>'bill_number')
+		  raw->'bill'->>'state', raw->'bill'->>'bill_number',
+		  title, COALESCE(raw->'bill'->>'description',''), COALESCE(raw->'bill'->>'url',''),
+		  COALESCE(raw->'bill'->'history', '[]'::jsonb)::text
+		FROM pipeline.documents
+		WHERE raw ? 'bill' AND raw->'bill'->>'state' IS NOT NULL
+		  AND jsonb_typeof(raw->'bill'->'history') = 'array'
+		  AND fetched_at > now() - interval '120 days'
+		ORDER BY raw->'bill'->>'state', raw->'bill'->>'bill_number', fetched_at DESC`)
+	if err != nil {
+		return 0, err
+	}
+	type cand struct {
+		state, bill, title, desc, url, hist string
+	}
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		if rows.Scan(&c.state, &c.bill, &c.title, &c.desc, &c.url, &c.hist) == nil {
+			cands = append(cands, c)
+		}
+	}
+	rows.Close()
+
+	newEvents := 0
+	for _, c := range cands {
+		rel, note := twoaiBillRelevant(c.title, c.desc)
+		if !rel {
+			continue // the gate applies here exactly as it does to the status path
+		}
+		var hist []struct {
+			Date   string `json:"date"`
+			Action string `json:"action"`
+		}
+		if json.Unmarshal([]byte(c.hist), &hist) != nil {
+			continue
+		}
+		// Strongest signal wins: a bill that was presented and then signed is a
+		// signing, and the presented event is still recorded so the review item
+		// carries the full sequence.
+		var signedDate, presentedDate, vetoedDate string
+		for _, h := range hist {
+			switch {
+			case twoaiGovVetoedRe.MatchString(h.Action):
+				if h.Date > vetoedDate {
+					vetoedDate = h.Date
+				}
+			case twoaiGovSignedRe.MatchString(h.Action):
+				if h.Date > signedDate {
+					signedDate = h.Date
+				}
+			case twoaiGovPresentedRe.MatchString(h.Action):
+				if h.Date > presentedDate {
+					presentedDate = h.Date
+				}
+			}
+		}
+		emit := func(status int, date string) error {
+			if date == "" {
+				return nil
+			}
+			res, err := db.Exec(`INSERT INTO twoai_bill_events
+				(state, bill_number, status, status_label, status_date, title, description, url, relevant, relevance_note)
+				VALUES ($1,$2,$3,$4,$5::date,$6,$7,$8,true,$9)
+				ON CONFLICT (state, bill_number, status) DO NOTHING`,
+				c.state, c.bill, status, twoaiBillStatusLabel[status], date,
+				c.title, c.desc, c.url, note+"; detected from LegiScan history action, not status code")
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				newEvents++
+				fmt.Printf("twoai_bill_events: history %s %s -> %s on %s\n", c.state, c.bill, twoaiBillStatusLabel[status], date)
+			}
+			return nil
+		}
+		if err := emit(7, presentedDate); err != nil {
+			return newEvents, err
+		}
+		if err := emit(4, signedDate); err != nil {
+			return newEvents, err
+		}
+		if err := emit(5, vetoedDate); err != nil {
+			return newEvents, err
+		}
+	}
+	if newEvents > 0 {
+		fmt.Printf("twoai_bill_events: history detector new=%d\n", newEvents)
+	}
+	return newEvents, nil
+}
+
+// twoaiBillPageReviews turns a governor-stage event into an open review item
+// on the compliance page it changes.
+//
+// This is the piece that was missing altogether. The four outputs above put
+// an enactment on an aggregate page, in the news, on social and in Stephen's
+// inbox. None of them touched the page a reader actually goes to - the
+// state's own compliance page, /ai-compliance/california-ai-laws/ - which
+// kept describing the law as it stood before the bill existed.
+//
+// A review item is not a link and not a rewrite. It is a visible flag on the
+// page: "SB 813 was signed on 2026-09-09; this guidance predates it", with
+// the primary source, until someone updates the prose and clears it. The
+// reader sees that the guidance is behind, which is the honest state, rather
+// than a page that looks current and is not.
+func twoaiBillPageReviews(db *sql.DB) (int, error) {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_page_reviews (
+		id serial PRIMARY KEY,
+		page_path text NOT NULL,
+		trigger_kind text NOT NULL,
+		trigger_ref text NOT NULL,
+		trigger_date date NOT NULL,
+		summary text NOT NULL,
+		source_url text NOT NULL DEFAULT '',
+		opened_on date NOT NULL DEFAULT current_date,
+		cleared_on date,
+		cleared_note text,
+		UNIQUE (page_path, trigger_kind, trigger_ref))`); err != nil {
+		return 0, err
+	}
+
+	// Which compliance page belongs to a state. The pages are named
+	// compliance/{state-name}-ai-laws.json; the map is the two-letter code to
+	// that slug. Puerto Rico and DC are included because pages exist for them.
+	stateSlug := map[string]string{
+		"AL": "alabama", "AK": "alaska", "AZ": "arizona", "AR": "arkansas", "CA": "california",
+		"CO": "colorado", "CT": "connecticut", "DE": "delaware", "FL": "florida", "GA": "georgia",
+		"HI": "hawaii", "ID": "idaho", "IL": "illinois", "IN": "indiana", "IA": "iowa",
+		"KS": "kansas", "KY": "kentucky", "LA": "louisiana", "ME": "maine", "MD": "maryland",
+		"MA": "massachusetts", "MI": "michigan", "MN": "minnesota", "MS": "mississippi", "MO": "missouri",
+		"MT": "montana", "NE": "nebraska", "NV": "nevada", "NH": "new-hampshire", "NJ": "new-jersey",
+		"NM": "new-mexico", "NY": "new-york", "NC": "north-carolina", "ND": "north-dakota", "OH": "ohio",
+		"OK": "oklahoma", "OR": "oregon", "PA": "pennsylvania", "RI": "rhode-island", "SC": "south-carolina",
+		"SD": "south-dakota", "TN": "tennessee", "TX": "texas", "UT": "utah", "VT": "vermont",
+		"VA": "virginia", "WA": "washington", "WV": "west-virginia", "WI": "wisconsin", "WY": "wyoming",
+		"DC": "dc", "PR": "puerto-rico",
+	}
+
+	rows, err := db.Query(`SELECT state, bill_number, status, status_label, status_date::text, title, url
+		FROM twoai_bill_events WHERE relevant AND status IN (4,5,7)
+		  AND status_date >= current_date - interval '180 days'`)
+	if err != nil {
+		return 0, err
+	}
+	type ev struct{ state, bill, label, date, title, url string; status int }
+	var evs []ev
+	for rows.Next() {
+		var e ev
+		if rows.Scan(&e.state, &e.bill, &e.status, &e.label, &e.date, &e.title, &e.url) == nil {
+			evs = append(evs, e)
+		}
+	}
+	rows.Close()
+
+	opened := 0
+	for _, e := range evs {
+		slug, ok := stateSlug[e.state]
+		if !ok {
+			continue
+		}
+		path := "compliance/" + slug + "-ai-laws.json"
+		var exists bool
+		db.QueryRow(`SELECT EXISTS (SELECT 1 FROM twoai_pages WHERE path=$1)`, path).Scan(&exists)
+		if !exists {
+			continue
+		}
+		subject := strings.TrimSpace(strings.TrimPrefix(e.title, e.state+" "+e.bill+":"))
+		var summary string
+		switch e.status {
+		case 7:
+			summary = fmt.Sprintf("%s %s was presented to the Governor on %s: %s. This guidance was written before it reached the Governor's desk.", e.state, e.bill, e.date, subject)
+		case 5:
+			summary = fmt.Sprintf("%s %s was vetoed on %s: %s. If this page discusses the bill, it should say so.", e.state, e.bill, e.date, subject)
+		default:
+			summary = fmt.Sprintf("%s %s became law on %s: %s. This guidance predates it and has not been reviewed against the enacted text.", e.state, e.bill, e.date, subject)
+		}
+		res, err := db.Exec(`INSERT INTO twoai_page_reviews (page_path, trigger_kind, trigger_ref, trigger_date, summary, source_url)
+			VALUES ($1,'bill:'||$2,$3,$4::date,$5,$6)
+			ON CONFLICT (page_path, trigger_kind, trigger_ref) DO NOTHING`,
+			path, strings.ToLower(e.label), e.state+" "+e.bill, e.date, summary, e.url)
+		if err != nil {
+			return opened, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			opened++
+			fmt.Printf("twoai_bill_events: review opened on %s for %s %s (%s)\n", path, e.state, e.bill, e.label)
+		}
+	}
+	var open int
+	db.QueryRow(`SELECT count(*) FROM twoai_page_reviews WHERE cleared_on IS NULL`).Scan(&open)
+	fmt.Printf("twoai_bill_events: page reviews opened=%d open_total=%d\n", opened, open)
+	return opened, nil
 }
 
 // ---- Output 1: the enacted-law page --------------------------------------
@@ -201,6 +451,33 @@ func twoaiBillEventsPublish(db *sql.DB, today string, upsert func(path, kind str
 		"laws": laws, "recent": recent,
 	}
 	if err := upsert("compliance/enacted-ai-laws.json", "compliance", doc); err != nil {
+		return 0, err
+	}
+
+	// Open page reviews, one document the compliance template reads to flag
+	// its own page. Keyed by the page's slug so the template needs no join.
+	// Cleared reviews are excluded here but never deleted from the table, so
+	// the record of what changed a page and when survives the clearing.
+	rrows, err := db.Query(`SELECT page_path, trigger_kind, trigger_ref, trigger_date::text, summary, source_url, opened_on::text
+		FROM twoai_page_reviews WHERE cleared_on IS NULL ORDER BY trigger_date DESC`)
+	if err != nil {
+		return 0, err
+	}
+	reviews := map[string][]map[string]string{}
+	for rrows.Next() {
+		var path, kind, ref, date, summary, url, opened string
+		if rrows.Scan(&path, &kind, &ref, &date, &summary, &url, &opened) != nil {
+			continue
+		}
+		slug := strings.TrimSuffix(strings.TrimPrefix(path, "compliance/"), ".json")
+		reviews[slug] = append(reviews[slug], map[string]string{
+			"kind": kind, "ref": ref, "date": date, "summary": summary, "source_url": url, "opened_on": opened,
+		})
+	}
+	rrows.Close()
+	if err := upsert("compliance/page-reviews.json", "compliance-reviews", map[string]any{
+		"generated": today, "pages": len(reviews), "reviews": reviews,
+	}); err != nil {
 		return 0, err
 	}
 	if _, err := db.Exec(`UPDATE twoai_bill_events SET published_on = current_date
