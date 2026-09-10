@@ -235,7 +235,13 @@ func main() {
 		// event, not a daily rhythm. Run `pipeline favicons` at that point. The
 		// stage is unchanged and still idempotent, so running it costs nothing
 		// but the GETs.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		// twoai_stocks sits before twoai_build so the day's closes are in the
+		// database when the pages that show them are rendered. It is the only
+		// stage that sleeps by design - eight requests a minute on the free
+		// Twelve Data plan, six batches for 45 instruments, so about six
+		// minutes - and it is cheap the rest of the time because it asks for
+		// five days once an instrument is seeded.
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -677,6 +683,14 @@ func main() {
 	if src == "inkbox_pull" {
 		if err := inkboxPull(db); err != nil {
 			fmt.Fprintln(os.Stderr, "inkbox_pull:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_stocks" {
+		if err := twoaiStocks(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_stocks:", err)
 			os.Exit(1)
 		}
 		return
