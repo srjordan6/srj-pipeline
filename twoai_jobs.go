@@ -1063,8 +1063,9 @@ func twoaiJobs(db *sql.DB, today string, upsert func(path, kind string, v any) e
 	type group struct {
 		Name  string `json:"name"`
 		Slug  string `json:"slug"`
+		UID   string `json:"uid"`
 		Count int    `json:"count"`
-		Jobs  []job  `json:"jobs"`
+		Jobs  []job  `json:"jobs,omitempty"`
 	}
 	groupIndex := map[string]*group{}
 	groups := []*group{}
@@ -1085,6 +1086,50 @@ func twoaiJobs(db *sql.DB, today string, upsert func(path, kind string, v any) e
 		}
 		return groups[i].Name < groups[k].Name
 	})
+
+	// Attribution block, rendered on the page: these terms are what make the
+	// listings publishable at all, so the credits are data, not decoration.
+	// Declared before the discipline pages, which carry it too.
+	sources := []map[string]string{
+		{"name": "USAJobs", "url": "https://www.usajobs.gov/", "note": "US federal openings, official OPM API"},
+		{"name": "Adzuna", "url": "https://www.adzuna.com/", "note": "aggregated listings"},
+		{"name": "Jooble", "url": "https://jooble.org/", "note": "aggregated listings"},
+		{"name": "Remotive", "url": "https://remotive.com/", "note": "remote jobs"},
+		{"name": "Remote OK", "url": "https://remoteok.com/", "note": "remote jobs"},
+		{"name": "Arbeitnow", "url": "https://www.arbeitnow.com/", "note": "European listings"},
+		{"name": "The Muse", "url": "https://www.themuse.com/", "note": "listings and employer profiles"},
+		{"name": "Company career boards", "url": "", "note": "Greenhouse, Ashby, and Lever public postings, linked directly"},
+		{"name": "Indeed Hiring Lab", "url": "https://www.hiringlab.org/", "note": "AI posting-share tracker (market data)"},
+		{"name": "InfoSec Job Board", "url": "https://www.infosecjobboard.com/", "note": "cybersecurity hiring aggregates (market data)"},
+	}
+
+	// ONE PAGE PER DISCIPLINE. Stephen, 2026-09-10: each discipline is its own
+	// hub page with that discipline's jobs listed on it. Until now all 29 were
+	// anchors on the one jobs hub, with every listing inline - 2,676 roles on a
+	// page nobody reads top to bottom. A reader who wants Detection Engineering
+	// now gets a page that is only that, at a permanent uid-addressed URL under
+	// the same category as the hub, on the site's own scheme.
+	//
+	// The jobs move to the discipline pages and leave the hub: a listing is
+	// rendered in exactly one place. The hub keeps the groups as an index -
+	// name, count, uid - so the "Roles by discipline" block links out instead
+	// of down. Flat jobs stay on the hub document for the counts and the
+	// market blocks that read them, not for rendering.
+	hubUID := twoaiUID("section:ai-jobs")
+	disciplinePages := 0
+	for _, g := range groups {
+		g.UID = twoaiUID("jobs-discipline:" + g.Slug)
+		if err := upsert("jobs/discipline-"+g.Slug+".json", "jobs-discipline", map[string]any{
+			"uid": g.UID, "name": g.Name, "slug": g.Slug, "count": g.Count,
+			"generated": today, "hub_uid": hubUID, "hub_name": "AI Jobs and Market Dynamics",
+			"jobs": g.Jobs, "sources": sources,
+		}); err != nil {
+			return 0, err
+		}
+		disciplinePages++
+		g.Jobs = nil // rendered on the discipline page, not the hub
+	}
+	fmt.Printf("twoai_jobs: discipline pages=%d\n", disciplinePages)
 
 	// SALARY DATA. Aggregated from the listings whose employer states a figure,
 	// which is the number the page leads with: a median computed from half the
@@ -1190,21 +1235,6 @@ func twoaiJobs(db *sql.DB, today string, upsert func(path, kind string, v any) e
 			}
 		}
 		mrows.Close()
-	}
-
-	// Attribution block, rendered on the page: these terms are what make the
-	// listings publishable at all, so the credits are data, not decoration.
-	sources := []map[string]string{
-		{"name": "USAJobs", "url": "https://www.usajobs.gov/", "note": "US federal openings, official OPM API"},
-		{"name": "Adzuna", "url": "https://www.adzuna.com/", "note": "aggregated listings"},
-		{"name": "Jooble", "url": "https://jooble.org/", "note": "aggregated listings"},
-		{"name": "Remotive", "url": "https://remotive.com/", "note": "remote jobs"},
-		{"name": "Remote OK", "url": "https://remoteok.com/", "note": "remote jobs"},
-		{"name": "Arbeitnow", "url": "https://www.arbeitnow.com/", "note": "European listings"},
-		{"name": "The Muse", "url": "https://www.themuse.com/", "note": "listings and employer profiles"},
-		{"name": "Company career boards", "url": "", "note": "Greenhouse, Ashby, and Lever public postings, linked directly"},
-		{"name": "Indeed Hiring Lab", "url": "https://www.hiringlab.org/", "note": "AI posting-share tracker (market data)"},
-		{"name": "InfoSec Job Board", "url": "https://www.infosecjobboard.com/", "note": "cybersecurity hiring aggregates (market data)"},
 	}
 
 	if len(jobs) == 0 {
