@@ -123,7 +123,7 @@ var twoaiDailyOnly = map[string]bool{
 	"legiscan": true, "twoai_claims": true, "intel": true, "twoai_recap": true,
 	"twoai_onet": true, "twoai_openlibrary": true, "twoai_case_studies": true,
 	"twoai_companyfacts": true, "twoai_orgfacts": true, "docwatch": true,
-	"twoai_etf_holdings": true, "openalex_watch": true, "export_corpus": true,
+	"twoai_etf_holdings": true, "openalex_watch": true, "export_corpus": true, "appsec_research": true,
 	"twoai_worklist_companies": true,
 }
 
@@ -242,7 +242,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "openalex_watch", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -684,6 +684,14 @@ func main() {
 	if src == "inkbox_pull" {
 		if err := inkboxPull(db); err != nil {
 			fmt.Fprintln(os.Stderr, "inkbox_pull:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "appsec_research" {
+		if err := appsecResearch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "appsec_research:", err)
 			os.Exit(1)
 		}
 		return
