@@ -4343,6 +4343,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	// Stock prices for the company pages and the Public AI Companies section.
+	if err := twoaiStocksDoc(db, today, upsert); err != nil {
+		return err
+	}
+
 	// Enactment trigger: detect bills that became law, then publish, write
 	// news, and queue the social post and Stephen's alert from that one event.
 	if _, err := twoaiBillEvents(db, today); err != nil {

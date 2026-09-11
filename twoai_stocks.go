@@ -30,6 +30,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -242,5 +243,110 @@ func twoaiStocks(db *sql.DB) error {
 		Scan(&tickers, &rowsTotal, &newest)
 	fmt.Printf("twoai_stocks: upserts=%d failed=%d tickers=%d rows=%d newest=%s ok=%v\n",
 		saved, failed, tickers, rowsTotal, newest.String, failed == 0)
+	return nil
+}
+
+// twoaiStocksDoc renders the prices into one content document the site reads:
+// companies/stocks.json, keyed by company uid for the company pages and by
+// fund ticker for the Public AI Companies section. Called from twoai_build
+// after the fetch has run, so the day's close is in it.
+//
+// Each entry carries what a call-out box needs and nothing it does not: the
+// latest close and its date, the previous close so the change can be shown,
+// the 52-week range, and a 30-point series for a sparkline. The full history
+// stays in twoai_stock_closes and is served through the API rather than
+// duplicated onto every page.
+//
+// No entry, no box. A company page with no entry here renders no stock box at
+// all, and a page whose instrument is not US-listed says prices are not
+// tracked, which is the free tier's honest limit rather than a blank.
+func twoaiStocksDoc(db *sql.DB, today string, upsert func(path, kind string, v any) error) error {
+	rows, err := db.Query(`
+		WITH latest AS (
+		  SELECT DISTINCT ON (ticker) ticker, trade_date, close
+		  FROM twoai_stock_closes ORDER BY ticker, trade_date DESC),
+		prev AS (
+		  SELECT DISTINCT ON (c.ticker) c.ticker, c.close
+		  FROM twoai_stock_closes c JOIN latest l ON l.ticker=c.ticker AND c.trade_date < l.trade_date
+		  ORDER BY c.ticker, c.trade_date DESC),
+		yr AS (
+		  SELECT ticker, min(close) AS lo, max(close) AS hi, count(*) AS n, min(trade_date) AS since
+		  FROM twoai_stock_closes WHERE trade_date > current_date - interval '365 days' GROUP BY ticker),
+		spark AS (
+		  SELECT ticker, jsonb_agg(close ORDER BY trade_date) AS pts FROM (
+		    SELECT ticker, trade_date, close, row_number() OVER (PARTITION BY ticker ORDER BY trade_date DESC) AS rn
+		    FROM twoai_stock_closes) s WHERE rn <= 30 GROUP BY ticker)
+		SELECT i.uid, i.ticker, i.name, i.kind, COALESCE(i.exchange,''), COALESCE(i.company_uid,''), COALESCE(i.issuer,''), COALESCE(i.note,''),
+		  l.trade_date::text, l.close, COALESCE(p.close, l.close), y.lo, y.hi, y.n, y.since::text, COALESCE(s.pts::text,'[]'),
+		  (SELECT count(*) FROM twoai_stock_closes c WHERE c.ticker=i.ticker),
+		  (SELECT min(trade_date)::text FROM twoai_stock_closes c WHERE c.ticker=i.ticker)
+		FROM twoai_stock_instruments i
+		JOIN latest l ON l.ticker=i.ticker
+		LEFT JOIN prev p ON p.ticker=i.ticker
+		LEFT JOIN yr y ON y.ticker=i.ticker
+		LEFT JOIN spark s ON s.ticker=i.ticker
+		WHERE i.active ORDER BY i.ticker`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	byCompany := map[string]any{}
+	funds := []map[string]any{}
+	n := 0
+	for rows.Next() {
+		var uid, ticker, name, kind, exchange, companyUID, issuer, note, date, since, pts, firstDate string
+		var close, prev float64
+		var lo, hi sql.NullFloat64
+		var yrN sql.NullInt64
+		var histN int
+		if err := rows.Scan(&uid, &ticker, &name, &kind, &exchange, &companyUID, &issuer, &note,
+			&date, &close, &prev, &lo, &hi, &yrN, &since, &pts, &histN, &firstDate); err != nil {
+			return err
+		}
+		var spark []float64
+		_ = json.Unmarshal([]byte(pts), &spark)
+		change := close - prev
+		pct := 0.0
+		if prev != 0 {
+			pct = change / prev * 100
+		}
+		entry := map[string]any{
+			"uid": uid, "ticker": ticker, "name": name, "kind": kind, "exchange": exchange,
+			"close": close, "close_date": date, "prev_close": prev,
+			"change": math.Round(change*100) / 100, "change_pct": math.Round(pct*100) / 100,
+			"spark": spark, "history_points": histN, "history_since": firstDate,
+			"source": twoaiStockSource, "source_url": "https://twelvedata.com/",
+		}
+		if lo.Valid && hi.Valid {
+			entry["year_low"] = lo.Float64
+			entry["year_high"] = hi.Float64
+			entry["year_points"] = yrN.Int64
+			entry["year_since"] = since
+		}
+		if issuer != "" {
+			entry["issuer"] = issuer
+		}
+		if note != "" {
+			entry["note"] = note
+		}
+		if kind == "index_etf" {
+			funds = append(funds, entry)
+		} else if companyUID != "" {
+			byCompany[companyUID] = entry
+		}
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := upsert("companies/stocks.json", "stocks", map[string]any{
+		"generated": today, "instruments": n, "by_company": byCompany, "funds": funds,
+		"source": twoaiStockSource, "source_url": "https://twelvedata.com/",
+		"coverage": "US-listed instruments only. Prices are end-of-day closes, not live quotes.",
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("twoai_stocks: doc companies=%d funds=%d\n", len(byCompany), len(funds))
 	return nil
 }
