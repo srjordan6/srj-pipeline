@@ -138,7 +138,18 @@ type incidentReport struct {
 type incidentOut struct {
 	IncidentID int    `json:"incident_id"`
 	Title      string `json:"title"`
-	URL        string `json:"url"`
+	// TitleEN and TitleLang: the headline in English, and the language the
+	// original is in. Stephen, 2026-09-11, after seeing incident 1684 titled
+	// "Motie van het lid Beckerman over een bevoegde instantie aanwijzen..."
+	// above an English summary: does the pipeline translate? It did not. The
+	// summary and reading are written by Claude, which writes English from
+	// whatever it reads, so they were always English; the title is copied
+	// verbatim from the AIID feed and was never touched. TitleEN is ours, a
+	// translation, and is rendered as such; Title stays the publisher's own
+	// headline, still the label on the link, which is the AIID rule above.
+	TitleEN   string `json:"title_en,omitempty"`
+	TitleLang string `json:"title_lang,omitempty"`
+	URL       string `json:"url"`
 	Domain     string `json:"domain"`
 	Published  string `json:"published"`
 	CiteURL    string `json:"cite_url"`
@@ -185,7 +196,73 @@ func twoaiIncidentsRecent(db *sql.DB, n int) []incidentOut {
 		out = out[:n]
 	}
 	twoaiIncidentsEnrich(db, out)
+	for i := range out {
+		out[i].TitleEN, out[i].TitleLang = twoaiTranslateTitle(db, out[i].Title)
+	}
 	return out
+}
+
+// twoaiTranslateTitle returns an English rendering of a headline and the
+// ISO 639-1 code of the language it was written in. English in, English out
+// with lang "en" and no call made once the cache holds it.
+//
+// One Haiku call per distinct headline, ever: the result is cached on the
+// headline's hash in twoai_translations, so a title seen on the briefing
+// today and on its incident page tomorrow costs one call, not two, and
+// nothing is retranslated on a rebuild. The model is asked for a literal
+// rendering, not a rewrite, and to leave names and proper nouns alone: a
+// translated headline is still the publisher's headline, in another language,
+// and the page labels it as a translation.
+//
+// Detection is left to the same call rather than a heuristic. A stopword
+// ratio misfires on a short headline full of names, and the call is made
+// once per title anyway. On any failure the original is returned as-is with
+// an empty lang, and the page shows the original, which is what it showed
+// before this existed.
+func twoaiTranslateTitle(db *sql.DB, title string) (string, string) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return "", ""
+	}
+	h := sha256.Sum256([]byte("title:" + title))
+	key := hex.EncodeToString(h[:8])
+	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_translations (
+		key text PRIMARY KEY, source text NOT NULL, lang text NOT NULL, english text NOT NULL,
+		model text, created_at timestamptz NOT NULL DEFAULT now())`)
+	var en, lang string
+	if db.QueryRow(`SELECT english, lang FROM twoai_translations WHERE key=$1`, key).Scan(&en, &lang) == nil {
+		return en, lang
+	}
+	if os.Getenv("ANTHROPIC_API_KEY") == "" {
+		return title, ""
+	}
+	model := os.Getenv("TWOAI_TRANSLATE_MODEL")
+	if model == "" {
+		model = "claude-haiku-4-5"
+	}
+	const sys = `You identify the language of a news headline and render it in English.
+Return ONLY a JSON object: {"lang":"<ISO 639-1 code>","english":"<headline in English>"}.
+If the headline is already English, return lang "en" and the headline unchanged.
+Translate literally and completely. Keep names, organisations, product names and numbers exactly as written. Do not summarise, shorten, editorialise or add words. No preamble, no markdown.`
+	out, err := twoaiClaudeCall(model, sys, title)
+	if err != nil {
+		return title, ""
+	}
+	out = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(out), "```json"), "```"))
+	var r struct {
+		Lang    string `json:"lang"`
+		English string `json:"english"`
+	}
+	if json.Unmarshal([]byte(out), &r) != nil || r.English == "" || len(r.Lang) < 2 {
+		return title, ""
+	}
+	r.Lang = strings.ToLower(r.Lang[:2])
+	if r.Lang == "en" {
+		r.English = title
+	}
+	db.Exec(`INSERT INTO twoai_translations (key, source, lang, english, model) VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (key) DO NOTHING`, key, title, r.Lang, r.English, model)
+	return r.English, r.Lang
 }
 
 // EVERY OUTLET, AND AN ORIGINAL SUMMARY. Stephen, 2026-08-30: we are just
@@ -356,6 +433,7 @@ func twoaiIncidentPages(db *sql.DB, incidents []incidentOut, today string) int {
 
 		doc := map[string]any{
 			"shape": "incident", "incident_id": inc.IncidentID, "title": inc.Title,
+			"title_en": inc.TitleEN, "title_lang": inc.TitleLang,
 			"summary": inc.Summary, "summary_domain": inc.SummaryDomain,
 			"summary_url": inc.SummaryURL, "reports": inc.Reports,
 			"outlet_count": inc.OutletCount, "published": inc.Published,
