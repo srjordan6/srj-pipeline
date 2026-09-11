@@ -170,6 +170,21 @@ func twoaiEtfHoldings(db *sql.DB) error {
 			continue
 		}
 		for _, h := range f.rows {
+			// Not every line in a holdings file is a company. Global X lists
+			// its cash and settlement lines - "OTHER PAYABLE & RECEIVABLES",
+			// "CASH" - in the same table with no ticker and no SEDOL. They are
+			// stored with the fund's holdings, since they are part of it, but
+			// they never reach the company worklist: a line with no
+			// identifier at all is not a company to research.
+			isCompany := h.sedol != "" || h.ticker != ""
+			// Non-US tickers arrive as "6954 JP", "ABBN SW", "2395 TT": the
+			// exchange is a Bloomberg suffix on the ticker. Split it so the
+			// worklist carries symbol and exchange separately and the symbol
+			// can be matched on its own.
+			sym, exch := h.ticker, ""
+			if parts := strings.Fields(h.ticker); len(parts) == 2 {
+				sym, exch = parts[0], parts[1]
+			}
 			key := h.sedol
 			if key == "" {
 				key = h.ticker
@@ -180,16 +195,17 @@ func twoaiEtfHoldings(db *sql.DB) error {
 			// Hard-identifier match: the constituent's ticker against the
 			// SEC-verified instrument list. Name is never used.
 			var companyUID sql.NullString
-			if h.ticker != "" {
-				db.QueryRow(`SELECT company_uid FROM twoai_stock_instruments WHERE ticker=$1 AND company_uid IS NOT NULL`, h.ticker).Scan(&companyUID)
+			if sym != "" && exch == "" {
+				db.QueryRow(`SELECT company_uid FROM twoai_stock_instruments WHERE ticker=$1 AND company_uid IS NOT NULL`, sym).Scan(&companyUID)
 			}
 			res, err := db.Exec(`INSERT INTO twoai_etf_holdings
-				(uid, etf_ticker, as_of_date, constituent_ticker, constituent_name, sedol, weight_pct, shares, market_value, company_uid, source_url)
-				VALUES ($1,$2,$3::date,$4,$5,NULLIF($6,''),$7,$8,$9,$10,$11)
+				(uid, etf_ticker, as_of_date, constituent_ticker, constituent_name, sedol, exchange, weight_pct, shares, market_value, company_uid, source_url)
+				VALUES ($1,$2,$3::date,NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,$9,$10,$11,$12)
 				ON CONFLICT (etf_ticker, as_of_date, constituent_name) DO UPDATE SET
 					weight_pct=EXCLUDED.weight_pct, shares=EXCLUDED.shares, market_value=EXCLUDED.market_value,
+					exchange=COALESCE(EXCLUDED.exchange, twoai_etf_holdings.exchange),
 					company_uid=COALESCE(EXCLUDED.company_uid, twoai_etf_holdings.company_uid), fetched_at=now()`,
-				uid, fd.ticker, f.asOf, h.ticker, h.name, h.sedol, h.weight, h.shares, h.value, companyUID, f.url)
+				uid, fd.ticker, f.asOf, sym, h.name, h.sedol, exch, h.weight, h.shares, h.value, companyUID, f.url)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "twoai_etf_holdings insert:", err)
 				continue
@@ -201,16 +217,19 @@ func twoaiEtfHoldings(db *sql.DB) error {
 				matched++
 				continue
 			}
+			if !isCompany {
+				continue
+			}
 			// Unmatched: queue for research. One row per constituent across
 			// all funds, accumulating which funds hold it.
 			csum := sha256.Sum256([]byte("company-candidate:" + key))
 			cuid := hex.EncodeToString(csum[:])[:8]
-			r2, err := db.Exec(`INSERT INTO twoai_company_worklist (uid, name, ticker, sedol, held_by)
-				VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),ARRAY[$5]::text[])
+			r2, err := db.Exec(`INSERT INTO twoai_company_worklist (uid, name, ticker, sedol, exchange, held_by)
+				VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),ARRAY[$6]::text[])
 				ON CONFLICT (uid) DO UPDATE SET
-					last_seen=current_date,
-					held_by=(SELECT array_agg(DISTINCT x) FROM unnest(twoai_company_worklist.held_by || ARRAY[$5]::text[]) x)`,
-				cuid, h.name, h.ticker, h.sedol, fd.ticker)
+					last_seen=current_date, exchange=COALESCE(EXCLUDED.exchange, twoai_company_worklist.exchange),
+					held_by=(SELECT array_agg(DISTINCT x) FROM unnest(twoai_company_worklist.held_by || ARRAY[$6]::text[]) x)`,
+				cuid, h.name, sym, h.sedol, exch, fd.ticker)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "twoai_etf_holdings worklist:", err)
 				continue
