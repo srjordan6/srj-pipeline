@@ -1128,7 +1128,7 @@ func twoaiJobs(db *sql.DB, today string, upsert func(path, kind string, v any) e
 		var guideBody, guideModel, guideWritten string
 		var guideSources string
 		if err := db.QueryRow(`SELECT body, model, written_on::text, sources::text FROM twoai_discipline_guides
-			WHERE uid=$1 AND status='drafted'`, g.UID).Scan(&guideBody, &guideModel, &guideWritten, &guideSources); err == nil && guideBody != "" {
+			WHERE uid=$1 AND status IN ('drafted','published') AND body IS NOT NULL AND body <> ''`, g.UID).Scan(&guideBody, &guideModel, &guideWritten, &guideSources); err == nil && guideBody != "" {
 			var srcs []map[string]string
 			json.Unmarshal([]byte(guideSources), &srcs)
 			if err := upsert("jobs/discipline-"+g.Slug+".json", "jobs-discipline", map[string]any{
