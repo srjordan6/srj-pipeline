@@ -124,6 +124,7 @@ var twoaiDailyOnly = map[string]bool{
 	"twoai_onet": true, "twoai_openlibrary": true, "twoai_case_studies": true,
 	"twoai_companyfacts": true, "twoai_orgfacts": true, "docwatch": true,
 	"twoai_etf_holdings": true, "openalex_watch": true, "export_corpus": true,
+	"twoai_worklist_companies": true,
 }
 
 // stageDueToday reports whether a once-a-day stage still owes a run today,
@@ -4306,6 +4307,21 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	_ = bookCatalog
 
+	// Companies discovered as AI-fund constituents, created by ticker,
+	// before twoaiCompanies reads twoai_company_profiles - so a company
+	// created this run reaches the directory the same run, not one run
+	// later. Gated daily: it hits SEC EDGAR the same way twoai_companyfacts
+	// does and has the same fair-use reason to run once a day.
+	if stageDueToday("twoai_worklist_companies") {
+		wlCreated, err := twoaiWorklistCompanies(db, today)
+		if err != nil {
+			fmt.Println("twoai_worklist_companies:", err)
+		}
+		_ = wlCreated
+	} else {
+		fmt.Println("twoai_worklist_companies: skipped, already ran today (once-a-day stage)")
+	}
+
 	companies, err := twoaiCompanies(db, today, upsert)
 	if err != nil {
 		return err
@@ -5496,6 +5512,7 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 
 	order := []string{}
 	by := map[string]*company{}
+	uidsFromCatalog := map[string]bool{}
 	for _, t := range cat.Tools {
 		v := strings.TrimSpace(t.Vendor)
 		if v == "" {
@@ -5506,11 +5523,43 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 			c = &company{UID: twoaiEntityID(db, "company", v), Name: v}
 			by[v] = c
 			order = append(order, v)
+			uidsFromCatalog[c.UID] = true
 		}
 		c.Products = append(c.Products, product{
 			Name: t.Name, Note: t.Note, URL: t.URL, Category: t.Category,
 			Profile: profiled[strings.ToLower(t.Name)],
 		})
+	}
+
+	// COMPANIES WITH NO PRODUCT IN THE CATALOG. Until 2026-09-11 the only way
+	// into this directory was publishing a tool: order/by came from the tools
+	// catalog and nowhere else, so a company created by twoai_worklist_companies
+	// - discovered as an AI-fund constituent, never having published a tool -
+	// got a companies/{uid}.json page written but no way to reach
+	// companies/index.json, no entry in the section counts, and no route back
+	// into this run's cases/mcp matching. The page would have existed and been
+	// unreachable from the one page a reader actually browses.
+	//
+	// Every twoai_company_profiles row not already seeded from the catalog is
+	// added here, keyed by its OWN uid rather than a freshly minted one: that
+	// uid was assigned at discovery (twoai_etf_holdings) or by ticker lookup
+	// (twoai_worklist_companies), and reusing it is what keeps a company's
+	// identity the same across the tables that already reference it -
+	// twoai_stock_instruments.company_uid, twoai_etf_holdings.company_uid -
+	// rather than minting a second uid for the same entity.
+	if prows, err := db.Query(`SELECT uid, name FROM twoai_company_profiles WHERE name <> ''`); err == nil {
+		for prows.Next() {
+			var uid, name string
+			if prows.Scan(&uid, &name) != nil || uidsFromCatalog[uid] {
+				continue
+			}
+			if by[name] != nil {
+				continue // name collision with a catalog vendor; catalog wins
+			}
+			by[name] = &company{UID: uid, Name: name}
+			order = append(order, name)
+		}
+		prows.Close()
 	}
 
 	// Litigation and MCP presence, matched on the company name appearing in the
