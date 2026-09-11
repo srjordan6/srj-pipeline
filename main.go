@@ -5556,7 +5556,14 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 			if by[name] != nil {
 				continue // name collision with a catalog vendor; catalog wins
 			}
-			by[name] = &company{UID: uid, Name: name}
+			by[name] = &company{UID: uid, Name: name,
+				// Initialised, not nil. A nil slice marshals to JSON null, and
+				// the ecosystem route calls .length on products at prerender:
+				// the first build carrying these companies died on
+				// 01d6e78d with "Cannot read properties of null", three times,
+				// on 2026-09-11. Catalog companies never hit this because
+				// every one of them has at least one product appended.
+				Products: []product{}, Cases: []map[string]string{}, MCP: []map[string]string{}}
 			order = append(order, name)
 		}
 		prows.Close()
