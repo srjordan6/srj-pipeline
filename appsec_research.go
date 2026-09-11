@@ -97,6 +97,64 @@ func appsecPermitted(code string) bool {
 	return false
 }
 
+// twoaiFindPdftotext locates Poppler's pdftotext.
+//
+// PATH alone is not enough, and 2026-09-11 showed both reasons in one
+// evening. winget installs Poppler USER-SCOPED, under the user's
+// AppData\Local\Microsoft\WinGet\Packages, and puts its shims in a Links
+// directory that a freshly opened shell still did not have on PATH. And the
+// pipeline's scheduled runs execute as SYSTEM, which never sees a
+// user-scoped PATH at all - so even a shell where pdftotext works proves
+// nothing about the nightly run.
+//
+// So: an explicit override first, then PATH, then the places winget and the
+// common installers actually put it. POPPLER_BIN in pipeline.env pins it if
+// this ever needs to be certain.
+func twoaiFindPdftotext() (string, error) {
+	if p := strings.TrimSpace(os.Getenv("POPPLER_BIN")); p != "" {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p, nil
+		}
+		cand := filepath.Join(p, "pdftotext.exe")
+		if _, err := os.Stat(cand); err == nil {
+			return cand, nil
+		}
+	}
+	if p, err := exec.LookPath("pdftotext"); err == nil {
+		return p, nil
+	}
+	var roots []string
+	if home, err := os.UserHomeDir(); err == nil {
+		roots = append(roots, filepath.Join(home, `AppData\Local\Microsoft\WinGet\Packages`))
+	}
+	// The pipeline may run as SYSTEM; look in every user profile too, because
+	// a user-scoped install is still the install we need to use.
+	if users, err := os.ReadDir(`C:\Users`); err == nil {
+		for _, u := range users {
+			if u.IsDir() {
+				roots = append(roots, filepath.Join(`C:\Users`, u.Name(), `AppData\Local\Microsoft\WinGet\Packages`))
+			}
+		}
+	}
+	roots = append(roots, `C:\Program Files\poppler`, `C:\Program Files (x86)\poppler`, `C:\poppler`)
+	for _, root := range roots {
+		var found string
+		filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+			if err != nil || found != "" {
+				return nil
+			}
+			if !d.IsDir() && strings.EqualFold(d.Name(), "pdftotext.exe") {
+				found = p
+			}
+			return nil
+		})
+		if found != "" {
+			return found, nil
+		}
+	}
+	return "", fmt.Errorf("pdftotext not found on PATH or in the usual install locations; set POPPLER_BIN in pipeline.env to its full path")
+}
+
 func appsecResearch(db *sql.DB) error {
 	if _, err := db.Exec(`ALTER TABLE srj_appsec_research
 		ADD COLUMN IF NOT EXISTS license_url text, ADD COLUMN IF NOT EXISTS license_raw text,
@@ -171,7 +229,7 @@ func appsecResearch(db *sql.DB) error {
 	}
 
 	// 3. Fetch full text for every permitted, unfetched row.
-	pdftotext, ptErr := exec.LookPath("pdftotext")
+	pdftotext, ptErr := twoaiFindPdftotext()
 	frows, err := db.Query(`SELECT id, arxiv_id FROM srj_appsec_research
 		WHERE full_text_permitted AND full_text_status='pending' AND arxiv_id IS NOT NULL ORDER BY id`)
 	if err != nil {
@@ -187,9 +245,9 @@ func appsecResearch(db *sql.DB) error {
 	frows.Close()
 	fetched, failed := 0, 0
 	if len(fetch) > 0 && ptErr != nil {
-		db.Exec(`UPDATE srj_appsec_research SET full_text_error='pdftotext not installed on the pipeline host; install Poppler and put pdftotext on PATH'
-			WHERE full_text_permitted AND full_text_status='pending'`)
-		fmt.Printf("appsec_research: %d permitted rows await full text but pdftotext is not on PATH (install Poppler)\n", len(fetch))
+		db.Exec(`UPDATE srj_appsec_research SET full_text_error=$1
+			WHERE full_text_permitted AND full_text_status='pending'`, ptErr.Error())
+		fmt.Printf("appsec_research: %d permitted rows await full text but pdftotext could not be located: %v\n", len(fetch), ptErr)
 	} else {
 		tmp := filepath.Join(os.TempDir(), "appsec")
 		os.MkdirAll(tmp, 0o755)
@@ -239,6 +297,13 @@ func appsecResearch(db *sql.DB) error {
 		count(*) FILTER (WHERE full_text_status='metadata_only'), count(*) FILTER (WHERE license='unresolved') FROM srj_appsec_research`).
 		Scan(&total, &permitted, &withText, &metaOnly, &unres)
 	fmt.Printf("appsec_research: licences resolved=%d unresolved_after=%d | fetched=%d failed=%d | total=%d permitted=%d with_text=%d metadata_only=%d ok=%v\n",
-		resolved, unres, fetched, failed, total, permitted, withText, metaOnly, unresolved == 0 && failed == 0)
+		resolved, unres, fetched, failed, total, permitted, withText, metaOnly, unresolved == 0 && failed == 0 && ptErr == nil)
+	// A run where every permitted row failed for one environmental reason is a
+	// FAILED run, not a quiet one. exit=0 on a run that fetched nothing is how
+	// 2026-09-11 looked fine in the log and had done nothing: the reason was
+	// only visible by querying the table. Now the run says so itself.
+	if ptErr != nil && len(fetch) > 0 {
+		return fmt.Errorf("%d permitted rows could not be fetched: %w", len(fetch), ptErr)
+	}
 	return nil
 }
