@@ -1119,6 +1119,31 @@ func twoaiJobs(db *sql.DB, today string, upsert func(path, kind string, v any) e
 	disciplinePages := 0
 	for _, g := range groups {
 		g.UID = twoaiUID("jobs-discipline:" + g.Slug)
+		// Guide prose, written by Cowork into twoai_discipline_guides per the
+		// 2026-09-10 brief: 500+ words on the discipline, credentials, experience
+		// and skills employers ask for, grounded in the postings this run
+		// itself holds. Only drafted rows publish; a row stays pending or held
+		// (a discipline too thin for 500 honest words) without blocking the
+		// page, which still lists every role either way.
+		var guideBody, guideModel, guideWritten string
+		var guideSources string
+		if err := db.QueryRow(`SELECT body, model, written_on::text, sources::text FROM twoai_discipline_guides
+			WHERE uid=$1 AND status='drafted'`, g.UID).Scan(&guideBody, &guideModel, &guideWritten, &guideSources); err == nil && guideBody != "" {
+			var srcs []map[string]string
+			json.Unmarshal([]byte(guideSources), &srcs)
+			if err := upsert("jobs/discipline-"+g.Slug+".json", "jobs-discipline", map[string]any{
+				"uid": g.UID, "name": g.Name, "slug": g.Slug, "count": g.Count,
+				"generated": today, "hub_uid": hubUID, "hub_name": "AI Jobs and Market Dynamics",
+				"jobs": g.Jobs, "sources": sources,
+				"guide": guideBody, "guide_model": guideModel, "guide_written_on": guideWritten, "guide_sources": srcs,
+			}); err != nil {
+				return 0, err
+			}
+			db.Exec(`UPDATE twoai_discipline_guides SET status='published', updated_at=now() WHERE uid=$1`, g.UID)
+			disciplinePages++
+			g.Jobs = nil
+			continue
+		}
 		if err := upsert("jobs/discipline-"+g.Slug+".json", "jobs-discipline", map[string]any{
 			"uid": g.UID, "name": g.Name, "slug": g.Slug, "count": g.Count,
 			"generated": today, "hub_uid": hubUID, "hub_name": "AI Jobs and Market Dynamics",
