@@ -94,7 +94,7 @@ const twoaiStageDeadlineDefault = 20 * time.Minute
 //	               the sweep completes.
 //	twoai_onet     already skips on freshness, but the call still costs.
 //	twoai_openlibrary, twoai_case_studies, twoai_companyfacts, twoai_orgfacts,
-//	               docwatch, arxiv_watch, export_corpus
+//	               docwatch, openalex_watch, export_corpus
 //	               sources that publish daily at most, or expensive sweeps
 //	               whose inputs move slower than three hours.
 //
@@ -123,7 +123,7 @@ var twoaiDailyOnly = map[string]bool{
 	"legiscan": true, "twoai_claims": true, "intel": true, "twoai_recap": true,
 	"twoai_onet": true, "twoai_openlibrary": true, "twoai_case_studies": true,
 	"twoai_companyfacts": true, "twoai_orgfacts": true, "docwatch": true,
-	"arxiv_watch": true, "export_corpus": true,
+	"openalex_watch": true, "export_corpus": true,
 }
 
 // stageDueToday reports whether a once-a-day stage still owes a run today,
@@ -241,7 +241,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "arxiv_watch", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_vendor_feeds", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "openalex_watch", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -355,9 +355,9 @@ func main() {
 		}
 		return
 	}
-	if src == "arxiv_watch" {
-		if err := arxivWatch(db); err != nil {
-			fmt.Fprintln(os.Stderr, "arxiv_watch:", err)
+	if src == "openalex_watch" {
+		if err := openalexWatch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "openalex_watch:", err)
 			os.Exit(1)
 		}
 		return
@@ -7044,17 +7044,17 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 	return len(blocks), nil
 }
 
-// twoaiResearchWatch builds research/watch.json: the arXiv Watch page at
-// /research/watch/, rendering the preprints arxiv_watch has filed in
-// ai_intel_candidates (source='arxiv').
+// twoaiResearchWatch builds research/watch.json: the Research Watch page at
+// /research/watch/, rendering the papers the watch has filed in
+// ai_intel_candidates. From 2026-09-11 the watch is openalexWatch
+// (source='openalex'); the 589 rows the retired arXiv watch filed
+// (source='arxiv') are kept and still render while inside the window, since
+// nothing on this site is deleted.
 //
-// The template labels each paper's vendor value as "mentions {name}", never
-// as authorship: arXiv's API exposes no affiliations, so arxiv_watch matches
-// names in the title and abstract, and a paper matched on a model family is
-// usually a paper studying that model. This stage only renders what the watch
-// stored; the honesty constraint lives in the wording, which the template
-// owns. Rows marked ignored in review are excluded, which is the operator's
-// lever for pruning noise without deleting the record.
+// The template's "mentions {name}" wording dates from arXiv, whose API
+// exposed no affiliations. OpenAlex rows are matched on the institution
+// record, so for them the word is authorship; the template can say so once
+// the arXiv rows have aged out of the window.
 //
 // Same defensive posture as twoaiVendorNews: an empty sweep leaves the last
 // good page in place, since arXiv API outages are routine (Aug 1) and a page
@@ -7065,7 +7065,7 @@ func twoaiResearchWatch(db *sql.DB, upsert func(path, kind string, v any) error)
 			replace(url, 'http://arxiv.org', 'https://arxiv.org'),
 			to_char(discovered_at at time zone 'UTC','YYYY-MM-DD')
 		FROM ai_intel_candidates
-		WHERE source = 'arxiv' AND status <> 'ignored'
+		WHERE source IN ('arxiv','openalex') AND status <> 'ignored'
 		  AND discovered_at > now() - ($1 || ' days')::interval
 		ORDER BY discovered_at DESC, id DESC`, windowDays)
 	if err != nil {
@@ -7093,7 +7093,7 @@ func twoaiResearchWatch(db *sql.DB, upsert func(path, kind string, v any) error)
 		return 0, err
 	}
 	if len(papers) == 0 {
-		fmt.Fprintln(os.Stderr, "twoai_build: arxiv watch found no papers, keeping the existing page")
+		fmt.Fprintln(os.Stderr, "twoai_build: research watch found no papers, keeping the existing page")
 		return 0, nil
 	}
 
@@ -9524,13 +9524,35 @@ func publishIntel(db *sql.DB) error {
 		fmt.Sprintf("intel: %d items %s", len(items), time.Now().UTC().Format("2006-01-02")), out)
 }
 
-// arxivWatch is phase 3 of the watch-everything directive: affiliation
-// tracking on new arXiv preprints. Pulls the newest submissions in cs.AI,
-// cs.CL, and cs.LG from the official arXiv Atom API and keeps only papers
-// whose title or abstract names a tracked institution, so the volume that
-// lands in ai_intel_candidates stays reviewable instead of flooding it with
-// every preprint. arXiv terms permit this use; the API is free and keyless.
-func arxivWatch(db *sql.DB) error {
+// openalexWatch is phase 3 of the watch-everything directive: affiliation
+// tracking on newly published AI research, from OpenAlex only.
+//
+// Stephen, 2026-09-11: arXiv removed from the pipeline, OpenAlex from now
+// on. This replaces arxivWatch, which pulled the newest cs.AI, cs.CL and
+// cs.LG submissions from the arXiv Atom API and matched institution NAMES
+// against the title and abstract text. That was mention detection, not
+// authorship - its own page had to say "mentions {name}" because arXiv's API
+// exposes no affiliations - and a paper matched on a model family was
+// usually a paper studying that model.
+//
+// OpenAlex carries structured affiliations with ROR identifiers on 99.9% of
+// works (2,706,403 of 2,706,423 in the last 30 days when checked), so this
+// matches on the institution record, which is authorship by a hard
+// identifier. That is the site's rule for every other entity, and the
+// research watch now keeps it.
+//
+// THE COST, STATED: arXiv was the platform's only same-day source. OpenAlex
+// takes days to weeks to index a new preprint, so the watch now runs behind
+// publication by that much. Accepted by Stephen with that stated.
+//
+// Reads twoai_works, which the OpenAlex ingest already fills - no fetch here
+// and no extra API call. A work qualifies when its pub_date is within the
+// window and any affiliated institution name contains a tracked name. The
+// link is the DOI at the publisher, or the open-access URL, never a
+// third-party aggregator. Rows land in ai_intel_candidates with
+// source='openalex' beside the 589 historical arXiv rows, which are kept,
+// not deleted, and still render on /research/watch/ inside the window.
+func openalexWatch(db *sql.DB) error {
 	orgs := []string{
 		"Tsinghua", "Peking University", "BAAI", "Beijing Academy",
 		"Shanghai AI Lab", "Chinese Academy of Sciences", "RIKEN", "AIST",
@@ -9540,108 +9562,60 @@ func arxivWatch(db *sql.DB) error {
 		"Anthropic", "Hugging Face", "Zhipu", "Moonshot", "DeepSeek", "Qwen",
 		"Alibaba", "Tencent", "ByteDance", "Huawei", "Baidu",
 	}
-	type entry struct {
-		Title   string `xml:"title"`
-		Summary string `xml:"summary"`
-		ID      string `xml:"id"`
+	const windowDays = 30
+	rows, err := db.Query(`
+		SELECT w.openalex_id, w.title,
+		  CASE WHEN COALESCE(w.doi,'') <> '' THEN 'https://doi.org/' || w.doi
+		       ELSE COALESCE(w.oa_url, 'https://openalex.org/' || w.openalex_id) END AS url,
+		  (SELECT string_agg(DISTINCT i->>'name', '; ') FROM jsonb_array_elements(w.institutions) i) AS insts
+		FROM twoai_works w
+		WHERE w.pub_date > current_date - ($1 || ' days')::interval
+		  AND w.duplicate_of IS NULL
+		  AND jsonb_typeof(w.institutions) = 'array'
+		  AND jsonb_array_length(w.institutions) > 0
+		  AND (w.topic ILIKE '%artificial intelligence%' OR w.topic ILIKE '%machine learning%'
+		       OR w.topic ILIKE '%natural language%' OR w.topic ILIKE '%computer vision%'
+		       OR w.topic ILIKE '%neural%' OR w.topic ILIKE '%language model%')
+		ORDER BY w.pub_date DESC`, windowDays)
+	if err != nil {
+		return err
 	}
-	var parsed struct {
-		Entries []entry `xml:"entry"`
-	}
+	defer rows.Close()
+
 	added, scanned := 0, 0
-	// THE SAMPLE WAS TOO SMALL FOR THE VOLUME. This fetched the newest 40 per
-	// category, which was reasonable when written and is not now: measured on
-	// 2026-08-26, cs.AI published 155 papers in a single day and cs.LG about
-	// 100, so 40 covered roughly a quarter of one day of one category, and
-	// only whatever happened to be newest at the moment the stage ran.
-	// Anything published between runs beyond that window was missed
-	// permanently, because this stage has no cursor - it always asks for the
-	// newest N.
-	//
-	// 200 per page, two pages, is 400 per category and comfortably covers a
-	// day even on a heavy one. arXiv permits max_results up to 2000 and asks
-	// for a courtesy delay between calls, which is already honoured below.
-	//
-	// WHY THIS MATTERS MORE THAN IT LOOKS: arXiv is the ONLY same-day source
-	// in the platform. OpenAlex, which carries the works spine, had none of
-	// the 15 newest cs.AI papers when checked on 2026-08-26 - preprints take
-	// days to weeks to appear there. If this watch misses a paper, nothing
-	// else catches it that week.
-	for _, cat := range []string{"cs.AI", "cs.CL", "cs.LG"} {
-		for _, start := range []int{0, 200} {
-			u := fmt.Sprintf("https://export.arxiv.org/api/query?search_query=cat:%s"+
-				"&sortBy=submittedDate&sortOrder=descending&start=%d&max_results=200", cat, start)
-		// arXiv's API is occasionally slow to first byte (Aug 1: cs.AI timed
-		// out at 30s and the whole category skipped for the day). One retry
-		// with a longer timeout keeps a slow response from costing a category.
-		fetch := func(timeout time.Duration) (*http.Response, error) {
-			req, _ := http.NewRequest("GET", u, nil)
-			req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
-			client := &http.Client{Timeout: timeout}
-			return client.Do(req)
+	for rows.Next() {
+		var id, title, url string
+		var insts sql.NullString
+		if err := rows.Scan(&id, &title, &url, &insts); err != nil {
+			return err
 		}
-		resp, err := fetch(30 * time.Second)
-		if err != nil || resp.StatusCode != 200 {
-			if resp != nil {
-				resp.Body.Close()
-			}
-			time.Sleep(5 * time.Second)
-			resp, err = fetch(90 * time.Second)
-		}
-		if err != nil || resp.StatusCode != 200 {
-			if resp != nil {
-				resp.Body.Close()
-			}
-			fmt.Fprintln(os.Stderr, "arxiv_watch", cat, ":", err)
+		scanned++
+		if !insts.Valid || insts.String == "" {
 			continue
 		}
-		parsed.Entries = nil
-		dec := xml.NewDecoder(resp.Body)
-		dec.Strict = false
-		dec.Entity = xml.HTMLEntity
-		derr := dec.Decode(&parsed)
-		resp.Body.Close()
-		if derr != nil {
-			fmt.Fprintln(os.Stderr, "arxiv_watch", cat, "parse:", derr)
+		var hit string
+		for _, o := range orgs {
+			if strings.Contains(insts.String, o) {
+				hit = o
+				break
+			}
+		}
+		if hit == "" || id == "" {
 			continue
 		}
-		for _, e := range parsed.Entries {
-			scanned++
-			text := e.Title + " " + e.Summary
-			var hit string
-			for _, o := range orgs {
-				if strings.Contains(text, o) {
-					hit = o
-					break
-				}
-			}
-			if hit == "" || e.ID == "" {
-				continue
-			}
-			title := strings.Join(strings.Fields(e.Title), " ")
-			r, ierr := db.Exec(`INSERT INTO ai_intel_candidates (kind, name, vendor, url, source, source_id)
-				VALUES ('paper', $1, $2, $3, 'arxiv', $4)
-				ON CONFLICT (source_id) DO NOTHING`,
-				trunc(title, 300), hit, e.ID, "arxiv-"+e.ID)
-			if ierr != nil {
-				// Say what failed. The original silent continue hid a CHECK
-				// constraint that rejected kind='paper' outright: every insert
-				// failed identically from the day this stage shipped, the log
-				// printed papers_added=0 ok=true, and nothing distinguished
-				// "no papers matched" from "every insert bounced" until
-				// someone asked where the papers were (2026-08-10). One line
-				// per failed insert makes that class of failure loud on day
-				// one; the constraint now includes 'paper'.
-				fmt.Fprintln(os.Stderr, "arxiv_watch insert:", ierr)
-				continue
-			}
-			if n, _ := r.RowsAffected(); n > 0 {
-				added++
-			}
+		title = strings.Join(strings.Fields(title), " ")
+		r, ierr := db.Exec(`INSERT INTO ai_intel_candidates (kind, name, vendor, url, source, source_id)
+			VALUES ('paper', $1, $2, $3, 'openalex', $4)
+			ON CONFLICT (source_id) DO NOTHING`,
+			trunc(title, 300), hit, url, "openalex-"+id)
+		if ierr != nil {
+			fmt.Fprintln(os.Stderr, "openalex_watch insert:", ierr)
+			continue
 		}
-		time.Sleep(3 * time.Second) // arXiv API courtesy delay
+		if n, _ := r.RowsAffected(); n > 0 {
+			added++
 		}
 	}
-	fmt.Printf("arxiv_watch: papers_added=%d scanned=%d ok=true\n", added, scanned)
+	fmt.Printf("openalex_watch: papers_added=%d scanned=%d window_days=%d ok=true\n", added, scanned, windowDays)
 	return nil
 }
