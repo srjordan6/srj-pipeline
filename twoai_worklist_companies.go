@@ -147,6 +147,53 @@ func twoaiWorklistCompanies(db *sql.DB, today string) (int, error) {
 			"verified": today,
 		})
 
+		// THE ENTITY COMES FIRST. twoai_company_profiles.uid is a foreign key
+		// into twoai_entities, which is the rule that makes a profile a fact
+		// about a KNOWN entity rather than a free-floating row - and the first
+		// run of this stage violated it 60 times out of 60, every company
+		// rejected on twoai_company_profiles_uid_fkey. The worklist uid was
+		// minted by twoai_etf_holdings from the constituent's SEDOL or ticker
+		// and had never been registered as an entity.
+		//
+		// Registered with the EDGAR registrant name, because the registrant is
+		// the legal name and this is the first moment we have it: "ADVANCED
+		// MICRO DEVICES INC" rather than the holdings file's "ADVANCED MICRO
+		// DEVICES". The holdings spelling is kept as an alias so the trail
+		// from the fund file to this entity stays visible.
+		//
+		// normalized is derived from the NAME by the same rule twoaiEntityID
+		// uses, never from the ticker: there is a unique index on (kind,
+		// normalized), so a ticker there would collide with an existing
+		// company whose normalized name happens to match (one such collision
+		// exists in this very batch) and, worse, would break the property the
+		// index exists for - that two spellings of one company resolve to one
+		// entity. An existing company that normalizes the same way is a
+		// genuine duplicate: the insert is skipped, the worklist row is
+		// marked, and it is not silently given a second identity.
+		norm := twoaiNormalizeEntityName(s.Name)
+		var existingUID string
+		db.QueryRow(`SELECT uid FROM twoai_entities WHERE kind='company' AND normalized=$1`, norm).Scan(&existingUID)
+		if existingUID != "" && existingUID != w.uid {
+			fmt.Printf("twoai_worklist_companies: %s (%s) is already entity %s, marking the worklist row duplicate rather than minting a second identity\n",
+				w.ticker, s.Name, existingUID)
+			db.Exec(`UPDATE twoai_company_worklist SET status='duplicate', company_uid=$1,
+				note='Already tracked as entity '||$1||' ('||$2||'); the ETF holding points at the existing company page.',
+				last_seen=current_date WHERE uid=$3`, existingUID, s.Name, w.uid)
+			db.Exec(`UPDATE twoai_etf_holdings SET company_uid=$1 WHERE constituent_ticker=$2 AND company_uid IS NULL`, existingUID, w.ticker)
+			skipped++
+			continue
+		}
+		if _, err := db.Exec(`INSERT INTO twoai_entities (uid, kind, name, normalized, aliases)
+			VALUES ($1,'company',$2,$3, jsonb_build_array($2::text,$4::text))
+			ON CONFLICT (uid) DO UPDATE SET last_seen = now(),
+				aliases = CASE WHEN twoai_entities.aliases ? $4 THEN twoai_entities.aliases
+					ELSE twoai_entities.aliases || jsonb_build_array($4::text) END`,
+			w.uid, s.Name, norm, w.name); err != nil {
+			fmt.Fprintf(os.Stderr, "twoai_worklist_companies: entity register %s: %v\n", w.ticker, err)
+			skipped++
+			continue
+		}
+
 		if _, err := db.Exec(`INSERT INTO twoai_company_profiles
 			(uid, name, org_type, for_profit, ticker, cik, headquarters, sources, edgar, verified_on, updated_at)
 			VALUES ($1,$2,'public-company',true,$3,$4,NULLIF($5,''),$6::jsonb,$7::jsonb,$8::date, now())

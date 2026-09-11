@@ -5418,7 +5418,13 @@ func nonAlnumLower(s string) string {
 	return entityPunctRe.ReplaceAllString(strings.ToLower(s), "")
 }
 
-func twoaiEntityID(db *sql.DB, kind, name string) string {
+// twoaiNormalizeEntityName reduces a display name to the key twoai_entities
+// stores in `normalized` and enforces a unique index on, per kind. Extracted
+// from twoaiEntityID on 2026-09-11 so twoai_worklist_companies can register
+// an entity under an identifier it already holds: two implementations of
+// this rule would drift, and the whole point of the column is that one
+// company normalizes one way everywhere.
+func twoaiNormalizeEntityName(name string) string {
 	n := strings.ToLower(strings.TrimSpace(name))
 	for {
 		stripped := entitySuffixRe.ReplaceAllString(n, "")
@@ -5431,6 +5437,11 @@ func twoaiEntityID(db *sql.DB, kind, name string) string {
 	if n == "" {
 		n = strings.Trim(entityPunctRe.ReplaceAllString(strings.ToLower(name), "-"), "-")
 	}
+	return n
+}
+
+func twoaiEntityID(db *sql.DB, kind, name string) string {
+	n := twoaiNormalizeEntityName(name)
 	uid := twoaiUID(kind + ":" + n)
 	if db != nil {
 		db.Exec(`INSERT INTO twoai_entities (uid, kind, name, normalized, aliases)
