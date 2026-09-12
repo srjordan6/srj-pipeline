@@ -269,17 +269,17 @@ func twoaiVendorEnrich(db *sql.DB) error {
 		// pages is that we publish our interpretation and link to the original.
 		// The prompt forbids naming anything absent from the text, which is the
 		// same no-invention guard the paper and point briefs use.
-		if (len([]rune(desc)) < 40 || boilerplate) && os.Getenv("ANTHROPIC_API_KEY") != "" {
+		if (len([]rune(desc)) < 40 || boilerplate) && (os.Getenv("ANTHROPIC_API_KEY") != "" || twoaiLLMFor("vendor_enrich") == "ollama") {
 			if prose := twoaiVendorBody(string(bodyB)); len([]rune(prose)) >= 400 {
-				model := os.Getenv("TWOAI_BRIEF_MODEL")
-				if model == "" {
-					model = "claude-haiku-4-5"
-				}
-				if out, cerr := twoaiClaudeCall(model, vendorBodySystem,
+				if out, usedModel, cerr := twoaiGenerate("vendor_enrich", vendorBodySystem,
 					"Post title: "+p.title+"\n\nText of the post:\n\n"+prose); cerr == nil {
 					w := strings.TrimSpace(out)
 					if w != "" && !strings.HasPrefix(w, "NOTHING") && len([]rune(w)) >= 40 {
-						desc, source, boilerplate = w, "page-body", false
+						// The model is recorded in summary_source, not just
+						// "page-body": when a local model takes over this job,
+						// the only way to compare its output against Claude's
+						// later is to know which wrote which.
+						desc, source, boilerplate = w, "page-body:"+usedModel, false
 					}
 				}
 				time.Sleep(900 * time.Millisecond)
@@ -320,7 +320,7 @@ func twoaiVendorEnrich(db *sql.DB) error {
 			continue
 		}
 		filled++
-		if source == "page-body" {
+		if strings.HasPrefix(source, "page-body") {
 			fromBody++
 		} else {
 			fromMeta++

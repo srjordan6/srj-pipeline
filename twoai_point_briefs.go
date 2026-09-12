@@ -74,13 +74,9 @@ func twoaiPointBriefs(db *sql.DB) error {
 		updated_at timestamptz NOT NULL DEFAULT now())`); err != nil {
 		return err
 	}
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		fmt.Println("twoai_point_briefs: ANTHROPIC_API_KEY unset, skipping")
+	if os.Getenv("ANTHROPIC_API_KEY") == "" && twoaiLLMFor("point_briefs") != "ollama" {
+		fmt.Println("twoai_point_briefs: no model configured (ANTHROPIC_API_KEY unset, TWOAI_LLM not ollama), skipping")
 		return nil
-	}
-	model := os.Getenv("TWOAI_BRIEF_MODEL")
-	if model == "" {
-		model = "claude-haiku-4-5"
 	}
 	limit := 40
 	if v := strings.TrimSpace(os.Getenv("TWOAI_BRIEF_LIMIT")); v != "" {
@@ -121,7 +117,7 @@ func twoaiPointBriefs(db *sql.DB) error {
 	written, nothing, failed := 0, 0, 0
 	for _, j := range jobs {
 		user := "Source: " + j.url + "\nPublisher: " + j.name + "\n\nText harvested from the page:\n\n" + j.extract
-		out, err := twoaiClaudeCall(model, pointBriefSystem, user)
+		out, usedModel, err := twoaiGenerate("point_briefs", pointBriefSystem, user)
 		if err != nil {
 			db.Exec(`INSERT INTO twoai_point_briefs (url, content_hash, attempts, last_note)
 				VALUES ($1,$2,1,$3)
@@ -161,7 +157,7 @@ func twoaiPointBriefs(db *sql.DB) error {
 			ON CONFLICT (url) DO UPDATE SET content_hash=EXCLUDED.content_hash, brief=EXCLUDED.brief,
 				model=EXCLUDED.model, words=EXCLUDED.words, generated_on=EXCLUDED.generated_on,
 				attempts=0, last_note=NULL, updated_at=now()`,
-			j.url, j.hash, brief, model, len(strings.Fields(brief))); err != nil {
+			j.url, j.hash, brief, usedModel, len(strings.Fields(brief))); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_point_briefs store:", err)
 			failed++
 			continue
