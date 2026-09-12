@@ -44,7 +44,47 @@ var (
 	vendorLdRe   = regexp.MustCompile(`(?is)<script[^>]+application/ld\+json[^>]*>([\s\S]*?)</script>`)
 	vendorTagRe  = regexp.MustCompile(`(?s)<[^>]+>`)
 	vendorWsRe   = regexp.MustCompile(`\s+`)
+	// Body extraction, for pages whose metadata is a site-wide tagline.
+	vendorChromeRe  = regexp.MustCompile(`(?is)<(script|style|nav|header|footer|form|noscript|svg|aside)[^>]*>[\s\S]*?</\s*\1\s*>`)
+	vendorArticleRe = regexp.MustCompile(`(?is)<(article|main)[^>]*>([\s\S]*?)</\s*\1\s*>`)
+	vendorParaRe    = regexp.MustCompile(`(?is)<p[^>]*>([\s\S]*?)</p>`)
 )
+
+// twoaiVendorBody pulls the opening prose of a post out of its own page, as
+// INPUT for the model to summarise. It is never rendered: this text is the
+// publisher's words, and this site publishes its own.
+func twoaiVendorBody(body string) string {
+	s := vendorChromeRe.ReplaceAllString(body, " ")
+	if m := vendorArticleRe.FindStringSubmatch(s); m != nil && len(m[2]) > 400 {
+		s = m[2]
+	}
+	var out []string
+	n := 0
+	for _, m := range vendorParaRe.FindAllStringSubmatch(s, -1) {
+		p := strings.TrimSpace(vendorWsRe.ReplaceAllString(
+			html.UnescapeString(vendorTagRe.ReplaceAllString(m[1], " ")), " "))
+		// Short lines are captions, bylines, cookie banners and button text.
+		if len([]rune(p)) < 60 {
+			continue
+		}
+		out = append(out, p)
+		n += len([]rune(p))
+		if n > 4000 {
+			break
+		}
+	}
+	return strings.Join(out, "\n\n")
+}
+
+const vendorBodySystem = `You write one or two sentences saying what a company's announcement post is about, for a reference site that links out to it.
+
+ABSOLUTE RULES:
+- Use ONLY what the supplied text says. Never add background knowledge, and never name a product, figure, company or date that is not in the text.
+- Write in your own words. Do NOT copy the post's sentences or reuse its opening line.
+- One or two sentences, under 300 characters. Plain and factual.
+- Say what was announced or described. Not that a post exists, not what the reader should do. No marketing language.
+
+If the text has nothing substantive to describe, output exactly: NOTHING`
 
 // twoaiVendorDescription pulls the publisher's own syndication description
 // out of a page. Ordered by intent: og:description is written for exactly
@@ -137,18 +177,18 @@ func twoaiVendorEnrich(db *sql.DB) error {
 	if v := strings.TrimSpace(os.Getenv("TWOAI_VENDOR_ENRICH_LIMIT")); v != "" {
 		fmt.Sscanf(v, "%d", &limit)
 	}
-	rows, err := db.Query(`SELECT slug, url FROM twoai_vendor_posts
+	rows, err := db.Query(`SELECT slug, url, COALESCE(title,'') FROM twoai_vendor_posts
 		WHERE retired_at IS NULL AND COALESCE(summary,'')='' AND enrich_attempts < 3
 		  AND url LIKE 'http%'
 		ORDER BY posted_on DESC NULLS LAST LIMIT $1`, limit)
 	if err != nil {
 		return err
 	}
-	type post struct{ slug, url string }
+	type post struct{ slug, url, title string }
 	var todo []post
 	for rows.Next() {
 		var p post
-		if rows.Scan(&p.slug, &p.url) == nil {
+		if rows.Scan(&p.slug, &p.url, &p.title) == nil {
 			todo = append(todo, p)
 		}
 	}
@@ -160,6 +200,7 @@ func twoaiVendorEnrich(db *sql.DB) error {
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	filled, empty, failed, boiler := 0, 0, 0, 0
+	fromMeta, fromBody := 0, 0
 	// Per-host pacing: several hundred posts can share one vendor, and a
 	// burst at one company's blog is rude regardless of robots.txt.
 	lastHost := map[string]time.Time{}
@@ -199,6 +240,52 @@ func twoaiVendorEnrich(db *sql.DB) error {
 
 		desc := twoaiVendorDescription(string(bodyB))
 		desc = strings.TrimSpace(vendorWsRe.ReplaceAllString(vendorTagRe.ReplaceAllString(desc, " "), " "))
+		source := "page-metadata"
+
+		// IS THIS DESCRIPTION ACTUALLY ABOUT THIS POST? A description already
+		// stored against another post from the same vendor is a site-wide
+		// tagline, not a summary: every Hugging Face post carries "We're on a
+		// journey to advance and democratize artificial intelligence", 107 of
+		// them, and Mistral serves its product pitch on all twelve of its.
+		boilerplate := false
+		if len([]rune(desc)) >= 40 {
+			var dupes int
+			db.QueryRow(`SELECT count(*) FROM twoai_vendor_posts
+				WHERE vendor=(SELECT vendor FROM twoai_vendor_posts WHERE slug=$1) AND summary=$2 AND slug <> $1`,
+				p.slug, desc).Scan(&dupes)
+			boilerplate = dupes > 0
+		}
+
+		// THE BODY IS THE FALLBACK, AND FOR SOME VENDORS IT IS THE ONLY PATH.
+		// Stephen, 2026-09-12: Hugging Face had 437 posts given up on and 406
+		// still queued against 24 real summaries, because their metadata is one
+		// tagline sitewide. Those posts have real content in the page body; the
+		// metadata simply does not describe it. So when the metadata is missing
+		// or is a tagline, the article's own prose is read and the model writes
+		// OUR sentence from it.
+		//
+		// Written, not copied. Taking the post's opening lines verbatim would
+		// be reproduction, and this site's standing rule since the research
+		// pages is that we publish our interpretation and link to the original.
+		// The prompt forbids naming anything absent from the text, which is the
+		// same no-invention guard the paper and point briefs use.
+		if (len([]rune(desc)) < 40 || boilerplate) && os.Getenv("ANTHROPIC_API_KEY") != "" {
+			if prose := twoaiVendorBody(string(bodyB)); len([]rune(prose)) >= 400 {
+				model := os.Getenv("TWOAI_BRIEF_MODEL")
+				if model == "" {
+					model = "claude-haiku-4-5"
+				}
+				if out, cerr := twoaiClaudeCall(model, vendorBodySystem,
+					"Post title: "+p.title+"\n\nText of the post:\n\n"+prose); cerr == nil {
+					w := strings.TrimSpace(out)
+					if w != "" && !strings.HasPrefix(w, "NOTHING") && len([]rune(w)) >= 40 {
+						desc, source, boilerplate = w, "page-body", false
+					}
+				}
+				time.Sleep(900 * time.Millisecond)
+			}
+		}
+
 		// A description that is just the title restated adds nothing, and a
 		// one-word fragment is not a summary. Better the honest stub.
 		if len([]rune(desc)) < 40 {
@@ -206,25 +293,12 @@ func twoaiVendorEnrich(db *sql.DB) error {
 			empty++
 			continue
 		}
-		// A SITE-WIDE TAGLINE IS NOT A PER-POST DESCRIPTION. The first run
-		// filled 373 posts and 133 of them were boilerplate: every Hugging
-		// Face post carries the same og:description ("We're on a journey to
-		// advance and democratize artificial intelligence..."), and Mistral
-		// serves its product pitch on all twelve. That is worse than an
-		// honest stub - it looks like a summary of THIS post and says nothing
-		// about it, which is the same false-specificity failure as the stub
-		// wording this stage was built to fix.
-		//
-		// So a description already stored against another post from the same
-		// vendor is rejected. The first post to carry a tagline keeps it and
-		// the rest do not, which is the right outcome either way: if it is
-		// genuinely that post's description it is still true, and if it is a
-		// tagline only one page is wrong instead of a hundred.
-		var dupes int
-		db.QueryRow(`SELECT count(*) FROM twoai_vendor_posts
-			WHERE vendor=(SELECT vendor FROM twoai_vendor_posts WHERE slug=$1) AND summary=$2 AND slug <> $1`,
-			p.slug, desc).Scan(&dupes)
-		if dupes > 0 {
+		// Still a tagline after the body attempt: nothing on this page is about
+		// this post. The first post to carry it keeps it and the rest do not,
+		// which is right either way - if it genuinely is that post's
+		// description it is still true, and if it is a tagline then one page is
+		// wrong instead of a hundred.
+		if boilerplate {
 			db.Exec(`UPDATE twoai_vendor_posts SET enrich_attempts=3, enriched_at=now() WHERE slug=$1`, p.slug)
 			boiler++
 			continue
@@ -238,20 +312,25 @@ func twoaiVendorEnrich(db *sql.DB) error {
 			desc = strings.TrimSpace(string(r[:cut])) + "\u2026"
 		}
 		if _, err := db.Exec(`UPDATE twoai_vendor_posts
-			SET summary=$1, summary_source='page-metadata', enriched_at=now(),
+			SET summary=$1, summary_source=$2, enriched_at=now(),
 				enrich_attempts=enrich_attempts+1
-			WHERE slug=$2 AND COALESCE(summary,'')=''`, desc, p.slug); err != nil {
+			WHERE slug=$3 AND COALESCE(summary,'')=''`, desc, source, p.slug); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_vendor_enrich:", p.slug, err)
 			failed++
 			continue
 		}
 		filled++
+		if source == "page-body" {
+			fromBody++
+		} else {
+			fromMeta++
+		}
 	}
 
 	var remaining, total int
 	db.QueryRow(`SELECT count(*) FILTER (WHERE COALESCE(summary,'')=''), count(*)
 		FROM twoai_vendor_posts WHERE retired_at IS NULL`).Scan(&remaining, &total)
-	fmt.Printf("twoai_vendor_enrich: filled=%d no_description=%d site_tagline_rejected=%d failed=%d | %d of %d posts still without a summary\n",
-		filled, empty, boiler, failed, remaining, total)
+	fmt.Printf("twoai_vendor_enrich: filled=%d (metadata=%d body=%d) no_description=%d site_tagline_rejected=%d failed=%d | %d of %d posts still without a summary\n",
+		filled, fromMeta, fromBody, empty, boiler, failed, remaining, total)
 	return nil
 }
