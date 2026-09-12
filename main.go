@@ -8456,7 +8456,24 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 		Status   string   `json:"status"`
 		Path     string   `json:"path,omitempty"`
 		Pages    int      `json:"pages"`
-		Sections []domain `json:"sections,omitempty"`
+		// WithSections is Pages plus every section beneath it. Kept apart from
+		// Pages because the two answer different questions and conflating them
+		// published a contradiction: on 2026-09-12 the AI Companies domain read
+		// 1,037 directly above its own AI Company Directory section reading 387.
+		//
+		// Both numbers were arithmetically right and one of them was a lie in
+		// context. The sections under AI Companies are ALTERNATE VIEWS of the
+		// same organisations, not additional ones: NVIDIA is in the directory,
+		// again under Public AI Companies, again under Patents, again under
+		// Funding. Summing them counts one company four times and labels the
+		// result "AI Companies", which a reader reads as a number of companies.
+		//
+		// So a domain that publishes its own page reports ITS OWN count, and
+		// the roll-up travels beside it for anyone who wants the total page
+		// footprint. A domain that is only a container for its sections still
+		// reports the sum, because there is nothing else it could honestly say.
+		WithSections int      `json:"pages_with_sections,omitempty"`
+		Sections     []domain `json:"sections,omitempty"`
 	}
 	type category struct {
 		Slug    string    `json:"slug"`
@@ -8542,10 +8559,23 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 		}
 		if d := doms[p.parent]; d != nil {
 			d.Sections = append(d.Sections, p.d)
-			d.Pages += p.d.Pages
+			// The roll-up accumulates here; Pages is left as the domain's own.
+			// See the WithSections comment on the struct: these sections are
+			// usually alternate views of the same entities, so adding them to
+			// the domain's headline number double-counts and contradicts the
+			// section list printed directly beneath it.
+			d.WithSections += p.d.Pages
 			if p.d.Status == "live" && d.Status != "live" {
 				d.Status = "live"
 			}
+		}
+	}
+	// A domain with no page of its own is a container, and the only honest
+	// number it has is its sections'. One with its own page keeps its own.
+	for _, d := range doms {
+		d.WithSections += d.Pages
+		if d.Pages == 0 {
+			d.Pages = d.WithSections
 		}
 	}
 	// AI Security and Risk presents its SIX SECURITY DOMAINS at this level,
@@ -8573,7 +8603,13 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 	}
 	for _, c := range cats {
 		for _, d := range c.Domains {
-			c.Pages += d.Pages
+			// The category totals the whole footprint beneath it, sections
+			// included, because a category has no page of its own to count.
+			if d.WithSections > 0 {
+				c.Pages += d.WithSections
+			} else {
+				c.Pages += d.Pages
+			}
 			if d.Status == "live" {
 				c.Live++
 			}
