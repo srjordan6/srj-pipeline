@@ -340,13 +340,37 @@ func twoaiStocksDoc(db *sql.DB, today string, upsert func(path, kind string, v a
 	if err := rows.Err(); err != nil {
 		return err
 	}
+
+	// Instruments we track that have no closes yet. A company registered
+	// today has none until the next twoai_stocks fetch, and the site cannot
+	// otherwise tell that apart from a listing the free feed will never
+	// cover: on 2026-09-11 AMD, on NASDAQ, rendered "prices are not tracked
+	// for this listing" an hour after being registered, with 67 instruments
+	// in the same state. Naming them here lets the page say "not collected
+	// yet" instead of asserting a limit that does not apply.
+	pending := map[string]any{}
+	prows, err := db.Query(`SELECT i.company_uid, i.ticker, COALESCE(i.exchange,'')
+		FROM twoai_stock_instruments i
+		WHERE i.active AND i.company_uid IS NOT NULL AND i.company_uid <> ''
+		  AND NOT EXISTS (SELECT 1 FROM twoai_stock_closes c WHERE c.ticker = i.ticker)`)
+	if err == nil {
+		for prows.Next() {
+			var cu, tk, ex string
+			if prows.Scan(&cu, &tk, &ex) == nil {
+				pending[cu] = map[string]any{"ticker": tk, "exchange": ex}
+			}
+		}
+		prows.Close()
+	}
+
 	if err := upsert("companies/stocks.json", "stocks", map[string]any{
 		"generated": today, "instruments": n, "by_company": byCompany, "funds": funds,
+		"pending_by_company": pending,
 		"source": twoaiStockSource, "source_url": "https://twelvedata.com/",
 		"coverage": "US-listed instruments only. Prices are end-of-day closes, not live quotes.",
 	}); err != nil {
 		return err
 	}
-	fmt.Printf("twoai_stocks: doc companies=%d funds=%d\n", len(byCompany), len(funds))
+	fmt.Printf("twoai_stocks: doc companies=%d funds=%d pending=%d\n", len(byCompany), len(funds), len(pending))
 	return nil
 }
