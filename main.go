@@ -9440,9 +9440,78 @@ func verifyTwoaiDeploy() {
 	want := twoaiPublishedSHA
 	today := time.Now().UTC().Format("2006-01-02")
 	client := &http.Client{Timeout: 30 * time.Second}
-	if want == "" {
-		fmt.Println("deploy_site: no bundle hash from this run, falling back to the date check, which cannot prove a build shipped")
+
+	// VERIFY BY BUNDLE HASH, NOT BY DATE.
+	//
+	// This printed "cannot prove a build shipped" on every run for weeks, and
+	// on 2026-09-12 it cost real time twice: a stale site answered the date
+	// check and was read as fresh, so a fix was hunted that had already been
+	// made and simply had not deployed.
+	//
+	// Everything needed was already in place. twoai_publish_r2 writes one
+	// bundle per run under its sha256 and records it in twoaiPublishedSHA;
+	// fetch-content.mjs writes that same sha256 into /api/build.json at build
+	// time, for exactly this purpose, with a comment saying so. The two were
+	// never compared. A date match only says something was built today, which
+	// on a site that rebuilds several times a day says almost nothing - and
+	// said nothing at all on 2026-09-05, when five consecutive builds failed
+	// while the verifier reported success every time.
+	buildJSON := func() (sha256, builtAt string, ok bool) {
+		req, _ := http.NewRequest("GET", "https://theworldofai.org/api/build.json", nil)
+		// Plain Go's user agent is bot-filtered by this zone: every check
+		// returned 403 on 2026-09-12 until a browser UA was set.
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; srj-pipeline deploy check; +https://theworldofai.org/)")
+		req.Header.Set("Cache-Control", "no-cache")
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", "", false
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return "", "", false
+		}
+		var b struct {
+			SHA256  string `json:"sha256"`
+			BuiltAt string `json:"built_at"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&b) != nil {
+			return "", "", false
+		}
+		return b.SHA256, b.BuiltAt, true
 	}
+
+	short := func(s string) string {
+		if len(s) > 12 {
+			return s[:12]
+		}
+		return s
+	}
+
+	if twoaiPublishedSHA != "" {
+		deadline := time.Now().Add(25 * time.Minute)
+		for {
+			sha, builtAt, ok := buildJSON()
+			if ok && sha == twoaiPublishedSHA {
+				fmt.Printf("deploy_site: VERIFIED by bundle hash. The live site was built from this run's bundle %s (built %s).\n",
+					short(sha), builtAt)
+				return
+			}
+			if time.Now().After(deadline) {
+				// Not verified is not the same as broken, and saying which is
+				// the whole point of this rewrite.
+				if ok {
+					fmt.Fprintf(os.Stderr, "deploy_site: NOT VERIFIED after 25 min. This run published bundle %s; the live site is still serving %s (built %s). The build either failed or has not finished. Check the Cloudflare build log.\n",
+						short(twoaiPublishedSHA), short(sha), builtAt)
+				} else {
+					fmt.Fprintln(os.Stderr, "deploy_site: NOT VERIFIED after 25 min: /api/build.json did not answer. The site may be down, or the endpoint moved.")
+				}
+				os.Exit(1)
+			}
+			time.Sleep(90 * time.Second)
+		}
+	}
+
+	fmt.Println("deploy_site: this run published nothing to R2, so there is no bundle to verify against. Falling back to the date check, which only says something was built today.")
 	// Builds take a few minutes. Give it a reasonable window, checking
 	// occasionally rather than tightly, then report whatever is true.
 	// 25 minutes, not 10. The build crossed 11,700 pages on 2026-09-04 and
