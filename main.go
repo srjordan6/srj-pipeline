@@ -690,6 +690,14 @@ func main() {
 		return
 	}
 
+	if src == "twoai_llm_compare" {
+		if err := twoaiLLMCompare(db, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_llm_compare:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "twoai_point_briefs" {
 		if err := twoaiPointBriefs(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_point_briefs:", err)

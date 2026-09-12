@@ -112,8 +112,19 @@ func twoaiOllamaCall(model, system, user string) (string, error) {
 			"num_ctx":     8192,
 		},
 	})
-	resp, err := twoaiOllamaClient.Post(twoaiOllamaHost()+"/api/generate",
-		"application/json", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", twoaiOllamaHost()+"/api/generate", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// Ollama Cloud (ollama.com) uses the same API as a local server plus a
+	// bearer key. Stephen took the Pro plan on 2026-09-12, which is what
+	// makes the larger models reachable for the judgment jobs a 12GB card
+	// cannot run. Local needs no key and ignores the header.
+	if key := strings.TrimSpace(os.Getenv("OLLAMA_API_KEY")); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := twoaiOllamaClient.Do(req)
 	if err != nil {
 		return "", err
 	}

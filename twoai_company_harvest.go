@@ -28,6 +28,41 @@ import (
 
 const twoaiCompanyGenCap = 60
 
+// twoaiCompanyProfileSystem is the profile prompt, shared with the model
+// comparison so a candidate model is judged on exactly the task Claude does.
+const twoaiCompanyProfileSystem = "You write company profiles for theworldofai.org, a sourced AI reference site. " +
+	"You are given JSON: the text this site's pipeline harvested from the company's own " +
+	"website, and the facts this site already holds about it (products tracked, lawsuits, " +
+	"MCP servers, SEC and patent facts where present). Write 2 to 3 short paragraphs of " +
+	"plain English: what the company is and does per its own site, its AI products and " +
+	"position, and anything the held facts add (litigation, filings, registry presence). " +
+	"HARD RULES: use ONLY facts in the JSON. Name only products, people, and organizations " +
+	"that appear in the JSON. Every percentage and dollar figure must appear verbatim in " +
+	"the JSON. Marketing language from the site gets reported neutrally (the company " +
+	"describes itself as...), never adopted. If the material is thin, write less. " +
+	"Plain sentences, no hype, commas over dashes."
+
+// twoaiCompanyProfilePayload builds the exact JSON the profile prompt sees,
+// so the harvester and the comparison feed a model the same input.
+func twoaiCompanyProfilePayload(db *sql.DB, uid, name string) (string, bool) {
+	var url2, extract string
+	db.QueryRow(`SELECT url, extract FROM twoai_company_harvest WHERE uid=$1`, uid).Scan(&url2, &extract)
+	if extract == "" {
+		return "", false
+	}
+	var pageData string
+	if db.QueryRow(`SELECT data::text FROM twoai_pages WHERE path=$1`, "companies/"+uid+".json").Scan(&pageData) != nil {
+		return "", false
+	}
+	var pd map[string]any
+	json.Unmarshal([]byte(pageData), &pd)
+	pj, _ := json.Marshal(map[string]any{
+		"company": name, "held_facts": pd["company"],
+		"company_website": url2, "what_the_company_site_says": extract,
+	})
+	return string(pj), true
+}
+
 var siteNameRe = regexp.MustCompile(`[^a-z0-9]+`)
 
 // resolveWebsite: the profile's verified website first, then the vendor
@@ -313,30 +348,18 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 			if len(jobs) >= twoaiCompanyGenCap {
 				break
 			}
-			var url2, extract string
-			db.QueryRow(`SELECT url, extract FROM twoai_company_harvest WHERE uid=$1`, e.uid).Scan(&url2, &extract)
-			if extract == "" {
+			payload, ok := twoaiCompanyProfilePayload(db, e.uid, e.name)
+			if !ok {
 				continue
 			}
-			var pageData string
-			if db.QueryRow(`SELECT data::text FROM twoai_pages WHERE path=$1`, "companies/"+e.uid+".json").Scan(&pageData) != nil {
-				continue
-			}
-			var pd map[string]any
-			json.Unmarshal([]byte(pageData), &pd)
-			payload := map[string]any{
-				"company": e.name, "held_facts": pd["company"],
-				"company_website": url2, "what_the_company_site_says": extract,
-			}
-			pj, _ := json.Marshal(payload)
-			h := sha256.Sum256(pj)
+			h := sha256.Sum256([]byte(payload))
 			cHash := hex.EncodeToString(h[:8])
 			metricKey := "company-" + e.uid
 			var exists int
 			db.QueryRow(`SELECT count(*) FROM twoai_industry_analysis WHERE metric=$1 AND data_hash=$2`,
 				metricKey, cHash).Scan(&exists)
 			if exists == 0 {
-				jobs = append(jobs, genJob{e.uid, e.name, metricKey, cHash, string(pj)})
+				jobs = append(jobs, genJob{e.uid, e.name, metricKey, cHash, payload})
 			}
 		}
 	}
@@ -345,17 +368,7 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 		if model == "" {
 			model = "claude-haiku-4-5"
 		}
-		system := "You write company profiles for theworldofai.org, a sourced AI reference site. " +
-			"You are given JSON: the text this site's pipeline harvested from the company's own " +
-			"website, and the facts this site already holds about it (products tracked, lawsuits, " +
-			"MCP servers, SEC and patent facts where present). Write 2 to 3 short paragraphs of " +
-			"plain English: what the company is and does per its own site, its AI products and " +
-			"position, and anything the held facts add (litigation, filings, registry presence). " +
-			"HARD RULES: use ONLY facts in the JSON. Name only products, people, and organizations " +
-			"that appear in the JSON. Every percentage and dollar figure must appear verbatim in " +
-			"the JSON. Marketing language from the site gets reported neutrally (the company " +
-			"describes itself as...), never adopted. If the material is thin, write less. " +
-			"Plain sentences, no hype, commas over dashes."
+		system := twoaiCompanyProfileSystem
 		sem := make(chan struct{}, 6)
 		var wg sync.WaitGroup
 		var mu sync.Mutex
