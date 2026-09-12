@@ -3638,7 +3638,12 @@ func anthropicSummarize(headline, text string) (string, error) {
 	if s == "" {
 		return "", fmt.Errorf("empty summary")
 	}
-	return s, nil
+	// The news path predates twoaiGenerate and calls Anthropic directly, so it
+	// needs the same strip: 103 of 593 stored summaries opened with a literal
+	// "# Summary" heading, which the briefing renders as a hash because these
+	// fields are plain text, not Markdown. Stephen saw them on the news pages
+	// on 2026-09-12.
+	return twoaiStripMarkdown(s), nil
 }
 
 // ---- twoai: theworldofai.org, SQL -> twoai-content ------------------------

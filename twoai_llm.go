@@ -39,6 +39,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -162,6 +163,36 @@ func twoaiOllamaCall(model, system, user string) (string, error) {
 	return r.Replace(out.Response), nil
 }
 
+// twoaiStripMarkdown removes heading and emphasis markup from model prose.
+//
+// Stephen, 2026-09-12: stray # headings visible on the news pages. 289 rows
+// carried them - 103 news summaries, every one opening with a bare
+// "# Summary" that adds nothing, and 186 analyses. Every prompt involved
+// says no headings. The models emit them anyway, often enough that
+// instructing harder is not the fix.
+//
+// These fields are rendered as PLAIN TEXT by the templates, not as Markdown,
+// so a # reaches the reader as a # and a ** as two asterisks. The right
+// place to handle that is here, once, on the way out of every model call,
+// rather than in each of the dozen templates that render this prose or each
+// of the prompts that fail to prevent it.
+//
+// A leading heading line is dropped entirely, because "# Summary" above a
+// summary is a label, not content. Later headings keep their text and lose
+// their hashes, because those usually do carry meaning.
+var (
+	mdLeadHeadRe = regexp.MustCompile(`\A#{1,6}[ \t]+[^\n]*\n+`)
+	mdHeadRe     = regexp.MustCompile(`(?m)^#{1,6}[ \t]+`)
+	mdBoldRe     = regexp.MustCompile(`\*\*([^*\n]+)\*\*`)
+)
+
+func twoaiStripMarkdown(s string) string {
+	s = mdLeadHeadRe.ReplaceAllString(s, "")
+	s = mdHeadRe.ReplaceAllString(s, "")
+	s = mdBoldRe.ReplaceAllString(s, "$1")
+	return strings.TrimSpace(s)
+}
+
 // twoaiGenerate is what every stage should call. It routes by stage, falls
 // back to Claude when the local server cannot answer, and says so once per
 // run rather than once per call - a hundred identical lines would bury the
@@ -179,7 +210,7 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 			model := twoaiOllamaModel(stage)
 			out, err := twoaiOllamaCall(model, system, user)
 			if err == nil {
-				return out, "ollama:" + model, nil
+				return twoaiStripMarkdown(out), "ollama:" + model, nil
 			}
 			// One failure marks the server down for the rest of the run. A
 			// model that is not pulled, or a service that is stopped, fails
@@ -203,5 +234,5 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	return out, model, nil
+	return twoaiStripMarkdown(out), model, nil
 }
