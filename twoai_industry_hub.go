@@ -908,6 +908,25 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 			}
 			patchDoc["sources_read"] = len(harvested)
 			patchDoc["sources_total"] = len(pts)
+			// Per-source briefs, keyed by URL so the template can put one under
+			// the point that cites it. Written by twoai_point_briefs from the
+			// same harvest read above; a source without one is simply absent
+			// from the map and its point renders as it always has.
+			briefs := map[string]any{}
+			if brows, berr := db.Query(`SELECT b.url, b.brief, b.generated_on::text
+				FROM twoai_point_briefs b JOIN twoai_source_harvest h ON h.url=b.url
+				WHERE h.sector_slug=$1 AND b.brief IS NOT NULL AND b.brief <> ''`, j.slug); berr == nil {
+				for brows.Next() {
+					var u, b, d string
+					if brows.Scan(&u, &b, &d) == nil {
+						briefs[u] = map[string]any{"brief": b, "written_on": d}
+					}
+				}
+				brows.Close()
+			}
+			if len(briefs) > 0 {
+				patchDoc["point_briefs"] = briefs
+			}
 			if len(patchDoc) > 0 {
 				pd, _ := json.Marshal(patchDoc)
 				if res, err := db.Exec(`UPDATE twoai_pages SET data = data || $1::jsonb, updated_at=now()
