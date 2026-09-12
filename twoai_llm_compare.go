@@ -35,7 +35,7 @@ import (
 
 func twoaiLLMCompare(db *sql.DB, args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: pipeline twoai_llm_compare <job> <ollama-model> [n]\n  jobs: company_profiles, point_briefs")
+		return fmt.Errorf("usage: pipeline twoai_llm_compare <job> <ollama-model> [n]\n  jobs: company_profiles, point_briefs, page_readings")
 	}
 	job, model := args[0], args[1]
 	n := 20
@@ -100,6 +100,30 @@ func twoaiLLMCompare(db *sql.DB, args []string) error {
 				tasks = append(tasks, task{key: key, aModel: am, aOut: ao,
 					system: pointBriefSystem,
 					user:   "Source: " + key + "\nPublisher: " + name + "\n\nText harvested from the page:\n\n" + extract})
+			}
+		}
+		rows.Close()
+	case "page_readings":
+		// Readings Claude wrote, replayed against the same page document. The
+		// -deep rows are excluded: their prompt takes the first reading as
+		// input, so comparing them would measure two variables at once.
+		rows, err := db.Query(`
+			SELECT a.metric, a.model, a.body, p.data::text
+			FROM twoai_industry_analysis a
+			JOIN twoai_pages p ON 'page:' || p.path = a.metric
+			WHERE a.metric LIKE 'page:%' AND a.data_hash NOT LIKE '%-deep'
+			  AND a.body <> '' AND length(p.data::text) < 60000
+			ORDER BY random() LIMIT $1`, n)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var key, am, ao, data string
+			if rows.Scan(&key, &am, &ao, &data) == nil {
+				url := "https://theworldofai.org/" + strings.TrimSuffix(strings.TrimPrefix(key, "page:"), ".json") + "/"
+				tasks = append(tasks, task{key: key, aModel: am, aOut: ao, payload: data,
+					system: thinPageSystem,
+					user:   "The page publishes at " + url + "\n\nIts data:\n" + data + "\n\nWrite the reading now."})
 			}
 		}
 		rows.Close()

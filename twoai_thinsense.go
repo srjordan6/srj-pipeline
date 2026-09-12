@@ -85,8 +85,8 @@ Return the paragraphs, then the questions and answers, separated by blank lines,
 // publishers merge it into the page at publish time, so no page builder
 // needs to know this exists.
 func twoaiThinSensePages(db *sql.DB) {
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		fmt.Println("thinpages: page readings: ANTHROPIC_API_KEY not set, skipped")
+	if os.Getenv("ANTHROPIC_API_KEY") == "" && twoaiLLMFor("page_readings") != "ollama" {
+		fmt.Println("thinpages: page readings: no model configured, skipped")
 		return
 	}
 	// HAIKU IS THE DEFAULT, SONNET IS A CHOICE. Until 2026-09-04 an unset
@@ -96,10 +96,9 @@ func twoaiThinSensePages(db *sql.DB) {
 	// billed at Sonnet rates unnoticed: 3,201 calls between 2026-08-15 and
 	// today. The fallback is now Haiku everywhere, and Sonnet is reached only
 	// by setting the variable on purpose.
-	model := os.Getenv("TWOAI_ANALYSIS_MODEL")
-	if model == "" {
-		model = "claude-haiku-4-5"
-	}
+	//
+	// The model choice moved into twoaiGenerate on 2026-09-12, which routes
+	// by stage and records what actually answered on every row.
 	due := thinDue(db, "thin-words", thinBudget("PAGEREAD", 400))
 	if len(due) == 0 {
 		return
@@ -240,7 +239,7 @@ func twoaiThinSensePages(db *sql.DB) {
 			}
 			var prior string
 			db.QueryRow(`SELECT body FROM twoai_industry_analysis WHERE metric=$1 AND data_hash=$2`, metric, hash).Scan(&prior)
-			body, err := twoaiClaudeCall(model, thinDeepSystem,
+			body, usedModel, err := twoaiGenerate("page_readings", thinDeepSystem,
 				"The page publishes at "+c.ref+"\n\nIts data:\n"+data+
 					"\n\nThe reading already published on it:\n"+prior+"\n\nWrite the second layer now.")
 			if err != nil || len(body) < 400 {
@@ -254,7 +253,7 @@ func twoaiThinSensePages(db *sql.DB) {
 			// and the first is retained rather than deleted.
 			if _, err := db.Exec(`INSERT INTO twoai_industry_analysis (metric, data_hash, model, body, generated_on)
 				VALUES ($1,$2,$3,$4,current_date) ON CONFLICT (metric, data_hash) DO NOTHING`,
-				metric, hash+"-deep", model, prior+"\n\n"+body); err != nil {
+				metric, hash+"-deep", usedModel, prior+"\n\n"+body); err != nil {
 				thinAttempt(db, c.path, "db: "+err.Error())
 				continue
 			}
@@ -263,7 +262,7 @@ func twoaiThinSensePages(db *sql.DB) {
 			time.Sleep(1200 * time.Millisecond)
 			continue
 		}
-		body, err := twoaiClaudeCall(model, thinPageSystem,
+		body, usedModel, err := twoaiGenerate("page_readings", thinPageSystem,
 			"The page publishes at "+c.ref+"\n\nIts data:\n"+data+"\n\nWrite the reading now.")
 		if err != nil || len(body) < 200 {
 			failed++
@@ -272,7 +271,7 @@ func twoaiThinSensePages(db *sql.DB) {
 		}
 		if _, err := db.Exec(`INSERT INTO twoai_industry_analysis (metric, data_hash, model, body, generated_on)
 			VALUES ($1,$2,$3,$4,current_date) ON CONFLICT (metric, data_hash) DO NOTHING`,
-			metric, hash, model, body); err != nil {
+			metric, hash, usedModel, body); err != nil {
 			thinAttempt(db, c.path, "db: "+err.Error())
 			continue
 		}
