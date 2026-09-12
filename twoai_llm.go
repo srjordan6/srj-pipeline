@@ -86,10 +86,16 @@ func twoaiOllamaModel(stage string) string {
 	if m := strings.TrimSpace(os.Getenv("OLLAMA_MODEL")); m != "" {
 		return m
 	}
-	// Mistral Small is the default for a 12GB card: independent summarisation
-	// testing put it at 80-81% correctness, ahead of several larger models,
-	// and it leaves headroom on an RTX 5070. Override per stage if a job
-	// wants something else.
+	// The default depends on where the request is going. Ollama Cloud's
+	// catalogue (read 2026-09-12 with Stephen's key) has no mistral-small;
+	// it carries gpt-oss:20b and :120b, gemma4:31b, the deepseek-v4 family,
+	// qwen3.5:397b, kimi and glm. gpt-oss:20b is the cheap fast one and
+	// suits the extractive jobs; the large ones are what the comparison
+	// exists to test. Local keeps Mistral Small, which fits a 12GB card and
+	// scored 80-81% on summarisation correctness in independent testing.
+	if strings.Contains(twoaiOllamaHost(), "ollama.com") {
+		return "gpt-oss:20b"
+	}
 	return "mistral-small"
 }
 
