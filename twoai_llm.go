@@ -152,7 +152,14 @@ func twoaiOllamaCall(model, system, user string) (string, error) {
 	if strings.TrimSpace(out.Response) == "" {
 		return "", fmt.Errorf("ollama returned an empty response")
 	}
-	return out.Response, nil
+	// Open models emit Unicode hyphens and dashes freely - U+2011 non-breaking
+	// hyphen in "contact‑center", U+2010 in compounds - seen in every
+	// gpt-oss:120b sample on 2026-09-12. They look right in a terminal and
+	// break site search, since a reader types ASCII. Normalised here so no
+	// stage has to remember. Em and en dashes become commas, per house style.
+	r := strings.NewReplacer("\u2011", "-", "\u2010", "-", "\u2212", "-",
+		"\u2014", ", ", "\u2013", ", ", " , ", ", ", ",,", ",")
+	return r.Replace(out.Response), nil
 }
 
 // twoaiGenerate is what every stage should call. It routes by stage, falls

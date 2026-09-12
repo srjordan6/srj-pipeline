@@ -40,7 +40,10 @@ const twoaiCompanyProfileSystem = "You write company profiles for theworldofai.o
 	"that appear in the JSON. Every percentage and dollar figure must appear verbatim in " +
 	"the JSON. Marketing language from the site gets reported neutrally (the company " +
 	"describes itself as...), never adopted. If the material is thin, write less. " +
-	"Plain sentences, no hype, commas over dashes."
+	"The held_facts object is this site's own record-keeping: never mention this site, page " +
+	"verification dates, catalog categories, or fields like has_page - those describe our " +
+	"records, not the company. Report what the fields say about the company, not that we hold them. " +
+	"Plain sentences, no hype, commas over dashes, plain ASCII hyphens only."
 
 // twoaiCompanyProfilePayload builds the exact JSON the profile prompt sees,
 // so the harvester and the comparison feed a model the same input.
@@ -343,7 +346,7 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 		uid, name, metricKey, cHash, payload string
 	}
 	var jobs []genJob
-	if os.Getenv("ANTHROPIC_API_KEY") != "" {
+	if os.Getenv("ANTHROPIC_API_KEY") != "" || twoaiLLMFor("company_profiles") == "ollama" {
 		for _, e := range ents {
 			if len(jobs) >= twoaiCompanyGenCap {
 				break
@@ -364,10 +367,6 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 		}
 	}
 	if len(jobs) > 0 {
-		model := os.Getenv("TWOAI_ANALYSIS_MODEL")
-		if model == "" {
-			model = "claude-haiku-4-5"
-		}
 		system := twoaiCompanyProfileSystem
 		sem := make(chan struct{}, 6)
 		var wg sync.WaitGroup
@@ -378,7 +377,7 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				body, aerr := twoaiClaudeCall(model, system,
+				body, usedModel, aerr := twoaiGenerate("company_profiles", system,
 					"Company: "+j.name+"\nThe data:\n"+j.payload+"\n\nWrite the profile now.")
 				mu.Lock()
 				defer mu.Unlock()
@@ -392,7 +391,7 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 				}
 				db.Exec(`INSERT INTO twoai_industry_analysis (metric, data_hash, model, body, generated_on)
 					VALUES ($1,$2,$3,$4,current_date) ON CONFLICT (metric, data_hash) DO NOTHING`,
-					j.metricKey, j.cHash, model, body)
+					j.metricKey, j.cHash, usedModel, body)
 				generated++
 			}(j)
 		}
