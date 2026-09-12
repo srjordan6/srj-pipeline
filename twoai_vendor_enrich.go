@@ -45,8 +45,12 @@ var (
 	vendorTagRe  = regexp.MustCompile(`(?s)<[^>]+>`)
 	vendorWsRe   = regexp.MustCompile(`\s+`)
 	// Body extraction, for pages whose metadata is a site-wide tagline.
-	vendorChromeRe  = regexp.MustCompile(`(?is)<(script|style|nav|header|footer|form|noscript|svg|aside)[^>]*>[\s\S]*?</\s*\1\s*>`)
-	vendorArticleRe = regexp.MustCompile(`(?is)<(article|main)[^>]*>([\s\S]*?)</\s*\1\s*>`)
+	// Go's regexp is RE2 and has no backreferences, so each element is
+	// spelled out rather than matched with \1 - the first draft used a
+	// backreference, which panicked at init and took EVERY stage of the
+	// binary down with it on 2026-09-12. One pattern per element, joined.
+	vendorChromeRe  = regexp.MustCompile(`(?is)<script[^>]*>[\s\S]*?</script\s*>|<style[^>]*>[\s\S]*?</style\s*>|<nav[^>]*>[\s\S]*?</nav\s*>|<header[^>]*>[\s\S]*?</header\s*>|<footer[^>]*>[\s\S]*?</footer\s*>|<form[^>]*>[\s\S]*?</form\s*>|<noscript[^>]*>[\s\S]*?</noscript\s*>|<svg[^>]*>[\s\S]*?</svg\s*>|<aside[^>]*>[\s\S]*?</aside\s*>`)
+	vendorArticleRe = regexp.MustCompile(`(?is)<article[^>]*>([\s\S]*?)</article\s*>|<main[^>]*>([\s\S]*?)</main\s*>`)
 	vendorParaRe    = regexp.MustCompile(`(?is)<p[^>]*>([\s\S]*?)</p>`)
 )
 
@@ -55,8 +59,15 @@ var (
 // publisher's words, and this site publishes its own.
 func twoaiVendorBody(body string) string {
 	s := vendorChromeRe.ReplaceAllString(body, " ")
-	if m := vendorArticleRe.FindStringSubmatch(s); m != nil && len(m[2]) > 400 {
-		s = m[2]
+	if m := vendorArticleRe.FindStringSubmatch(s); m != nil {
+		// Two capture groups, one per alternative; whichever matched is set.
+		inner := m[1]
+		if inner == "" {
+			inner = m[2]
+		}
+		if len(inner) > 400 {
+			s = inner
+		}
 	}
 	var out []string
 	n := 0
