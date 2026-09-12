@@ -403,59 +403,38 @@ func twoaiHarvestSources(db *sql.DB) error {
 
 // ---- Anthropic messages call ----------------------------------------------
 
+// The four analysis entry points. Each returns the model that actually
+// answered, which since 2026-09-12 may be Claude or an Ollama model - the
+// routing is twoaiGenerate's, per stage, and the returned name is stored on
+// the row so a page can always say what wrote it.
+//
+// THE VALIDATOR IS WHY THIS JOB COULD MOVE AT ALL. Every analysis here goes
+// through twoaiAnalyzeValidated, which rejects any percentage not present
+// verbatim in the payload and retries once naming the offending figure. It
+// caught gpt-oss:120b deriving "97%" from 515 of 531 during the model
+// comparison: arithmetically right, and exactly the kind of derived number
+// that must not appear as though it were sourced.
 func twoaiClaudeAnalyze(payload string) (model, body string, err error) {
-	key := os.Getenv("ANTHROPIC_API_KEY")
-	if key == "" {
-		return "", "", fmt.Errorf("not configured")
-	}
-	model = os.Getenv("TWOAI_ANALYSIS_MODEL")
-	if model == "" {
-		model = "claude-haiku-4-5"
-	}
-	system := twoaiNationalSystem
-	body, err = twoaiClaudeCall(model, system, "The data:\n"+payload+"\n\nWrite the analysis now.")
+	body, model, err = twoaiGenerate("sector_analysis", twoaiNationalSystem,
+		"The data:\n"+payload+"\n\nWrite the analysis now.")
 	return model, body, err
 }
 
 func twoaiClaudeAnalyzeExtra(payload, extra string) (model, body string, err error) {
-	key := os.Getenv("ANTHROPIC_API_KEY")
-	if key == "" {
-		return "", "", fmt.Errorf("not configured")
-	}
-	model = os.Getenv("TWOAI_ANALYSIS_MODEL")
-	if model == "" {
-		model = "claude-haiku-4-5"
-	}
-	system := twoaiNationalSystem
-	body, err = twoaiClaudeCall(model, system, "The data:\n"+payload+"\n\nWrite the analysis now."+extra)
+	body, model, err = twoaiGenerate("sector_analysis", twoaiNationalSystem,
+		"The data:\n"+payload+"\n\nWrite the analysis now."+extra)
 	return model, body, err
 }
 
 func twoaiClaudeAnalyzeSectorExtra(sector, payload, extra string) (model, body string, err error) {
-	key := os.Getenv("ANTHROPIC_API_KEY")
-	if key == "" {
-		return "", "", fmt.Errorf("not configured")
-	}
-	model = os.Getenv("TWOAI_ANALYSIS_MODEL")
-	if model == "" {
-		model = "claude-haiku-4-5"
-	}
-	system := twoaiSectorSystem
-	body, err = twoaiClaudeCall(model, system, "Sector: "+sector+"\nThe data:\n"+payload+"\n\nWrite the analysis now."+extra)
+	body, model, err = twoaiGenerate("sector_analysis", twoaiSectorSystem,
+		"Sector: "+sector+"\nThe data:\n"+payload+"\n\nWrite the analysis now."+extra)
 	return model, body, err
 }
 
 func twoaiClaudeAnalyzeSector(sector, payload string) (model, body string, err error) {
-	key := os.Getenv("ANTHROPIC_API_KEY")
-	if key == "" {
-		return "", "", fmt.Errorf("not configured")
-	}
-	model = os.Getenv("TWOAI_ANALYSIS_MODEL")
-	if model == "" {
-		model = "claude-haiku-4-5"
-	}
-	system := twoaiSectorSystem
-	body, err = twoaiClaudeCall(model, system, "Sector: "+sector+"\nThe data:\n"+payload+"\n\nWrite the analysis now.")
+	body, model, err = twoaiGenerate("sector_analysis", twoaiSectorSystem,
+		"Sector: "+sector+"\nThe data:\n"+payload+"\n\nWrite the analysis now.")
 	return model, body, err
 }
 
@@ -881,7 +860,7 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 				metricKey, btosSectorURL, string(pj), secHash)
 			var exists int
 			db.QueryRow(`SELECT count(*) FROM twoai_industry_analysis WHERE metric=$1 AND data_hash=$2`, metricKey, secHash).Scan(&exists)
-			if exists == 0 && os.Getenv("ANTHROPIC_API_KEY") != "" {
+			if exists == 0 && (os.Getenv("ANTHROPIC_API_KEY") != "" || twoaiLLMFor("sector_analysis") == "ollama") {
 				model, body, aerr := twoaiAnalyzeValidated(func(extra string) (string, string, error) {
 					return twoaiClaudeAnalyzeSectorExtra(j.name, string(pj), extra)
 				}, string(pj))
@@ -968,7 +947,7 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 			xHash := hex.EncodeToString(xh[:8])
 			var exists int
 			db.QueryRow(`SELECT count(*) FROM twoai_industry_analysis WHERE metric='cross-industry' AND data_hash=$1`, xHash).Scan(&exists)
-			if exists == 0 && os.Getenv("ANTHROPIC_API_KEY") != "" {
+			if exists == 0 && (os.Getenv("ANTHROPIC_API_KEY") != "" || twoaiLLMFor("sector_analysis") == "ollama") {
 				model, body, xerr := twoaiAnalyzeValidated(func(extra string) (string, string, error) {
 					return twoaiClaudeAnalyzeSectorExtra("All 21 industries, synthesized", string(xj), extra)
 				}, string(xj))

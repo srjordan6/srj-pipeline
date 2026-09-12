@@ -35,7 +35,7 @@ import (
 
 func twoaiLLMCompare(db *sql.DB, args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: pipeline twoai_llm_compare <job> <ollama-model> [n]\n  jobs: company_profiles, point_briefs, page_readings")
+		return fmt.Errorf("usage: pipeline twoai_llm_compare <job> <ollama-model> [n]\n  jobs: company_profiles, point_briefs, page_readings, sector_analysis")
 	}
 	job, model := args[0], args[1]
 	n := 20
@@ -124,6 +124,34 @@ func twoaiLLMCompare(db *sql.DB, args []string) error {
 				tasks = append(tasks, task{key: key, aModel: am, aOut: ao, payload: data,
 					system: thinPageSystem,
 					user:   "The page publishes at " + url + "\n\nIts data:\n" + data + "\n\nWrite the reading now."})
+			}
+		}
+		rows.Close()
+	case "sector_analysis":
+		// The sector analyses, replayed against the exact payload that
+		// produced them: the stored twoai_industry_metrics row IS that
+		// payload, so nothing has to be rebuilt and nothing can drift.
+		rows, err := db.Query(`
+			SELECT DISTINCT ON (a.metric) a.metric, a.model, a.body, m.payload::text, t.name
+			FROM twoai_industry_analysis a
+			JOIN twoai_industry_metrics m ON m.metric = a.metric
+			LEFT JOIN twoai_taxonomy t ON t.slug = 'industry-' || replace(a.metric,'sector-','')
+			WHERE a.metric LIKE 'sector-%' AND a.body <> ''
+			ORDER BY a.metric, a.generated_on DESC LIMIT $1`, n)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var key, am, ao, payload string
+			var name sql.NullString
+			if rows.Scan(&key, &am, &ao, &payload, &name) == nil {
+				sector := name.String
+				if sector == "" {
+					sector = strings.TrimPrefix(key, "sector-")
+				}
+				tasks = append(tasks, task{key: key, aModel: am, aOut: ao, payload: payload,
+					system: twoaiSectorSystem,
+					user:   "Sector: " + sector + "\nThe data:\n" + payload + "\n\nWrite the analysis now."})
 			}
 		}
 		rows.Close()
