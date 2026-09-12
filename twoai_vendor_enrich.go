@@ -159,7 +159,7 @@ func twoaiVendorEnrich(db *sql.DB) error {
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	filled, empty, failed := 0, 0, 0
+	filled, empty, failed, boiler := 0, 0, 0, 0
 	// Per-host pacing: several hundred posts can share one vendor, and a
 	// burst at one company's blog is rude regardless of robots.txt.
 	lastHost := map[string]time.Time{}
@@ -206,6 +206,29 @@ func twoaiVendorEnrich(db *sql.DB) error {
 			empty++
 			continue
 		}
+		// A SITE-WIDE TAGLINE IS NOT A PER-POST DESCRIPTION. The first run
+		// filled 373 posts and 133 of them were boilerplate: every Hugging
+		// Face post carries the same og:description ("We're on a journey to
+		// advance and democratize artificial intelligence..."), and Mistral
+		// serves its product pitch on all twelve. That is worse than an
+		// honest stub - it looks like a summary of THIS post and says nothing
+		// about it, which is the same false-specificity failure as the stub
+		// wording this stage was built to fix.
+		//
+		// So a description already stored against another post from the same
+		// vendor is rejected. The first post to carry a tagline keeps it and
+		// the rest do not, which is the right outcome either way: if it is
+		// genuinely that post's description it is still true, and if it is a
+		// tagline only one page is wrong instead of a hundred.
+		var dupes int
+		db.QueryRow(`SELECT count(*) FROM twoai_vendor_posts
+			WHERE vendor=(SELECT vendor FROM twoai_vendor_posts WHERE slug=$1) AND summary=$2 AND slug <> $1`,
+			p.slug, desc).Scan(&dupes)
+		if dupes > 0 {
+			db.Exec(`UPDATE twoai_vendor_posts SET enrich_attempts=3, enriched_at=now() WHERE slug=$1`, p.slug)
+			boiler++
+			continue
+		}
 		if len([]rune(desc)) > 600 {
 			r := []rune(desc)
 			cut := 600
@@ -228,7 +251,7 @@ func twoaiVendorEnrich(db *sql.DB) error {
 	var remaining, total int
 	db.QueryRow(`SELECT count(*) FILTER (WHERE COALESCE(summary,'')=''), count(*)
 		FROM twoai_vendor_posts WHERE retired_at IS NULL`).Scan(&remaining, &total)
-	fmt.Printf("twoai_vendor_enrich: filled=%d no_description=%d failed=%d | %d of %d posts still without a summary\n",
-		filled, empty, failed, remaining, total)
+	fmt.Printf("twoai_vendor_enrich: filled=%d no_description=%d site_tagline_rejected=%d failed=%d | %d of %d posts still without a summary\n",
+		filled, empty, boiler, failed, remaining, total)
 	return nil
 }
