@@ -238,10 +238,22 @@ func twoaiCompanySites(db *sql.DB) error {
 		}
 	}
 
+	// AeroVironment trades as AVAV and its site is avinc.com; the name check
+	// cannot see that and correctly refuses to guess. Cases like it are
+	// listed here rather than loosening the matcher, because the matcher is
+	// what stopped consumerrights.wiki being published as Qualcomm's website.
+	// Each entry is a human decision, verified once.
+	knownSites := map[string]string{
+		"AVAV": "https://www.avinc.com/",
+	}
+
 	client := &http.Client{Timeout: 30 * time.Second}
 	set, dead, none := 0, 0, 0
 	for t, c := range byTicker {
 		site := best[t]
+		if site == "" {
+			site = knownSites[t]
+		}
 		if site == "" {
 			none++
 			if r := rejected[t]; len(r) > 0 {
@@ -252,18 +264,43 @@ func twoaiCompanySites(db *sql.DB) error {
 		}
 		// Never store a URL without checking it answers. A dead link in the
 		// sources block is worse than no link.
+		//
+		// BUT A BOT BLOCK IS NOT A DEAD SITE. The first run rejected amd.com,
+		// snap.com, uber.com, nokia.com, cadence.com and six more as "did not
+		// answer": every one is live and simply refuses a non-browser client.
+		// Measured 2026-09-13 - amd.com returns 503 to plain curl and 301 to a
+		// browser UA, uber.com 406 then 200, cadence.com 403 then 302. Eleven
+		// correct websites were thrown away by a check that was wrong, which is
+		// worse than the problem it was guarding against.
+		//
+		// So: send a browser user agent, follow redirects, and treat the
+		// statuses that mean "you are not a browser" as ALIVE. The URL is what
+		// is being verified here, not our ability to crawl it - the harvester
+		// has its own fetching and already reports blocked sites separately.
+		// Only a real 404 or 410, or a connection that fails outright, means
+		// the URL is wrong.
 		hreq, _ := http.NewRequest("GET", site, nil)
-		hreq.Header.Set("User-Agent", "Mozilla/5.0 (compatible; SRJ-Consulting-research/1.0; +https://theworldofai.org/about/)")
+		hreq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+		hreq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		hreq.Header.Set("Accept-Language", "en-US,en;q=0.9")
 		hresp, herr := client.Do(hreq)
-		if herr != nil || hresp.StatusCode >= 400 {
-			if hresp != nil {
-				hresp.Body.Close()
-			}
-			fmt.Printf("twoai_company_sites: %s (%s) %s did not answer, left unset\n", t, c.name, site)
+		if herr != nil {
+			fmt.Printf("twoai_company_sites: %s (%s) %s could not be reached (%v), left unset\n", t, c.name, site, herr)
 			dead++
 			continue
 		}
+		code := hresp.StatusCode
 		hresp.Body.Close()
+		gone := code == 404 || code == 410
+		if gone {
+			fmt.Printf("twoai_company_sites: %s (%s) %s returned %d, left unset\n", t, c.name, site, code)
+			dead++
+			continue
+		}
+		if code >= 400 {
+			fmt.Printf("twoai_company_sites: %s (%s) %s answered %d to an automated request, which is a bot block rather than a bad URL. Storing it; the harvester reports separately whether it can crawl.\n",
+				t, c.name, site, code)
+		}
 		if _, err := db.Exec(`UPDATE twoai_company_profiles
 			SET website=$1, updated_at=now() WHERE uid=$2 AND COALESCE(website,'')=''`, site, c.uid); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_company_sites:", c.name, err)

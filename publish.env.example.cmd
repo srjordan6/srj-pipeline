@@ -17,10 +17,22 @@ rem  GITHUB_TOKEN - leave empty. publish.cmd obtains it automatically from
 rem    this PC's git credential store (the same credential git push uses).
 rem    Only fill it if that automatic step ever fails.
 rem
-rem  CLOUDFLARE_DEPLOY_HOOK - already filled in; its only capability is
-rem    starting a site build.
+rem  CLOUDFLARE_DEPLOY_HOOK - paste your own. Cloudflare dashboard - the
+rem    Worker - Settings - Builds - Deploy hooks - copy the URL.
+rem
+rem    A real hook URL used to be filled in here, in a file that IS committed,
+rem    on the reasoning that "its only capability is starting a site build".
+rem    That reasoning is wrong. Anyone holding it can trigger unlimited
+rem    builds, which burns the account's build minutes, and on a site that
+rem    publishes whatever the pipeline last wrote, it decides WHEN content
+rem    goes live. Removed 2026-09-13 before this repo goes public.
+rem
+rem    REMOVING IT HERE DOES NOT REVOKE IT. The old hook is in the git
+rem    history and always will be. Delete hook e69389bf-e2f0-4d52-8eb2-
+rem    8fb0fdb75e02 in the Cloudflare dashboard and create a new one; that
+rem    is the only action that actually revokes it.
 rem ============================================================================
 
 set DATABASE_URL=PASTE_EXTERNAL_DATABASE_URL_HERE
 set GITHUB_TOKEN=
-set CLOUDFLARE_DEPLOY_HOOK=https://api.cloudflare.com/client/v4/workers/builds/deploy_hooks/e69389bf-e2f0-4d52-8eb2-8fb0fdb75e02
+set CLOUDFLARE_DEPLOY_HOOK=PASTE_DEPLOY_HOOK_URL_HERE

@@ -41,6 +41,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -59,7 +60,133 @@ ABSOLUTE RULES:
 
 If the text has no substantive content to summarise - a navigation page, a paywall notice, a cookie banner, an error - output exactly: NOTHING`
 
+// LINKING WAS TRIED HERE AND REMOVED, 2026-09-13. The prompt above used to
+// offer the model a list of this site's compliance and lawsuit pages and
+// invite it to mark, in double brackets, any subject the source genuinely
+// discussed. The resolver below still exists and is still safe, so the idea
+// can be revived; the prompt instruction is gone because the results did not
+// justify it.
+//
+// Of 36 briefs, 4 carried a link and 1 was right:
+//
+//   GOOD  artificialintelligenceact.eu/article/50 linked the EU AI Act. The
+//         source IS that article. Natural, correct.
+//   BAD   ILTA ended "...claims intelligence from EvenUp. Agentic AI and the
+//         CFAA" - a link bolted onto the paragraph with no sentence around
+//         it, which the prompt explicitly forbade.
+//   WORSE CodeX became "prototype Agentic AI and the CFAA applications at the
+//         intersection of technology and law." CodeX prototypes legal-tech
+//         applications. The model took our page title and used it as a noun
+//         phrase, changing what the source said.
+//
+// That last one is the reason this is off rather than tuned. A wrong link is
+// recoverable. A SENTENCE REWRITTEN TO ACCOMMODATE A LINK is a distortion of
+// the source wearing our own markup, on pages whose whole claim is that they
+// report what the source says. The model is excellent at "summarise only what
+// is here" and reaches when told it may link, and reaching is the one thing
+// that cannot be allowed here.
+//
+// The earlier regex approach (twoai_internal_links) produced 9 correct links
+// across 23 pages and remains the honest fallback. The real answer to
+// Stephen's observation is probably neither: it is that these pages cite
+// outside sources because the site has not yet written its own pages on what
+// they discuss. More pages, not more linking.
+
 var pbSentRe = regexp.MustCompile(`[.!?]`)
+var pbLinkRe = regexp.MustCompile(`\[\[([^\]]{3,80})\]\]`)
+
+// twoaiLinkableSubjects is what this site can honestly link to: its own
+// compliance frameworks, tracked companies and lawsuit pages. Built once per
+// run and offered to the model that writes each brief.
+//
+// WHY THE MODEL AND NOT A REGEX. The first attempt matched finished prose
+// against these titles afterwards and produced 9 links across 23 pages, one
+// of them wrong: "the Evident AI Index" matched Stanford HAI, whose alias is
+// "AI Index". Guarding against that - reject a match preceded by a capital -
+// then killed a link we wanted, "under Fed SR 11-7 supervision", because the
+// two cases are grammatically identical and mean opposite things. No pattern
+// separates them. A model reading the source text can tell whether the page
+// is ABOUT SR 11-7, which is the only question that matters.
+func twoaiLinkableSubjects(db *sql.DB) (map[string]string, error) {
+	out := map[string]string{}
+	add := func(title, url string) {
+		t := strings.TrimSpace(title)
+		if len([]rune(t)) < 4 || url == "" {
+			return
+		}
+		if _, seen := out[strings.ToLower(t)]; !seen {
+			out[strings.ToLower(t)] = url
+		}
+	}
+	rows, err := db.Query(`SELECT COALESCE(data->>'title',''), path FROM twoai_pages WHERE kind='compliance'`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var t, p string
+		if rows.Scan(&t, &p) == nil {
+			add(t, "/ai-compliance/"+strings.TrimSuffix(strings.TrimPrefix(p, "compliance/"), ".json")+"/")
+		}
+	}
+	rows.Close()
+	if crows, err := db.Query(`SELECT name, uid FROM twoai_company_profiles`); err == nil {
+		for crows.Next() {
+			var n, uid string
+			if crows.Scan(&n, &uid) == nil {
+				add(n, "/companies/"+uid+"/")
+			}
+		}
+		crows.Close()
+	}
+	// Lawsuits live as 108 cases inside ONE document, not as one page per
+	// case. Querying kind='lawsuit' returned nothing and cost the first run
+	// every case link it could have made - including the training-data suits,
+	// which are exactly what an industry point about media or copyright is
+	// usually discussing. The page kind is 'lawsuits', plural, and the cases
+	// are an array inside it.
+	var lj []byte
+	if db.QueryRow(`SELECT data::text FROM twoai_pages WHERE kind='lawsuits' LIMIT 1`).Scan(&lj) == nil && len(lj) > 0 {
+		var ld struct {
+			Cases []struct {
+				Slug string `json:"slug"`
+				Name string `json:"case_name"`
+				Short string `json:"short_name"`
+			} `json:"cases"`
+		}
+		if json.Unmarshal(lj, &ld) == nil {
+			for _, c := range ld.Cases {
+				if c.Slug == "" {
+					continue
+				}
+				add(c.Name, "/ai-lawsuits/"+c.Slug+"/")
+				add(c.Short, "/ai-lawsuits/"+c.Slug+"/")
+			}
+		}
+	}
+	return out, nil
+}
+
+// twoaiResolveBriefLinks turns [[Title]] into markup the template can render,
+// and is the gate that makes offering links to a model safe.
+//
+// A bracketed title that is not in the inventory is UNWRAPPED, not linked:
+// the words stay in the sentence and no link is emitted. So the worst a
+// hallucinated title can do is leave ordinary prose. Nothing the model
+// invents can become a URL, which is the property that lets the model make
+// the judgement a regex could not.
+func twoaiResolveBriefLinks(brief string, subjects map[string]string) (string, int) {
+	n := 0
+	out := pbLinkRe.ReplaceAllStringFunc(brief, func(m string) string {
+		title := strings.TrimSpace(pbLinkRe.FindStringSubmatch(m)[1])
+		url, ok := subjects[strings.ToLower(title)]
+		if !ok {
+			return title
+		}
+		n++
+		return `<a href="` + url + `">` + title + `</a>`
+	})
+	return out, n
+}
 
 func twoaiPointBriefs(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_point_briefs (
@@ -87,7 +214,7 @@ func twoaiPointBriefs(db *sql.DB) error {
 	// or which have no brief at all. Newest harvest first so a source that
 	// just changed is refreshed before the backlog.
 	rows, err := db.Query(`
-		SELECT h.url, h.source_name, h.extract, h.content_hash
+		SELECT h.url, h.source_name, h.extract, h.content_hash, COALESCE(h.sector_slug,'')
 		FROM twoai_source_harvest h
 		LEFT JOIN twoai_point_briefs b ON b.url = h.url
 		WHERE h.extract <> '' AND h.http_status = 200
@@ -98,15 +225,67 @@ func twoaiPointBriefs(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	type job struct{ url, name, extract, hash string }
+	type job struct{ url, name, extract, hash, sector string }
 	var jobs []job
 	for rows.Next() {
 		var j job
-		if rows.Scan(&j.url, &j.name, &j.extract, &j.hash) == nil {
+		if rows.Scan(&j.url, &j.name, &j.extract, &j.hash, &j.sector) == nil {
 			jobs = append(jobs, j)
 		}
 	}
 	rows.Close()
+
+	// The subjects this site can link to. Built once; offered to the model as
+	// a list it may draw from, never as a list it must use.
+	subjects, serr := twoaiLinkableSubjects(db)
+	if serr != nil {
+		return serr
+	}
+	// The whole inventory is over a thousand titles, which is both expensive
+	// to send on every call and an invitation to reach. The model gets the
+	// compliance frameworks and lawsuits - the subjects an industry point is
+	// most often actually about - plus nothing else, and it is told these are
+	// optional. Companies stay resolvable in twoaiResolveBriefLinks, so a
+	// model that names one from the source text still gets a working link.
+	var offerLines []string
+	if orows, oerr := db.Query(`SELECT COALESCE(data->>'title','') FROM twoai_pages
+		WHERE kind='compliance' AND COALESCE(data->>'title','') <> '' ORDER BY 1`); oerr == nil {
+		for orows.Next() {
+			var t string
+			if orows.Scan(&t) == nil {
+				offerLines = append(offerLines, t)
+			}
+		}
+		orows.Close()
+	}
+	// The lawsuit case names, from the single lawsuits document. Offered by
+	// their short name where they have one, because that is what a source
+	// actually calls them.
+	var rawCases []byte
+	if db.QueryRow(`SELECT data::text FROM twoai_pages WHERE kind='lawsuits' LIMIT 1`).Scan(&rawCases) == nil && len(rawCases) > 0 {
+		var ld struct {
+			Cases []struct {
+				Name  string `json:"case_name"`
+				Short string `json:"short_name"`
+			} `json:"cases"`
+		}
+		if json.Unmarshal(rawCases, &ld) == nil {
+			for _, c := range ld.Cases {
+				if c.Short != "" {
+					offerLines = append(offerLines, c.Short)
+				} else if c.Name != "" {
+					offerLines = append(offerLines, c.Name)
+				}
+			}
+		}
+	}
+	fmt.Printf("twoai_point_briefs: offering %d linkable subjects (%d resolvable)\n", len(offerLines), len(subjects))
+	offer := ""
+	// The offer is built but not sent: see the note under pointBriefSystem.
+	// Kept assembled rather than deleted because the inventory queries are the
+	// expensive part of reviving this, and because the count in the log is a
+	// useful measure of how much this site could link to if it linked at all.
+	_ = offerLines
 	if len(jobs) == 0 {
 		var have, total int
 		db.QueryRow(`SELECT count(*) FILTER (WHERE brief IS NOT NULL AND brief <> ''), count(*) FROM twoai_point_briefs`).Scan(&have, &total)
@@ -114,9 +293,9 @@ func twoaiPointBriefs(db *sql.DB) error {
 		return nil
 	}
 
-	written, nothing, failed := 0, 0, 0
+	written, nothing, failed, linked := 0, 0, 0, 0
 	for _, j := range jobs {
-		user := "Source: " + j.url + "\nPublisher: " + j.name + "\n\nText harvested from the page:\n\n" + j.extract
+		user := "Source: " + j.url + "\nPublisher: " + j.name + "\n\nText harvested from the page:\n\n" + j.extract + offer
 		out, usedModel, err := twoaiGenerate("point_briefs", pointBriefSystem, user)
 		if err != nil {
 			db.Exec(`INSERT INTO twoai_point_briefs (url, content_hash, attempts, last_note)
@@ -140,6 +319,12 @@ func twoaiPointBriefs(db *sql.DB) error {
 			time.Sleep(1200 * time.Millisecond)
 			continue
 		}
+		// Resolve the model's [[Title]] marks against the real inventory. An
+		// unknown title is unwrapped to plain words, so nothing invented can
+		// become a URL.
+		resolved, nlinks := twoaiResolveBriefLinks(brief, subjects)
+		brief = resolved
+		linked += nlinks
 		// House rule, enforced here rather than trusted to the prompt: no
 		// paragraph over five sentences anywhere on this site.
 		if n := len(pbSentRe.FindAllString(brief, -1)); n > 6 {
@@ -170,7 +355,7 @@ func twoaiPointBriefs(db *sql.DB) error {
 	db.QueryRow(`SELECT count(*) FILTER (WHERE brief IS NOT NULL AND brief <> ''), count(*) FROM twoai_point_briefs`).Scan(&have, &total)
 	db.QueryRow(`SELECT count(*) FROM twoai_source_harvest h LEFT JOIN twoai_point_briefs b ON b.url=h.url
 		WHERE h.extract <> '' AND h.http_status=200 AND (b.url IS NULL OR b.content_hash <> h.content_hash)`).Scan(&stale)
-	fmt.Printf("twoai_point_briefs: written=%d nothing_to_say=%d failed=%d | %d briefs held, %d sources still to write\n",
-		written, nothing, failed, have, stale)
+	fmt.Printf("twoai_point_briefs: written=%d internal_links=%d nothing_to_say=%d failed=%d | %d briefs held, %d sources still to write\n",
+		written, linked, nothing, failed, have, stale)
 	return nil
 }
