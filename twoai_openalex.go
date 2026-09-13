@@ -90,6 +90,40 @@ var twoaiOASubfields = []struct{ id, name string }{
 	{"2718", "Health Informatics"},
 }
 
+// TOPICS, NOT ONLY SUBFIELDS. Stephen, 2026-09-13: does OpenAlex look for
+// privacy documents and data-center documents? It did not, and could not.
+// The harvest is keyed on five computer-science subfields, and a paper on
+// data-center cooling or biometric privacy law is classified by OpenAlex
+// into Information Systems, Energy, or Law - subfields this stage never
+// asks for. Three million works and, structurally, none about the two
+// subjects this site added the same day.
+//
+// A whole subfield is the wrong unit for these. Law is millions of works and
+// almost none are about data protection; Energy is the same for data centres.
+// OpenAlex's TOPICS sit one level down - about 4,500 of them - and
+// primary_topic.id filters to exactly one. Cloud Computing and Resource
+// Management (T10101) is 131,387 works, all of them about the thing.
+//
+// Each topic keeps its own cursor under openalex:topic:<id>, exactly as the
+// subfields do, and shares the same per-run page budget. Every ID here was
+// verified against api.openalex.org/topics before being added; an ID typed
+// from memory harvests nothing and says nothing, which is the failure this
+// file's history keeps recording.
+//
+// Verified 2026-09-13 against api.openalex.org/topics with Stephen's key.
+// The privacy search returned four topics. T10764, Privacy-Preserving
+// Technologies in Data, sits inside subfield 1702 and was already being
+// harvested - the technical privacy literature was in the corpus all along.
+// What was missing was the LAW and the POLICY, which live under Law and
+// under Sociology and Political Science, subfields this stage never walked.
+// T13048, Patient Dignity and Privacy, is bedside dignity in clinical care,
+// not data, and is left out on purpose.
+var twoaiOATopics = []struct{ id, name string }{
+	{"T10101", "Cloud Computing and Resource Management"}, // data centres: 131,387 works
+	{"T14234", "Data Privacy and Cybersecurity"},          // Law: 31,975 works
+	{"T11045", "Privacy, Security, and Data Protection"},  // policy: 70,840 works
+}
+
 // twoaiOADoc is one work as OpenAlex returns it. Named rather than inline
 // because the DOI queue resolves single works through the same shape, and
 // two copies of this struct would drift apart.
@@ -313,13 +347,13 @@ func twoaiOpenAlex(db *sql.DB) error {
 	if err := twoaiOAEnsureTables(db); err != nil {
 		return err
 	}
-	per := twoaiOAPagesPerRun / len(twoaiOASubfields)
+	per := twoaiOAPagesPerRun / (len(twoaiOASubfields) + len(twoaiOATopics))
 	if per < 1 {
 		per = 1
 	}
 	total := 0
 	for _, sf := range twoaiOASubfields {
-		n, err := twoaiOAHarvestSubfield(db, sf.id, sf.name, per)
+		n, err := twoaiOAHarvestScope(db, "primary_topic.subfield.id:subfields/"+sf.id, "openalex:"+sf.id, sf.name, per)
 		if errors.Is(err, errOpenAlexBudget) {
 			total += n
 			fmt.Printf("openalex: stopping after %s, daily budget spent; cursors are saved and the next run resumes\n", sf.name)
@@ -332,9 +366,22 @@ func twoaiOpenAlex(db *sql.DB) error {
 		}
 		total += n
 	}
+	for _, tp := range twoaiOATopics {
+		n, err := twoaiOAHarvestScope(db, "primary_topic.id:"+tp.id, "openalex:topic:"+tp.id, tp.name, per)
+		if errors.Is(err, errOpenAlexBudget) {
+			total += n
+			fmt.Printf("openalex: stopping after topic %s, daily budget spent\n", tp.name)
+			break
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "openalex topic %s: %v\n", tp.name, err)
+			continue
+		}
+		total += n
+	}
 	var works int
 	db.QueryRow(`SELECT count(*) FROM twoai_works`).Scan(&works)
-	fmt.Printf("openalex: subfields=%d saved=%d works_total=%d\n", len(twoaiOASubfields), total, works)
+	fmt.Printf("openalex: subfields=%d topics=%d saved=%d works_total=%d\n", len(twoaiOASubfields), len(twoaiOATopics), total, works)
 	return nil
 }
 
@@ -381,9 +428,10 @@ func twoaiOAEnsureTables(db *sql.DB) error {
 	return nil
 }
 
-// twoaiOAHarvestSubfield walks one subfield, resuming from its own cursor.
-func twoaiOAHarvestSubfield(db *sql.DB, subfieldID, subfieldName string, pageBudget int) (int, error) {
-	source := "openalex:" + subfieldID
+// twoaiOAHarvestScope walks one scope - a subfield or a topic - resuming
+// from its own cursor. base is the OpenAlex filter that names the scope;
+// source is the cursor key.
+func twoaiOAHarvestScope(db *sql.DB, base, source, subfieldName string, pageBudget int) (int, error) {
 	var mode, cursor, highWater string
 	err := db.QueryRow(`SELECT mode, COALESCE(cursor,''), COALESCE(high_water,'')
 		FROM twoai_harvest_cursors WHERE source=$1`, source).Scan(&mode, &cursor, &highWater)
@@ -420,7 +468,6 @@ func twoaiOAHarvestSubfield(db *sql.DB, subfieldID, subfieldName string, pageBud
 	// Changing the filter invalidates an in-flight cursor, so a subfield
 	// entering phase one restarts its walk. Upserts make that safe and the
 	// cost is pages, not correctness.
-	base := "primary_topic.subfield.id:subfields/" + subfieldID
 	filter := base
 	switch mode {
 	case "delta":
