@@ -549,11 +549,29 @@ func twoaiBundleItems(path string, doc map[string]any) []map[string]any {
 			}
 		}
 	case "news/archive.json":
+		// THE KEYS ARE CAPITALISED, AND THIS READ THE WRONG ONES. The archive
+		// stories carry Headline and Slug - the same Go struct field names the
+		// briefing publishes with - and this case read Title and slug. Both
+		// lookups returned empty, add() dropped every item on the empty-url
+		// guard, and the entire news archive was absent from the index: 524
+		// stories, none retrievable. Stephen found it on 2026-09-13 when Ask
+		// could not see a National Law Review piece that site search found in
+		// one try. Pagefind indexes the built HTML; this indexes the SQL
+		// document; and for the news corpus the two had silently diverged.
+		//
+		// The story's own Summary is set as the subject so every chunk of a
+		// story opens with what it is about, the same rule as lawsuits.
 		if st, ok := doc["stories"].([]any); ok {
 			for _, x := range st {
 				m, _ := x.(map[string]any)
-				slug, _ := m["slug"].(string)
-				title, _ := m["Title"].(string)
+				slug, _ := m["Slug"].(string)
+				title, _ := m["Headline"].(string)
+				if slug == "" {
+					slug, _ = m["slug"].(string)
+				}
+				if title == "" {
+					title, _ = m["Title"].(string)
+				}
 				add(m, base+"/ai-news/"+slug+"/", title)
 			}
 		}
@@ -766,7 +784,7 @@ func twoaiEmbedRun(db *sql.DB) error {
 				break
 			}
 		}
-		for _, k := range []string{"significance", "summary", "hook", "description",
+		for _, k := range []string{"significance", "summary", "Summary", "hook", "description",
 			"definition", "blurb", "answer", "tagline"} {
 			if v, ok := m[k].(string); ok {
 				v = strings.TrimSpace(v)

@@ -690,6 +690,14 @@ func main() {
 		return
 	}
 
+	if src == "legiscan_add" {
+		if err := legiscanAdd(db, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "legiscan_add:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "twoai_internal_links" {
 		if err := twoaiInternalLinks(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_internal_links:", err)
@@ -1021,7 +1029,8 @@ func govinfo(db *sql.DB, sourceID int) (fetched, added int, err error) {
 	body, _ := json.Marshal(map[string]any{
 		"query": `collection:USCOURTS ("artificial intelligence" OR "machine learning" OR ` +
 			`"large language model" OR "facial recognition" OR "algorithmic" OR ` +
-			`"automated decision" OR deepfake OR "synthetic media" OR "data center") ` +
+			`"automated decision" OR deepfake OR "synthetic media" OR "data center" OR ` +
+			`"data privacy" OR "consumer privacy" OR "biometric" OR "data broker" OR "invasion of privacy") ` +
 			`publishdate:range(` + since + `,)`,
 		"pageSize":   100,
 		"offsetMark": "*",
@@ -1163,6 +1172,39 @@ var aiTerm = regexp.MustCompile(`(?i)\b(` +
 
 func mentionsAI(s string) bool { return s != "" && aiTerm.MatchString(s) }
 
+// privacyTerm is the privacy-law vocabulary, added 2026-09-13 at Stephen's
+// direction: privacy laws belong on this site alongside AI laws, in every
+// search, the news, the laws tracker, everything.
+//
+// The case that proved it: a National Law Review roundup led with
+// California's SB 690, which restricts website-tracking lawsuits under the
+// state's invasion-of-privacy law. The AI-policy press covers it as the same
+// beat. The sweep never found it because it says nothing about AI, and every
+// other bill in that article was already here because it does.
+//
+// THE WORDS ARE LAW-SHAPED ON PURPOSE. "privacy" alone matches a phone's
+// settings menu and a celebrity's divorce; "privacy act", "data protection",
+// "data broker", "biometric" and the named statutes match legislation and
+// regulation. That keeps the news feed from filling with consumer tech tips
+// while letting a Kids Code Act, a CCPA amendment or a wiretap ruling in.
+var privacyTerm = regexp.MustCompile(`(?i)\b(` +
+	`privacy (?:act|law|laws|bill|rule|rules|regulation|rights?|protection|legislation)|` +
+	`data (?:privacy|protection|broker|brokers|minimization|minimisation)|` +
+	`consumer privacy|invasion of privacy|right to privacy|` +
+	`personal (?:data|information) protection|` +
+	`biometric (?:privacy|data|information|identifiers?)|` +
+	`age.appropriate design|kids code|children's (?:privacy|online)|` +
+	`ccpa|cpra|gdpr|coppa|bipa|hipaa privacy|` +
+	`wiretap(?:ping)? (?:act|law|statute)|` +
+	`website tracking|online tracking|tracking (?:pixels?|cookies)|` +
+	`surveillance (?:law|advertising|pricing)|` +
+	`opt.out (?:rights?|preference)|do not (?:sell|track)|` +
+	`geolocation (?:data|privacy)|` +
+	`privacy commissioner|data protection (?:authority|officer)` +
+	`)\b`)
+
+func mentionsPrivacy(s string) bool { return s != "" && privacyTerm.MatchString(s) }
+
 // dcTerm is the data center vocabulary, kept separate from aiTerm because a
 // data center is not itself AI: it is the layer underneath, and this site's
 // whole thesis is that AI capability is downstream of buildings and power.
@@ -1183,10 +1225,12 @@ var dcTerm = regexp.MustCompile(`(?i)\b(` +
 func mentionsDC(s string) bool { return s != "" && dcTerm.MatchString(s) }
 
 // A document earns a corpus row if its title or abstract is ABOUT one of the
-// two subjects this site covers. Body mentions do not count; that is what the
-// source queries already over-return.
+// three subjects this site covers: AI, the data centres under it, and since
+// 2026-09-13 the privacy law that governs the data AI runs on. Body mentions
+// do not count; that is what the source queries already over-return.
 func onSubject(title, abstract string) bool {
-	return mentionsAI(title) || mentionsAI(abstract) || mentionsDC(title) || mentionsDC(abstract)
+	return mentionsAI(title) || mentionsAI(abstract) || mentionsDC(title) || mentionsDC(abstract) ||
+		mentionsPrivacy(title) || mentionsPrivacy(abstract)
 }
 
 // SOURCE QUERIES: WHAT WE ASK FOR, NOT ONLY WHAT WE KEEP.
@@ -1224,6 +1268,12 @@ var frQueries = []struct{ label, term string }{
 	{"data center + interconnection", `"data center" AND "interconnection"`},
 	{"data center + large load", `"data center" AND "large load"`},
 	{"data center + electricity", `"data center" AND "electricity"`},
+	// Privacy law, 2026-09-13. Same one-term-per-query rule.
+	{"data privacy", `"data privacy"`},
+	{"consumer privacy", `"consumer privacy"`},
+	{"data broker", `"data broker"`},
+	{"biometric", `biometric`},
+	{"children's privacy", `"children's online privacy"`},
 }
 
 // insertDoc appends one document to the corpus with change_hash dedupe.
@@ -1291,6 +1341,15 @@ var legiscanQueries = []struct {
 	{"automated decision", "%22automated+decision%22", 1},
 	{"algorithmic", "algorithmic", 1},
 	{"data center", "%22data+center%22", 1},
+	// Privacy law, 2026-09-13. LegiScan's relevance threshold of 50 still
+	// applies, so a bill that mentions privacy once in a definitions section
+	// does not qualify.
+	{"data privacy", "%22data+privacy%22", 2},
+	{"consumer privacy", "%22consumer+privacy%22", 1},
+	{"data broker", "%22data+broker%22", 1},
+	{"biometric", "biometric", 1},
+	{"age-appropriate design", "%22age-appropriate+design%22", 1},
+	{"invasion of privacy", "%22invasion+of+privacy%22", 1},
 }
 
 func legiscanQuery(db *sql.DB, sourceID int, key string, client *http.Client,
@@ -1426,7 +1485,8 @@ func gdelt(db *sql.DB, sourceID int) (fetched, added int, err error) {
 		for sc.Scan() {
 			line := sc.Text()
 			low := strings.ToLower(line)
-			if !strings.Contains(low, "artificial intelligence") && !strings.Contains(low, "artificialintelligence") {
+			if !strings.Contains(low, "artificial intelligence") && !strings.Contains(low, "artificialintelligence") &&
+				!strings.Contains(low, "privacy") && !strings.Contains(low, "biometric") && !strings.Contains(low, "data broker") {
 				continue
 			}
 			c := strings.Split(line, "\t")
@@ -1510,13 +1570,16 @@ func trunc(s string, n int) string {
 // green-computing stories in.
 var twoaiAIWordRe = regexp.MustCompile(`(?i)\b(a\.?i\.?|artificial intelligence|machine learning|deep learning|neural network|large language model|llm|llms|generative ai|genai|chatbot|chatgpt|openai|anthropic|deepmind|copilot|gemini|claude|llama|transformer model|foundation model|agentic|robotaxi|humanoid robot|self-driving|autonomous vehicle|computer vision|speech recognition|deepfake|algorithmic bias)\b`)
 
-// twoaiTitleIsAI reports whether a headline is about AI on its own terms.
+// twoaiTitleIsAI reports whether a headline is about AI on its own terms, or
+// since 2026-09-13 about privacy law, which this site now covers as the same
+// beat. The privacy vocabulary is law-shaped (see privacyTerm) so a headline
+// about a phone's privacy settings still does not qualify.
 func twoaiTitleIsAI(title string) bool {
 	t := strings.TrimSpace(title)
 	if t == "" {
 		return false
 	}
-	return twoaiAIWordRe.MatchString(t)
+	return twoaiAIWordRe.MatchString(t) || privacyTerm.MatchString(t)
 }
 
 // twoaiWireTitle normalises a headline so the same wire item recognises
@@ -2164,7 +2227,7 @@ func publishLegislation(db *sql.DB) error {
 		if rows.Scan(&b.State, &b.Number, &b.Title, &b.URL, &b.LastAction, &b.LastActionDate, &b.TextURL) != nil {
 			continue
 		}
-		if b.State == "" || b.Number == "" || !mentionsAI(b.Title) {
+		if b.State == "" || b.Number == "" || (!mentionsAI(b.Title) && !mentionsPrivacy(b.Title)) {
 			continue
 		}
 		bills = append(bills, b)

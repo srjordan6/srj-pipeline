@@ -160,11 +160,22 @@ func twoaiRecapCitations(db *sql.DB) error {
 					if docURL != "" && !strings.HasPrefix(docURL, "http") {
 						docURL = "https://www.courtlistener.com" + docURL
 					}
+					// INVALID UTF-8 KILLS THE STAGE. A RECAP filing arrived with a
+					// 0x80 byte on 2026-09-13 - a mis-encoded PDF extraction is the
+					// usual cause - and Postgres refused the row, which aborted the
+					// whole sweep rather than the one citation. archive_news hit the
+					// identical error on July 31 and guards with ToValidUTF8; this
+					// path never did. The raw text is CourtListener's own record and
+					// stays with them; replacing the bad byte here loses nothing that
+					// could be read anyway.
 					if _, err := db.Exec(`INSERT INTO twoai_precedent_citations
 						(lawsuit_slug, precedent_slug, recap_doc_id, doc_description, doc_url, quoted_by, snippet)
 						VALUES ($1,$2,$3,$4,$5,$6,$7)
 						ON CONFLICT (lawsuit_slug, precedent_slug, recap_doc_id) DO NOTHING`,
-						j.slug, p.slug, d.ID, strings.TrimSpace(d.Description), docURL, by, snippet); err != nil {
+						j.slug, p.slug, d.ID,
+						strings.ToValidUTF8(strings.TrimSpace(d.Description), "\uFFFD"),
+						docURL, by,
+						strings.ToValidUTF8(snippet, "\uFFFD")); err != nil {
 						return err
 					}
 					hits++
