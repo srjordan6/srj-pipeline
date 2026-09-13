@@ -119,9 +119,21 @@ var twoaiOASubfields = []struct{ id, name string }{
 // T13048, Patient Dignity and Privacy, is bedside dignity in clinical care,
 // not data, and is left out on purpose.
 var twoaiOATopics = []struct{ id, name string }{
-	{"T10101", "Cloud Computing and Resource Management"}, // data centres: 131,387 works
-	{"T14234", "Data Privacy and Cybersecurity"},          // Law: 31,975 works
-	{"T11045", "Privacy, Security, and Data Protection"},  // policy: 70,840 works
+	// Data centres. Verified 2026-09-13 across four topic searches with
+	// Stephen's key. OpenAlex has no "data center" topic: it splits the
+	// physical layer across computing, storage and power engineering, so
+	// coverage means several topics, each wider than the beat, with dcTerm
+	// doing the narrowing at render. Thermal management returned nothing under
+	// that name and cooling is therefore still a gap.
+	{"T10101", "Cloud Computing and Resource Management"},     // 131,387: scheduling, utilisation, efficiency
+	{"T12055", "Distributed and Parallel Computing Systems"},   // 32,924: cluster architecture at scale
+	{"T11227", "Advanced Data Storage Technologies"},          // 30,713: the storage half of a facility
+	{"T10627", "Smart Grid Energy Management"},                // 40,745: demand response, large-load integration
+	{"T12147", "Power System Optimization and Stability"},    // 36,555: grid stability under new load
+	// Privacy law and policy, verified the same day. See the note above for
+	// what was already covered and what was left out.
+	{"T14234", "Data Privacy and Cybersecurity"},              // Law: 31,975
+	{"T11045", "Privacy, Security, and Data Protection"},      // policy: 70,840
 }
 
 // twoaiOADoc is one work as OpenAlex returns it. Named rather than inline
