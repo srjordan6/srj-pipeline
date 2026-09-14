@@ -793,10 +793,14 @@ func twoaiJobsFetch(db *sql.DB) error {
 
 	// ---- USAJobs: the whole federal AI + cyber hiring pipeline. Free key,
 	// most permissive republication terms of any job API.
-	if key := os.Getenv("USAJOBS_API_KEY"); key == "" {
+	// twoaiEnv: the key is base64 and ends in '=', so it is a natural thing to
+	// write in quotes in an env file, and it was. The quotes reached the
+	// Authorization-Key header and USAJobs answered 401 on all four queries
+	// every run.
+	if key := twoaiEnv("USAJOBS_API_KEY"); key == "" {
 		fmt.Fprintln(os.Stderr, "twoai_jobs: USAJOBS_API_KEY unset, skipping USAJobs")
 	} else {
-		email := os.Getenv("USAJOBS_EMAIL")
+		email := twoaiEnv("USAJOBS_EMAIL")
 		if email == "" {
 			email = "stephen@srjconsultingservices.com"
 		}
@@ -857,7 +861,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 	}
 
 	// ---- Adzuna: free 1,000 calls/month; eight calls a day is well inside.
-	if id, k := os.Getenv("ADZUNA_APP_ID"), os.Getenv("ADZUNA_APP_KEY"); id == "" || k == "" {
+	if id, k := twoaiEnv("ADZUNA_APP_ID"), twoaiEnv("ADZUNA_APP_KEY"); id == "" || k == "" {
 		fmt.Fprintln(os.Stderr, "twoai_jobs: ADZUNA_APP_ID/ADZUNA_APP_KEY unset, skipping Adzuna")
 	} else {
 		for _, q := range []string{"artificial intelligence", "machine learning", "cybersecurity", "security engineer"} {
@@ -900,7 +904,7 @@ func twoaiJobsFetch(db *sql.DB) error {
 	}
 
 	// ---- Jooble: free partner API, POST with the key in the path.
-	if key := os.Getenv("JOOBLE_API_KEY"); key == "" {
+	if key := twoaiEnv("JOOBLE_API_KEY"); key == "" {
 		fmt.Fprintln(os.Stderr, "twoai_jobs: JOOBLE_API_KEY unset, skipping Jooble")
 	} else {
 		for _, q := range []string{"artificial intelligence", "cybersecurity"} {

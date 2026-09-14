@@ -717,11 +717,18 @@ func twoaiBillEventsQueue(db *sql.DB, today string) (int, error) {
 // silently undelivered alert is worse than an obvious one: the whole point is
 // that Stephen learns a bill passed without having to check.
 func twoaiBillAlertsSend(db *sql.DB) (int, error) {
-	host := os.Getenv("TWOAI_ALERT_SMTP_HOST")
-	port := os.Getenv("TWOAI_ALERT_SMTP_PORT")
-	user := os.Getenv("TWOAI_ALERT_SMTP_USER")
-	pass := os.Getenv("TWOAI_ALERT_SMTP_PASS")
-	to := os.Getenv("TWOAI_ALERT_TO")
+	host := twoaiEnv("TWOAI_ALERT_SMTP_HOST")
+	port := twoaiEnv("TWOAI_ALERT_SMTP_PORT")
+	user := twoaiEnv("TWOAI_ALERT_SMTP_USER")
+	// twoaiEnv, not os.Getenv. A Gmail app password contains spaces, so it is
+	// the value in pipeline.env most likely to be written in quotes, and it
+	// was: TWOAI_ALERT_SMTP_PASS="cdgo njjr isoy odum". The loader passes the
+	// quotes through, Gmail sees a wrong password, and every run this week
+	// logged 535 BadCredentials while the alerts sat in the outbox. The whole
+	// point of this stage is that Stephen learns a bill passed without
+	// checking, and it had been silently failing to do that.
+	pass := twoaiEnv("TWOAI_ALERT_SMTP_PASS")
+	to := twoaiEnv("TWOAI_ALERT_TO")
 	if host == "" || user == "" || pass == "" || to == "" {
 		var pending int
 		db.QueryRow(`SELECT count(*) FROM twoai_bill_outbox WHERE channel='alert' AND sent_on IS NULL`).Scan(&pending)
@@ -831,8 +838,8 @@ func twoaiSendImplicitTLS(addr, host string, auth smtp.Auth, from, to string, pa
 // audiences are there for, and posting it anyway trains people to scroll past
 // the account.
 func twoaiBillSocialToMarky(db *sql.DB) (int, error) {
-	key := os.Getenv("MARKY_API_KEY")
-	bizID := os.Getenv("MARKY_BUSINESS_ID")
+	key := twoaiEnv("MARKY_API_KEY")
+	bizID := twoaiEnv("MARKY_BUSINESS_ID")
 	if key == "" || bizID == "" {
 		var pending int
 		db.QueryRow(`SELECT count(*) FROM twoai_bill_outbox WHERE channel='social' AND sent_on IS NULL`).Scan(&pending)
