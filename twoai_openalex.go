@@ -510,7 +510,7 @@ func twoaiOAHarvestScope(db *sql.DB, base, source, subfieldName string, pageBudg
 		// stage still runs and still stops cleanly when the allowance goes.
 		u := fmt.Sprintf("https://api.openalex.org/works?filter=%s&per-page=200&cursor=%s&select=%s&mailto=%s",
 			url.QueryEscape(filter), url.QueryEscape(cursor), url.QueryEscape(twoaiOASelect), twoaiOAMailto)
-		if k := os.Getenv("OPENALEX_API_KEY"); k != "" {
+		if k := twoaiEnv("OPENALEX_API_KEY"); k != "" {
 			u += "&api_key=" + url.QueryEscape(k)
 		}
 		req, _ := http.NewRequest("GET", u, nil)
