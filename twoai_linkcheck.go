@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -68,12 +69,29 @@ func twoaiLinkCheck(db *sql.DB) error {
 			      WHEN 'object' THEN jsonb_build_array(profile->'sources')
 			      ELSE '[]'::jsonb END) s
 			  WHERE coalesce(s->>'url','') <> ''
+			UNION ALL
+			-- Added 2026-09-14. A Screaming Frog crawl flagged dead outbound
+			-- links on pages this stage had never looked at: it knew about
+			-- facilities, dockets and papers and nothing else. These are the
+			-- other places the site sends a reader.
+			SELECT website, 'company-site' FROM twoai_company_profiles WHERE coalesce(website,'') <> ''
+			UNION ALL
+			SELECT p->>'source', 'industry-point' FROM twoai_pages, jsonb_array_elements(
+			    CASE jsonb_typeof(data->'points') WHEN 'array' THEN data->'points' ELSE '[]'::jsonb END) p
+			  WHERE path LIKE 'industries/%' AND coalesce(p->>'source','') <> ''
+			UNION ALL
+			SELECT url, 'vendor-post' FROM twoai_vendor_posts WHERE retired_at IS NULL AND coalesce(url,'') <> ''
+			UNION ALL
+			SELECT url, 'tool-site' FROM twoai_pages, jsonb_array_elements(
+			    CASE jsonb_typeof(data->'tools') WHEN 'array' THEN data->'tools' ELSE '[]'::jsonb END) t,
+			  LATERAL (SELECT t->>'url' AS url) x
+			  WHERE path = 'tools/index.json' AND coalesce(url,'') <> ''
 		) x WHERE u LIKE 'http%'
 		ON CONFLICT (url) DO NOTHING`); err != nil {
 		return err
 	}
 
-	budget := 50
+	budget := 150
 	if v, err := strconv.Atoi(os.Getenv("TWOAI_LINKCHECK_BUDGET")); err == nil && v >= 0 {
 		budget = v
 	}
@@ -81,9 +99,30 @@ func twoaiLinkCheck(db *sql.DB) error {
 		return nil
 	}
 
+	// WHAT TO CHECK, IN THE ORDER IT MATTERS. Until 2026-09-14 this was
+	// "never checked, or checked over 30 days ago", and the first full pass
+	// finished on the 9th - so every night since, the query selected nothing,
+	// the log said checked=0, and 24 links that had already failed once sat
+	// waiting a month for the second failure that would confirm them. A
+	// checker that goes quiet for three weeks after its first pass is not
+	// checking.
+	//
+	// Now: a link that failed once is rechecked after three days, because that
+	// is the check that turns a suspicion into a fact. A confirmed-dead link
+	// is rechecked weekly, because pages come back. A healthy link is
+	// rechecked monthly. Never-checked first, always.
 	rows, err := db.Query(`SELECT url, kind FROM twoai_link_health
-		WHERE checked_at IS NULL OR checked_at < now() - interval '30 days'
-		ORDER BY checked_at NULLS FIRST, url LIMIT $1`, budget)
+		WHERE checked_at IS NULL
+		   OR (verdict = 'broken' AND fail_count = 1 AND checked_at < now() - interval '3 days')
+		   OR (verdict = 'broken' AND fail_count >= 2 AND checked_at < now() - interval '7 days')
+		   OR (verdict = 'blocked' AND checked_at < now() - interval '14 days')
+		   OR (checked_at < now() - interval '30 days')
+		ORDER BY
+		  CASE WHEN checked_at IS NULL THEN 0
+		       WHEN verdict = 'broken' AND fail_count = 1 THEN 1
+		       ELSE 2 END,
+		  checked_at NULLS FIRST, url
+		LIMIT $1`, budget)
 	if err != nil {
 		return err
 	}
@@ -138,6 +177,41 @@ func twoaiLinkCheck(db *sql.DB) error {
 			}
 			fmt.Fprintln(os.Stderr, "  "+d)
 		}
+	}
+
+	// PUBLISH THE DEAD LIST SO THE SITE CAN ACT ON IT. Until 2026-09-14 a
+	// confirmed-dead link's only consequence was a line in stderr; the page
+	// kept rendering the link and a reader kept getting a 404. The site's
+	// build now reads meta/dead-links.json and neutralises those anchors in
+	// the rendered HTML - the text stays, the click goes nowhere - so the
+	// fix reaches every template in one place, the same way the paragraph
+	// cap does. Written every run, empty list included, so a recovered link
+	// comes back on the next build without anyone touching it.
+	drows, derr := db.Query(`SELECT url, kind, status, first_failed_at::date::text
+		FROM twoai_link_health WHERE verdict='broken' AND fail_count >= 2 ORDER BY url`)
+	if derr == nil {
+		type deadLink struct {
+			URL, Kind, Since string
+			Status            int
+		}
+		var list []map[string]any
+		for drows.Next() {
+			var u, k, since string
+			var st int
+			if drows.Scan(&u, &k, &st, &since) == nil {
+				list = append(list, map[string]any{"url": u, "kind": k, "status": st, "since": since})
+			}
+		}
+		drows.Close()
+		if list == nil {
+			list = []map[string]any{}
+		}
+		doc, _ := json.Marshal(map[string]any{
+			"generated": time.Now().UTC().Format("2006-01-02"), "count": len(list), "links": list,
+			"note": "External URLs this site renders that have answered 404/410 on two checks at least three days apart. The build removes the href from these anchors.",
+		})
+		db.Exec(`INSERT INTO twoai_pages (path, kind, data, updated_at) VALUES ('meta/dead-links.json','meta',$1::jsonb,now())
+			ON CONFLICT (path) DO UPDATE SET data=EXCLUDED.data, updated_at=now()`, string(doc))
 	}
 	return nil
 }
