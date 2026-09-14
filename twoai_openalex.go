@@ -364,36 +364,49 @@ func twoaiOpenAlex(db *sql.DB) error {
 		per = 1
 	}
 	total := 0
+
+	// ROTATE THE STARTING SCOPE. Until 2026-09-14 this walked the list in a
+	// fixed order every run, which is fine while the budget covers the whole
+	// list and starvation the moment it does not. That day's run died on 429s
+	// at the fourth scope of twelve, so the eight after it got nothing - and
+	// seven of those eight were the data-centre and privacy topics added hours
+	// earlier. They would not have been slowly backfilled; they would never
+	// have started.
+	//
+	// Starting at a different offset each day gives every scope its turn at
+	// the front. A budget that covers four scopes a run still walks all twelve
+	// over three days, instead of the same four forever.
+	type scope struct {
+		filter, source, name string
+	}
+	var scopes []scope
 	for _, sf := range twoaiOASubfields {
-		n, err := twoaiOAHarvestScope(db, "primary_topic.subfield.id:subfields/"+sf.id, "openalex:"+sf.id, sf.name, per)
-		if errors.Is(err, errOpenAlexBudget) {
-			total += n
-			fmt.Printf("openalex: stopping after %s, daily budget spent; cursors are saved and the next run resumes\n", sf.name)
-			break
-		}
-		if err != nil {
-			// One subfield failing must not cost the others their turn.
-			fmt.Fprintf(os.Stderr, "openalex %s: %v\n", sf.name, err)
-			continue
-		}
-		total += n
+		scopes = append(scopes, scope{"primary_topic.subfield.id:subfields/" + sf.id, "openalex:" + sf.id, sf.name})
 	}
 	for _, tp := range twoaiOATopics {
-		n, err := twoaiOAHarvestScope(db, "primary_topic.id:"+tp.id, "openalex:topic:"+tp.id, tp.name, per)
+		scopes = append(scopes, scope{"primary_topic.id:" + tp.id, "openalex:topic:" + tp.id, tp.name})
+	}
+	offset := time.Now().UTC().YearDay() % len(scopes)
+
+	for i := 0; i < len(scopes); i++ {
+		s := scopes[(offset+i)%len(scopes)]
+		n, err := twoaiOAHarvestScope(db, s.filter, s.source, s.name, per)
 		if errors.Is(err, errOpenAlexBudget) {
 			total += n
-			fmt.Printf("openalex: stopping after topic %s, daily budget spent\n", tp.name)
+			fmt.Printf("openalex: stopping after %s, daily budget spent; cursors are saved and tomorrow starts at a different scope\n", s.name)
 			break
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "openalex topic %s: %v\n", tp.name, err)
+			// One scope failing must not cost the others their turn.
+			fmt.Fprintf(os.Stderr, "openalex %s: %v\n", s.name, err)
 			continue
 		}
 		total += n
 	}
 	var works int
 	db.QueryRow(`SELECT count(*) FROM twoai_works`).Scan(&works)
-	fmt.Printf("openalex: subfields=%d topics=%d saved=%d works_total=%d\n", len(twoaiOASubfields), len(twoaiOATopics), total, works)
+	fmt.Printf("openalex: scopes=%d (started at %s) saved=%d works_total=%d\n",
+		len(scopes), scopes[offset].name, total, works)
 	return nil
 }
 
