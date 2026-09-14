@@ -222,13 +222,43 @@ func twoaiGATop(db *sql.DB) error {
 		return nil
 	}
 
-	// Titles come from the url registry the site already maintains; a path the
-	// registry does not know keeps a null title and the renderer derives one
-	// from the path.
+	// Titles come from twoai_pages, which is where they are.
+	//
+	// This used to read twoai_url_registry.title. That column exists and is
+	// empty on all 12,907 rows - the registry is built from the sitemap, which
+	// carries URLs and not titles, so the lookup returned null every time and
+	// the footer fell back to deriving a name from the path. That is why the
+	// list read "995676ef" and "B441a27b" instead of company names: a UID is
+	// all a path has when the page is an ecosystem entry. Stephen caught it on
+	// 2026-09-14.
+	//
+	// A page document knows its own title. The lookup maps the public path
+	// back to the document, tries the two shapes the site uses, and leaves the
+	// title null if neither matches, which keeps the old fallback for anything
+	// genuinely unknown.
 	for i, r := range top {
 		var title sql.NullString
-		db.QueryRow(`SELECT title FROM twoai_url_registry WHERE url = $1`,
-			"https://theworldofai.org"+r.path).Scan(&title)
+		db.QueryRow(`SELECT COALESCE(NULLIF(p.data->>'title',''), NULLIF(p.data->'company'->>'name',''),
+		                    NULLIF(p.data->>'name',''), NULLIF(p.data->>'headline',''))
+			FROM twoai_pages p
+			WHERE p.data->>'live_path' = $1 OR p.data->>'path' = $1
+			   OR ('/' || regexp_replace(p.path, '\.json$', '') || '/') = $1
+			LIMIT 1`, r.path).Scan(&title)
+		if !title.Valid || strings.TrimSpace(title.String) == "" {
+			// Second chance: the taxonomy knows the live path of every
+			// ecosystem page, which is exactly the shape that produced a bare
+			// UID in the footer.
+			db.QueryRow(`SELECT name FROM twoai_taxonomy WHERE live_path = $1 LIMIT 1`, r.path).Scan(&title)
+		}
+		if !title.Valid || strings.TrimSpace(title.String) == "" {
+			// Third: lawsuits are 108 cases inside ONE document, so no page row
+			// has their path. Matched on the slug in the URL.
+			if s := strings.Trim(strings.TrimPrefix(r.path, "/ai-lawsuits/"), "/"); s != "" && strings.HasPrefix(r.path, "/ai-lawsuits/") {
+				db.QueryRow(`SELECT COALESCE(NULLIF(c->>'short_name',''), c->>'case_name')
+					FROM twoai_pages p, jsonb_array_elements(p.data->'cases') c
+					WHERE p.kind='lawsuits' AND c->>'slug' = $1 LIMIT 1`, s).Scan(&title)
+			}
+		}
 		if _, err := db.Exec(`INSERT INTO twoai_ga_top_pages (day, rank, path, views, title)
 			VALUES (current_date, $1, $2, $3, $4)
 			ON CONFLICT (day, rank) DO UPDATE SET path=EXCLUDED.path,
