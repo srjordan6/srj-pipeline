@@ -50,7 +50,7 @@ import (
 // gaSAToken is erSAToken without the delegation sub claim: Analytics grants
 // access to the service account itself via Property Access Management.
 func gaSAToken(scope string) (string, error) {
-	email, key := os.Getenv("GOOGLE_SA_EMAIL"), os.Getenv("GOOGLE_SA_KEY")
+	email, key := twoaiEnv("GOOGLE_SA_EMAIL"), twoaiEnv("GOOGLE_SA_KEY")
 	if key == "" {
 		return "", fmt.Errorf("GOOGLE_SA_KEY must be set")
 	}
@@ -118,8 +118,39 @@ func gaSAToken(scope string) (string, error) {
 	return t.AccessToken, nil
 }
 
+// twoaiEnv reads an environment variable and strips a matching pair of
+// surrounding quotes.
+//
+// pipeline.env is read by run-pipeline.ps1 with a regex that captures
+// everything after the first '=' verbatim, quotes included. A value written
+// as KEY='value' therefore arrives with the apostrophes attached, and the
+// consumer sees a string that is almost right, which is the worst kind of
+// wrong. On 2026-09-14 three variables were quoted and all three failed
+// silently for different-looking reasons:
+//
+//   GOOGLE_SA_KEY         -> "GOOGLE_SA_KEY is not valid PEM", because PEM
+//                            must begin with five dashes and this began with
+//                            an apostrophe. The Most Visited panel had been
+//                            nine days stale.
+//   TWOAI_ALERT_SMTP_PASS -> Gmail 535 BadCredentials on every run this week.
+//                            Bill alerts queued and never delivered.
+//   USAJOBS_API_KEY       -> 401 on every USAJOBS query.
+//
+// Three unrelated-looking failures, one cause. Quoting a value in an env
+// file is a completely reasonable thing for a person to do, so the code
+// tolerates it rather than the person having to remember.
+func twoaiEnv(name string) string {
+	v := strings.TrimSpace(os.Getenv(name))
+	if len(v) >= 2 {
+		if (v[0] == '\'' && v[len(v)-1] == '\'') || (v[0] == '"' && v[len(v)-1] == '"') {
+			v = v[1 : len(v)-1]
+		}
+	}
+	return v
+}
+
 func twoaiGATop(db *sql.DB) error {
-	prop := os.Getenv("GA4_PROPERTY_ID")
+	prop := twoaiEnv("GA4_PROPERTY_ID")
 	if prop == "" {
 		fmt.Println("twoai_ga_top: skipped, GA4_PROPERTY_ID not set (see twoai_ga.go SETUP)")
 		return nil
