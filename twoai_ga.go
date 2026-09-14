@@ -274,6 +274,13 @@ func twoaiGATop(db *sql.DB) error {
 			FROM twoai_pages p
 			WHERE p.data->>'live_path' = $1 OR p.data->>'path' = $1
 			   OR ('/' || regexp_replace(p.path, '\.json$', '') || '/') = $1
+			   -- The stored path and the public URL are not the same string.
+			-- compliance/china-ai-regulation.json publishes at
+			-- /ai-compliance/china-ai-regulation/, and only the slug is shared.
+			-- Matching on the last segment catches every prefix the site
+			-- rewrites - compliance to ai-compliance, lawsuits to ai-lawsuits,
+			-- news to ai-news - without hardcoding the map.
+			   OR regexp_replace(p.path, '^.*/|\.json$', '', 'g') = regexp_replace($1, '^.*/([^/]+)/$', '\1')
 			LIMIT 1`, r.path).Scan(&title)
 		if !title.Valid || strings.TrimSpace(title.String) == "" {
 			// Second chance: the taxonomy knows the live path of every
