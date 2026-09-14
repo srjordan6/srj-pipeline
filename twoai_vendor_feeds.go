@@ -221,6 +221,29 @@ func twoaiVendorFeeds(db *sql.DB) error {
 			if date != "" {
 				posted = date
 			}
+			// THE URL IS THE IDENTITY, THE SLUG IS THE PERMALINK. The slug is
+			// derived from the title, so when a vendor edits a headline the same
+			// URL arrives under a new slug. The insert below conflicts on slug
+			// only; the URL is unique among live rows too, so the second slug
+			// violated twoai_vendor_posts_url_live_uq and the post was skipped
+			// with an error line - six a night, silently, until 2026-09-14.
+			//
+			// A URL already published under some slug keeps that slug. Changing
+			// it would break a permalink to follow a headline edit, which is the
+			// wrong trade. The existing row is refreshed instead: title updates,
+			// summary only if it had none, last_seen moves.
+			var existing string
+			if db.QueryRow(`SELECT slug FROM twoai_vendor_posts WHERE url=$1 AND retired_at IS NULL LIMIT 1`,
+				link).Scan(&existing) == nil && existing != "" && existing != slug {
+				db.Exec(`UPDATE twoai_vendor_posts SET title=$2,
+					summary=CASE WHEN summary='' THEN $3 ELSE summary END,
+					entity_uid=COALESCE(entity_uid,$4), entity_kind=COALESCE(entity_kind,$5),
+					source='feed', last_seen=now() WHERE slug=$1`,
+					existing, title, summary, nullIfEmpty(f.uid), nullIfEmpty(f.kind))
+				n++
+				saved++
+				continue
+			}
 			// first_published and posted_on are written once. A permalink's
 			// date must not move because a feed re-dated an old post.
 			if _, err := db.Exec(`INSERT INTO twoai_vendor_posts
