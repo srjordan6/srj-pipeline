@@ -272,7 +272,11 @@ func appsecResearch(db *sql.DB) error {
 				continue
 			}
 			txtB, _ := os.ReadFile(tf)
-			txt := strings.TrimSpace(string(txtB))
+			// pdftotext emits NUL bytes from some PDFs. NUL is valid UTF-8 and
+			// Postgres still refuses it in a text column - two papers failed to
+			// store on 2026-09-14 with "invalid byte sequence 0x00". Stripped,
+			// along with anything that is not valid UTF-8, before the write.
+			txt := strings.TrimSpace(strings.ToValidUTF8(strings.ReplaceAll(string(txtB), "\x00", ""), "\uFFFD"))
 			os.Remove(pf)
 			os.Remove(tf)
 			if len(txt) < 2000 {

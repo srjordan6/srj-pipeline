@@ -215,8 +215,19 @@ func twoaiVendorEnrich(db *sql.DB) error {
 	// Per-host pacing: several hundred posts can share one vendor, and a
 	// burst at one company's blog is rude regardless of robots.txt.
 	lastHost := map[string]time.Time{}
+	// STOP BEFORE THE RUNNER STOPS US. The scheduled run gives each stage 20
+	// minutes and kills it at the deadline - which it did on 2026-09-14,
+	// mid-batch, losing the post in flight and the summary line. With the
+	// body path adding a model call per post, 400 posts no longer fit. So
+	// this stops itself at 17 minutes and reports what it did; the rest
+	// waits for the next run, exactly as it would have anyway.
+	stopAt := time.Now().Add(17 * time.Minute)
 
 	for _, p := range todo {
+		if time.Now().After(stopAt) {
+			fmt.Println("twoai_vendor_enrich: stopping at the 17-minute mark, the remainder waits for the next run")
+			break
+		}
 		host := ""
 		if i := strings.Index(p.url, "://"); i > 0 {
 			host = p.url[i+3:]

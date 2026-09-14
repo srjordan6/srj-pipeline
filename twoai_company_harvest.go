@@ -275,7 +275,11 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 				status = resp.StatusCode
 				if status == 200 {
 					body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-					extract = twoaiHarvestExtract(body)
+					// A site that declares UTF-8 and serves Latin-1 - Celestica
+					// on 2026-09-14, byte 0xb8 - fails the store and loses the
+					// harvest. Bad bytes become U+FFFD; the text is still readable
+					// and the row is still written.
+					extract = strings.ToValidUTF8(twoaiHarvestExtract(body), "\uFFFD")
 				}
 				resp.Body.Close()
 			}

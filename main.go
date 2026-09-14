@@ -7557,8 +7557,22 @@ func urlRegistry(db *sql.DB) error {
 
 // fetchUnlistedURLs reads the manifest of live pages the build deliberately
 // keeps out of the sitemap. See astro.config.mjs for why it exists.
+//
+// With a browser user agent, because Bot Fight Mode challenges Go's default
+// one. On 2026-09-14 this fetch got a 403, the registry fell back to the
+// sitemap alone, and 2,870 vendor pages that are live and deliberately
+// unlisted were declared "out of the sitemap for over 48 hours" - the
+// pipeline's own self-check failing the same way every curl test had. A
+// self-check that cannot read its own site is worse than none, because it
+// reports a catastrophe that is not happening.
 func fetchUnlistedURLs(u string) ([]string, error) {
-	resp, err := http.Get(u)
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; srj-pipeline url-registry; +https://theworldofai.org/)")
+	req.Header.Set("Cache-Control", "no-cache")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -9566,6 +9580,41 @@ func verifyTwoaiDeploy() {
 		return s
 	}
 
+	// THE BUNDLE HASH COMES FROM R2, NOT FROM MEMORY. The first version of
+	// this check read twoaiPublishedSHA, a global set by twoai_publish_r2. On
+	// the first scheduled run it reported "published nothing to R2" one line
+	// after R2 had accepted 5,466 files - because every stage of `pipeline
+	// all` runs as its own child process (which is what lets a stage be
+	// killed on a deadline without killing the run), and a global set in one
+	// process is empty in the next. R2 publishes manifest.json alongside the
+	// bundle with the same sha256 the site writes into /api/build.json, so
+	// the question "does the live site carry the latest bundle" can be asked
+	// of the two public documents directly.
+	latest := func() (sha string, ok bool) {
+		req, _ := http.NewRequest("GET", "https://pub-b8347c6e4e8c40febe3c83d8860826e2.r2.dev/manifest.json", nil)
+		req.Header.Set("Cache-Control", "no-cache")
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", false
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return "", false
+		}
+		var m struct {
+			SHA256 string `json:"sha256"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&m) != nil || m.SHA256 == "" {
+			return "", false
+		}
+		return m.SHA256, true
+	}
+	if twoaiPublishedSHA == "" {
+		if sha, ok := latest(); ok {
+			twoaiPublishedSHA = sha
+		}
+	}
+
 	if twoaiPublishedSHA != "" {
 		deadline := time.Now().Add(25 * time.Minute)
 		for {
@@ -9884,8 +9933,8 @@ func openalexWatch(db *sql.DB) error {
 		FROM twoai_works w
 		WHERE w.pub_date > current_date - ($1 || ' days')::interval
 		  AND w.duplicate_of IS NULL
-		  AND jsonb_typeof(w.institutions) = 'array'
-		  AND jsonb_array_length(w.institutions) > 0
+		  AND (CASE WHEN jsonb_typeof(w.institutions) = 'array'
+		            THEN jsonb_array_length(w.institutions) ELSE 0 END) > 0
 		  AND (w.topic ILIKE '%artificial intelligence%' OR w.topic ILIKE '%machine learning%'
 		       OR w.topic ILIKE '%natural language%' OR w.topic ILIKE '%computer vision%'
 		       OR w.topic ILIKE '%neural%' OR w.topic ILIKE '%language model%')

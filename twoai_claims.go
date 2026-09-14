@@ -94,7 +94,7 @@ func twoaiExtractClaims(title, abstract string) ([]twoaiClaim, error) {
 		"Title: " + title + "\nAbstract: " + abstract
 	body, _ := json.Marshal(map[string]any{
 		"model":      twoaiClaimModel,
-		"max_tokens": 900,
+		"max_tokens": 2000, // 900 truncated multi-claim abstracts mid-array on 2026-09-14
 		"messages":   []map[string]string{{"role": "user", "content": prompt}},
 	})
 	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
@@ -126,12 +126,36 @@ func twoaiExtractClaims(title, abstract string) ([]twoaiClaim, error) {
 		raw += c.Text
 	}
 	raw = strings.TrimSpace(raw)
-	// Defensive: strip a fence if one appears despite the instruction.
-	if strings.HasPrefix(raw, "```") {
-		if i := strings.Index(raw, "\n"); i >= 0 {
-			raw = raw[i+1:]
+	// EXTRACT THE ARRAY, IGNORE EVERYTHING AROUND IT. The old form stripped a
+	// fence at the start and a fence at the very end, and the model does
+	// neither of those reliably: on 2026-09-14 seven of 113 came back as
+	// "[]\n```\n\nThe abstract makes claims about..." - a correct empty
+	// answer followed by an explanation the prompt forbade, which the
+	// trailing trim never reached. The JSON is wherever it is; find the first
+	// '[' and walk to its matching ']' respecting string literals, and parse
+	// that. Prose before, after, or around it stops mattering.
+	if s := strings.Index(raw, "["); s >= 0 {
+		depth, inStr, esc := 0, false, false
+		for i := s; i < len(raw); i++ {
+			ch := raw[i]
+			switch {
+			case esc:
+				esc = false
+			case inStr && ch == '\\':
+				esc = true
+			case ch == '"':
+				inStr = !inStr
+			case inStr:
+			case ch == '[':
+				depth++
+			case ch == ']':
+				depth--
+				if depth == 0 {
+					raw = raw[s : i+1]
+					i = len(raw) // exit
+				}
+			}
 		}
-		raw = strings.TrimSuffix(strings.TrimSpace(raw), "```")
 	}
 	if raw == "" {
 		return nil, fmt.Errorf("empty response")
