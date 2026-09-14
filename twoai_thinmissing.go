@@ -145,11 +145,15 @@ func twoaiThinMissingEntities(db *sql.DB) {
 		) d
 		WHERE length(btrim(d.party)) BETWEEN 4 AND 60
 		  AND btrim(d.party) ~ '^[A-Z]'
+		  -- These two belong in WHERE, not HAVING. They test each row, not
+		  -- the group, and Postgres rejects a HAVING that names an ungrouped
+		  -- column - which silently cost this stage every lawsuit defendant
+		  -- until the log line was read on 2026-09-14.
+		  AND NOT EXISTS (SELECT 1 FROM twoai_company_profiles c WHERE lower(c.name) = lower(btrim(d.party)))
+		  AND NOT EXISTS (SELECT 1 FROM twoai_entities e WHERE e.kind='company'
+		       AND e.normalized = regexp_replace(regexp_replace(lower(btrim(d.party)),'[^a-z0-9]+','-','g'),'^-|-$','','g'))
 		GROUP BY 1,2
 		HAVING count(*) >= 2
-		   AND NOT EXISTS (SELECT 1 FROM twoai_company_profiles c WHERE lower(c.name) = lower(btrim(d.party)))
-		   AND NOT EXISTS (SELECT 1 FROM twoai_entities e WHERE e.kind='company'
-		        AND e.normalized = regexp_replace(regexp_replace(lower(btrim(d.party)),'[^a-z0-9]+','-','g'),'^-|-$','','g'))
 		ON CONFLICT (normalized) DO UPDATE
 		  SET mentions = EXCLUDED.mentions, sources = EXCLUDED.sources, last_seen = now()
 		  WHERE twoai_missing_entities.status = 'proposed'`); err != nil {
