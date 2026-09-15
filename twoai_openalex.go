@@ -496,7 +496,34 @@ func twoaiOAHarvestScope(db *sql.DB, base, source, subfieldName string, pageBudg
 	filter := base
 	switch mode {
 	case "delta":
-		filter = base + ",from_updated_date:" + highWater
+		// from_updated_date IS A PAID FILTER, AND IT RETURNS 429.
+		//
+		// This asked for works updated since the high-water date, which is the
+		// natural way to run a delta. OpenAlex put that filter behind a
+		// Premium, Institutional or Partner plan, and it refuses it with HTTP
+		// 429 - the same status as a rate limit. So the backoff treated a
+		// permanent refusal as congestion, burned four attempts and 75 seconds
+		// per scope per run, and gave up with pages=0 saved=0.
+		//
+		// The consequence was worse than the wasted time. Every scope reaches
+		// delta after its backfill and archive complete, and delta could never
+		// succeed, so a completed scope stopped collecting new work FOREVER
+		// while the log showed what looked like transient throttling. Four
+		// scopes were already in that state when Stephen sent the overnight
+		// logs on 2026-09-15, including Computer Science Applications and
+		// Health Informatics.
+		//
+		// from_publication_date is free. It is not the same question - a work
+		// whose metadata changed today but published in 2019 will not be seen -
+		// but for a corpus whose job is to be current on new research it asks
+		// the more useful one, and it asks it with a filter that answers. The
+		// window reaches back 30 days from the high-water mark so a paper
+		// indexed late is still caught.
+		since := highWater
+		if t, perr := time.Parse("2006-01-02", highWater); perr == nil {
+			since = t.AddDate(0, 0, -30).Format("2006-01-02")
+		}
+		filter = base + ",from_publication_date:" + since
 		if cursor == "" {
 			cursor = "*"
 		}
@@ -555,6 +582,16 @@ func twoaiOAHarvestScope(db *sql.DB, base, source, subfieldName string, pageBudg
 				}
 				fmt.Fprintf(os.Stderr, "openalex: daily budget spent, stopping the stage%s: %s\n", hint, truncate(string(body), 200))
 				return saved, errOpenAlexBudget
+			}
+			// A PAID-PLAN REFUSAL IS ALSO A 429, AND WAITING NEVER FIXES IT.
+			// OpenAlex answers a request for a premium-only filter with 429 and
+			// "Plan upgrade required". Backing off on that wastes 75 seconds and
+			// then reports a rate limit, which is how a permanently broken delta
+			// mode read as congestion for weeks. Fail fast and name it.
+			if resp.StatusCode == 429 && strings.Contains(string(body), "Plan upgrade required") {
+				fmt.Fprintf(os.Stderr, "openalex %s: this query uses a filter the current plan does not allow, skipping: %s\n",
+					subfieldName, truncate(string(body), 200))
+				break
 			}
 			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
 				wait := time.Duration(5*(1<<attempt)) * time.Second
