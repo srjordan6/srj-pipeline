@@ -1767,7 +1767,32 @@ func publishNews(db *sql.DB) error {
 	// more specific than a word and GDELT already extracted them. Cluster
 	// token overlap at 0.5: below the 0.6 a single headline needs, because a
 	// cluster's union of tokens is a more forgiving comparison than one title.
-	// Repeat until nothing merges, since a merge widens the survivor.
+	//
+	// TWO CORRECTIONS, 2026-09-15, AFTER THIS PASS ATE THE DAY'S NEWS.
+	//
+	// Stephen opened a story about the Aberdeen school district drafting an AI
+	// policy and found its coverage list carried Todd Blanche on Chinese AI
+	// theft and a wire piece about tech CEOs and Congress. The cluster held 426
+	// articles across 197 domains. It was not alone: 24 clusters were over 100
+	// articles, topped by a Longmont police-report budget line at 489 and a
+	// Linden data-centre ban at 479. Small local stories had swallowed the
+	// national feed.
+	//
+	// FIRST, two shared names is not evidence when the names are ubiquitous.
+	// Nearly every AI policy story in this period mentions Donald Trump and Sam
+	// Altman, so the person test fired on story pairs with nothing else in
+	// common. A person match now also requires real token overlap. Names
+	// corroborate a merge; they no longer justify one alone.
+	//
+	// SECOND, and this is what made it runaway: the survivor's token set was
+	// widened with the absorbed cluster's tokens, and the loop repeats until
+	// nothing merges. Each merge therefore made the next merge easier, so a
+	// cluster that swallowed two siblings could reach a third it never
+	// resembled. The comment above called that widening a reason to repeat. It
+	// is the reason not to. Comparison now uses the tokens the cluster had
+	// when it formed, held in seedTk, so a cluster cannot bootstrap itself into
+	// matching the whole feed. The union is still tracked in tk for anything
+	// else that reads it.
 	personSet := func(c *cluster) map[string]bool {
 		m := map[string]bool{}
 		for _, a := range c.arts {
@@ -1789,12 +1814,28 @@ func publishNews(db *sql.DB) error {
 		}
 		return n
 	}
+	// The tokens each cluster had when it formed. Merging widens tk; seedTk is
+	// deliberately left alone, so similarity is always measured against what
+	// the cluster originally was.
+	seedTk := make([]map[string]bool, len(cls))
+	for i, c := range cls {
+		m := make(map[string]bool, len(c.tk))
+		for k := range c.tk {
+			m[k] = true
+		}
+		seedTk[i] = m
+	}
 	for merged := true; merged; {
 		merged = false
 		for i := 0; i < len(cls) && !merged; i++ {
 			pi := personSet(cls[i])
 			for j := i + 1; j < len(cls); j++ {
-				same := sim(cls[i].tk, cls[j].tk) >= 0.5 || sharedPersons(pi, personSet(cls[j])) >= 2
+				overlap := sim(seedTk[i], seedTk[j])
+				// A person match corroborates, it does not carry the merge on
+				// its own: two stories naming Trump and Altman still have to
+				// look somewhat alike.
+				same := overlap >= 0.5 ||
+					(sharedPersons(pi, personSet(cls[j])) >= 2 && overlap >= 0.25)
 				if !same {
 					continue
 				}
@@ -1803,6 +1844,7 @@ func publishNews(db *sql.DB) error {
 					cls[i].tk[k] = true
 				}
 				cls = append(cls[:j], cls[j+1:]...)
+				seedTk = append(seedTk[:j], seedTk[j+1:]...)
 				merged = true
 				break
 			}
