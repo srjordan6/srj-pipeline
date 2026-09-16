@@ -5885,6 +5885,23 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 
 	for _, v := range order {
 		c := by[v]
+		// ALIASES REACH THE SITE, so a story that names a model can link to the
+		// lab that makes it. Stephen, 2026-09-15: a story about China closing
+		// the technology gap should chip Moonshot AI, DeepSeek and Z.ai. All
+		// three had pages; none chipped, because the article names Kimi, GLM
+		// and Qwen and nothing connected a model to its company. The aliases
+		// were in twoai_entities the whole time and simply never travelled.
+		var aliases []string
+		if ar, aerr := db.Query(`SELECT jsonb_array_elements_text(COALESCE(aliases,'[]'::jsonb))
+			FROM twoai_entities WHERE uid=$1`, c.UID); aerr == nil {
+			for ar.Next() {
+				var a string
+				if ar.Scan(&a) == nil && strings.TrimSpace(a) != "" {
+					aliases = append(aliases, a)
+				}
+			}
+			ar.Close()
+		}
 		// Every tracked company gets a page. The directory was linking entries
 		// whose pages did not exist - a reader clicked a company and landed on
 		// nothing. Thin companies say less on their page; they no longer say
@@ -5904,6 +5921,7 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 				enriched["cases"] = c.Cases
 				enriched["mcp"] = c.MCP
 				enriched["has_page"] = c.Pages
+				enriched["aliases"] = aliases
 				enriched["profile"] = p
 				if hq, _ := p["headquarters"].(string); hq != "" {
 					if l, ok := lawFor(hq); ok {
@@ -5919,6 +5937,7 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 			}
 			count++
 		}
+		_ = aliases
 		entry := map[string]any{
 			"uid": c.UID, "name": c.Name, "products": len(c.Products),
 			"cases": len(c.Cases), "mcp": len(c.MCP), "has_page": c.Pages,
