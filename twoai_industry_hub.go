@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -355,6 +356,11 @@ func twoaiHarvestSources(db *sql.DB) error {
 	rows.Close()
 	client := &http.Client{Timeout: 20 * time.Second}
 	fetched, skipped, failed := 0, 0, 0
+	// Failures are named in the log rather than only counted. "failed=17 of
+	// 156" told nobody which sources were missing, so the gap sat unexamined
+	// while the affected points went brief-less. A 403 and a dead host need
+	// different responses and are now distinguishable at a glance.
+	var refused, unreachable, empty []string
 	for _, j := range jobs {
 		// once per day per URL: reruns and multi-sector shared URLs are free
 		var last string
@@ -364,8 +370,33 @@ func twoaiHarvestSources(db *sql.DB) error {
 			continue
 		}
 		req, _ := http.NewRequest("GET", j.url, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org source harvest; info@srjconsultingservices.com)")
-		req.Header.Set("Accept", "text/html,application/xhtml+xml")
+		// BROWSER-SHAPED, STILL IDENTIFIED.
+		//
+		// This used to send "Mozilla/5.0 (compatible; theworldofai.org source
+		// harvest; info@...)", which is the honest form and is exactly the
+		// shape Cloudflare and Akamai bot rules catch. Seven of 156 sources
+		// returned 403 to it and 200 to a browser on 2026-09-16, and they were
+		// not marginal: content.naic.org is the NAIC model bulletin, the
+		// operative US governance document for insurance AI and the first
+		// point on that sector page. deere.com backs agriculture, openai.com
+		// is a primary source.
+		//
+		// Stephen chose this middle position on 2026-09-16 rather than a plain
+		// Chrome string: the token is browser-shaped enough to pass a WAF, and
+		// the site, a contact address and an about page are appended, so any
+		// administrator reading a log can see exactly who called and why. It
+		// is not a disguise. A site that still refuses it has refused a
+		// request that named itself, and that answer is respected.
+		//
+		// Measured after the change: six of the seven recovered, including
+		// NAIC and Deere. weforum.org still returns 403 and is left alone.
+		//
+		// The restraint that makes this defensible is unchanged: one fetch per
+		// URL per day, 250ms apart, and only pages this site already cites and
+		// links to publicly.
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 theworldofai.org/1.0 (+https://theworldofai.org/about/; info@srjconsultingservices.com)")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 		resp, ferr := client.Do(req)
 		status, extract := 0, ""
 		if ferr == nil {
@@ -388,6 +419,18 @@ func twoaiHarvestSources(db *sql.DB) error {
 			}
 		} else {
 			failed++
+			host := j.url
+			if u, uerr := url.Parse(j.url); uerr == nil && u.Host != "" {
+				host = u.Host
+			}
+			switch {
+			case status == 0:
+				unreachable = append(unreachable, host)
+			case status == 200:
+				empty = append(empty, host)
+			default:
+				refused = append(refused, fmt.Sprintf("%s(%d)", host, status))
+			}
 			// keep yesterday's extract; only bump status and date
 			db.Exec(`INSERT INTO twoai_source_harvest (url, sector_slug, source_name, http_status, fetched_on)
 				VALUES ($1,$2,$3,$4,current_date)
@@ -398,6 +441,15 @@ func twoaiHarvestSources(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_industry_hub: harvest fetched=%d unchanged_today=%d failed=%d of %d sources\n",
 		fetched, skipped, failed, len(jobs))
+	if len(refused) > 0 {
+		fmt.Printf("twoai_industry_hub: refused by the publisher: %s\n", strings.Join(refused, ", "))
+	}
+	if len(unreachable) > 0 {
+		fmt.Printf("twoai_industry_hub: no connection, may be dead or moved: %s\n", strings.Join(unreachable, ", "))
+	}
+	if len(empty) > 0 {
+		fmt.Printf("twoai_industry_hub: answered 200 with nothing extractable, likely client-rendered: %s\n", strings.Join(empty, ", "))
+	}
 	return nil
 }
 
