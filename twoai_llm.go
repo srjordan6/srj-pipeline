@@ -310,7 +310,13 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 			// model had simply spent its budget thinking. Only a refused
 			// connection or an HTTP error from the server marks it down.
 			isTimeout := strings.Contains(err.Error(), "deadline exceeded") || strings.Contains(err.Error(), "Timeout")
-			isPerCall := isTimeout || strings.Contains(err.Error(), "empty response") || strings.Contains(err.Error(), "budget exhausted")
+			// A 5xx from the server is one request the server could not serve,
+			// not the server being gone; Ollama Cloud returned a 500 with a
+			// reference id on the first statute of 2026-09-17 and answered the
+			// next request normally. Only a refused connection, a DNS failure or
+			// a 4xx that says the key or model is wrong marks it down.
+			is5xx := strings.Contains(err.Error(), "ollama 5")
+			isPerCall := isTimeout || is5xx || strings.Contains(err.Error(), "empty response") || strings.Contains(err.Error(), "budget exhausted")
 			if isPerCall {
 				fmt.Fprintf(os.Stderr, "twoai_llm: ollama call failed on %s (%v), retrying once\n", stage, err)
 				if out, err2 := twoaiOllamaCallThink(model, system, user, think); err2 == nil {

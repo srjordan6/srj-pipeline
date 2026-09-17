@@ -74,14 +74,17 @@ func twoaiEnactedLaws(db *sql.DB) error {
 	if v := os.Getenv("TWOAI_ENACTED_LAWS_LIMIT"); v != "" {
 		fmt.Sscanf(v, "%d", &limit)
 	}
-	// A statute needs a wide window. Set for this stage only.
+	// A statute needs a wide window. 131,072 drew a 500 from Ollama Cloud on
+	// the first bill; 65,536 is what a long bill actually needs and is known
+	// to be served. Set for this stage only unless the caller chose one.
 	if os.Getenv("OLLAMA_NUM_CTX") == "" {
-		os.Setenv("OLLAMA_NUM_CTX", "131072")
+		os.Setenv("OLLAMA_NUM_CTX", "65536")
 	}
 
 	// Passed, relevant, and either never paged or changed since.
 	rows, err := db.Query(`
-		SELECT d.external_id, d.change_hash, d.url,
+		SELECT DISTINCT ON (d.raw->'bill'->>'state', d.raw->'bill'->>'bill_number')
+		       d.external_id, d.change_hash, d.url,
 		       d.raw->'bill'->>'state', d.raw->'bill'->>'bill_number', d.raw->'bill'->>'title',
 		       COALESCE(d.raw->'bill'->>'status_date',''),
 		       COALESCE(d.raw->'bill'->>'description',''),
@@ -98,7 +101,7 @@ func twoaiEnactedLaws(db *sql.DB) error {
 		      WHERE p.path = 'compliance/law-' || lower(d.raw->'bill'->>'state') || '-' ||
 		                     lower(regexp_replace(d.raw->'bill'->>'bill_number','[^A-Za-z0-9]','','g')) || '.json'
 		        AND p.data->>'change_hash' = d.change_hash)
-		ORDER BY d.raw->'bill'->>'status_date' DESC
+		ORDER BY d.raw->'bill'->>'state', d.raw->'bill'->>'bill_number', d.raw->'bill'->>'status_date' DESC, d.change_hash DESC
 		LIMIT $1`, limit)
 	if err != nil {
 		return err
@@ -153,9 +156,10 @@ Rules. Every item in obligations, prohibitions, definitions, effects and exempti
 			failed++
 			continue
 		}
-		// Cap the prompt at roughly 100,000 tokens; a longer bill is cut with
-		// a note, which the model is told about.
-		const capChars = 380000
+		// Cap the prompt at roughly 40,000 tokens to stay inside the window
+		// with room for the answer; a longer bill is cut with a note, which
+		// the model is told about.
+		const capChars = 160000
 		prompt := text
 		if len(prompt) > capChars {
 			prompt = prompt[:capChars] + "\n\n[TEXT TRUNCATED AT THIS POINT FOR LENGTH]"
