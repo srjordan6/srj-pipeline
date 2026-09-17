@@ -8681,18 +8681,23 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 	// tools across 87 — and using it wherever it is larger would silently
 	// restate counts the site has shown for weeks. Only the one-page-many-items
 	// case is wrong, so only that case changes.
-	// The one-page-many-items rule reads `total`, and the Industry Use Cases
-	// hub declares its count as `total_points` - 159 sourced points across 21
-	// industries, stated on the page itself. So the hub reported 1 on the
-	// category page beside sections reporting 4, 7, 17. Stephen, 2026-09-16.
-	// Both names are read now; a page states its own size under whichever
-	// it uses.
+	// COUNT THE UNIQUE DATA, NOT THE PAGES. Stephen, 2026-09-16: every piece
+	// of unique data will have its own uid. The count beside a section is how
+	// many of the thing it holds, and a page that declares its total knows
+	// that better than a count of files does. AI Tools Catalog reported 98
+	// beside a page saying 320 tools across 23 categories; state-ai-laws
+	// reports pages where a reader expects bills.
+	//
+	// This reverses the narrow reading that used a declared total only for a
+	// single-page section. That caution was about not silently restating
+	// numbers the site had shown for weeks; the owner has now stated the
+	// numbers should be the data, so the restatement is deliberate. A section
+	// whose pages declare no total still reports its page count.
 	rows, err := db.Query(`SELECT t.slug, t.name, COALESCE(t.blurb,''), t.status,
 			COALESCE(t.live_path,''), COALESCE(t.parent_slug,''), t.level,
-			(SELECT CASE
-				WHEN count(*) = 1 AND COALESCE(max(COALESCE(NULLIF(p.data->>'total',''), NULLIF(p.data->>'total_points',''))::int),0) > COALESCE(sum(p.url_count),0)
-					THEN max(COALESCE(NULLIF(p.data->>'total',''), NULLIF(p.data->>'total_points',''))::int)
-				ELSE COALESCE(sum(p.url_count),0) END
+			(SELECT GREATEST(
+				COALESCE(max(COALESCE(NULLIF(p.data->>'total',''), NULLIF(p.data->>'total_points',''))::int),0),
+				COALESCE(sum(p.url_count),0))
 			 FROM twoai_pages p WHERE p.taxonomy_slug = t.slug)
 		FROM twoai_taxonomy t WHERE t.level IN (1,2,3) AND COALESCE(t.status,'') <> 'retired'
 		ORDER BY t.level, t.sort`)
