@@ -156,6 +156,18 @@ Rules. Every item in obligations, prohibitions, definitions, effects and exempti
 			failed++
 			continue
 		}
+		// A PDF THAT EXTRACTED AS GIBBERISH IS NOT A STATUTE. Maryland serves
+		// its bills as PDFs, and MD SB8 came back as text pdftotext could
+		// produce characters from but not words: the model read it, cited 55
+		// sections, and none of the 55 existed. The citation check caught it,
+		// which is what it is for, but the cheaper test is upstream. A statute
+		// says "section" and "shall"; a failed extraction does not.
+		low := strings.ToLower(text)
+		if !strings.Contains(low, "section") && !strings.Contains(low, "§") {
+			fmt.Fprintf(os.Stderr, "twoai_enacted_laws: %s %s: extracted text names no sections (%d chars, %s); likely a failed PDF extraction, skipping\n", b.state, b.number, len(text), mime)
+			failed++
+			continue
+		}
 		// Cap the prompt at roughly 40,000 tokens to stay inside the window
 		// with room for the answer. A bill longer than that is NOT cut at the
 		// cap: an omnibus puts its AI section wherever it lands, and CT HB
