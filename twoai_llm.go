@@ -152,11 +152,14 @@ func twoaiOllamaCallThink(model, system, user string, think bool) (string, error
 	// 52,000 to 66,000 characters on the harder items, about 13,000 to
 	// 16,000 tokens, before writing a word of JSON - measured 2026-09-17 -
 	// and a 16,000 budget cut it off at the answer. A retry re-spends all of
-	// that thinking, so the budget is eight times the answer budget by
-	// default, 32,000 on the standard 4,000. TWOAI_THINK_MULTIPLIER tunes it.
+	// that thinking, so the budget is sixteen times the answer budget by
+	// default, 64,000 on the standard 4,000. Stephen, on seeing the retries:
+	// give it a bigger budget. The cost of unused headroom is nothing; the
+	// cost of a cutoff is the whole thinking pass again. TWOAI_THINK_MULTIPLIER
+	// tunes it.
 	budget := twoaiMaxTokens()
 	if think {
-		mult := 8
+		mult := 16
 		if v := strings.TrimSpace(os.Getenv("TWOAI_THINK_MULTIPLIER")); v != "" {
 			fmt.Sscanf(v, "%d", &mult)
 		}
