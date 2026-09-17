@@ -340,9 +340,20 @@ func twoaiHarvestExtract(raw []byte) string {
 }
 
 func twoaiHarvestSources(db *sql.DB) error {
+	// Sources come from two places. The 21 sector pages keep their points in
+	// twoai_industries. The AI Insurance hub - 10 sections, 100 items, and
+	// their children - keeps its points on the page documents themselves in
+	// twoai_pages. Until 2026-09-17 only the first was harvested, so of the
+	// 26 sources cited across the insurance pages, 2 had ever been fetched,
+	// and none of the rest could get a reading or be noticed going stale.
 	rows, err := db.Query(`SELECT i.slug, p->>'name', p->>'source'
 		FROM twoai_industries i, jsonb_array_elements(i.points) p
-		WHERE p->>'source' LIKE 'http%'`)
+		WHERE p->>'source' LIKE 'http%'
+		UNION
+		SELECT COALESCE(pg.data->>'tax', pg.path), p->>'name', p->>'source'
+		FROM twoai_pages pg, jsonb_array_elements(pg.data->'points') p
+		WHERE (pg.path LIKE 'industries/ins-%' OR pg.data->>'shape' = 'coverage-item')
+		  AND p->>'source' LIKE 'http%'`)
 	if err != nil {
 		return err
 	}
