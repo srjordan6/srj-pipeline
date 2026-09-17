@@ -8764,6 +8764,13 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 				COALESCE(max(COALESCE(NULLIF(p.data->>'total',''), NULLIF(p.data->>'total_points',''))::int),0),
 				COALESCE(sum(p.url_count),0))
 			 FROM twoai_pages p WHERE p.taxonomy_slug = t.slug)
+			-- Downloads are assets, not pages, and live in their own table keyed
+			-- by section. Stephen, 2026-09-17: the Downloads section showed no
+			-- counts at all, because it has eight assets and zero pages. A
+			-- section counts its own assets; the Downloads hub counts them all.
+			+ (SELECT count(*) FROM twoai_downloads d
+			    WHERE d.status = 'live'
+			      AND (d.section_slug = t.slug OR (t.slug = 'downloads' AND d.section_slug LIKE 'dl-%')))
 		FROM twoai_taxonomy t WHERE t.level IN (1,2,3) AND COALESCE(t.status,'') <> 'retired'
 		ORDER BY t.level, t.sort`)
 	if err != nil {
