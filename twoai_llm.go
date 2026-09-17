@@ -26,16 +26,17 @@ package main
 // The split is per stage rather than global, so moving one job is a config
 // change and never an all-or-nothing switch.
 //
-// FALLING BACK IS THE POINT, UNLESS THE OWNER SAYS OTHERWISE. If Ollama is
-// not running, the default answer is not "write nothing" - it is Claude, plus
-// a line in the log saying the local model was unreachable. A stopped service
-// must degrade to working-and-paid, never to silently-producing-nothing.
+// NO FALLBACK. Stephen, 2026-09-16: I do not want Claude at all. If Ollama
+// cannot handle it, just fail and tell me. So the default is Ollama, and a
+// stage that cannot get an answer from it reports the error and writes
+// nothing. TWOAI_LLM_FALLBACK=claude restores the paid fallback for a run;
+// nothing reaches Anthropic unless that is set, or a stage is routed there
+// explicitly with TWOAI_LLM_<STAGE>=anthropic.
 //
-// Stephen, 2026-09-16: I do not want to fall back to Claude. TWOAI_LLM_FALLBACK
-// set to "none" honours that: a stage asked for Ollama gets Ollama or gets an
-// error, and the stage decides what an error means - the insurance seed
-// counts it failed and moves on, leaving the item unseeded rather than
-// seeded by a model he did not choose. The log says which happened.
+// This reverses the posture the file opened with, that a stopped local
+// service should degrade to working-and-paid rather than to nothing. The
+// owner has chosen nothing, and a stage that writes nothing says so in the
+// log with the reason, which is the part that matters.
 
 import (
 	"bytes"
@@ -55,7 +56,8 @@ import (
 //	TWOAI_LLM              default for every stage: "ollama" or "anthropic"
 //	TWOAI_LLM_<STAGE>      override for one stage, same values
 //
-// Unset means anthropic, so nothing changes until somebody turns it on.
+// Unset means ollama. Anthropic is reached only when a stage is routed there
+// by name.
 func twoaiLLMFor(stage string) string {
 	if v := strings.TrimSpace(os.Getenv("TWOAI_LLM_" + strings.ToUpper(stage))); v != "" {
 		return strings.ToLower(v)
@@ -63,7 +65,7 @@ func twoaiLLMFor(stage string) string {
 	if v := strings.TrimSpace(os.Getenv("TWOAI_LLM")); v != "" {
 		return strings.ToLower(v)
 	}
-	return "anthropic"
+	return "ollama"
 }
 
 var (
@@ -225,7 +227,8 @@ func twoaiStripMarkdown(s string) string {
 // model that is down should cost money, not content.
 func twoaiGenerate(stage, system, user string) (string, string, error) {
 	want := twoaiLLMFor(stage)
-	noFallback := strings.EqualFold(strings.TrimSpace(os.Getenv("TWOAI_LLM_FALLBACK")), "none")
+	// Fallback to Claude is off unless asked for by name.
+	noFallback := !strings.EqualFold(strings.TrimSpace(os.Getenv("TWOAI_LLM_FALLBACK")), "claude")
 	if want == "ollama" {
 		ollamaMu.Lock()
 		down := ollamaDown
@@ -265,10 +268,10 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 			if noFallback {
 				ollamaWarnOnce.Do(func() {
 					fmt.Fprintf(os.Stderr,
-						"twoai_llm: ollama unreachable at %s (%v); TWOAI_LLM_FALLBACK=none, so nothing is written for the rest of this run\n",
+						"twoai_llm: ollama unreachable at %s (%v); no fallback, nothing is written for the rest of this run\n",
 						twoaiOllamaHost(), err)
 				})
-				return "", "", fmt.Errorf("ollama unavailable and fallback is off: %w", err)
+				return "", "", fmt.Errorf("ollama unavailable: %w", err)
 			}
 			ollamaWarnOnce.Do(func() {
 				fmt.Fprintf(os.Stderr,
@@ -276,9 +279,11 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 					twoaiOllamaHost(), err)
 			})
 		} else if noFallback {
-			return "", "", fmt.Errorf("ollama marked down earlier in this run and fallback is off")
+			return "", "", fmt.Errorf("ollama marked down earlier in this run")
 		}
 	}
+	// Only reached when a stage is routed to anthropic by name, or fallback
+	// was requested by name. Neither happens by default.
 	model := os.Getenv("TWOAI_BRIEF_MODEL")
 	if model == "" {
 		model = "claude-haiku-4-5"
