@@ -151,24 +151,21 @@ func twoaiOllamaCall(model, system, user string) (string, error) {
 }
 
 func twoaiOllamaCallThink(model, system, user string, think bool) (string, error) {
-	// THINKING SPENDS THE OUTPUT BUDGET. Reasoning tokens count against
-	// num_predict. DeepSeek V4 Pro on the insurance template reasoned for
-	// 52,000 to 66,000 characters on the harder items, about 13,000 to
-	// 16,000 tokens, before writing a word of JSON - measured 2026-09-17 -
-	// and a 16,000 budget cut it off at the answer. A retry re-spends all of
-	// that thinking, so the budget is sixteen times the answer budget by
-	// default, 64,000 on the standard 4,000. Stephen, on seeing the retries:
-	// give it a bigger budget. The cost of unused headroom is nothing; the
-	// cost of a cutoff is the whole thinking pass again. TWOAI_THINK_MULTIPLIER
-	// tunes it.
-	budget := twoaiMaxTokens()
-	if think {
-		mult := 16
-		if v := strings.TrimSpace(os.Getenv("TWOAI_THINK_MULTIPLIER")); v != "" {
-			fmt.Sscanf(v, "%d", &mult)
-		}
-		budget *= mult
+	// THE MODEL DECIDES WHETHER TO THINK, so the budget cannot depend on the
+	// flag. The scheduled run of 2026-09-17 had no thinking flag set for the
+	// enacted-laws stage; DeepSeek Pro reasoned for 18,000 characters on each
+	// statute regardless, hit the 4,000 answer budget before writing a word,
+	// and twenty bills failed twice each. Reasoning tokens count against
+	// num_predict whether or not the request asked for them. Unused headroom
+	// costs nothing, so the ceiling is sixteen times the answer budget for
+	// every call, 64,000 on the standard 4,000. TWOAI_THINK_MULTIPLIER tunes
+	// it. The think flag now only controls whether the request ASKS for
+	// reasoning; it never narrows the room to finish.
+	mult := 16
+	if v := strings.TrimSpace(os.Getenv("TWOAI_THINK_MULTIPLIER")); v != "" {
+		fmt.Sscanf(v, "%d", &mult)
 	}
+	budget := twoaiMaxTokens() * mult
 	// Context window. 8,192 fits a summary job. A statute does not: the
 	// enacted-laws stage hands the model a whole bill, and a 40,000 token bill
 	// in an 8,192 window is read from the middle with the title cut off.
