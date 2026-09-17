@@ -147,6 +147,15 @@ func twoaiOllamaCall(model, system, user string) (string, error) {
 }
 
 func twoaiOllamaCallThink(model, system, user string, think bool) (string, error) {
+	// THINKING SPENDS THE OUTPUT BUDGET. Reasoning tokens count against
+	// num_predict, and DeepSeek V4 Pro working through a structured template
+	// used the whole 4,000 on reasoning and returned an empty response on
+	// 2026-09-17. With thinking on, the budget is four times the answer
+	// budget so the answer still fits after the thinking.
+	budget := twoaiMaxTokens()
+	if think {
+		budget *= 4
+	}
 	payload := map[string]any{
 		"model":  model,
 		"system": system,
@@ -158,8 +167,7 @@ func twoaiOllamaCallThink(model, system, user string, think bool) (string, error
 			// indistinguishable from invention.
 			"temperature": 0.2,
 			"num_ctx":     8192,
-			// Enough output for a structured document, not just a paragraph.
-			"num_predict": twoaiMaxTokens(),
+			"num_predict": budget,
 		},
 	}
 	if think {
@@ -189,8 +197,11 @@ func twoaiOllamaCallThink(model, system, user string, think bool) (string, error
 		return "", fmt.Errorf("ollama %d: %.200s", resp.StatusCode, b)
 	}
 	var out struct {
-		Response string `json:"response"`
-		Error    string `json:"error"`
+		Response   string `json:"response"`
+		Thinking   string `json:"thinking"`
+		Error      string `json:"error"`
+		DoneReason string `json:"done_reason"`
+		EvalCount  int    `json:"eval_count"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
@@ -199,7 +210,14 @@ func twoaiOllamaCallThink(model, system, user string, think bool) (string, error
 		return "", fmt.Errorf("ollama: %s", out.Error)
 	}
 	if strings.TrimSpace(out.Response) == "" {
-		return "", fmt.Errorf("ollama returned an empty response")
+		// Say what actually happened, because the fix differs. A budget
+		// exhausted by thinking wants a bigger num_predict; a genuinely empty
+		// answer from a working model wants a different prompt. Neither is
+		// the server being down.
+		if out.DoneReason == "length" {
+			return "", fmt.Errorf("output budget exhausted before the answer (eval_count=%d, thinking=%d chars); raise TWOAI_MAX_TOKENS", out.EvalCount, len(out.Thinking))
+		}
+		return "", fmt.Errorf("ollama returned an empty response (done_reason=%s, thinking=%d chars)", out.DoneReason, len(out.Thinking))
 	}
 	// Open models emit Unicode hyphens and dashes freely - U+2011 non-breaking
 	// hyphen in "contact‑center", U+2010 in compounds - seen in every
@@ -263,23 +281,24 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 			if err == nil {
 				return twoaiStripMarkdown(out), "ollama:" + model, nil
 			}
-			// A TIMEOUT IS NOT THE SERVER BEING DOWN. It is one generation
-			// taking longer than the deadline, which a large cloud model does
-			// on a long structured answer. Marking the server down on that
-			// sent every remaining item of the insurance seed to Claude on
-			// 2026-09-16 after a single slow call. A timeout gets one retry;
-			// only a refused connection or an HTTP error from the server
-			// itself marks it down for the run.
+			// A TIMEOUT IS NOT THE SERVER BEING DOWN, and neither is a reply
+			// with nothing in it. Both are one call going wrong. Marking the
+			// server down on a timeout sent every remaining insurance item to
+			// Claude on 2026-09-16; marking it down on an empty response
+			// stopped the whole run after one item on the 17th, when the
+			// model had simply spent its budget thinking. Only a refused
+			// connection or an HTTP error from the server marks it down.
 			isTimeout := strings.Contains(err.Error(), "deadline exceeded") || strings.Contains(err.Error(), "Timeout")
-			if isTimeout {
-				fmt.Fprintf(os.Stderr, "twoai_llm: ollama timed out on %s, retrying once\n", stage)
+			isPerCall := isTimeout || strings.Contains(err.Error(), "empty response") || strings.Contains(err.Error(), "budget exhausted")
+			if isPerCall {
+				fmt.Fprintf(os.Stderr, "twoai_llm: ollama call failed on %s (%v), retrying once\n", stage, err)
 				if out, err2 := twoaiOllamaCallThink(model, system, user, think); err2 == nil {
 					return twoaiStripMarkdown(out), "ollama:" + model, nil
 				} else {
 					err = err2
 				}
 				if noFallback {
-					return "", "", fmt.Errorf("ollama timed out twice and fallback is off: %w", err)
+					return "", "", fmt.Errorf("ollama failed twice: %w", err)
 				}
 			} else {
 				// One failure marks the server down for the rest of the run. A
