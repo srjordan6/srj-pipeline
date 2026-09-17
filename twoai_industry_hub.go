@@ -490,13 +490,28 @@ func twoaiClaudeAnalyzeSector(sector, payload string) (model, body string, err e
 	return model, body, err
 }
 
+// twoaiMaxTokens is the output ceiling for a model call. 1200 was enough for
+// a summary and is not enough for a structured document: the insurance seed
+// template is about 2,000 tokens of JSON, and a ceiling below that returned
+// well-formed JSON cut off mid-string, which the parser correctly refused.
+// TWOAI_MAX_TOKENS raises it for a run.
+func twoaiMaxTokens() int {
+	if v := strings.TrimSpace(os.Getenv("TWOAI_MAX_TOKENS")); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 4000
+}
+
 // twoaiClaudeCall posts a messages request with one retry on rate limits
 // and overloads: 429 and 529 wait out the backoff and try once more, so a
 // 22-call run does not lose its biggest payloads to a burst limit.
 func twoaiClaudeCall(model, system, user string) (string, error) {
 	key := os.Getenv("ANTHROPIC_API_KEY")
 	reqBody, _ := json.Marshal(map[string]any{
-		"model": model, "max_tokens": 1200, "system": system,
+		"model": model, "max_tokens": twoaiMaxTokens(), "system": system,
 		"messages": []map[string]string{{"role": "user", "content": user}},
 	})
 	client := &http.Client{Timeout: 120 * time.Second}

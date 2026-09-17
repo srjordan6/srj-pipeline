@@ -26,11 +26,16 @@ package main
 // The split is per stage rather than global, so moving one job is a config
 // change and never an all-or-nothing switch.
 //
-// FALLING BACK IS THE POINT. If Ollama is not running, the answer is not
-// "write nothing" - it is Claude, plus a line in the log saying the local
-// model was unreachable. A stopped service must degrade to working-and-paid,
-// never to silently-producing-nothing, which is the failure this pipeline has
-// been bitten by more than once.
+// FALLING BACK IS THE POINT, UNLESS THE OWNER SAYS OTHERWISE. If Ollama is
+// not running, the default answer is not "write nothing" - it is Claude, plus
+// a line in the log saying the local model was unreachable. A stopped service
+// must degrade to working-and-paid, never to silently-producing-nothing.
+//
+// Stephen, 2026-09-16: I do not want to fall back to Claude. TWOAI_LLM_FALLBACK
+// set to "none" honours that: a stage asked for Ollama gets Ollama or gets an
+// error, and the stage decides what an error means - the insurance seed
+// counts it failed and moves on, leaving the item unseeded rather than
+// seeded by a model he did not choose. The log says which happened.
 
 import (
 	"bytes"
@@ -100,7 +105,22 @@ func twoaiOllamaModel(stage string) string {
 	return "mistral-small"
 }
 
-var twoaiOllamaClient = &http.Client{Timeout: 180 * time.Second}
+// twoaiOllamaTimeout is how long one non-streaming generation may take. 180
+// seconds was fine for a summary. A large cloud model producing two thousand
+// tokens of structured JSON can take longer than that to return its FIRST
+// byte, because a non-streaming call answers only when it is finished, and
+// the client reported that as "context deadline exceeded while awaiting
+// headers" - which reads as the server being down when it was simply still
+// writing. OLLAMA_TIMEOUT_SEC raises it for a run.
+func twoaiOllamaTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("OLLAMA_TIMEOUT_SEC")); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 180 * time.Second
+}
 
 // twoaiOllamaCall runs one completion against the local server. Same shape as
 // twoaiClaudeCall so a stage can swap between them without knowing which it
@@ -117,6 +137,8 @@ func twoaiOllamaCall(model, system, user string) (string, error) {
 			// indistinguishable from invention.
 			"temperature": 0.2,
 			"num_ctx":     8192,
+			// Enough output for a structured document, not just a paragraph.
+			"num_predict": twoaiMaxTokens(),
 		},
 	})
 	req, err := http.NewRequest("POST", twoaiOllamaHost()+"/api/generate", bytes.NewReader(body))
@@ -131,7 +153,8 @@ func twoaiOllamaCall(model, system, user string) (string, error) {
 	if key := strings.TrimSpace(os.Getenv("OLLAMA_API_KEY")); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
-	resp, err := twoaiOllamaClient.Do(req)
+	client := &http.Client{Timeout: twoaiOllamaTimeout()}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -202,6 +225,7 @@ func twoaiStripMarkdown(s string) string {
 // model that is down should cost money, not content.
 func twoaiGenerate(stage, system, user string) (string, string, error) {
 	want := twoaiLLMFor(stage)
+	noFallback := strings.EqualFold(strings.TrimSpace(os.Getenv("TWOAI_LLM_FALLBACK")), "none")
 	if want == "ollama" {
 		ollamaMu.Lock()
 		down := ollamaDown
@@ -212,18 +236,47 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 			if err == nil {
 				return twoaiStripMarkdown(out), "ollama:" + model, nil
 			}
-			// One failure marks the server down for the rest of the run. A
-			// model that is not pulled, or a service that is stopped, fails
-			// identically on every subsequent call, and retrying four hundred
-			// times at a three-minute timeout would eat the whole run.
-			ollamaMu.Lock()
-			ollamaDown = true
-			ollamaMu.Unlock()
+			// A TIMEOUT IS NOT THE SERVER BEING DOWN. It is one generation
+			// taking longer than the deadline, which a large cloud model does
+			// on a long structured answer. Marking the server down on that
+			// sent every remaining item of the insurance seed to Claude on
+			// 2026-09-16 after a single slow call. A timeout gets one retry;
+			// only a refused connection or an HTTP error from the server
+			// itself marks it down for the run.
+			isTimeout := strings.Contains(err.Error(), "deadline exceeded") || strings.Contains(err.Error(), "Timeout")
+			if isTimeout {
+				fmt.Fprintf(os.Stderr, "twoai_llm: ollama timed out on %s, retrying once\n", stage)
+				if out, err2 := twoaiOllamaCall(model, system, user); err2 == nil {
+					return twoaiStripMarkdown(out), "ollama:" + model, nil
+				} else {
+					err = err2
+				}
+				if noFallback {
+					return "", "", fmt.Errorf("ollama timed out twice and fallback is off: %w", err)
+				}
+			} else {
+				// One failure marks the server down for the rest of the run. A
+				// model that is not pulled, or a service that is stopped, fails
+				// identically on every subsequent call.
+				ollamaMu.Lock()
+				ollamaDown = true
+				ollamaMu.Unlock()
+			}
+			if noFallback {
+				ollamaWarnOnce.Do(func() {
+					fmt.Fprintf(os.Stderr,
+						"twoai_llm: ollama unreachable at %s (%v); TWOAI_LLM_FALLBACK=none, so nothing is written for the rest of this run\n",
+						twoaiOllamaHost(), err)
+				})
+				return "", "", fmt.Errorf("ollama unavailable and fallback is off: %w", err)
+			}
 			ollamaWarnOnce.Do(func() {
 				fmt.Fprintf(os.Stderr,
 					"twoai_llm: ollama unreachable at %s (%v), falling back to Claude for the rest of this run\n",
 					twoaiOllamaHost(), err)
 			})
+		} else if noFallback {
+			return "", "", fmt.Errorf("ollama marked down earlier in this run and fallback is off")
 		}
 	}
 	model := os.Getenv("TWOAI_BRIEF_MODEL")

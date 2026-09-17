@@ -149,6 +149,7 @@ Rules. Each list holds 4 to 7 items, each one sentence, specific to THIS exposur
 			continue
 		}
 		seeded++
+		fmt.Printf("twoai_insurance_seed: %s <- %s\n", j.name, model)
 		time.Sleep(400 * time.Millisecond)
 	}
 	fmt.Printf("twoai_insurance_seed: seeded=%d failed=%d of %d items; every seeded item stays draft until reviewed\n", seeded, failed, len(jobs))
