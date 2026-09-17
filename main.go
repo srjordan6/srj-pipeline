@@ -8758,6 +8758,21 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 	// numbers the site had shown for weeks; the owner has now stated the
 	// numbers should be the data, so the restatement is deliberate. A section
 	// whose pages declare no total still reports its page count.
+	// EVERY HUB GETS A LANDING PAGE. Stephen, 2026-09-17, clicking AI
+	// Compliance, Law and Regulation on the category page and landing on AI
+	// Laws by State instead: a level-2 hub with no live_path has nowhere to
+	// send a reader, so the category page falls back to the first child. Ten
+	// more hubs were in the same state - Foundation Models, AI Litigation, AI
+	// Datasets, the Tools Directory, the Observatory. A hub whose sections
+	// have paths and which has none of its own now gets a generated page
+	// listing its sections, at a uid derived from its slug, and the taxonomy
+	// row learns that path. Idempotent: a hub that already has a path is
+	// left alone, and the generated page is rewritten each run from the
+	// current children so it cannot drift.
+	if err := twoaiEnsureHubPages(db); err != nil {
+		fmt.Fprintln(os.Stderr, "twoai_ecosystem: hub pages:", err)
+	}
+
 	rows, err := db.Query(`SELECT t.slug, t.name, COALESCE(t.blurb,''), t.status,
 			COALESCE(t.live_path,''), COALESCE(t.parent_slug,''), t.level,
 			(SELECT GREATEST(
