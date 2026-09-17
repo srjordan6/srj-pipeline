@@ -94,13 +94,17 @@ func twoaiOllamaModel(stage string) string {
 	if m := strings.TrimSpace(os.Getenv("OLLAMA_MODEL")); m != "" {
 		return m
 	}
-	// The default depends on where the request is going. Stephen, 2026-09-16:
-	// move all to DeepSeek. Ollama Cloud's catalogue (read 2026-09-12 with
-	// his key) carries the deepseek-v4 family; v4.1-flash is the one he chose
-	// for the insurance seed and now for everything. Local keeps Mistral
-	// Small, which fits a 12GB card, for anyone running without the cloud.
+	// The default depends on where the request is going. Stephen, 2026-09-17:
+	// I want Pro on everything. So the cloud default is deepseek-v4-pro, the
+	// 1.6T reasoning model, for every stage that does not name its own. Flash
+	// remains available per stage with OLLAMA_MODEL_<STAGE>=deepseek-v4.1-flash
+	// for anyone who wants the cheaper tier on an extractive job. Thinking is a
+	// separate switch and stays off unless OLLAMA_THINK or OLLAMA_THINK_<STAGE>
+	// turns it on, so Pro without thinking is still a fast intuitive answer.
+	// Local keeps Mistral Small, which fits a 12GB card, for anyone running
+	// without the cloud.
 	if strings.Contains(twoaiOllamaHost(), "ollama.com") {
-		return "deepseek-v4.1-flash"
+		return "deepseek-v4-pro"
 	}
 	return "mistral-small"
 }
