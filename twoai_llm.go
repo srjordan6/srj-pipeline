@@ -122,11 +122,32 @@ func twoaiOllamaTimeout() time.Duration {
 	return 180 * time.Second
 }
 
+// twoaiOllamaThink says whether a stage should ask the model to reason
+// before answering. DeepSeek V4 Pro has three modes, no thinking, thinking
+// and max thinking, and runs in the first unless the request says
+// otherwise. Routing the judgment stages to the deep thinker and leaving
+// thinking off would buy the price of the large model and none of the
+// reasoning. OLLAMA_THINK_<STAGE>=true turns it on for one stage,
+// OLLAMA_THINK=true for all. Thinking output arrives in its own field and
+// never reaches the response text, so the parser sees only the answer.
+func twoaiOllamaThink(stage string) bool {
+	for _, k := range []string{"OLLAMA_THINK_" + strings.ToUpper(stage), "OLLAMA_THINK"} {
+		if v := strings.ToLower(strings.TrimSpace(os.Getenv(k))); v != "" {
+			return v == "1" || v == "true" || v == "yes" || v == "on"
+		}
+	}
+	return false
+}
+
 // twoaiOllamaCall runs one completion against the local server. Same shape as
 // twoaiClaudeCall so a stage can swap between them without knowing which it
 // got.
 func twoaiOllamaCall(model, system, user string) (string, error) {
-	body, _ := json.Marshal(map[string]any{
+	return twoaiOllamaCallThink(model, system, user, false)
+}
+
+func twoaiOllamaCallThink(model, system, user string, think bool) (string, error) {
+	payload := map[string]any{
 		"model":  model,
 		"system": system,
 		"prompt": user,
@@ -140,7 +161,11 @@ func twoaiOllamaCall(model, system, user string) (string, error) {
 			// Enough output for a structured document, not just a paragraph.
 			"num_predict": twoaiMaxTokens(),
 		},
-	})
+	}
+	if think {
+		payload["think"] = true
+	}
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest("POST", twoaiOllamaHost()+"/api/generate", bytes.NewReader(body))
 	if err != nil {
 		return "", err
@@ -233,7 +258,8 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 		ollamaMu.Unlock()
 		if !down {
 			model := twoaiOllamaModel(stage)
-			out, err := twoaiOllamaCall(model, system, user)
+			think := twoaiOllamaThink(stage)
+			out, err := twoaiOllamaCallThink(model, system, user, think)
 			if err == nil {
 				return twoaiStripMarkdown(out), "ollama:" + model, nil
 			}
@@ -247,7 +273,7 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 			isTimeout := strings.Contains(err.Error(), "deadline exceeded") || strings.Contains(err.Error(), "Timeout")
 			if isTimeout {
 				fmt.Fprintf(os.Stderr, "twoai_llm: ollama timed out on %s, retrying once\n", stage)
-				if out, err2 := twoaiOllamaCall(model, system, user); err2 == nil {
+				if out, err2 := twoaiOllamaCallThink(model, system, user, think); err2 == nil {
 					return twoaiStripMarkdown(out), "ollama:" + model, nil
 				} else {
 					err = err2
