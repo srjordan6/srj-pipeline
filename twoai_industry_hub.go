@@ -47,6 +47,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -505,10 +506,38 @@ func twoaiMaxTokens() int {
 	return 4000
 }
 
-// twoaiClaudeCall posts a messages request with one retry on rate limits
+// twoaiClaudeCall is the name every stage calls. Stephen, 2026-09-16: move
+// all to DeepSeek, and I do not want Claude at all. So this name no longer
+// reaches Anthropic by default. It routes to Ollama with the default model,
+// and reaches Anthropic only when TWOAI_LLM=anthropic is set globally, which
+// is the one way left to opt back in.
+//
+// Done here rather than at each call site because a dozen stages call this
+// directly, and a stage that was missed would keep spending money quietly.
+// Redirecting the name closes every path at once. The model argument the
+// caller passes is a Claude model name and is ignored on the Ollama path;
+// the log says so once so the provenance in a run log is truthful.
+var claudeRedirectOnce sync.Once
+
+func twoaiClaudeCall(model, system, user string) (string, error) {
+	if twoaiLLMFor("") != "anthropic" {
+		om := twoaiOllamaModel("")
+		claudeRedirectOnce.Do(func() {
+			fmt.Fprintf(os.Stderr, "twoai_llm: a stage asked for %s; routed to ollama:%s (set TWOAI_LLM=anthropic to reach Claude)\n", model, om)
+		})
+		out, err := twoaiOllamaCall(om, system, user)
+		if err != nil {
+			return "", err
+		}
+		return twoaiStripMarkdown(out), nil
+	}
+	return twoaiAnthropicCall(model, system, user)
+}
+
+// twoaiAnthropicCall posts a messages request with one retry on rate limits
 // and overloads: 429 and 529 wait out the backoff and try once more, so a
 // 22-call run does not lose its biggest payloads to a burst limit.
-func twoaiClaudeCall(model, system, user string) (string, error) {
+func twoaiAnthropicCall(model, system, user string) (string, error) {
 	key := os.Getenv("ANTHROPIC_API_KEY")
 	reqBody, _ := json.Marshal(map[string]any{
 		"model": model, "max_tokens": twoaiMaxTokens(), "system": system,

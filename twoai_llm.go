@@ -94,15 +94,13 @@ func twoaiOllamaModel(stage string) string {
 	if m := strings.TrimSpace(os.Getenv("OLLAMA_MODEL")); m != "" {
 		return m
 	}
-	// The default depends on where the request is going. Ollama Cloud's
-	// catalogue (read 2026-09-12 with Stephen's key) has no mistral-small;
-	// it carries gpt-oss:20b and :120b, gemma4:31b, the deepseek-v4 family,
-	// qwen3.5:397b, kimi and glm. gpt-oss:20b is the cheap fast one and
-	// suits the extractive jobs; the large ones are what the comparison
-	// exists to test. Local keeps Mistral Small, which fits a 12GB card and
-	// scored 80-81% on summarisation correctness in independent testing.
+	// The default depends on where the request is going. Stephen, 2026-09-16:
+	// move all to DeepSeek. Ollama Cloud's catalogue (read 2026-09-12 with
+	// his key) carries the deepseek-v4 family; v4.1-flash is the one he chose
+	// for the insurance seed and now for everything. Local keeps Mistral
+	// Small, which fits a 12GB card, for anyone running without the cloud.
 	if strings.Contains(twoaiOllamaHost(), "ollama.com") {
-		return "gpt-oss:20b"
+		return "deepseek-v4.1-flash"
 	}
 	return "mistral-small"
 }
@@ -288,7 +286,7 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 	if model == "" {
 		model = "claude-haiku-4-5"
 	}
-	out, err := twoaiClaudeCall(model, system, user)
+	out, err := twoaiAnthropicCall(model, system, user)
 	if err != nil {
 		return "", "", err
 	}
