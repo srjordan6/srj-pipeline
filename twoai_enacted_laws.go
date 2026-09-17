@@ -157,12 +157,18 @@ Rules. Every item in obligations, prohibitions, definitions, effects and exempti
 			continue
 		}
 		// Cap the prompt at roughly 40,000 tokens to stay inside the window
-		// with room for the answer; a longer bill is cut with a note, which
-		// the model is told about.
+		// with room for the answer. A bill longer than that is NOT cut at the
+		// cap: an omnibus puts its AI section wherever it lands, and CT HB
+		// 05222, 308,000 characters ending "...And Artificial Intelligence",
+		// got a reading about baby food and used cars because the AI provisions
+		// were past the cut. So a long bill is read as its opening, which
+		// carries the title and definitions, plus a window around every place
+		// the AI vocabulary appears, up to the cap. The model is told what it
+		// is looking at.
 		const capChars = 160000
 		prompt := text
 		if len(prompt) > capChars {
-			prompt = prompt[:capChars] + "\n\n[TEXT TRUNCATED AT THIS POINT FOR LENGTH]"
+			prompt = twoaiFocusStatute(text, capChars)
 		}
 		user := fmt.Sprintf("STATE: %s\nBILL: %s\nTITLE: %s\nSTATUS DATE: %s\n\nFULL TEXT OF THE ENACTED LAW:\n\n%s", b.state, b.number, b.title, b.statusDate, prompt)
 		raw, model, err := twoaiGenerate("ENACTED_LAWS", system, user)
@@ -340,4 +346,40 @@ func renderLawPage(state, number, title, statusDate, legiscanURL, textURL, model
 	sb.WriteString("<h2>Full text of the law</h2><p class=\"meta-line\">" + esc(state+" "+number) + ", " + fmt.Sprintf("%d", len(text)) + " characters, as enrolled. Public record.</p>")
 	sb.WriteString("<details><summary>Show the full text</summary><pre style=\"white-space:pre-wrap;font-size:.85em\">" + esc(text) + "</pre></details>")
 	return sb.String()
+}
+
+// twoaiFocusStatute reduces a long bill to its opening plus windows around
+// every AI-relevant passage, within budget, so an omnibus is read where it
+// matters rather than where it starts.
+var statuteAIRe = regexp.MustCompile(`(?i)artificial intelligence|automated decision|algorithmic|machine learning|generative|chatbot|deepfake|synthetic media|large language model|automated system|frontier model|foundation model`)
+
+func twoaiFocusStatute(text string, budget int) string {
+	head := 40000
+	if head > len(text) {
+		head = len(text)
+	}
+	out := []string{text[:head]}
+	used := head
+	last := head
+	const win = 6000
+	for _, m := range statuteAIRe.FindAllStringIndex(text, -1) {
+		start := m[0] - win/2
+		if start < last {
+			start = last
+		}
+		end := m[1] + win/2
+		if end > len(text) {
+			end = len(text)
+		}
+		if start >= end {
+			continue
+		}
+		if used+(end-start) > budget {
+			break
+		}
+		out = append(out, "\n\n[...]\n\n"+text[start:end])
+		used += end - start
+		last = end
+	}
+	return strings.Join(out, "") + fmt.Sprintf("\n\n[THIS BILL IS %d CHARACTERS. YOU HAVE BEEN GIVEN ITS OPENING AND EVERY PASSAGE THAT MENTIONS AI, AUTOMATED DECISIONS OR RELATED TERMS. READ FOR THE AI PROVISIONS; DESCRIBE THE REST ONLY AS CONTEXT.]", len(text))
 }
