@@ -8817,12 +8817,16 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 		level  int
 	}
 	var later []pending
+	// Numbers in blurbs come from the database, not from the day the blurb
+	// was typed. See twoai_live_counts.go.
+	live := twoaiLiveCounts(db)
 	for rows.Next() {
 		var slug, name, blurb, status, path, parent string
 		var level, pages int
 		if rows.Scan(&slug, &name, &blurb, &status, &path, &parent, &level, &pages) != nil {
 			continue
 		}
+		blurb = twoaiFillLiveCounts(blurb, live)
 		if level == 1 {
 			c := &category{Slug: slug, Name: name, Blurb: blurb}
 			cats = append(cats, c)
