@@ -690,6 +690,14 @@ func main() {
 		return
 	}
 
+	if src == "twoai_enacted_laws" {
+		if err := twoaiEnactedLaws(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_enacted_laws:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "twoai_insurance_watch" {
 		if err := twoaiInsuranceWatch(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_insurance_watch:", err)
@@ -4489,6 +4497,15 @@ func twoaiBuild(db *sql.DB) error {
 	// fatal: a checker that stops the build is worse than a dead link.
 	if err := twoaiLinkCheck(db); err != nil {
 		fmt.Println("twoai_link_check:", err)
+	}
+
+	// A compliance page for every passed AI law, from the enrolled text.
+	// Stephen, 2026-09-17: /ai-laws/ gave links to bills, not the law and
+	// what it means for AI. Twenty-five a run so the backlog of 192 clears in
+	// about a week and a busy session day never eats the run; a bill is done
+	// once and redone only when LegiScan reports it changed.
+	if err := twoaiEnactedLaws(db); err != nil {
+		fmt.Println("twoai_enacted_laws:", err)
 	}
 
 	// Monday: what the AI Insurance hub needs a person for. Anchor reports

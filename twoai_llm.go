@@ -169,6 +169,14 @@ func twoaiOllamaCallThink(model, system, user string, think bool) (string, error
 		}
 		budget *= mult
 	}
+	// Context window. 8,192 fits a summary job. A statute does not: the
+	// enacted-laws stage hands the model a whole bill, and a 40,000 token bill
+	// in an 8,192 window is read from the middle with the title cut off.
+	// OLLAMA_NUM_CTX raises it; Pro takes a million.
+	numCtx := 8192
+	if v := strings.TrimSpace(os.Getenv("OLLAMA_NUM_CTX")); v != "" {
+		fmt.Sscanf(v, "%d", &numCtx)
+	}
 	payload := map[string]any{
 		"model":  model,
 		"system": system,
@@ -179,7 +187,7 @@ func twoaiOllamaCallThink(model, system, user string, think bool) (string, error
 			// and creative variation in a summary of somebody else's text is
 			// indistinguishable from invention.
 			"temperature": 0.2,
-			"num_ctx":     8192,
+			"num_ctx":     numCtx,
 			"num_predict": budget,
 		},
 	}
