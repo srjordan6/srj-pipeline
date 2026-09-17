@@ -690,6 +690,14 @@ func main() {
 		return
 	}
 
+	if src == "twoai_insurance_seed" {
+		if err := twoaiInsuranceSeed(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_insurance_seed:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "legiscan_add" {
 		if err := legiscanAdd(db, os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "legiscan_add:", err)
