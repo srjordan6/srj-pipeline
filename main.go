@@ -690,6 +690,14 @@ func main() {
 		return
 	}
 
+	if src == "twoai_insurance_watch" {
+		if err := twoaiInsuranceWatch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_insurance_watch:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "twoai_insurance_seed" {
 		if err := twoaiInsuranceSeed(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_insurance_seed:", err)
@@ -1038,7 +1046,8 @@ func govinfo(db *sql.DB, sourceID int) (fetched, added int, err error) {
 		"query": `collection:USCOURTS ("artificial intelligence" OR "machine learning" OR ` +
 			`"large language model" OR "facial recognition" OR "algorithmic" OR ` +
 			`"automated decision" OR deepfake OR "synthetic media" OR "data center" OR ` +
-			`"data privacy" OR "consumer privacy" OR "biometric" OR "data broker" OR "invasion of privacy") ` +
+			`"data privacy" OR "consumer privacy" OR "biometric" OR "data broker" OR "invasion of privacy" OR ` +
+			`"algorithmic underwriting" OR "insurance" "artificial intelligence") ` +
 			`publishdate:range(` + since + `,)`,
 		"pageSize":   100,
 		"offsetMark": "*",
@@ -1213,6 +1222,37 @@ var privacyTerm = regexp.MustCompile(`(?i)\b(` +
 
 func mentionsPrivacy(s string) bool { return s != "" && privacyTerm.MatchString(s) }
 
+// insuranceTerm is the vocabulary of the AI Insurance hub, added 2026-09-17
+// as the second step of the plan to keep that hub current. Like privacyTerm
+// it is deliberately the language of the market rather than the bare word:
+// "insurance" alone matches a car ad and a health plan explainer, while
+// "reinsurance capacity", "errors and omissions", "catastrophe bond" and
+// "model bulletin" match the stories the hub is about. Paired with the AI
+// or data centre gate on the news path, so an insurance story passes when
+// it is about AI, a data centre, or a cyber loss - not on its own.
+var insuranceTerm = regexp.MustCompile(`(?i)\b(` +
+	`reinsurance|reinsurer|reinsurers|underwriting|underwriters?|` +
+	`errors and omissions|e&o|d&o|directors and officers|` +
+	`business interruption|contingent business interruption|equipment breakdown|` +
+	`catastrophe bond|cat bond|parametric (?:cover|coverage|insurance|policy)|` +
+	`surplus lines|excess and surplus|manuscript (?:form|wording|policy)|` +
+	`umbrella (?:policy|cover|coverage)|excess liability|` +
+	`policy (?:exclusion|wording|form)|exclusion endorsement|carve.?back|` +
+	`loss (?:ratio|history|run)|combined ratio|` +
+	`captive insurer|single parent captive|risk retention group|` +
+	`model bulletin|naic|insurance (?:commissioner|regulator|department)|` +
+	`lloyd's|lloyds of london|swiss re|munich re|hannover re|scor se|` +
+	`marsh mclennan|aon plc|willis towers|gallagher re|guy carpenter|am best|` +
+	`insurable value|total insured value|probable maximum loss|` +
+	`algorithmic underwriting|ai underwriting|automated underwriting` +
+	`)\b`)
+
+func mentionsInsurance(s string) bool { return s != "" && insuranceTerm.MatchString(s) }
+
+// insCyberTerm is the cyber-loss vocabulary that, with dcTerm, decides
+// whether an insurance headline is on this site's beat.
+var insCyberTerm = regexp.MustCompile(`(?i)\b(cyber|ransomware|data breach|prompt injection|model (?:theft|extraction|poisoning)|deepfake)\b`)
+
 // dcTerm is the data center vocabulary, kept separate from aiTerm because a
 // data center is not itself AI: it is the layer underneath, and this site's
 // whole thesis is that AI capability is downstream of buildings and power.
@@ -1358,6 +1398,12 @@ var legiscanQueries = []struct {
 	{"biometric", "biometric", 1},
 	{"age-appropriate design", "%22age-appropriate+design%22", 1},
 	{"invasion of privacy", "%22invasion+of+privacy%22", 1},
+	// AI Insurance, 2026-09-17. State adoptions of the NAIC model bulletin on
+	// insurers' use of AI arrive as bills and regulations; "algorithmic
+	// underwriting" is the phrase the bills use, and "insurance" paired with
+	// AI catches the rest without pulling in every auto insurance bill.
+	{"algorithmic underwriting", "%22algorithmic+underwriting%22", 1},
+	{"insurance artificial intelligence", "insurance+%22artificial+intelligence%22", 1},
 }
 
 func legiscanQuery(db *sql.DB, sourceID int, key string, client *http.Client,
@@ -1582,12 +1628,20 @@ var twoaiAIWordRe = regexp.MustCompile(`(?i)\b(a\.?i\.?|artificial intelligence|
 // since 2026-09-13 about privacy law, which this site now covers as the same
 // beat. The privacy vocabulary is law-shaped (see privacyTerm) so a headline
 // about a phone's privacy settings still does not qualify.
+//
+// Since 2026-09-17, also an insurance-market headline that touches AI, a
+// data centre or cyber - which is the AI Insurance hub's beat. Insurance
+// alone is not enough: a story about hurricane season passes only if it also
+// says something the hub tracks.
 func twoaiTitleIsAI(title string) bool {
 	t := strings.TrimSpace(title)
 	if t == "" {
 		return false
 	}
-	return twoaiAIWordRe.MatchString(t) || privacyTerm.MatchString(t)
+	if twoaiAIWordRe.MatchString(t) || privacyTerm.MatchString(t) {
+		return true
+	}
+	return insuranceTerm.MatchString(t) && (dcTerm.MatchString(t) || insCyberTerm.MatchString(t))
 }
 
 // twoaiWireTitle normalises a headline so the same wire item recognises
@@ -4435,6 +4489,17 @@ func twoaiBuild(db *sql.DB) error {
 	// fatal: a checker that stops the build is worse than a dead link.
 	if err := twoaiLinkCheck(db); err != nil {
 		fmt.Println("twoai_link_check:", err)
+	}
+
+	// Monday: what the AI Insurance hub needs a person for. Anchor reports
+	// due, items whose evidence moved since they were seeded, published
+	// points still without a source. Prints a queue; changes nothing. Once a
+	// week because the queue is for Stephen, and a daily copy of the same
+	// list is noise he would learn to skip.
+	if time.Now().UTC().Weekday() == time.Monday {
+		if err := twoaiInsuranceWatch(db); err != nil {
+			fmt.Println("twoai_insurance_watch:", err)
+		}
 	}
 
 	// Reader demand becomes shelf rows before the explanations run, so a

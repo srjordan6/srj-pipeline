@@ -422,10 +422,18 @@ func twoaiHarvestSources(db *sql.DB) error {
 		h := sha256.Sum256([]byte(extract))
 		if status == 200 && extract != "" {
 			fetched++
-			if _, err := db.Exec(`INSERT INTO twoai_source_harvest (url, sector_slug, source_name, http_status, extract, content_hash, fetched_on)
-				VALUES ($1,$2,$3,$4,$5,$6,current_date)
+			if _, err := db.Exec(`INSERT INTO twoai_source_harvest (url, sector_slug, source_name, http_status, extract, content_hash, fetched_on, content_changed_on)
+				VALUES ($1,$2,$3,$4,$5,$6,current_date,now())
 				ON CONFLICT (url) DO UPDATE SET sector_slug=$2, source_name=$3, http_status=$4,
-					extract=$5, content_hash=$6, fetched_on=current_date`,
+					extract=$5, fetched_on=current_date,
+					-- The date the CONTENT last changed, distinct from the date it
+					-- was last fetched. A source fetched daily and unchanged for a
+					-- year keeps its old content_changed_on; the day it changes,
+					-- that date moves, and twoai_insurance_watch lists every seeded
+					-- item that cites it. That is the review trigger.
+					content_changed_on = CASE WHEN twoai_source_harvest.content_hash IS DISTINCT FROM $6
+					                          THEN now() ELSE twoai_source_harvest.content_changed_on END,
+					content_hash=$6`,
 				j.url, j.slug, j.name, status, extract, hex.EncodeToString(h[:8])); err != nil {
 				return err
 			}
