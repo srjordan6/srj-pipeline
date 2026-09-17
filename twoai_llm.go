@@ -148,13 +148,19 @@ func twoaiOllamaCall(model, system, user string) (string, error) {
 
 func twoaiOllamaCallThink(model, system, user string, think bool) (string, error) {
 	// THINKING SPENDS THE OUTPUT BUDGET. Reasoning tokens count against
-	// num_predict, and DeepSeek V4 Pro working through a structured template
-	// used the whole 4,000 on reasoning and returned an empty response on
-	// 2026-09-17. With thinking on, the budget is four times the answer
-	// budget so the answer still fits after the thinking.
+	// num_predict. DeepSeek V4 Pro on the insurance template reasoned for
+	// 52,000 to 66,000 characters on the harder items, about 13,000 to
+	// 16,000 tokens, before writing a word of JSON - measured 2026-09-17 -
+	// and a 16,000 budget cut it off at the answer. A retry re-spends all of
+	// that thinking, so the budget is eight times the answer budget by
+	// default, 32,000 on the standard 4,000. TWOAI_THINK_MULTIPLIER tunes it.
 	budget := twoaiMaxTokens()
 	if think {
-		budget *= 4
+		mult := 8
+		if v := strings.TrimSpace(os.Getenv("TWOAI_THINK_MULTIPLIER")); v != "" {
+			fmt.Sscanf(v, "%d", &mult)
+		}
+		budget *= mult
 	}
 	payload := map[string]any{
 		"model":  model,
