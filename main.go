@@ -690,6 +690,14 @@ func main() {
 		return
 	}
 
+	if src == "twoai_glossary_seed" {
+		if err := twoaiGlossarySeed(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_glossary_seed:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "twoai_enacted_laws" {
 		if err := twoaiEnactedLaws(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_enacted_laws:", err)
@@ -4132,6 +4140,19 @@ func twoaiBuild(db *sql.DB) error {
 						t, ok := raw.(map[string]any)
 						if !ok {
 							continue
+						}
+						// EVERY TERM CARRIES A UID. Stephen, 2026-09-17: none of the
+						// glossary terms have a uid. Every other entity on this site
+						// does, and the standing rule is that every piece of data
+						// shows one. Minted from the slug the same way as every
+						// generated uid here, so it is stable for the life of the
+						// term, and attached at publish rather than written into the
+						// shared library, which srjconsultingservices.com also reads.
+						if slug, _ := t["slug"].(string); slug != "" {
+							if _, has := t["uid"]; !has {
+								h8 := sha256.Sum256([]byte("glossary:" + slug))
+								t["uid"] = hex.EncodeToString(h8[:4])
+							}
 						}
 						slug, _ := t["slug"].(string)
 						if ls, found := byTerm[slug]; found {
