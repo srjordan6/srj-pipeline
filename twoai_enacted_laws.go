@@ -160,11 +160,23 @@ Rules. Every item in obligations, prohibitions, definitions, effects and exempti
 		// its bills as PDFs, and MD SB8 came back as text pdftotext could
 		// produce characters from but not words: the model read it, cited 55
 		// sections, and none of the 55 existed. The citation check caught it,
-		// which is what it is for, but the cheaper test is upstream. A statute
-		// says "section" and "shall"; a failed extraction does not.
+		// which is what it is for, but the cheaper test is upstream.
+		//
+		// THE TEST IS WORDS, NOT SECTIONS. The first version of this check
+		// required the word "section", and skipped SC H5085 and VA HJR32, both
+		// clean HTML resolutions that simply say "Resolved, that..." without
+		// numbering anything. A resolution is a real enactment and belongs on
+		// the site. What a failed extraction lacks is not sections, it is
+		// ordinary words: it is characters without English in them. So the test
+		// is the density of common legislative words, which any genuine bill
+		// clears and a mangled PDF does not.
 		low := strings.ToLower(text)
-		if !strings.Contains(low, "section") && !strings.Contains(low, "§") {
-			fmt.Fprintf(os.Stderr, "twoai_enacted_laws: %s %s: extracted text names no sections (%d chars, %s); likely a failed PDF extraction, skipping\n", b.state, b.number, len(text), mime)
+		words := 0
+		for _, w := range []string{" the ", " shall ", " of ", " and ", " to ", " that ", " act ", " state "} {
+			words += strings.Count(low, w)
+		}
+		if words*400 < len(text) {
+			fmt.Fprintf(os.Stderr, "twoai_enacted_laws: %s %s: %d chars with only %d common words (%s); the text did not extract, skipping\n", b.state, b.number, len(text), words, mime)
 			failed++
 			continue
 		}
@@ -215,6 +227,8 @@ Rules. Every item in obligations, prohibitions, definitions, effects and exempti
 				bad++
 			}
 		}
+		// A bill that cites nothing is fine - a resolution has nothing to cite.
+		// A bill that cites sections which are not in the text is a fabrication.
 		if bad > 0 && bad*3 > len(r.SectionsCited) {
 			fmt.Fprintf(os.Stderr, "twoai_enacted_laws: %s %s: %d of %d cited sections not found in the text; rejected\n", b.state, b.number, bad, len(r.SectionsCited))
 			failed++
