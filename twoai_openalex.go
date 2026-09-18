@@ -520,8 +520,19 @@ func twoaiOAHarvestScope(db *sql.DB, base, source, subfieldName string, pageBudg
 		// window reaches back 30 days from the high-water mark so a paper
 		// indexed late is still caught.
 		since := highWater
-		if t, perr := time.Parse("2006-01-02", highWater); perr == nil {
+		// HIGH WATER IS A TIMESTAMP; THIS FILTER WANTS A DATE. high_water
+		// stores OpenAlex's updated_date, which arrives as
+		// 2026-09-17T12:34:56.789012. from_updated_date accepted that;
+		// from_publication_date refuses anything but yyyy-mm-dd with an HTTP
+		// 400, and the 2026-09-17 21:05 run got exactly that on all eight delta
+		// scopes. The date is the first ten characters, whatever follows them.
+		if len(since) >= 10 {
+			since = since[:10]
+		}
+		if t, perr := time.Parse("2006-01-02", since); perr == nil {
 			since = t.AddDate(0, 0, -30).Format("2006-01-02")
+		} else {
+			since = time.Now().UTC().AddDate(0, 0, -30).Format("2006-01-02")
 		}
 		filter = base + ",from_publication_date:" + since
 		if cursor == "" {
@@ -668,6 +679,11 @@ func twoaiOAHarvestScope(db *sql.DB, base, source, subfieldName string, pageBudg
 		fmt.Printf("openalex %s: archive complete, switching to delta mode\n", subfieldName)
 	}
 	if mode == "delta" {
+		// Store the high-water mark as a date, not a timestamp, so the next
+		// run can hand it to a filter that only takes dates.
+		if len(newestUpdate) > 10 {
+			newestUpdate = newestUpdate[:10]
+		}
 		db.Exec(`UPDATE twoai_harvest_cursors SET cursor='', high_water=$1, updated_at=now()
 			WHERE source=$2`, newestUpdate, source)
 	}

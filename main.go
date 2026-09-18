@@ -690,6 +690,14 @@ func main() {
 		return
 	}
 
+	if src == "twoai_freshness" {
+		if err := twoaiFreshnessReport(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_freshness:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "twoai_glossary_seed" {
 		if err := twoaiGlossarySeed(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_glossary_seed:", err)
@@ -4529,6 +4537,13 @@ func twoaiBuild(db *sql.DB) error {
 		fmt.Println("twoai_enacted_laws:", err)
 	}
 
+	// Every page carries its refresh contract before it is published, so
+	// the site can say on the page whether it is current. See
+	// twoai_freshness.go.
+	if err := twoaiStampFreshness(db); err != nil {
+		fmt.Println("twoai_freshness: stamp:", err)
+	}
+
 	// Monday: what the AI Insurance hub needs a person for. Anchor reports
 	// due, items whose evidence moved since they were seeded, published
 	// points still without a source. Prints a queue; changes nothing. Once a
@@ -4537,6 +4552,9 @@ func twoaiBuild(db *sql.DB) error {
 	if time.Now().UTC().Weekday() == time.Monday {
 		if err := twoaiInsuranceWatch(db); err != nil {
 			fmt.Println("twoai_insurance_watch:", err)
+		}
+		if err := twoaiFreshnessReport(db); err != nil {
+			fmt.Println("twoai_freshness:", err)
 		}
 	}
 
