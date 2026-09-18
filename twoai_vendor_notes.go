@@ -9,8 +9,9 @@ package main
 // every night would make the page unquotable and would hide a bad note behind
 // a good one the next day.
 //
-// COST. claude-haiku-4-5, the same model email_route already uses, is the
-// cheapest available here. Only posts that will actually get a page are
+// COST. This ran on claude-haiku-4-5 until 2026-09-18. Stephen cut all ties
+// with the Anthropic API on the 17th, so it now goes through twoaiGenerate to
+// Ollama like every other stage. Only posts that will actually get a page are
 // considered, which is roughly 1,956 of 4,856 rather than all of them, and the
 // per-run cap spreads the backfill across nightly runs instead of spending it
 // in one burst. Steady state is a handful of new posts a day.
@@ -27,15 +28,10 @@ package main
 // by a generated one.
 
 import (
-	"bytes"
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
-	"time"
 )
 
 // Posts per run. The backfill is ~1,950 notes, so this clears it in about a
@@ -61,36 +57,17 @@ Hard rules:
 
 Reply with the section text only, no heading, no preamble.`
 
-func vnGenerate(key, vendor, title, summary string) (string, error) {
+// vnGenerate asks the model for the reader note. Ollama only, through
+// twoaiGenerate under stage VENDOR_NOTES. It called Anthropic directly until
+// 2026-09-18 and had been silently skipped since the key was removed on the
+// 17th, which is how it was found: the log said "ANTHROPIC_API_KEY not set".
+func vnGenerate(vendor, title, summary string) (string, error) {
 	user := fmt.Sprintf("Vendor: %s\nHeadline: %s\n\nThe vendor's own description:\n%s", vendor, title, summary)
-	body, _ := json.Marshal(map[string]any{
-		"model":      "claude-haiku-4-5",
-		"max_tokens": 320,
-		"system":     vnPrompt,
-		"messages":   []map[string]string{{"role": "user", "content": user}},
-	})
-	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+	out, _, err := twoaiGenerate("vendor_notes", vnPrompt, user)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("anthropic: %d %s", resp.StatusCode, string(raw[:min(len(raw), 200)]))
-	}
-	var out struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if json.Unmarshal(raw, &out) != nil || len(out.Content) == 0 {
-		return "", fmt.Errorf("anthropic response unusable")
-	}
-	return strings.TrimSpace(out.Content[0].Text), nil
+	return strings.TrimSpace(out), nil
 }
 
 // vnUsable rejects the failure modes that would otherwise reach the site: the
@@ -108,11 +85,6 @@ func vnUsable(s string) bool {
 }
 
 func vendorNotes(db *sql.DB) error {
-	key := os.Getenv("ANTHROPIC_API_KEY")
-	if key == "" {
-		fmt.Println("vendor_notes: ANTHROPIC_API_KEY not set, skipped")
-		return nil
-	}
 	if _, err := db.Exec(`ALTER TABLE twoai_vendor_posts ADD COLUMN IF NOT EXISTS reader_note text`); err != nil {
 		return err
 	}
@@ -145,7 +117,7 @@ func vendorNotes(db *sql.DB) error {
 
 	written, declined, failed := 0, 0, 0
 	for _, c := range todo {
-		note, err := vnGenerate(key, c.vendor, c.title, c.summary)
+		note, err := vnGenerate(c.vendor, c.title, c.summary)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "vendor_notes:", c.slug, err)
 			failed++

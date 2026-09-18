@@ -29,6 +29,8 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+
+	"github.com/lib/pq"
 )
 
 // twoaiCadenceDays is the contract by page family. A page not matched here
@@ -83,8 +85,15 @@ func twoaiStampFreshness(db *sql.DB) error {
 	}
 	for c, paths := range byCadence {
 		// One statement per cadence value rather than one per page.
+		//
+		// pq.Array, not the bare slice. database/sql cannot send a Go []string
+		// as a Postgres array by itself, so this failed on every run with
+		// "unsupported type []string" and no page ever received its
+		// refresh_every_days. The stage logged the error and the pipeline
+		// carried on, which is how it went unnoticed until Stephen's log of
+		// 2026-09-18. main.go already wraps its arrays this way.
 		if _, err := db.Exec(`UPDATE twoai_pages SET data = data || jsonb_build_object('refresh_every_days', $1::int)
-			WHERE path = ANY($2) AND COALESCE((data->>'refresh_every_days')::int, -1) <> $1`, c, paths); err != nil {
+			WHERE path = ANY($2) AND COALESCE((data->>'refresh_every_days')::int, -1) <> $1::int`, c, pq.Array(paths)); err != nil {
 			return fmt.Errorf("stamp cadence %d: %w", c, err)
 		}
 	}

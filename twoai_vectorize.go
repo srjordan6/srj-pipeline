@@ -10,7 +10,49 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
+
+// twoaiVectorMetaCap is the ceiling we hold metadata to. Vectorize rejects
+// anything over 10240 bytes of compact JSON. The margin covers the difference
+// between how we serialise and how Cloudflare re-serialises to measure.
+const twoaiVectorMetaCap = 9600
+
+// twoaiFitMetadata returns url, title and as much of body as fits under the
+// cap, MEASURED AS JSON, which is what Vectorize measures.
+//
+// The old guard was `if len(body) > 6000 { body = body[:6000] }`. That counts
+// bytes of text, and JSON is not text: every quote, backslash and newline
+// becomes two bytes, and encoding/json writes each <, > and & as six. A table
+// heavy or code heavy chunk of 6000 bytes serialised to 12614 and 13512 bytes
+// in Stephen's log of 2026-09-18 and was rejected. Slicing at a fixed byte
+// could also cut a multi-byte character in half.
+//
+// It shrinks in proportion to how much this particular text inflates and
+// re-measures, cutting only at the start of a rune. Proportion matters: the
+// first draft subtracted the overshoot in JSON bytes from the raw length, and
+// on text that inflates sixfold that threw the entire body away. The test
+// caught it before it shipped.
+func twoaiFitMetadata(url, title, body string) map[string]string {
+	m := map[string]string{"url": url, "title": title, "body": body}
+	for i := 0; i < 8; i++ {
+		b, err := json.Marshal(m)
+		if err != nil || len(b) <= twoaiVectorMetaCap || len(body) == 0 {
+			return m
+		}
+		cut := len(body)*twoaiVectorMetaCap/len(b) - 32
+		if cut < 0 {
+			cut = 0
+		}
+		for cut > 0 && !utf8.RuneStart(body[cut]) {
+			cut--
+		}
+		body = body[:cut]
+		m["body"] = body
+	}
+	m["body"] = ""
+	return m
+}
 
 // twoaiVectorize pushes the retrieval index from Postgres to Cloudflare
 // Vectorize, so the Worker serving theworldofai.org can query it at the edge.
@@ -89,18 +131,11 @@ func twoaiVectorizeRun(db *sql.DB) error {
 		if json.Unmarshal([]byte(emb), &vals) != nil || len(vals) == 0 {
 			continue
 		}
-		// Metadata cap is 10KiB. Chunks are ~2KB, but trim defensively rather
-		// than have Vectorize reject a batch for one long row.
-		if len(body) > 6000 {
-			body = body[:6000]
-		}
 		todo = append(todo, vec{
-			ID:     fmt.Sprintf("%x", md5sum(path+"#"+fmt.Sprint(n))),
-			Values: vals,
-			Metadata: map[string]string{
-				"url": url, "title": title, "body": body,
-			},
-			hash: hash,
+			ID:       fmt.Sprintf("%x", md5sum(path+"#"+fmt.Sprint(n))),
+			Values:   vals,
+			Metadata: twoaiFitMetadata(url, title, body),
+			hash:     hash,
 		})
 	}
 	rows.Close()

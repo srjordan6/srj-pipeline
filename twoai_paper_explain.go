@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -39,10 +38,6 @@ import (
 // gains its explanations re-enters the sitemap automatically on the next
 // build, because the thin-page checks read the same fields this writes.
 func twoaiPaperExplain(db *sql.DB) error {
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		fmt.Println("twoai_paper_explain: ANTHROPIC_API_KEY not set, skipped")
-		return nil
-	}
 	// THE SAME TWELVE, FOREVER. This query took the twelve most-cited
 	// pending papers every run. When none of those twelve had an abstract in
 	// the local mirror and the API pot was already spent by the nightly
@@ -254,41 +249,18 @@ func paperExplainCall(title, authors string, year int, journal, note, abstract s
 		"3. business: for an executive, what this means in practice and what decision it informs.\n" +
 		"Output ONLY a JSON object: {\"beginner\":\"...\",\"practitioner\":\"...\",\"business\":\"...\"}\n\n" +
 		fmt.Sprintf("Title: %s\nAuthors: %s\nYear: %d\nVenue: %s\nEditor's note: %s\n\nAbstract:\n%s", title, authors, year, journal, note, abstract)
-	body, _ := json.Marshal(map[string]any{
-		"model":      "claude-haiku-4-5",
-		"max_tokens": 800,
-		"messages":   []map[string]string{{"role": "user", "content": prompt}},
-	})
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return "", "", "", err
+	// Ollama only, through twoaiGenerate under stage PAPER_EXPLAIN. This called
+	// Anthropic directly until 2026-09-18 and had been skipped since the key
+	// was removed on the 17th.
+	answer, _, gerr := twoaiGenerate("paper_explain", "", prompt)
+	if gerr != nil {
+		return "", "", "", gerr
 	}
-	req.Header.Set("x-api-key", os.Getenv("ANTHROPIC_API_KEY"))
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("content-type", "application/json")
-	client := &http.Client{Timeout: 90 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", "", err
+	raw := strings.TrimSpace(answer)
+	// A reasoning model may put words around the object. Take the object.
+	if i, j := strings.Index(raw, "{"), strings.LastIndex(raw, "}"); i >= 0 && j > i {
+		raw = raw[i : j+1]
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
-		return "", "", "", fmt.Errorf("anthropic %d: %s", resp.StatusCode, b)
-	}
-	var out struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", "", "", err
-	}
-	var sb strings.Builder
-	for _, c := range out.Content {
-		sb.WriteString(c.Text)
-	}
-	raw := strings.TrimSpace(sb.String())
 	raw = strings.TrimPrefix(raw, "```json")
 	raw = strings.TrimPrefix(raw, "```")
 	raw = strings.TrimSuffix(raw, "```")
