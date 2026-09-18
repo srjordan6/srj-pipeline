@@ -380,6 +380,44 @@ func twoaiTaxIndex(db *sql.DB) (map[string]string, []twoaiTaxNode) {
 // Hub h1s, verified against the built pages.
 var twoaiHubTitles = map[string]string{
 	"research": "AI Research Library",
+	// Added 2026-09-18, when the embed log still listed about 25 documents as
+	// "no title". Each is the hub page's own h1, read from the live site that
+	// day, not written here: the rule above, applied to the rest of the hubs.
+	"benchmarks": "AI Benchmarks and Performance",
+	"compliance": "AI Governance Frameworks",
+	"compute":    "GPU Compute Providers",
+	"downloads":  "Downloads and Asset Repository",
+	"laws":       "AI Laws by State",
+	"prompts":    "AI Prompts: Library and Techniques",
+	"skills":     "AI Skills Graph",
+	"sources":    "Sources & References",
+	"tools":      "AI Tools Directory",
+	"week":       "This Week in AI",
+}
+
+// twoaiDocTitlesByPath names a titleless document that is not a hub index.
+// Same rule: the live page's own h1.
+var twoaiDocTitlesByPath = map[string]string{
+	"research/watch.json": "arXiv Watch",
+}
+
+// twoaiEmbedByDesign lists documents that are deliberately not in the index,
+// with the reason. They used to be reported as "no title", which made a
+// decision look like a fault and hid the real faults among them. A directory
+// hub is a list of thousands of names whose own pages are each indexed, so
+// the list adds nothing a reader could be cited to; the meta and talent files
+// are the site's working data and member records, not reading matter.
+var twoaiEmbedByDesign = map[string]string{
+	"companies/index.json":         "directory list, each company is indexed by its own page",
+	"mcp/index.json":               "directory list, each server is indexed by its own page",
+	"people/index.json":            "directory list, each person is indexed by their own page",
+	"ecosystem/index.json":         "the home page map, every section in it is indexed by its own page",
+	"meta/dead-links.json":         "maintenance data, not a page for readers",
+	"meta/popular-pages.json":      "maintenance data, not a page for readers",
+	"talent/matches.json":          "member records, never indexed",
+	"talent/options.json":          "form options, not a page",
+	"talent/profiles.json":         "member records, never indexed",
+	"compliance/page-reviews.json": "review queue, not a page for readers",
 }
 
 // twoaiDocURL resolves ONE document to its page URL. Empty means the document
@@ -496,7 +534,23 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 		}
 		return ""
 	case "week":
+		if name == "index" {
+			return base + "/this-week-in-ai/"
+		}
 		return base + "/this-week-in-ai/" + name + "/"
+	case "compute":
+		return base + "/compute/"
+	case "sources":
+		return base + "/sources/"
+	case "jobs":
+		// The 30 discipline pages, "no url: jobs x30" in the embed log of
+		// 2026-09-18. Each renders under the market section by its own uid;
+		// checked live for edbea9a4, AI Company Operations Jobs. The jobs hub
+		// itself resolves through its taxonomy row before this switch is reached.
+		if uid, ok := doc["uid"].(string); ok && uid != "" {
+			return base + "/ai-ecosystem/ecosystem-entities-market-and-operations/" + uid + "/"
+		}
+		return ""
 	case "caselaw":
 		// Caselaw cases have no page of their own. They render inside their
 		// section page under doctrine headings (Fair use, Section 230, DMCA
@@ -691,6 +745,9 @@ func twoaiDocTitle(path string, doc map[string]any) string {
 		if t, ok := twoaiHubTitles[strings.TrimSuffix(path, "/index.json")]; ok {
 			return t
 		}
+	}
+	if t, ok := twoaiDocTitlesByPath[path]; ok {
+		return t
 	}
 	return ""
 }
@@ -925,6 +982,11 @@ func twoaiEmbedRun(db *sql.DB) error {
 		// asking whether everything on the site was reachable. A count
 		// cannot be acted on; a prefix and a reason can.
 		title := twoaiDocTitle(path, doc)
+		if _, ok := twoaiEmbedByDesign[path]; ok {
+			skipped++
+			skipWhy["by design: "+path[:strings.Index(path, "/")]]++
+			continue
+		}
 		if title == "" {
 			skipped++
 			skipWhy["no title: "+path[:strings.Index(path, "/")]]++

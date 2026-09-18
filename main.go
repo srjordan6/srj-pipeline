@@ -4577,12 +4577,13 @@ func twoaiBuild(db *sql.DB) error {
 		fmt.Println("twoai_state_law_pages:", err)
 	}
 
-	// Every page carries its refresh contract before it is published, so
-	// the site can say on the page whether it is current. See
-	// twoai_freshness.go.
-	if err := twoaiStampFreshness(db); err != nil {
-		fmt.Println("twoai_freshness: stamp:", err)
-	}
+	// THE REFRESH CONTRACT USED TO BE STAMPED HERE, part way through the build.
+	// Everything the build wrote after this point, companies, people, the MCP
+	// directory, tools, jobs, replaced its whole document and so dropped the
+	// field it had just been given. After the []string fix of 2026-09-18 let
+	// the stamp run at all, 587 of 5,789 pages kept it: exactly the pages
+	// written before this line. The call now sits at the end of twoaiBuild,
+	// after the last write.
 
 	// Monday: what the AI Insurance hub needs a person for. Anchor reports
 	// due, items whose evidence moved since they were seeded, published
@@ -4895,6 +4896,16 @@ func twoaiBuild(db *sql.DB) error {
 	if staleTimeline > 0 {
 		fmt.Fprintf(os.Stderr, "twoai_build: WARNING %d timeline entr(ies) past review interval, oldest %s - re-verify the source and bump twoai_timeline.reviewed_on\n",
 			staleTimeline, oldestTimeline.String)
+	}
+
+	// Every page carries its refresh contract before it is published, so the
+	// site can say on the page whether it is current. LAST, after every write
+	// above: an upsert replaces a whole document, so a stamp placed any earlier
+	// is lost on every page written after it. See twoai_freshness.go, and the
+	// note higher up where this call used to be. The default for a page family
+	// the table does not name is 30 days, Stephen's call on 2026-09-18.
+	if err := twoaiStampFreshness(db); err != nil {
+		fmt.Println("twoai_freshness: stamp:", err)
 	}
 
 	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d skills=%d downloads=%d ok=true\n",

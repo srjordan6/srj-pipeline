@@ -59,7 +59,9 @@ func twoaiCadenceDays(path, kind, shape string) int {
 	case strings.HasPrefix(path, "glossary/"), strings.HasPrefix(path, "tools/"):
 		return 90
 	}
-	return 60
+	// The default, for a page family this table does not name. 30 days,
+	// Stephen's decision on 2026-09-18. It was 60.
+	return 30
 }
 
 // twoaiStampFreshness writes the contract onto every page document. Runs
