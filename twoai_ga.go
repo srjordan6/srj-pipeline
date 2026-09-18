@@ -177,12 +177,46 @@ func twoaiGATop(db *sql.DB) error {
 	if start == "" {
 		start = "7daysAgo"
 	}
-	reqBody, _ := json.Marshal(map[string]any{
+	// THE BOTNET IS FILTERED OUT OF "MOST VISITED". Stephen's GA4 exploration of
+	// 2026-09-18, last 7 days: 7,374 active users, of which 7,047 reported a
+	// screen of 1366x1366, 147 reported 1280x1280 and 21 reported 800x600. No
+	// real device has a square screen, and 800x600 is a headless browser's
+	// default, so 98 percent of the week's "users" were one residential proxy
+	// botnet. This query fed the footer's Most visited list unfiltered, which
+	// means bots were choosing what the site recommends to readers.
+	//
+	// The filter names the dimension without requesting it as a column, which
+	// the Data API allows. The list is overridable, comma separated, because
+	// the operators will change fingerprint and the fix should be an env line,
+	// not a rebuild. Set GA_BOT_RESOLUTIONS=none to switch the filter off.
+	botRes := []string{"1366x1366", "1280x1280", "1024x1024", "2000x2000", "800x600"}
+	if v := strings.TrimSpace(os.Getenv("GA_BOT_RESOLUTIONS")); v != "" {
+		botRes = nil
+		if v != "none" {
+			for _, r := range strings.Split(v, ",") {
+				if r = strings.TrimSpace(r); r != "" {
+					botRes = append(botRes, r)
+				}
+			}
+		}
+	}
+	report := map[string]any{
 		"dateRanges": []map[string]string{{"startDate": start, "endDate": "yesterday"}},
 		"dimensions": []map[string]string{{"name": "pagePath"}},
 		"metrics":    []map[string]string{{"name": "screenPageViews"}},
 		"limit":      50,
-	})
+	}
+	if len(botRes) > 0 {
+		report["dimensionFilter"] = map[string]any{
+			"notExpression": map[string]any{
+				"filter": map[string]any{
+					"fieldName":    "screenResolution",
+					"inListFilter": map[string]any{"values": botRes},
+				},
+			},
+		}
+	}
+	reqBody, _ := json.Marshal(report)
 	req, _ := http.NewRequest("POST",
 		"https://analyticsdata.googleapis.com/v1beta/properties/"+prop+":runReport",
 		bytes.NewReader(reqBody))
