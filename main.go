@@ -54,6 +54,7 @@ var twoaiStageDeadline = map[string]time.Duration{
 	"twoai_vectorize": 30 * time.Minute,
 	"openalex_pull":   25 * time.Minute, // 150 pages plus backoff on 504s
 	"twoai_claims":    25 * time.Minute,
+	"twoai_lawsuit_fill": 30 * time.Minute, // up to 40 cases a run through Ollama
 	"twoai_jobs":      25 * time.Minute,
 	"intel":           10 * time.Minute, // the stage that proved the need
 	"twoai_recap":     8 * time.Minute,  // RECAP filing harvest, 12 dockets a run
@@ -120,7 +121,7 @@ const twoaiStageDeadlineDefault = 20 * time.Minute
 // same politeness per request, against an API with no monthly quota to
 // exhaust. It runs every time.
 var twoaiDailyOnly = map[string]bool{
-	"legiscan": true, "twoai_claims": true, "intel": true, "twoai_recap": true,
+	"legiscan": true, "twoai_claims": true, "intel": true, "twoai_recap": true, "twoai_lawsuit_fill": true,
 	"twoai_onet": true, "twoai_openlibrary": true, "twoai_case_studies": true,
 	"twoai_companyfacts": true, "twoai_orgfacts": true, "docwatch": true,
 	"twoai_etf_holdings": true, "openalex_watch": true, "export_corpus": true, "appsec_research": true,
@@ -250,6 +251,15 @@ func main() {
 		// first and trusting that the other cron gets created is exactly the
 		// silent-degradation failure this pipeline is built to avoid - the
 		// corpus would simply stop growing and nothing would say so.
+		// twoai_lawsuit_fill rides directly behind intel: intel promotes new
+		// cases and refreshes every docket, and the fill stage reads those
+		// dockets, so a case promoted this run can be described this run.
+		for i, s := range seq {
+			if s == "intel" {
+				seq = append(seq[:i+1], append([]string{"twoai_lawsuit_fill"}, seq[i+1:]...)...)
+				break
+			}
+		}
 		if os.Getenv("CORPUS_CRON") == "" {
 			seq = append(seq[:1], append([]string{"openalex_pull"}, seq[1:]...)...)
 			for i, s := range seq {
@@ -701,6 +711,14 @@ func main() {
 	if src == "twoai_glossary_seed" {
 		if err := twoaiGlossarySeed(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_glossary_seed:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_lawsuit_fill" {
+		if err := twoaiLawsuitFill(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_lawsuit_fill:", err)
 			os.Exit(1)
 		}
 		return
@@ -3303,24 +3321,40 @@ func intelPromote(db *sql.DB) (int, error) {
 	// stays a candidate. A case sitting in the queue costs nothing; a wrong
 	// case on a public tracker costs the credibility the whole site runs on.
 	aiCore := regexp.MustCompile(`(?i)openai|anthropic|midjourney|stability ai|uncharted labs|udio|suno,? inc|suno inc|perplexity ai|character technologies|character\.ai|clearview ai|workday|hirevue|runway ai|eleven ?labs|minimax|hugging face|deepseek|mistral ai|scale ai|x\.ai|meta platforms`)
-	noise := regexp.MustCompile(`(?i)cohere health|cohere beauty|cali-curl|villanueva|monolithic 3d|speednic|edgecomm|array cache|arlington technologies|mobility workx|health discovery|concurrent ventures|in re subpoena|department of war|nvidia|patent|licensing, ?llc|technologies llc`)
+	noise := regexp.MustCompile(`(?i)cohere health|cohere beauty|cali-curl|villanueva|monolithic 3d|speednic|edgecomm|array cache|arlington technologies|mobility workx|health discovery|concurrent ventures|in re subpoena|department of war|nvidia|patent|licensing, ?llc|technologies llc|neural ai|jamendo|siliconarts|ted entertainment`)
+
+	// THE GATE, REBUILT 2026-09-18. It asked for score >= 5, and the scorer gives
+	// 3 for an AI party in the caption plus 2 for an AI subject in the SNIPPET.
+	// CourtListener returns an empty snippet on most docket hits, so a real suit
+	// against OpenAI scored 3 and sat in the queue for months: 26 genuine cases
+	// were stuck there when Stephen asked why we tracked 113 against the 249 in
+	// RAND's count, Seattle Times v. OpenAI and Sony Music v. Anthropic among them.
+	//
+	// The fix is a better test, not a looser one. A caption naming a company
+	// whose whole business is AI is evidence by itself, so those promote at 3.
+	// A caption naming a company that is sued over everything, Google, Microsoft,
+	// Meta, Workday, Nvidia, says nothing about the subject, so those still need
+	// the subject signal and the full 5. Tested against the live queue before
+	// this shipped: every AI-native case passes, every patent shell is held.
+	aiNative := regexp.MustCompile(`(?i)openai|anthropic|midjourney|stability ai|uncharted labs|udio|suno,? inc|suno inc|perplexity ai|character technologies|character\.ai|clearview ai|hirevue|runway ai|eleven ?labs|minimax|hugging face|deepseek|mistral ai|scale ai|x\.ai`)
 
 	rows, err := db.Query(`SELECT id, case_name, court, COALESCE(docket,''),
-			COALESCE(filed_date::text,''), url, COALESCE(snippet,'')
+			COALESCE(filed_date::text,''), url, COALESCE(snippet,''), score
 		FROM ai_lawsuit_candidates
-		WHERE status='new' AND score >= 5
-		ORDER BY filed_date DESC NULLS LAST LIMIT 20`)
+		WHERE status='new' AND score >= 3
+		ORDER BY filed_date DESC NULLS LAST LIMIT 60`)
 	if err != nil {
 		return 0, err
 	}
 	type cand struct {
 		id                                       int64
 		name, court, docket, filed, url, snippet string
+		score                                    int
 	}
 	var cs []cand
 	for rows.Next() {
 		var c cand
-		if rows.Scan(&c.id, &c.name, &c.court, &c.docket, &c.filed, &c.url, &c.snippet) == nil {
+		if rows.Scan(&c.id, &c.name, &c.court, &c.docket, &c.filed, &c.url, &c.snippet, &c.score) == nil {
 			cs = append(cs, c)
 		}
 	}
@@ -3330,6 +3364,29 @@ func intelPromote(db *sql.DB) (int, error) {
 	promoted := 0
 	for _, c := range cs {
 		if !aiCore.MatchString(c.name) || noise.MatchString(c.name) {
+			continue
+		}
+		if c.score < 5 && !aiNative.MatchString(c.name) {
+			continue
+		}
+		// The same case reaches the queue twice, once from CourtListener and
+		// once from govinfo, under different URLs. Three of the 31 candidates
+		// that passed the new gate were already on the tracker that way. A
+		// govinfo row carries no docket number, so it is matched on caption
+		// alone; a CourtListener row is matched on caption and docket, because
+		// two real suits can share a caption, as two Does v. x.AI actions do.
+		var dup bool
+		if c.docket == "" {
+			db.QueryRow(`SELECT EXISTS(SELECT 1 FROM ai_lawsuits
+				WHERE lower(regexp_replace(case_name,'[^A-Za-z0-9]','','g')) = lower(regexp_replace($1,'[^A-Za-z0-9]','','g')))`,
+				c.name).Scan(&dup)
+		} else {
+			db.QueryRow(`SELECT EXISTS(SELECT 1 FROM ai_lawsuits
+				WHERE lower(regexp_replace(case_name,'[^A-Za-z0-9]','','g')) = lower(regexp_replace($1,'[^A-Za-z0-9]','','g'))
+				  AND COALESCE(docket,'') = $2)`, c.name, c.docket).Scan(&dup)
+		}
+		if dup {
+			db.Exec(`UPDATE ai_lawsuit_candidates SET status='ignored' WHERE id=$1`, c.id)
 			continue
 		}
 		// Two guards the defendant-name test cannot give, found by srj's audit
@@ -3388,7 +3445,7 @@ func intelPromote(db *sql.DB) (int, error) {
 			(slug, case_name, court, docket, filed_date, plaintiffs, defendants, category,
 			 status, status_badge, courtlistener_url, source_url, is_active, display_order,
 			 verified_date, summary)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,'copyright',
+			VALUES ($1,$2,$3,$4,$5,$6,$7,'unclassified',
 			 'Filed; docket monitoring active, no development recorded yet by this tracker',
 			 'Active Litigation',$8,$8,true,
 			 (SELECT COALESCE(MAX(display_order),0)+10 FROM ai_lawsuits),
