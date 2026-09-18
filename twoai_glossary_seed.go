@@ -104,6 +104,22 @@ type glossReading struct {
 	Origin     string `json:"origin"`
 }
 
+// twoaiGlossarySlug makes a term name safe as a URL path segment.
+//
+// twoaiSlug was not enough. "Tier III / Tier IV (Uptime Institute)" became
+// "tier-iii-/-tier-iv-(uptime-institute)", the slash made Astro read it as a
+// nested route with a missing parameter, and the site build failed twice on
+// 2026-09-17 before the cause was visible. Parentheses, ampersands and plus
+// signs in twenty other seeded terms were the same class of problem waiting.
+// A slug is a URL, a URL that can never move once published, and it is worth
+// being strict about at the point it is minted.
+func twoaiGlossarySlug(term string) string {
+	s := strings.ToLower(term)
+	s = strings.ReplaceAll(s, "&", " and ")
+	s = regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(s, "-")
+	return strings.Trim(s, "-")
+}
+
 func twoaiGlossarySeed(db *sql.DB) error {
 	limit := len(glossaryCandidates)
 	if v := os.Getenv("TWOAI_GLOSSARY_SEED_LIMIT"); v != "" {
@@ -145,7 +161,7 @@ Plain English. No hyphens in prose, use commas or periods.`
 		if made+failed >= limit {
 			break
 		}
-		slug := twoaiSlug(c.term)
+		slug := twoaiGlossarySlug(c.term)
 		if have[slug] || have[strings.ToLower(c.term)] {
 			skipped++
 			continue
