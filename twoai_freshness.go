@@ -46,6 +46,11 @@ func twoaiCadenceDays(path, kind, shape string) int {
 		return 14
 	case strings.HasPrefix(path, "jobs/"), strings.HasPrefix(path, "stocks/"):
 		return 1
+	case strings.HasPrefix(path, "lawsuits/"):
+		// Dockets are checked daily. Without this line the tracker fell to the
+		// default, and on 2026-09-18 its live stamp read "refreshed every 30
+		// days" directly under a sentence saying dockets are checked daily.
+		return 1
 	case strings.HasPrefix(path, "datacenters/"), strings.HasPrefix(path, "dc/"):
 		return 7
 	case strings.HasPrefix(path, "industries/"):
