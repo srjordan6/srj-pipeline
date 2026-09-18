@@ -3795,10 +3795,6 @@ func archiveNews(db *sql.DB) error {
 // anthropicSummarize writes a two-paragraph, own-words news summary. House
 // style: plain English, commas rather than dashes, no reproduced passages.
 func anthropicSummarize(headline, text string) (string, error) {
-	key := os.Getenv("ANTHROPIC_API_KEY")
-	if key == "" {
-		return "", fmt.Errorf("ANTHROPIC_API_KEY not set")
-	}
 	if len(text) < 400 {
 		return "", fmt.Errorf("article text too short to summarize")
 	}
@@ -3807,50 +3803,20 @@ func anthropicSummarize(headline, text string) (string, error) {
 		"Plain English. Use commas rather than dashes. Do not quote more than a few words. Do not repeat the headline. " +
 		"Do not add opinions or information that is not in the article. Output only the summary paragraphs.\n\n" +
 		"Headline: " + headline + "\n\nArticle text:\n" + text
-	body, _ := json.Marshal(map[string]any{
-		"model":      "claude-haiku-4-5",
-		"max_tokens": 400,
-		"messages":   []map[string]string{{"role": "user", "content": prompt}},
-	})
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	// NO ANTHROPIC. Stephen, 2026-09-17: cut all ties with the API. This was
+	// the oldest direct caller in the binary and it never went through
+	// twoaiGenerate, so the no-Claude rule of 09-16 did not reach it and it
+	// kept billing Haiku on every news run. It goes through the router now:
+	// Ollama Cloud or an error, and publish_news already degrades on an error.
+	s, _, err := twoaiGenerate("news_summary", "", prompt)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("content-type", "application/json")
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
-		return "", fmt.Errorf("anthropic %d: %s", resp.StatusCode, b)
-	}
-	var out struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	var sb strings.Builder
-	for _, c := range out.Content {
-		sb.WriteString(c.Text)
-	}
-	s := strings.TrimSpace(sb.String())
+	s = strings.TrimSpace(s)
 	if s == "" {
 		return "", fmt.Errorf("empty summary")
 	}
-	// The news path predates twoaiGenerate and calls Anthropic directly, so it
-	// needs the same strip: 103 of 593 stored summaries opened with a literal
-	// "# Summary" heading, which the briefing renders as a hash because these
-	// fields are plain text, not Markdown. Stephen saw them on the news pages
-	// on 2026-09-12.
-	return twoaiStripMarkdown(s), nil
+	return s, nil
 }
 
 // ---- twoai: theworldofai.org, SQL -> twoai-content ------------------------
@@ -9008,7 +8974,9 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 // THIRD, a failure is not fatal. No API key, a timeout, or a refusal returns an
 // empty string, the page renders without the recap, and the tables carry it.
 // The prose is a convenience on top of the record, never the record itself.
-const twoaiRecapModel = "claude-sonnet-5"
+// twoaiRecapModel is kept only so nothing else in the package stops compiling;
+// the recap goes through twoaiGenerate and no request is sent to Anthropic.
+const twoaiRecapModel = "removed-2026-09-17"
 
 func twoaiWeekRecap(db *sql.DB, label, start, end string, analysis map[string]any,
 	bills, federal, courts int) (string, string, error) {
@@ -9032,10 +9000,6 @@ func twoaiWeekRecap(db *sql.DB, label, start, end string, analysis map[string]an
 		return cached, cachedModel, nil
 	}
 
-	key := os.Getenv("ANTHROPIC_API_KEY")
-	if key == "" {
-		return "", "", nil // silent, not an error: the tables stand alone
-	}
 	prompt := "You are writing the opening recap for a weekly record of United States AI policy " +
 		"and litigation. Below is the ONLY information you have: computed counts from a database. " +
 		"You cannot see the individual bills or cases, and you must not invent any.\n\n" +
@@ -9047,52 +9011,27 @@ func twoaiWeekRecap(db *sql.DB, label, start, end string, analysis map[string]an
 		"a bill passed: a bill movement means its record changed status. Output only the paragraphs.\n\n" +
 		"Data:\n" + string(facts)
 
-	body, _ := json.Marshal(map[string]any{
-		"model":      twoaiRecapModel,
-		"max_tokens": 500,
-		"messages":   []map[string]string{{"role": "user", "content": prompt}},
-	})
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return "", "", err
+	// NO ANTHROPIC. This called claude-sonnet-5 directly and wrote a recap as
+	// late as 2026-09-17 22:01 CT, a day after the no-Claude rule, because it
+	// never went through twoaiGenerate. It does now. A model failure is still
+	// not fatal: the page renders without the recap and the tables carry it.
+	recap, usedModel, gerr := twoaiGenerate("week_recap", "", prompt)
+	if gerr != nil {
+		fmt.Fprintf(os.Stderr, "twoai_week_recap: %v, page renders without a recap\n", gerr)
+		return "", "", nil
 	}
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("content-type", "application/json")
-	client := &http.Client{Timeout: 90 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
-		return "", "", fmt.Errorf("anthropic %d: %s", resp.StatusCode, b)
-	}
-	var out struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", "", err
-	}
-	var sb strings.Builder
-	for _, c := range out.Content {
-		sb.WriteString(c.Text)
-	}
-	recap := strings.TrimSpace(sb.String())
+	recap = strings.TrimSpace(recap)
 	if recap == "" {
-		return "", "", fmt.Errorf("empty recap")
+		return "", "", nil
 	}
 	if _, err := db.Exec(`INSERT INTO twoai_week_recaps (slug, fingerprint, recap, model)
 		VALUES ($1,$2,$3,$4)
 		ON CONFLICT (slug) DO UPDATE SET fingerprint=EXCLUDED.fingerprint,
 			recap=EXCLUDED.recap, model=EXCLUDED.model, created_at=now()`,
-		slug, fp, recap, twoaiRecapModel); err != nil {
-		return recap, twoaiRecapModel, nil
+		slug, fp, recap, usedModel); err != nil {
+		return recap, usedModel, nil
 	}
-	return recap, twoaiRecapModel, nil
+	return recap, usedModel, nil
 }
 
 // twoaiPublish exports twoai_pages to the twoai-content repo, sha-compared

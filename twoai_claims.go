@@ -1,12 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -45,8 +42,15 @@ import (
 // abstract, and the extractor version is stored so a better prompt later can
 // re-run only what it needs to.
 
-const twoaiClaimModel = "claude-haiku-4-5"
-const twoaiClaimExtractor = "haiku-4-5/claims-v2"
+// The extractor label is provenance, so it changed with the model on
+// 2026-09-17 when Anthropic was removed. twoaiClaimExtractorPrior keeps the
+// works Haiku already read out of the queue: the prompt is the same, and
+// re-reading them on a new model would be spend with no new question asked.
+// twoaiClaimModel is kept only so nothing else in the package stops compiling;
+// no code path sends a request to it.
+const twoaiClaimModel = "removed-2026-09-17"
+const twoaiClaimExtractor = "ollama/claims-v2"
+const twoaiClaimExtractorPrior = "haiku-4-5/claims-v2"
 const twoaiClaimBatch = 120 // works per run; the backfill is a marathon
 
 type twoaiClaim struct {
@@ -65,7 +69,6 @@ type twoaiClaim struct {
 // is explicit that absence is an acceptable answer, because a model pushed to
 // find a number in every abstract will invent one.
 func twoaiExtractClaims(title, abstract string) ([]twoaiClaim, error) {
-	key := os.Getenv("ANTHROPIC_API_KEY")
 	prompt := "Extract every measured result this abstract CLAIMS. Return a JSON array and nothing else - " +
 		"no prose, no code fence.\n\n" +
 		"Each element: {\"metric\":\"\",\"value\":0,\"unit\":\"\",\"kind\":\"\",\"dataset\":\"\",\"task\":\"\",\"system\":\"\",\"baseline\":\"\",\"direction\":\"\"}\n\n" +
@@ -92,38 +95,10 @@ func twoaiExtractClaims(title, abstract string) ([]twoaiClaim, error) {
 		"IF THE ABSTRACT STATES NO MEASURED RESULT, RETURN []. An empty array is a correct and " +
 		"expected answer; do not manufacture a claim to avoid returning nothing.\n\n" +
 		"Title: " + title + "\nAbstract: " + abstract
-	body, _ := json.Marshal(map[string]any{
-		"model":      twoaiClaimModel,
-		"max_tokens": 2000, // 900 truncated multi-claim abstracts mid-array on 2026-09-14
-		"messages":   []map[string]string{{"role": "user", "content": prompt}},
-	})
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("content-type", "application/json")
-	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
-		return nil, fmt.Errorf("anthropic %d: %s", resp.StatusCode, b)
-	}
-	var out struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	raw := ""
-	for _, c := range out.Content {
-		raw += c.Text
+	// No Anthropic, 2026-09-17. Through the router like every other stage.
+	raw, _, gerr := twoaiGenerate("claims", "", prompt)
+	if gerr != nil {
+		return nil, gerr
 	}
 	raw = strings.TrimSpace(raw)
 	// EXTRACT THE ARRAY, IGNORE EVERYTHING AROUND IT. The old form stripped a
@@ -233,24 +208,19 @@ func twoaiClaims(db *sql.DB) error {
 		return fmt.Errorf("claims create attempts: %w", err)
 	}
 
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		fmt.Fprintln(os.Stderr, "twoai_claims: ANTHROPIC_API_KEY not set, nothing extracted")
-		return nil
-	}
-
 	// The cheap gate. A named metric AND a digit; ordered by citations so the
 	// papers the field actually reads are mined first, which matters while
 	// the backfill is incomplete.
 	rows, err := db.Query(`SELECT w.openalex_id, w.title, w.abstract
 		FROM twoai_works w
 		LEFT JOIN twoai_claim_attempts a
-		  ON a.openalex_id = w.openalex_id AND a.extractor = $1
+		  ON a.openalex_id = w.openalex_id AND a.extractor IN ($1, $3)
 		WHERE w.abstract IS NOT NULL
 		  AND a.openalex_id IS NULL
 		  AND w.abstract ~* '\m(accuracy|f1|bleu|auc|precision|recall|error rate|perplexity|iou|rouge|speedup|win rate)\M'
 		  AND w.abstract ~ '[0-9]'
 		ORDER BY w.cited_by DESC
-		LIMIT $2`, twoaiClaimExtractor, twoaiClaimBatch)
+		LIMIT $2`, twoaiClaimExtractor, twoaiClaimBatch, twoaiClaimExtractorPrior)
 	if err != nil {
 		return fmt.Errorf("claims candidate query: %w", err)
 	}

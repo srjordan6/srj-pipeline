@@ -65,8 +65,9 @@ package main
 // logged and marked read but never routed, so the bridge carries signal.
 //
 // Environment: DATABASE_URL, GOOGLE_SA_EMAIL, GOOGLE_SA_KEY (PEM),
-// ANTHROPIC_API_KEY. Without the Anthropic key the stage falls back to
-// keyword routing, cruder but functional.
+// OLLAMA_HOST and OLLAMA_API_KEY. Anthropic was removed on 2026-09-17: triage
+// goes through twoaiGenerate, and when the model cannot answer the stage
+// falls back to keyword routing, cruder but functional.
 
 import (
 	"bytes"
@@ -255,10 +256,6 @@ type erVerdict struct {
 }
 
 func erCategorize(m erMessage) (erVerdict, error) {
-	key := os.Getenv("ANTHROPIC_API_KEY")
-	if key == "" {
-		return erKeywordFallback(m), nil
-	}
 	prompt := "You triage email for Stephen R. Jordan, who runs SRJ Consulting (AI advisory), " +
 		"a nine-volume book series (The Operating Discipline for AI Library, Volumes I-IX, published via Amazon KDP), " +
 		"the srjconsultingservices.com website, and theworldofai.org (publishing, launches, newsletter, promotion). " +
@@ -272,36 +269,24 @@ func erCategorize(m erMessage) (erVerdict, error) {
 		"deadline=true for time-sensitive language; financial_legal=true for money, contracts, or legal language.\n\n" +
 		"From: " + m.From + "\nSubject: " + m.Subject + "\n\n" + m.Body +
 		"\n\nReply with ONLY this JSON, no prose: {\"noise\":bool,\"expertise\":\"...\",\"site\":\"...\",\"volume\":int,\"deadline\":bool,\"financial_legal\":bool}"
-	body, _ := json.Marshal(map[string]any{
-		"model": "claude-haiku-4-5", "max_tokens": 150,
-		"messages": []map[string]string{{"role": "user", "content": prompt}},
-	})
-	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return erVerdict{}, err
+	// No Anthropic. A model that cannot answer is not a reason to leave mail
+	// unread for a day, so failure drops to the keyword router instead of
+	// returning an error.
+	answer, _, gerr := twoaiGenerate("email_route", "", prompt)
+	if gerr != nil {
+		fmt.Fprintf(os.Stderr, "email_route: model unavailable (%v), keyword routing\n", gerr)
+		return erKeywordFallback(m), nil
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return erVerdict{}, fmt.Errorf("anthropic: %d %s", resp.StatusCode, string(raw[:min(len(raw), 200)]))
+	text := strings.TrimSpace(answer)
+	// Take the JSON object wherever it sits; a reasoning model may wrap it.
+	if i, j := strings.Index(text, "{"), strings.LastIndex(text, "}"); i >= 0 && j > i {
+		text = text[i : j+1]
 	}
-	var out struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if json.Unmarshal(raw, &out) != nil || len(out.Content) == 0 {
-		return erVerdict{}, fmt.Errorf("anthropic response unusable")
-	}
-	text := strings.TrimSpace(out.Content[0].Text)
 	text = strings.TrimPrefix(strings.TrimSuffix(text, "```"), "```json")
 	var v erVerdict
 	if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &v); err != nil {
-		return erVerdict{}, fmt.Errorf("verdict not JSON: %s", text[:min(len(text), 120)])
+		fmt.Fprintf(os.Stderr, "email_route: verdict not JSON (%s), keyword routing\n", text[:min(len(text), 120)])
+		return erKeywordFallback(m), nil
 	}
 	return v, nil
 }

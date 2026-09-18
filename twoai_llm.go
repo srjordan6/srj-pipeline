@@ -349,15 +349,11 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 			return "", "", fmt.Errorf("ollama marked down earlier in this run")
 		}
 	}
-	// Only reached when a stage is routed to anthropic by name, or fallback
-	// was requested by name. Neither happens by default.
-	model := os.Getenv("TWOAI_BRIEF_MODEL")
-	if model == "" {
-		model = "claude-haiku-4-5"
-	}
-	out, err := twoaiAnthropicCall(model, system, user)
-	if err != nil {
-		return "", "", err
-	}
-	return twoaiStripMarkdown(out), model, nil
+	// NO ANTHROPIC, BY ANY ROUTE. Stephen, 2026-09-17: I am still being charged,
+	// cut all ties with the API. Until today a stage could still be sent there
+	// with TWOAI_LLM=anthropic, TWOAI_LLM_<STAGE>=anthropic or
+	// TWOAI_LLM_FALLBACK=claude. Those switches now do nothing but fail loudly,
+	// so a stale env var on a cron cannot spend money. twoaiAnthropicCall stays
+	// in the tree uncalled; bringing it back is a code change, not a setting.
+	return "", "", fmt.Errorf("stage %s is routed to anthropic, which was removed on 2026-09-17: unset TWOAI_LLM, TWOAI_LLM_%s and TWOAI_LLM_FALLBACK", stage, strings.ToUpper(stage))
 }
