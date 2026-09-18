@@ -4179,7 +4179,19 @@ func twoaiBuild(db *sql.DB) error {
 		var cj, tj any
 		json.Unmarshal([]byte(claims), &cj)
 		json.Unmarshal([]byte(timeline), &tj)
+		// EVERY CASE CARRIES ITS UID. Stephen, 2026-09-17: I don't see uids on
+		// /ai-lawsuits/. The cases had them in twoai_entities, hashed from
+		// "lawsuit:" + slug, but the published JSON never carried one, so neither
+		// the tracker table nor a case page could show it. 20 of 113 active cases
+		// had no entity row at all, the newer ones, so the row is ensured here
+		// with the same key and the same normalized shape the first 93 use.
+		caseUID := twoaiUID("lawsuit:" + slug)
+		db.Exec(`INSERT INTO twoai_entities (uid, kind, name, normalized, aliases)
+			VALUES ($1,'lawsuit',$2,$3, jsonb_build_array($2::text))
+			ON CONFLICT DO NOTHING`,
+			caseUID, strings.TrimSpace(name), twoaiNormalizeEntityName(name)+"#"+slug)
 		cases = append(cases, map[string]any{
+			"uid":  caseUID,
 			"slug": slug, "case_name": name, "court": court, "docket": docket,
 			"filed_date": filed, "plaintiffs": pl, "defendants": de, "category": cat,
 			"status": status, "status_badge": badge, "latest_development": dev,
