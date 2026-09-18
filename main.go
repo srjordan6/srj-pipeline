@@ -4536,6 +4536,11 @@ func twoaiBuild(db *sql.DB) error {
 	if err := twoaiEnactedLaws(db); err != nil {
 		fmt.Println("twoai_enacted_laws:", err)
 	}
+	// A page for every state that has enacted AI law, built from the law
+	// pages above; the parent's list of states is the set that has law.
+	if err := twoaiStateLawPages(db); err != nil {
+		fmt.Println("twoai_state_law_pages:", err)
+	}
 
 	// Every page carries its refresh contract before it is published, so
 	// the site can say on the page whether it is current. See
