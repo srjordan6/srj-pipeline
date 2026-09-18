@@ -69,26 +69,46 @@ func twoaiCadenceDays(path, kind, shape string) int {
 	return 30
 }
 
+// twoaiSettledCadenceDays is the cadence for a page whose subject cannot
+// change. Stephen, 2026-09-18, looking at the people directory: if somebody is
+// already dead we probably do not need to refresh their data quite so often.
+// 32 of the 283 people here have a date of death, from Ada Lovelace in 1852 to
+// John Searle in 2025. A living researcher changes employer, publishes and
+// wins prizes, which is what 90 days is for. A record that ends does not. Once
+// a year is enough to catch a corrected date, a new biography or a posthumous
+// award, and it keeps 32 pages out of the overdue list four times a year for
+// no reason. Not never: the page is about a person, and what is known about
+// a person does still move.
+const twoaiSettledCadenceDays = 365
+
 // twoaiStampFreshness writes the contract onto every page document. Runs
 // inside the publish step, so a page cannot be published without one.
 func twoaiStampFreshness(db *sql.DB) error {
-	rows, err := db.Query(`SELECT path, COALESCE(kind,''), COALESCE(data->>'shape','') FROM twoai_pages`)
+	rows, err := db.Query(`SELECT path, COALESCE(kind,''), COALESCE(data->>'shape',''), COALESCE(data->>'died','') FROM twoai_pages`)
 	if err != nil {
 		return err
 	}
-	type pg struct{ path, kind, shape string }
+	type pg struct{ path, kind, shape, died string }
 	var pages []pg
 	for rows.Next() {
 		var p pg
-		if rows.Scan(&p.path, &p.kind, &p.shape) == nil {
+		if rows.Scan(&p.path, &p.kind, &p.shape, &p.died) == nil {
 			pages = append(pages, p)
 		}
 	}
 	rows.Close()
 	byCadence := map[int][]string{}
+	settled := 0
 	for _, p := range pages {
 		c := twoaiCadenceDays(p.path, p.kind, p.shape)
+		if p.kind == "person" && strings.TrimSpace(p.died) != "" {
+			c = twoaiSettledCadenceDays
+			settled++
+		}
 		byCadence[c] = append(byCadence[c], p.path)
+	}
+	if settled > 0 {
+		fmt.Printf("twoai_freshness: %d people with a date of death are on the yearly cadence\n", settled)
 	}
 	for c, paths := range byCadence {
 		// One statement per cadence value rather than one per page.
