@@ -70,6 +70,16 @@ var lawsuitCatSignals = map[string]*regexp.Regexp{
 	"defamation":                         regexp.MustCompile(`(?i)defamation|libel|slander`),
 }
 
+// The order signals are tried in. A Go map iterates in random order, so a
+// docket matching two families would have been labelled differently from one
+// run to the next. Most specific first, copyright last, because "infring"
+// also appears in patent and trademark dockets.
+var lawsuitCatOrder = []string{
+	"product liability & wrongful death", "biometric privacy", "hiring discrimination",
+	"securities fraud", "trade secrets", "platform access & scraping", "defamation",
+	"right of publicity", "consumer protection", "copyright",
+}
+
 var (
 	fillNumRe  = regexp.MustCompile(`\$[0-9][0-9,.]*|\b[0-9]{3,}\b`)
 	fillNameRe = regexp.MustCompile(`\b[A-Z][a-zA-Z]{3,}\b`)
@@ -196,20 +206,27 @@ func twoaiLawsuitFill(db *sql.DB) error {
 			continue
 		}
 
-		// Claim family: only moved off the promotion default when the record
-		// itself carries the signal, and never onto a family it does not show.
+		// Claim family. A case with no family yet may be given one, and only one
+		// the record itself shows. A case that already HAS a family is never
+		// touched.
+		//
+		// The first version of this treated "copyright" as a meaningless default,
+		// because intelPromote used to stamp it on every new row, and moved any
+		// copyright case whose docket titles did not say the word to
+		// unclassified. Docket titles are summonses and scheduling orders; they
+		// rarely name the claim. On its first run, 2026-09-18, that demoted 45
+		// correctly labelled cases, Getty Images v. Stability AI and Disney v.
+		// MiniMax among them. They were restored the same hour from the labels
+		// still on the live site. Absence of a word in a docket is not evidence
+		// about the claim, so it no longer removes anything.
 		cat := r.category
-		if cat == "" || cat == "copyright" || cat == "unclassified" {
-			if !lawsuitCatSignals["copyright"].MatchString(record) {
-				cat = "unclassified"
-				for c, re := range lawsuitCatSignals {
-					if c != "copyright" && re.MatchString(record) {
-						cat = c
-						break
-					}
+		if cat == "" || cat == "unclassified" {
+			cat = "unclassified"
+			for _, c := range lawsuitCatOrder {
+				if lawsuitCatSignals[c].MatchString(record) {
+					cat = c
+					break
 				}
-			} else {
-				cat = "copyright"
 			}
 		}
 		why := lawsuitWhy[cat]
