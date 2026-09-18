@@ -478,6 +478,23 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 			return base + "/ai-ecosystem/technology-and-core-infrastructure/" + uid + "/"
 		}
 		return ""
+	case "industries":
+		// The AI Insurance item pages, and any other industries document with no
+		// taxonomy row. The taxonomy stops at level 3 by design, so the 100
+		// coverage items are page documents with a uid and no taxonomy row, and
+		// the lookup above cannot see them. The embed log of 2026-09-18 said
+		// "no url: industries x104": those pages were being left out of the
+		// index. Checked in the database the same day: 101 industries documents
+		// have no taxonomy row, all 101 are AI Insurance pages, and every one
+		// has a uid. The hub and its ten sections were findable; the 100 item
+		// pages, where the underwriting detail lives, were not, so the Ask box
+		// could name a coverage topic and never answer from it. Every industries
+		// document renders under this one section by uid, which is what the
+		// site route does.
+		if uid, ok := doc["uid"].(string); ok && uid != "" {
+			return base + "/ai-ecosystem/enterprise-applications-governance-and-tools/" + uid + "/"
+		}
+		return ""
 	case "week":
 		return base + "/this-week-in-ai/" + name + "/"
 	case "caselaw":
