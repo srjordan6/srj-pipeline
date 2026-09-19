@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"html"
 	"strings"
 )
 
@@ -24,9 +25,19 @@ import (
 // month it says so instead of repeating July.
 //
 // Links go to the site's own pages: the state law page for a bill, the
-// agency enforcement explainer for an agency action, the framework page for
-// a revision. Titles come from the record; the site's own prose is the only
+// framework page for a revision. Titles come from the record; the site's own prose is the only
 // prose here.
+//
+// AGENCY ACTIONS LEFT THIS DIGEST ON 2026-09-18. Stephen, reading the
+// framework library: none of that should be in AI Governance Frameworks. The
+// block had filled with DOJ sentencing releases, and even a good agency item
+// was a poor fit: it linked to the agency enforcement explainer, which did
+// not show the action the reader had just clicked on. The library's digest is
+// now about the library: bills that change what the frameworks must say, and
+// explainers that were revised. Agency actions publish as their own record,
+// compliance/agency-actions.json, rendered on the agency enforcement page,
+// and a prosecution of an individual is left out of it (see
+// twoaiAgencyIndividual in twoai_agencywatch.go).
 func twoaiComplianceDigest(db *sql.DB, today string, upsert func(path, kind string, v any) error) error {
 	type item struct {
 		Flag      string `json:"flag"`
@@ -65,28 +76,54 @@ func twoaiComplianceDigest(db *sql.DB, today string, upsert func(path, kind stri
 		rows.Close()
 	}
 
-	// Federal agency actions, newest first.
-	rows, err = db.Query(`SELECT agency, COALESCE(title,''), COALESCE(summary,''), published_on::text
+	// Federal and state agency actions: their own record, for the agency
+	// enforcement page. Every action kept, newest first, with the date it was
+	// published, the time this site first saw it, and its uid.
+	type action struct {
+		UID       string `json:"uid"`
+		Agency    string `json:"agency"`
+		Title     string `json:"title"`
+		Summary   string `json:"summary"`
+		URL       string `json:"url"`
+		Published string `json:"published"`
+		FirstSeen string `json:"first_seen"`
+		Basis     string `json:"basis"`
+	}
+	actions := []action{}
+	rows, err = db.Query(`SELECT uid, agency, COALESCE(title,''), COALESCE(summary,''), url,
+			COALESCE(published_on::text,''), to_char(first_seen AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI "UTC"'),
+			COALESCE(matched_terms,'')
 		FROM twoai_agency_actions
-		WHERE published_on > current_date - 90
-		ORDER BY published_on DESC LIMIT 8`)
+		WHERE ` + twoaiAgencyPublishable + `
+		ORDER BY published_on DESC NULLS LAST, first_seen DESC LIMIT 60`)
 	if err == nil {
 		for rows.Next() {
-			var agency, title, summary, date string
-			if rows.Scan(&agency, &title, &summary, &date) != nil {
+			var a action
+			if rows.Scan(&a.UID, &a.Agency, &a.Title, &a.Summary, &a.URL, &a.Published, &a.FirstSeen, &a.Basis) != nil {
 				continue
 			}
-			body := strings.TrimSpace(summary)
-			if len(body) > 280 {
-				body = body[:277] + "..."
+			// Rows stored before 2026-09-18 carry escaped entities such as
+			// &nbsp; and the FTC's trailing "View Press Release" link text.
+			clean := func(s string) string {
+				s = strings.Join(strings.Fields(html.UnescapeString(s)), " ")
+				return strings.TrimSpace(strings.TrimSuffix(s, "View Press Release"))
 			}
-			if body == "" {
-				body = fmt.Sprintf("Published by %s on %s.", agency, date)
+			a.Title, a.Summary = clean(a.Title), clean(a.Summary)
+			if r := []rune(a.Summary); len(r) > 600 {
+				cut := string(r[:600])
+				if i := strings.LastIndex(cut, ". "); i > 200 {
+					cut = cut[:i+1]
+				}
+				a.Summary = cut
 			}
-			items = append(items, item{"Agency", "is-superseded", agency + ": " + strings.TrimSpace(title), body,
-				"/ai-compliance/agency-enforcement/", "Read agency enforcement", date})
+			actions = append(actions, a)
 		}
 		rows.Close()
+	}
+	if err := upsert("compliance/agency-actions.json", "compliance-agency-actions", map[string]any{
+		"generated": today, "total": len(actions), "actions": actions,
+	}); err != nil {
+		return err
 	}
 
 	// Framework explainers revised, newest first.
@@ -124,9 +161,9 @@ func twoaiComplianceDigest(db *sql.DB, today string, upsert func(path, kind stri
 		items = items[:12]
 	}
 
-	intro := fmt.Sprintf("This library is reviewed against primary sources, not secondary summaries. %d changes in the last ninety days, from the state bill tracker, the federal agency watch and the framework explainers, newest first.", len(items))
+	intro := fmt.Sprintf("This library is reviewed against primary sources, not secondary summaries. %d changes in the last ninety days, from the state bill tracker and the framework explainers, newest first.", len(items))
 	if len(items) == 0 {
-		intro = "This library is reviewed against primary sources, not secondary summaries. No relevant state bill, federal agency action or framework revision was recorded in the last ninety days."
+		intro = "This library is reviewed against primary sources, not secondary summaries. No relevant state bill or framework revision was recorded in the last ninety days."
 	}
 	return upsert("compliance/what-changed.json", "compliance-digest", map[string]any{
 		"reviewed": today, "intro": intro, "items": items, "generated": today,

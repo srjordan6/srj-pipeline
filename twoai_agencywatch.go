@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"os"
@@ -46,6 +47,25 @@ import (
 // says so. Kept short on purpose; every addition should be justified by an
 // action it would have caught.
 var twoaiAgencyAdjacent = regexp.MustCompile(`(?i)\b(personalized pricing|surveillance pricing|dynamic pricing|automated system|dark pattern|facial recognition|biometric|predictive analytic)`)
+
+// A PROSECUTION OF A PERSON IS NOT A GOVERNANCE ACTION. Stephen, 2026-09-18,
+// reading the framework library: none of that should be in AI Governance
+// Frameworks. "That" was four DOJ releases in ten days, three sentencings for
+// AI-generated child sexual abuse material and one guilty plea by a founder.
+// The DOJ feed was added for civil rights and antitrust, the RealPage kind of
+// case, and mentionsAI cannot tell that from a US Attorney's sentencing
+// release, because both say AI in the title. These releases tell a compliance
+// reader nothing about what an organisation must do.
+//
+// The row is still kept, because nothing seen is thrown away, and it is
+// marked: matched_terms gains ;individual_prosecution after the test that
+// fired. Every reader of this table that publishes must leave marked rows
+// out. The list is words a sentencing or plea release uses and a consent
+// order, policy statement or comment docket does not.
+var twoaiAgencyIndividual = regexp.MustCompile(`(?i)\b(sentenced|pleads? guilty|pled guilty|pleaded guilty|indicted|convicted|arrested|years in prison|imprisonment|child sexual abuse|csam|child pornography|cyberstalk\w*|sexually explicit)\b`)
+
+// twoaiAgencyPublishable is the one filter every publishing query uses.
+const twoaiAgencyPublishable = `COALESCE(matched_terms,'') NOT LIKE '%individual_prosecution%'`
 
 // EVERY FEED HERE WAS PROBED BEFORE IT WAS ADDED, and the ones that are
 // missing are missing for a reason recorded below. A dead feed in this list
@@ -168,8 +188,11 @@ func twoaiAgencyWatch(db *sql.DB) error {
 
 		for _, it := range feed.Items {
 			seen++
-			title := strings.Join(strings.Fields(it.Title), " ")
-			summary := strings.Join(strings.Fields(stripTags(it.Description)), " ")
+			// Unescaped twice over: the decoder resolves the feed's own entities,
+			// and what is left is HTML the agency escaped inside the description,
+			// which is how a literal &nbsp; reached the page on 2026-09-18.
+			title := strings.Join(strings.Fields(html.UnescapeString(it.Title)), " ")
+			summary := strings.Join(strings.Fields(html.UnescapeString(stripTags(it.Description))), " ")
 			if title == "" || it.Link == "" {
 				continue
 			}
@@ -200,6 +223,9 @@ func twoaiAgencyWatch(db *sql.DB) error {
 				matched = "ai_adjacent_practice"
 			default:
 				continue
+			}
+			if twoaiAgencyIndividual.MatchString(title + " " + summary) {
+				matched += ";individual_prosecution"
 			}
 			// The uid is the link, hashed: agencies reuse titles across years
 			// and the link is the thing that identifies the action.
