@@ -80,6 +80,12 @@ func twoaiBuildWatch(db *sql.DB) error {
 		Commit  string `json:"commit"`
 		BuiltAt string `json:"built_at"`
 		Bundle  string `json:"bundle"`
+		// Written by scripts/url-guard.mjs since 2026-09-18. A pointer, so a
+		// build from before that date reads as "says nothing", not "unguarded".
+		URLGuard *struct {
+			Guarded bool   `json:"guarded"`
+			Reason  string `json:"reason"`
+		} `json:"url_guard"`
 	}{}
 	body, err := twoaiJobsGet(bwSite+"/api/build.json", map[string]string{"Cache-Control": "no-cache"})
 	if err != nil {
@@ -207,6 +213,28 @@ when it ships.`,
 fires a build after every publish, so a site this old means the trigger, the
 build or the deploy has been failing since then. Bundle on the site: %s.`,
 				builtAt.Format("2006-01-02 15:04"), now.Sub(builtAt).Hours(), live.Bundle))
+	}
+
+	// Rule 3: the live build shipped without its URL guard. Found 2026-09-18:
+	// Bot Fight Mode answered the guard's fetch with a 403 challenge, the guard
+	// read that as an empty sitemap and passed open, and it had done so on every
+	// build since the mode went on, with one line in a 15,000 line log as the
+	// only trace. Published URLs never disappear, and the guard is what stands
+	// between a build that drops some and production, so an unguarded deploy is
+	// reported the way a failed one is. Once per build.
+	if live.URLGuard != nil && !live.URLGuard.Guarded && live.BuiltAt != "" && get("unguarded_build") != live.BuiltAt {
+		set("unguarded_build", live.BuiltAt)
+		queue("theworldofai.org shipped without its URL guard",
+			fmt.Sprintf(`The live build, %s UTC from commit %s, was deployed without being
+checked for dropped URLs. The guard could not read the live site and passed open.
+
+What it said: %s
+
+Until this is fixed a build that loses published pages will deploy. The guard is
+scripts/url-guard.mjs in twoai-site; it reads the live sitemap and
+/unlisted-urls.json from theworldofai.org, then from the workers.dev hostname.
+If both refuse, look at Cloudflare Security, Events for the build runner.`,
+				builtAt.Format("2006-01-02 15:04"), firstN(liveSHA, 7), live.URLGuard.Reason))
 	}
 
 	fmt.Printf("buildwatch: head=%s pushed=%s live=%s built=%s shipped=%v\n",
