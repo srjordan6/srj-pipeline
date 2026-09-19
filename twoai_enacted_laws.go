@@ -82,26 +82,57 @@ func twoaiEnactedLaws(db *sql.DB) error {
 	}
 
 	// Passed, relevant, and either never paged or changed since.
+	//
+	// THE CHECK IS AGAINST THE VERSION THIS QUERY PICKS, NOT EACH CANDIDATE ROW.
+	// Stephen, 2026-09-19, reading three runs of the log: the same ten bills
+	// regenerated every day and the section never finished. Ten of the 101
+	// eligible bills have TWO rows in pipeline.documents with different
+	// change_hash values and the identical status_date. The first version of
+	// this query filtered row by row, so with two rows one always lacked a
+	// matching page: the bill was picked, the page was stamped with whichever
+	// hash won DISTINCT ON, and on the next run the other row was the unmatched
+	// one. They alternated forever.
+	//
+	// That is worse than wasted calls. Each regeneration is a fresh reading of
+	// the same statute, so ten published compliance pages were quietly rewritten
+	// every day with different content: IL SB1920 cited 17 sections, then 13,
+	// then 4, across three runs. A reader who cites one of these pages should
+	// find the same page tomorrow.
+	//
+	// So the latest version per bill is chosen FIRST, in the inner query, and
+	// only then compared against what is published. A bill whose chosen version
+	// is already on the site is not picked up again, whatever older rows exist
+	// beside it. Genuine LegiScan changes still trigger a rebuild, because a new
+	// change_hash on a newer status_date becomes the chosen version.
 	rows, err := db.Query(`
-		SELECT DISTINCT ON (d.raw->'bill'->>'state', d.raw->'bill'->>'bill_number')
-		       d.external_id, d.change_hash, d.url,
-		       d.raw->'bill'->>'state', d.raw->'bill'->>'bill_number', d.raw->'bill'->>'title',
-		       COALESCE(d.raw->'bill'->>'status_date',''),
-		       COALESCE(d.raw->'bill'->>'description',''),
-		       d.raw->'bill'->'texts'
-		FROM pipeline.documents d
-		JOIN pipeline.sources s ON s.id = d.source_id AND s.key = 'legiscan'
-		JOIN twoai_bill_events e ON e.state = d.raw->'bill'->>'state'
-		                        AND e.bill_number = d.raw->'bill'->>'bill_number'
-		                        AND e.relevant AND e.status = 4
-		WHERE (d.raw->'bill'->>'status')::int = 4
-		  AND jsonb_array_length(COALESCE(d.raw->'bill'->'texts','[]'::jsonb)) > 0
-		  AND NOT EXISTS (
-		      SELECT 1 FROM twoai_pages p
-		      WHERE p.path = 'compliance/law-' || lower(d.raw->'bill'->>'state') || '-' ||
-		                     lower(regexp_replace(d.raw->'bill'->>'bill_number','[^A-Za-z0-9]','','g')) || '.json'
-		        AND p.data->>'change_hash' = d.change_hash)
-		ORDER BY d.raw->'bill'->>'state', d.raw->'bill'->>'bill_number', d.raw->'bill'->>'status_date' DESC, d.change_hash DESC
+		WITH latest AS (
+		  SELECT DISTINCT ON (d.raw->'bill'->>'state', d.raw->'bill'->>'bill_number')
+		         d.external_id, d.change_hash, d.url,
+		         d.raw->'bill'->>'state'        AS state,
+		         d.raw->'bill'->>'bill_number'  AS bill_number,
+		         d.raw->'bill'->>'title'        AS title,
+		         COALESCE(d.raw->'bill'->>'status_date','') AS status_date,
+		         COALESCE(d.raw->'bill'->>'description','') AS description,
+		         d.raw->'bill'->'texts'         AS texts
+		  FROM pipeline.documents d
+		  JOIN pipeline.sources s ON s.id = d.source_id AND s.key = 'legiscan'
+		  JOIN twoai_bill_events e ON e.state = d.raw->'bill'->>'state'
+		                          AND e.bill_number = d.raw->'bill'->>'bill_number'
+		                          AND e.relevant AND e.status = 4
+		  WHERE (d.raw->'bill'->>'status')::int = 4
+		    AND jsonb_array_length(COALESCE(d.raw->'bill'->'texts','[]'::jsonb)) > 0
+		  ORDER BY d.raw->'bill'->>'state', d.raw->'bill'->>'bill_number',
+		           d.raw->'bill'->>'status_date' DESC, d.change_hash DESC
+		)
+		SELECT l.external_id, l.change_hash, l.url, l.state, l.bill_number, l.title,
+		       l.status_date, l.description, l.texts
+		FROM latest l
+		WHERE NOT EXISTS (
+		    SELECT 1 FROM twoai_pages p
+		    WHERE p.path = 'compliance/law-' || lower(l.state) || '-' ||
+		                   lower(regexp_replace(l.bill_number,'[^A-Za-z0-9]','','g')) || '.json'
+		      AND p.data->>'change_hash' = l.change_hash)
+		ORDER BY l.state, l.bill_number
 		LIMIT $1`, limit)
 	if err != nil {
 		return err
