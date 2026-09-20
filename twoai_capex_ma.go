@@ -315,13 +315,29 @@ func twoaiCapexMA(db *sql.DB, today string) (int, error) {
 		Filed   string `json:"filed"`
 		Items   string `json:"items"`
 		URL     string `json:"url"`
+		// WHAT THE FILING SAYS, not just that one exists. Stephen, 2026-09-20:
+		// this takes us to a link that nobody can read. The URL on each row was
+		// the EDGAR archive DIRECTORY, a bare list of a dozen files with names
+		// like crwv-20260807.htm and ex101creditagreement.htm, and the row
+		// itself said only "CoreWeave, items 1.01,2.03,7.01,9.01". That row was
+		// a $2.6 billion delayed draw term loan from JPMorgan and MUFG to buy
+		// GPU servers, maturing in 2031, and none of it was on the site.
+		// twoai_ma_readings.go now reads the filing and writes three paragraphs,
+		// and DocURL points at the document rather than the folder.
+		Reading string `json:"reading,omitempty"`
+		DocURL  string `json:"doc_url,omitempty"`
+		ReadOn  string `json:"read_on,omitempty"`
 	}
 	var completed, agreements []maRow
-	mrows, err := db.Query(`SELECT company, filed, items, doc_url FROM twoai_ma_filings ORDER BY filed DESC LIMIT 200`)
+	mrows, err := db.Query(`SELECT f.company, f.filed, f.items, f.doc_url,
+		       COALESCE(r.reading,''), COALESCE(r.doc_url,''), COALESCE(r.generated_on::text,'')
+		FROM twoai_ma_filings f
+		LEFT JOIN twoai_ma_readings r ON r.accession = f.accession AND r.reading IS NOT NULL
+		ORDER BY f.filed DESC LIMIT 200`)
 	if err == nil {
 		for mrows.Next() {
 			var m maRow
-			if mrows.Scan(&m.Company, &m.Filed, &m.Items, &m.URL) == nil {
+			if mrows.Scan(&m.Company, &m.Filed, &m.Items, &m.URL, &m.Reading, &m.DocURL, &m.ReadOn) == nil {
 				if strings.Contains(m.Items, "2.01") {
 					completed = append(completed, m)
 				} else {
