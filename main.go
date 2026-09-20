@@ -126,13 +126,26 @@ var twoaiDailyOnly = map[string]bool{
 	"twoai_companyfacts": true, "twoai_orgfacts": true, "docwatch": true,
 	"twoai_etf_holdings": true, "openalex_watch": true, "export_corpus": true, "appsec_research": true,
 	"twoai_vendor_enrich": true, "twoai_point_briefs": true, "twoai_model_watch": true, "twoai_company_sites": true,
-	"twoai_worklist_companies": true, "twoai_learning_readings": true, "twoai_dart": true, "twoai_ma_readings": true, "twoai_gaps": true,
+	"twoai_worklist_companies": true, "twoai_learning_readings": true, "twoai_dart": true, "twoai_ma_readings": true,
+	// twoai_stocks added 2026-09-20. The price provider allows 800 calls a
+	// day. A second build in one day spent 930 and every one of 117 tickers
+	// failed with a 429, so the run reported ok=false and wrote nothing. The
+	// data does not change often enough to be worth paying for twice.
+	"twoai_stocks": true,
 }
 
-// stageDueToday reports whether a once-a-day stage still owes a run today,
-// and claims the slot when it does. A database that cannot be reached is
-// answered with yes: a monitoring table must never be the reason real work
-// stops happening.
+// stageDueToday reports whether a once-a-day stage still owes a run today.
+// A database that cannot be reached is answered with yes: a monitoring table
+// must never be the reason real work stops happening.
+//
+// IT NO LONGER CLAIMS THE SLOT. It used to mark the stage as run BEFORE the
+// stage executed, so "already ran today" really meant "was attempted today",
+// and one failure locked the stage out until tomorrow. On 2026-09-20
+// twoai_ma_readings ran under an old binary, read nothing, and then skipped
+// every later run that day while 351 filings sat unread. The slot is now
+// claimed by runSequence only after the stage exits cleanly, so a failed run
+// is retried by the next one, which is what a daily gate should have meant
+// all along.
 func stageDueToday(stage string) bool {
 	if !twoaiDailyOnly[stage] || os.Getenv("IGNORE_DAILY_GATE") != "" {
 		return true
@@ -148,10 +161,23 @@ func stageDueToday(stage string) bool {
 	if err == nil && last == today {
 		return false
 	}
+	return true
+}
+
+// stageRanToday records a SUCCESSFUL run, so the gate above can skip it for
+// the rest of the day. Called only when the stage exited 0.
+func stageRanToday(stage string) {
+	if !twoaiDailyOnly[stage] {
+		return
+	}
+	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
+	if err != nil {
+		return
+	}
+	defer db.Close()
 	db.Exec(`INSERT INTO pipeline_stage_runs (stage, last_run_date, last_run_at)
 		VALUES ($1, current_date, now())
 		ON CONFLICT (stage) DO UPDATE SET last_run_date=current_date, last_run_at=now()`, stage)
-	return true
 }
 
 func runSequence(stages []string) {
@@ -167,9 +193,14 @@ func runSequence(stages []string) {
 		ctx, cancel := context.WithTimeout(context.Background(), limit)
 		cmd := exec.CommandContext(ctx, os.Args[0], s)
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-		cmd.Run() // a failing source must not block the others
+		runErr := cmd.Run() // a failing source must not block the others
 		if ctx.Err() == context.DeadlineExceeded {
 			fmt.Fprintf(os.Stderr, "%s: KILLED after %s deadline, continuing the run\n", s, limit)
+		} else if runErr == nil {
+			// The slot is claimed here, not before the stage ran, so a stage
+			// that failed or was killed is retried by the next run instead of
+			// being locked out until tomorrow.
+			stageRanToday(s)
 		}
 		cancel()
 	}
@@ -187,7 +218,10 @@ func main() {
 	// only the stages that turn existing SQL into a published site, which takes
 	// about a minute. Nothing here fetches from an external source.
 	if src == "twoai" {
-		for _, s := range []string{"twoai_build", "twoai_publish_r2", "twoai_publish", "deploy_site"} {
+		// twoai_gaps leads, so a hand build refreshes the published backlog
+		// rather than leaving yesterday's figures on the site. It reads only
+		// this database and makes no external call, so it costs nothing here.
+		for _, s := range []string{"twoai_gaps", "twoai_build", "twoai_publish_r2", "twoai_publish", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run()
