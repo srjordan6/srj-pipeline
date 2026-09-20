@@ -135,23 +135,55 @@ func twoaiThinMissingEntities(db *sql.DB) {
 	// COMPANIES BEING SUED, WITH NO PAGE. A defendant in an AI lawsuit that
 	// the site tracks is, by the site's own editorial judgement, a company
 	// worth knowing about.
+	//
+	// THE COMMA IN "Suno, Inc." IS NOT A SEPARATOR. Splitting defendants on
+	// every comma made "Inc." the second most mentioned company on the site
+	// with no page: 62 lawsuits, reported in the log on 2026-09-19 alongside
+	// Digital Realty and Anthropic. It was never created, because this stage
+	// only proposes and a person decides, and the fabrication rule held. But
+	// it sat at the top of the worklist, and it was also truncating the real
+	// defendants beside it: "Perplexity AI, Inc." was proposed as "Perplexity
+	// AI", "Uncharted Labs, Inc." as "Uncharted Labs". Accepting one of those
+	// would have minted a uid under a name no court document uses.
+	//
+	// The suffix comma is now folded into the name before the split, so
+	// "Suno, Inc." becomes "Suno Inc." and survives as one party. Semicolons
+	// are separators and are treated as such; a trailing "et al" is dropped,
+	// since it names nobody. A token that is ONLY a suffix is refused outright,
+	// which is the guard that does not depend on the regex above being
+	// complete: a form of incorporation this list has never seen costs one
+	// defendant, not a junk entity.
+	//
+	// Measured on the live table: "Inc." 62 to 0, and the list it returns is
+	// 19 real defendants led by Anthropic PBC at 26 and OpenAI Inc. at 13.
 	if _, err := db.Exec(`
 		INSERT INTO twoai_missing_entities (normalized, name, kind, mentions, sources, last_seen)
-		SELECT lower(btrim(d.party)), btrim(d.party), 'company', count(*),
+		SELECT lower(d.party), d.party, 'company', count(*),
 		       'defendant in ' || count(*) || ' tracked lawsuits', now()
 		FROM (
-			SELECT unnest(string_to_array(defendants, ',')) AS party
-			FROM ai_lawsuits WHERE is_active AND COALESCE(defendants,'') <> ''
+			SELECT btrim(regexp_replace(raw, '\s*(et\s+al\.?|and others)\s*$', '', 'i')) AS party
+			FROM (
+				SELECT unnest(string_to_array(
+					replace(
+						regexp_replace(defendants,
+							',\s*(Inc|LLC|L\.L\.C|Ltd|Limited|Corp|Corporation|Co|Company|PBC|LP|LLP|PLC|N\.V|S\.A|GmbH|AG|SAS|Pty|Incorporated|Holdings|Group)(\.?)(?=[\s,;)]|$)',
+							' \1\2', 'gi'),
+						';', ','),
+					',')) AS raw
+				FROM ai_lawsuits WHERE is_active AND COALESCE(defendants,'') <> ''
+			) s
 		) d
-		WHERE length(btrim(d.party)) BETWEEN 4 AND 60
-		  AND btrim(d.party) ~ '^[A-Z]'
+		WHERE length(d.party) BETWEEN 4 AND 60
+		  AND d.party ~ '^[A-Z]'
+		  -- A token that is only a form of incorporation names no company.
+		  AND d.party !~* '^(Inc|LLC|L\.L\.C|Ltd|Limited|Corp|Corporation|Co|Company|PBC|LP|LLP|PLC|N\.V|S\.A|GmbH|AG|SAS|Pty|Incorporated|Holdings|Group|et al)\.?$'
 		  -- These two belong in WHERE, not HAVING. They test each row, not
 		  -- the group, and Postgres rejects a HAVING that names an ungrouped
 		  -- column - which silently cost this stage every lawsuit defendant
 		  -- until the log line was read on 2026-09-14.
-		  AND NOT EXISTS (SELECT 1 FROM twoai_company_profiles c WHERE lower(c.name) = lower(btrim(d.party)))
+		  AND NOT EXISTS (SELECT 1 FROM twoai_company_profiles c WHERE lower(c.name) = lower(d.party))
 		  AND NOT EXISTS (SELECT 1 FROM twoai_entities e WHERE e.kind='company'
-		       AND e.normalized = regexp_replace(regexp_replace(lower(btrim(d.party)),'[^a-z0-9]+','-','g'),'^-|-$','','g'))
+		       AND e.normalized = regexp_replace(regexp_replace(lower(d.party),'[^a-z0-9]+','-','g'),'^-|-$','','g'))
 		GROUP BY 1,2
 		HAVING count(*) >= 2
 		ON CONFLICT (normalized) DO UPDATE
