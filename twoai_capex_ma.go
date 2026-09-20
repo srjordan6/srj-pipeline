@@ -329,6 +329,15 @@ func twoaiCapexMA(db *sql.DB, today string) (int, error) {
 		ReadOn  string `json:"read_on,omitempty"`
 	}
 	var completed, agreements []maRow
+	// The readings table is created by the twoai_ma_readings stage, which runs
+	// in the daily sequence but NOT inside -Stage twoai. Without this, a build
+	// on a database where that stage has never run fails here on a missing
+	// relation, which is a defect introduced with the join on 2026-09-20.
+	// twoaiMAReadingEnsure is CREATE TABLE IF NOT EXISTS and is safe to call
+	// from either path.
+	if err := twoaiMAReadingEnsure(db); err != nil {
+		fmt.Fprintln(os.Stderr, "twoai_ma: readings table:", err)
+	}
 	mrows, err := db.Query(`SELECT f.company, f.filed, f.items, f.doc_url,
 		       COALESCE(r.reading,''), COALESCE(r.doc_url,''), COALESCE(r.generated_on::text,'')
 		FROM twoai_ma_filings f
