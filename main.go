@@ -126,7 +126,7 @@ var twoaiDailyOnly = map[string]bool{
 	"twoai_companyfacts": true, "twoai_orgfacts": true, "docwatch": true,
 	"twoai_etf_holdings": true, "openalex_watch": true, "export_corpus": true, "appsec_research": true,
 	"twoai_vendor_enrich": true, "twoai_point_briefs": true, "twoai_model_watch": true, "twoai_company_sites": true,
-	"twoai_worklist_companies": true, "twoai_learning_readings": true,
+	"twoai_worklist_companies": true, "twoai_learning_readings": true, "twoai_dart": true,
 }
 
 // stageDueToday reports whether a once-a-day stage still owes a run today,
@@ -244,7 +244,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_model_watch", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_dart", "twoai_model_watch", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -799,6 +799,14 @@ func main() {
 	if src == "twoai_point_briefs" {
 		if err := twoaiPointBriefs(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_point_briefs:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_dart" {
+		if err := twoaiDart(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_dart:", err)
 			os.Exit(1)
 		}
 		return
