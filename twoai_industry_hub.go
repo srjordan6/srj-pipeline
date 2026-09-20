@@ -422,15 +422,24 @@ func twoaiHarvestSources(db *sql.DB) error {
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 		resp, ferr := client.Do(req)
 		status, extract := 0, ""
+		// hashSrc is what the change hash is taken from. For every industry
+		// source it is the extract, as it always was. For a certification or
+		// course page it is not: see twoai_learning_extract.go.
+		hashSrc := ""
 		if ferr == nil {
 			status = resp.StatusCode
 			if status == 200 {
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-				extract = twoaiHarvestExtract(body)
+				if twoaiLearningHasPages(j.slug) {
+					extract, hashSrc = twoaiLearningExtract(body)
+				} else {
+					extract = twoaiHarvestExtract(body)
+					hashSrc = extract
+				}
 			}
 			resp.Body.Close()
 		}
-		h := sha256.Sum256([]byte(extract))
+		h := sha256.Sum256([]byte(hashSrc))
 		if status == 200 && extract != "" {
 			fetched++
 			if _, err := db.Exec(`INSERT INTO twoai_source_harvest (url, sector_slug, source_name, http_status, extract, content_hash, fetched_on, content_changed_on)

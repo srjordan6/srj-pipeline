@@ -102,6 +102,9 @@ ABSOLUTE RULES:
 - Paraphrase in your own words. Do NOT copy the page's sentences. No marketing language, no superlatives, no exhortation to enrol.
 - Plain English. Short sentences. No hyphens used as dashes.
 - If the page says the certification, course or exam is retired, being retired, replaced, renamed or no longer offered, or gives a retirement date, say so in "status" with the date exactly as the page gives it. This is the most important field. If the page says nothing of the kind, return an empty string for "status".
+- Be exact about WHAT is ending. Say whether it is the whole credential, one exam version, one language version of the exam, or only the preparation material. "The Italian and German versions of the exam will be retired after October 15, 2026" is a correct status. Turning that into "this certification is being retired" is a serious error.
+- A bare label with nothing after it, such as "Retirement date:" followed by no date, states nothing. Do not report it.
+- The page text may open with a block headed "LINES ON THE PAGE ABOUT RETIREMENT, REPLACEMENT OR PRICE". Those lines were lifted out of the page and placed first so they are not missed. Read them as part of the page. Some will be about other products or training bundles sold on the same page: only report a price as the cost when the page ties it to this credential or course.
 
 Return ONE JSON object and nothing else, with exactly these keys:
 {
