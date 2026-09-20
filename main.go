@@ -1448,8 +1448,30 @@ var legiscanQueries = []struct {
 	{"insurance artificial intelligence", "insurance+%22artificial+intelligence%22", 1},
 }
 
+// legiscanHash is a change_hash that survives LegiScan sending something other
+// than a string. Found 2026-09-19 in the log: "legiscan biometric: json: cannot
+// unmarshal bool into Go struct field .searchresult.results.995.change_hash of
+// type string". One row in a page of a thousand carried false where its hash
+// belongs, the strict decode failed, and the WHOLE biometric query was thrown
+// away while the run still ended status=ok. Anything that is not a JSON string
+// becomes the empty hash, which the caller treats as "no hash given".
+type legiscanHash string
+
+func (h *legiscanHash) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		*h = legiscanHash(s)
+	} else {
+		*h = ""
+	}
+	return nil
+}
+
 func legiscanQuery(db *sql.DB, sourceID int, key string, client *http.Client,
 	label, term string, maxPages int, hydrated *int, hydrateBudget int) (fetched, added int, err error) {
+	// Rows this query could not use, reported once at the end so a gap is a
+	// line in the log and not a silence.
+	badRows, noHash := 0, []int{}
 	for page := 1; page <= maxPages; page++ {
 		url := fmt.Sprintf("https://api.legiscan.com/?key=%s&op=getSearchRaw&state=ALL&query=%s&page=%d",
 			key, term, page)
@@ -1462,17 +1484,16 @@ func legiscanQuery(db *sql.DB, sourceID int, key string, client *http.Client,
 		if e != nil {
 			return fetched, added, e
 		}
+		// ONE BAD ROW COSTS ONE ROW, NOT THE QUERY. Each result is decoded on its
+		// own, so a malformed entry is counted and skipped and the other 999 on
+		// the page are still read.
 		var payload struct {
 			Status       string `json:"status"`
 			SearchResult struct {
 				Summary struct {
 					PageTotal int `json:"page_total"`
 				} `json:"summary"`
-				Results []struct {
-					Relevance  int    `json:"relevance"`
-					BillID     int    `json:"bill_id"`
-					ChangeHash string `json:"change_hash"`
-				} `json:"results"`
+				Results []json.RawMessage `json:"results"`
 			} `json:"searchresult"`
 		}
 		if e := json.Unmarshal(body, &payload); e != nil {
@@ -1481,16 +1502,37 @@ func legiscanQuery(db *sql.DB, sourceID int, key string, client *http.Client,
 		if payload.Status != "OK" {
 			return fetched, added, fmt.Errorf("legiscan status %s", payload.Status)
 		}
-		for _, r := range payload.SearchResult.Results {
+		for _, rawRow := range payload.SearchResult.Results {
+			var r struct {
+				Relevance  int          `json:"relevance"`
+				BillID     int          `json:"bill_id"`
+				ChangeHash legiscanHash `json:"change_hash"`
+			}
+			if json.Unmarshal(rawRow, &r) != nil {
+				badRows++
+				continue
+			}
 			if r.BillID == 0 || r.Relevance < 50 {
 				continue
 			}
 			fetched++
 			extID := fmt.Sprintf("%d", r.BillID)
+			hash := string(r.ChangeHash)
 			var exists bool
-			if e := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pipeline.documents
+			if hash == "" {
+				// No hash from the search. If the corpus already holds this bill
+				// in any version, leave it: a real change will arrive with a real
+				// hash. If it holds nothing, fetch the bill once and take the
+				// hash from the bill itself, so the row costs one getBill ever
+				// rather than one per run.
+				noHash = append(noHash, r.BillID)
+				if e := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pipeline.documents
+					WHERE source_id=$1 AND external_id=$2)`, sourceID, extID).Scan(&exists); e != nil {
+					return fetched, added, e
+				}
+			} else if e := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pipeline.documents
 				WHERE source_id=$1 AND external_id=$2 AND change_hash=$3)`,
-				sourceID, extID, r.ChangeHash).Scan(&exists); e != nil {
+				sourceID, extID, hash).Scan(&exists); e != nil {
 				return fetched, added, e
 			}
 			if exists {
@@ -1513,12 +1555,13 @@ func legiscanQuery(db *sql.DB, sourceID int, key string, client *http.Client,
 			var bp struct {
 				Status string `json:"status"`
 				Bill   struct {
-					BillID     int    `json:"bill_id"`
-					State      string `json:"state"`
-					BillNumber string `json:"bill_number"`
-					Title      string `json:"title"`
-					URL        string `json:"url"`
-					StatusDate string `json:"status_date"`
+					BillID     int          `json:"bill_id"`
+					State      string       `json:"state"`
+					BillNumber string       `json:"bill_number"`
+					Title      string       `json:"title"`
+					URL        string       `json:"url"`
+					StatusDate string       `json:"status_date"`
+					ChangeHash legiscanHash `json:"change_hash"`
 				} `json:"bill"`
 			}
 			if json.Unmarshal(bb, &bp) != nil || bp.Status != "OK" || bp.Bill.BillID == 0 {
@@ -1526,11 +1569,20 @@ func legiscanQuery(db *sql.DB, sourceID int, key string, client *http.Client,
 				continue
 			}
 			*hydrated++
+			if hash == "" {
+				hash = string(bp.Bill.ChangeHash)
+			}
+			if hash == "" {
+				// Neither the search nor the bill gave a hash. Storing it under an
+				// empty one would make every later version collide with it.
+				fmt.Fprintln(os.Stderr, "legiscan getBill", r.BillID, ": no change_hash in search or bill, not stored")
+				continue
+			}
 			var pub any
 			if bp.Bill.StatusDate != "" {
 				pub = bp.Bill.StatusDate
 			}
-			ok, e := insertDoc(db, sourceID, extID, r.ChangeHash, bp.Bill.URL,
+			ok, e := insertDoc(db, sourceID, extID, hash, bp.Bill.URL,
 				bp.Bill.State+" "+bp.Bill.BillNumber+": "+bp.Bill.Title, pub, bb)
 			if e != nil {
 				return fetched, added, e
@@ -1546,6 +1598,14 @@ func legiscanQuery(db *sql.DB, sourceID int, key string, client *http.Client,
 		time.Sleep(2 * time.Second)
 	}
 	fmt.Printf("legiscan [%s]: %d results seen, %d new bill rows\n", label, fetched, added)
+	if badRows > 0 || len(noHash) > 0 {
+		show := noHash
+		if len(show) > 8 {
+			show = show[:8]
+		}
+		fmt.Fprintf(os.Stderr, "legiscan [%s]: %d unreadable row(s) skipped, %d row(s) had no change_hash (bill_id %v)\n",
+			label, badRows, len(noHash), show)
+	}
 	return fetched, added, nil
 }
 
