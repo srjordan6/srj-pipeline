@@ -271,6 +271,7 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 			req.Header.Set("Accept", "text/html,application/xhtml+xml")
 			resp, ferr := client.Do(req)
 			status, extract := 0, ""
+			feedURL := ""
 			if ferr == nil {
 				status = resp.StatusCode
 				if status == 200 {
@@ -280,6 +281,14 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 					// harvest. Bad bytes become U+FFFD; the text is still readable
 					// and the row is still written.
 					extract = strings.ToValidUTF8(twoaiHarvestExtract(body), "\uFFFD")
+					// A PRESS FEED, FOR FREE. Stephen, 2026-09-20: I want press
+					// reports from all the companies we track, as quick as
+					// possible. Nearly every site declares its feed in the head of
+					// the markup we are holding right here and about to discard.
+					// Reading it costs no request, no politeness budget and no new
+					// user agent. See twoai_feed_discovery.go. The find is a
+					// candidate, never a live feed: a person decides.
+					feedURL = twoaiDiscoverFeedInHTML(site, body)
 				}
 				resp.Body.Close()
 			}
@@ -297,6 +306,7 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 					// and inside a worker there is nobody to return the error to.
 					fmt.Fprintf(os.Stderr, "twoai_company_harvest: store %s: %v\n", e.name, err)
 				}
+				twoaiFeedNote(db, e.uid, e.name, site, feedURL, "declared")
 			} else {
 				// A publisher refusing a self-identified robot is not our failure,
 				// and counting it as one buries the handful that ARE. Same rule as
