@@ -573,6 +573,18 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 			}
 		}
 		return ""
+	case "learn":
+		// One page per certification and course, 2026-09-19. These documents
+		// deliberately carry no "tax", because the taxonomy lookup above would
+		// resolve them to their section hub and every answer would cite the
+		// list instead of the page. They render at their own uid under the
+		// learning category. The section hubs themselves never reach this
+		// case: they carry a tax and resolve above.
+		if shape, _ := doc["shape"].(string); shape == "learning-entry" {
+			if uid, ok := doc["uid"].(string); ok && uid != "" {
+				return base + "/ai-ecosystem/research-knowledge-and-learning/" + uid + "/"
+			}
+		}
 	case "static":
 		return base + "/" + name + "/"
 	}

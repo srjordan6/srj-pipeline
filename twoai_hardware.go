@@ -257,6 +257,10 @@ func twoaiHardware(db *sql.DB, today string) (int, error) {
 		Renewal  string `json:"renewal,omitempty"`
 		Source   string `json:"source_url"`
 		Verified string `json:"verified"`
+		// UID and Page are set for sections whose entries have their own page
+		// on this site. The hub links the heading to Page, never to Source.
+		UID  string `json:"uid,omitempty"`
+		Page string `json:"page,omitempty"`
 	}
 	for _, sec := range []struct{ slug, path string }{
 		{"books", "learn/books.json"},
@@ -292,6 +296,25 @@ func twoaiHardware(db *sql.DB, today string) (int, error) {
 			}
 		}
 		name, blurb := taxMeta(sec.slug)
+		// A PAGE FOR EVERY ENTRY. Stephen, 2026-09-19. See
+		// twoai_learning_pages.go for why and for what the pages hold. The uid
+		// is minted here because the hub needs it to link to the page, and the
+		// page is emitted here because this loop owns the curated row.
+		if twoaiLearningHasPages(sec.slug) {
+			secUID := twoaiUID("section:" + sec.slug)
+			for i := range items {
+				items[i].UID = twoaiLearningUID(db, items[i].Name)
+				items[i].Page = "/ai-ecosystem/research-knowledge-and-learning/" + items[i].UID + "/"
+				var entry map[string]any
+				ej, _ := json.Marshal(items[i])
+				json.Unmarshal(ej, &entry)
+				if err := twoaiLearningEmitPage(db, today, sec.slug, name, secUID, entry); err != nil {
+					return count, err
+				}
+				// count is not incremented: it is logged as "sections", and an
+				// entry page is not a section.
+			}
+		}
 		doc := map[string]any{
 			"name": name, "blurb": blurb, "shape": "learning",
 			"items": items, "total": len(items), "free": free, "with_code": withCode,

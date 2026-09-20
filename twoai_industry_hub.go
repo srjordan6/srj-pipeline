@@ -353,7 +353,18 @@ func twoaiHarvestSources(db *sql.DB) error {
 		SELECT COALESCE(pg.data->>'tax', pg.path), p->>'name', p->>'source'
 		FROM twoai_pages pg, jsonb_array_elements(pg.data->'points') p
 		WHERE (pg.path LIKE 'industries/ins-%' OR pg.data->>'shape' = 'coverage-item')
-		  AND p->>'source' LIKE 'http%'`)
+		  AND p->>'source' LIKE 'http%'
+		UNION
+		-- The issuer's own page for every certification and course, 2026-09-19.
+		-- These rows carried a daily "verified" date that only meant the link
+		-- answered 200; three of nine certifications had been retired or renamed
+		-- by their issuers while showing verified today. Harvesting the page
+		-- gives twoai_learning_readings the text to read and a hash that moves
+		-- when the issuer changes it. sector_slug carries the section so
+		-- twoai_point_briefs can leave these to their own stage.
+		SELECT l.section_slug, l.name, l.source_url
+		FROM twoai_learning l
+		WHERE l.section_slug IN ('certifications','courses') AND l.source_url LIKE 'http%'`)
 	if err != nil {
 		return err
 	}
