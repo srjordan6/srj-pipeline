@@ -51,6 +51,36 @@ import (
 //
 // FIRST RUN NEVER FIRES. A document with no stored hash records one and says
 // nothing, because "we have never checked this before" is not a change.
+//
+// A SOURCE WE PUBLISH OURSELVES IS NOT WATCHED. Found 2026-09-19: three
+// documents, the Accountability Register, the Adoption Policy and the Incident
+// Response Plan, all flagged SOURCE CHANGED on the same day, all against
+// srjconsultingservices.com/books/. That is Stephen's own page and he had
+// edited it. The loud line exists for the morning NIST revises the AI RMF
+// without telling anyone; a change to our own site is one we made, and
+// reporting it spends the one signal this stage has that is meant to be rare.
+// based_on_url still renders on the download page as the link to the book, so
+// it stays in the row. It is simply not fetched.
+//
+// WATCH THE DOCUMENT, NOT THE FRONT PAGE. The same day, the vendor scorecard
+// flagged against artificialintelligenceact.eu/, whose visible text is a feed
+// of post teasers and changes whenever they publish. The fingerprint was
+// designed to survive a changed menu; it cannot survive a page whose prose IS
+// the news. That row now points at /article/50/, the transparency obligations
+// the scorecard actually cites, whose text is the statute. A based_on_url
+// should be the most specific stable page that carries the cited text.
+var twoaiDocOwnHosts = []string{"srjconsultingservices.com", "theworldofai.org"}
+
+func twoaiDocIsOwn(u string) bool {
+	l := strings.ToLower(u)
+	for _, h := range twoaiDocOwnHosts {
+		if strings.Contains(l, "://"+h+"/") || strings.Contains(l, "://www."+h+"/") ||
+			strings.HasSuffix(l, "://"+h) || strings.HasSuffix(l, "://www."+h) {
+			return true
+		}
+	}
+	return false
+}
 
 var twoaiDocTagRe = regexp.MustCompile(`(?s)<(script|style|noscript)[^>]*>.*?</(script|style|noscript)>`)
 var twoaiDocAngleRe = regexp.MustCompile(`<[^>]+>`)
@@ -101,7 +131,7 @@ func twoaiDocWatch(db *sql.DB) error {
 	}
 
 	client := &http.Client{Timeout: 25 * time.Second}
-	checked, firstSeen, unreachable := 0, 0, 0
+	checked, firstSeen, unreachable, own := 0, 0, 0, 0
 	var changed []string
 	dueCount := 0
 	var oldest string
@@ -122,6 +152,10 @@ func twoaiDocWatch(db *sql.DB) error {
 		}
 
 		if d.url == "" || !strings.HasPrefix(d.url, "http") {
+			continue
+		}
+		if twoaiDocIsOwn(d.url) {
+			own++
 			continue
 		}
 		req, _ := http.NewRequest("GET", d.url, nil)
@@ -172,8 +206,8 @@ func twoaiDocWatch(db *sql.DB) error {
 	// The quiet line. One count, never a list, because at a 7-day interval
 	// this is true of nearly everything nearly always and a list would train
 	// the reader to skip the whole stage.
-	fmt.Printf("docwatch: docs=%d sources_checked=%d baselined=%d unreachable=%d review_due=%d",
-		len(docs), checked, firstSeen, unreachable, dueCount)
+	fmt.Printf("docwatch: docs=%d sources_checked=%d own_not_watched=%d baselined=%d unreachable=%d review_due=%d",
+		len(docs), checked, own, firstSeen, unreachable, dueCount)
 	if oldestDays > 0 {
 		fmt.Printf(" oldest=%dd (%s)", oldestDays, truncate(oldest, 40))
 	}
