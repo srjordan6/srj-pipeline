@@ -71,6 +71,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -79,6 +80,40 @@ import (
 // Books are left out on purpose: that section is merged with the Open Library
 // catalogue in the template and needs its own treatment.
 var twoaiLearningPageSections = []string{"certifications", "courses"}
+
+// twoaiLearningRelatedProbes turns a credential name into the ILIKE patterns
+// worth trying against compliance page titles. Deliberately narrow: a standard
+// number or a named framework, never a common word, because "AI" or
+// "Professional" would match half the site.
+func twoaiLearningRelatedProbes(name string) []string {
+	var out []string
+	add := func(p string) {
+		for _, e := range out {
+			if e == p {
+				return
+			}
+		}
+		out = append(out, p)
+	}
+	// A standard number, such as the 42001 in "ISO/IEC 42001 Lead Implementer".
+	for _, m := range twoaiStandardNumRe.FindAllString(name, -1) {
+		add("%" + m + "%")
+	}
+	// Named frameworks a credential can be awarded against.
+	for _, k := range []string{"NIST AI RMF", "AI RMF", "GDPR", "HIPAA", "EU AI Act", "SOC 2"} {
+		if strings.Contains(strings.ToLower(name), strings.ToLower(k)) {
+			add("%" + k + "%")
+		}
+	}
+	// The governance credentials belong beside the governance frameworks.
+	if strings.Contains(strings.ToLower(name), "governance") {
+		add("%AI Risk Management Framework%")
+		add("%ISO/IEC 42001%")
+	}
+	return out
+}
+
+var twoaiStandardNumRe = regexp.MustCompile(`\b\d{4,5}\b`)
 
 func twoaiLearningHasPages(section string) bool {
 	for _, s := range twoaiLearningPageSections {
@@ -315,6 +350,34 @@ func twoaiLearningReadings(db *sql.DB) error {
 // reading yet still gets its page, built from the curated row alone, and the
 // page says the issuer's page has not been read yet. It never waits on the
 // model to exist.
+//
+// WHY THE PAGE CARRIES MORE THAN ITS OWN READING. Stephen, 2026-09-20, on the
+// first published set: it looks like we created some thin pages. Measured
+// against the live sitemap he was right, and precisely so. The thirty pages
+// were the thirty thinnest in the category, 479 to 523 words against a 500
+// word audit threshold, while the next thinnest page on the site was 590 and
+// the hubs above them ran from 1,063 to 3,110.
+//
+// The cause was not a defect. A certification page has a finite amount to say
+// about itself, and the readings were already near the limit of what the
+// issuer states. So the page gains three things it can say honestly from data
+// this site already holds, and no filler:
+//
+//   - siblings: the other entries at the same level, and everything else from
+//     the same provider. A reader on a page about one credential is usually
+//     choosing between several, and this site knows all thirty.
+//   - related: the compliance pages this credential is a credential IN. The
+//     ISO 42001 Lead Implementer belongs beside /ai-compliance/iso-42001/,
+//     and a reader wanting to know what the standard requires should not have
+//     to search for it. Matched on the credential name against the compliance
+//     page titles, so a page that does not exist is never linked.
+//   - faq: cost, expiry and prerequisites, answered from the reading where
+//     the issuer stated them and answered honestly where it did not. This is
+//     the block that earns FAQPage schema, which the state law pages already
+//     use.
+//
+// The related list is built here rather than in the template because the
+// template cannot query; the same reason the siblings are passed in whole.
 func twoaiLearningEmitPage(db *sql.DB, today, section, sectionName, sectionUID string, l map[string]any) error {
 	slug, _ := l["slug"].(string)
 	uid, _ := l["uid"].(string)
@@ -357,6 +420,61 @@ func twoaiLearningEmitPage(db *sql.DB, today, section, sectionName, sectionUID s
 		doc["source_read_on"] = fetched.String
 		doc["source_http_status"] = status.Int64
 	}
+
+	// SIBLINGS. Same section, same level first, then anything else by the same
+	// provider. Each carries the uid so the template links to our page and not
+	// out to the issuer.
+	provider, _ := l["provider"].(string)
+	level, _ := l["level"].(string)
+	sameLevel := []map[string]any{}
+	sameProvider := []map[string]any{}
+	srows, serr := db.Query(`SELECT slug, name, provider, level, COALESCE(note,'')
+		FROM twoai_learning WHERE section_slug=$1 AND slug<>$2 ORDER BY provider, name`, section, slug)
+	if serr == nil {
+		for srows.Next() {
+			var sSlug, sName, sProv, sLevel, sNote string
+			if srows.Scan(&sSlug, &sName, &sProv, &sLevel, &sNote) != nil {
+				continue
+			}
+			entry := map[string]any{
+				"slug": sSlug, "name": sName, "provider": sProv, "level": sLevel, "note": sNote,
+				"uid": twoaiLearningUID(nil, sName),
+			}
+			switch {
+			case sProv == provider:
+				sameProvider = append(sameProvider, entry)
+			case sLevel == level && len(sameLevel) < 6:
+				sameLevel = append(sameLevel, entry)
+			}
+		}
+		srows.Close()
+	}
+	doc["same_level"] = sameLevel
+	doc["same_provider"] = sameProvider
+
+	// RELATED COMPLIANCE PAGES. Only where this site has the page: the title is
+	// matched against the credential's name, so nothing is linked on a guess.
+	// ISO/IEC 42001 is the case this exists for; the pattern holds for any
+	// standard or framework a credential is awarded against.
+	name, _ := l["name"].(string)
+	related := []map[string]any{}
+	for _, probe := range twoaiLearningRelatedProbes(name) {
+		var rPath, rTitle string
+		if db.QueryRow(`SELECT path, data->>'title' FROM twoai_pages
+			WHERE kind='compliance' AND data->>'title' ILIKE $1
+			ORDER BY length(data->>'title') LIMIT 1`, probe).Scan(&rPath, &rTitle) != nil {
+			continue
+		}
+		slugPart := strings.TrimSuffix(strings.TrimPrefix(rPath, "compliance/"), ".json")
+		related = append(related, map[string]any{
+			"title": rTitle, "href": "/ai-compliance/" + slugPart + "/",
+		})
+		if len(related) >= 3 {
+			break
+		}
+	}
+	doc["related"] = related
+
 	j, _ := json.Marshal(doc)
 	_, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
 		VALUES ($1,'learning-entry',$2::jsonb,NULL,1)
