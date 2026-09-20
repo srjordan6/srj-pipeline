@@ -1,18 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"database/sql"
-	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"html"
-	"io"
-	"net/http"
 	"os"
 	"regexp"
 	"strings"
-	"time"
 )
 
 // The disclosure wordings the covered publishers actually use.
@@ -191,14 +186,25 @@ func twoaiCaseStudyHarvest(db *sql.DB) error {
 	return twoaiCaseStudyClassify(db)
 }
 
-// twoaiCaseStudyClassify asks Haiku, once per item, whether a stored candidate
-// is actually a case study. Only case_study rows ever render, so the cost of
-// being wrong here is a missing entry, never a mislabelled one.
+// twoaiCaseStudyClassify asks the model, once per item, whether a stored
+// candidate is actually a case study. Only case_study rows ever render, so the
+// cost of being wrong here is a missing entry, never a mislabelled one.
+//
+// THIS WAS THE ONE STAGE STILL WIRED TO ANTHROPIC. Stephen, 2026-09-17: cut all
+// ties with the API. twoai_llm.go was changed that day so no switch can route a
+// stage there, but this file never went through twoaiGenerate. It built its own
+// request to api.anthropic.com and gated on ANTHROPIC_API_KEY, so it was missed.
+// It has cost nothing since, because the key is not in pipeline.env. It has
+// also classified nothing: the log said "candidates stay unclassified" on every
+// run, 104 harvested articles sat unrendered, and the case studies page stopped
+// growing the day the key was removed.
+//
+// Stephen, 2026-09-19, when told to add the key back: I only want ollama. So it
+// now goes through twoaiGenerate like every other stage, which means Ollama,
+// the per-stage model override OLLAMA_MODEL_CASE_STUDIES, and the same
+// behaviour when Ollama is down: nothing is written, and the row stays
+// unclassified for the next run rather than getting a guess.
 func twoaiCaseStudyClassify(db *sql.DB) error {
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		fmt.Fprintln(os.Stderr, "twoai_case_studies: ANTHROPIC_API_KEY not set, candidates stay unclassified")
-		return nil
-	}
 	rows, err := db.Query(`SELECT slug, title, summary, publisher FROM twoai_case_studies
 		WHERE active AND classification='unclassified' ORDER BY posted_on DESC NULLS LAST LIMIT 120`)
 	if err != nil {
@@ -219,6 +225,13 @@ func twoaiCaseStudyClassify(db *sql.DB) error {
 		verdict, err := twoaiClassifyCaseStudy(c.title, c.summary, c.publisher)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "twoai_case_studies: classify %s: %v\n", c.slug, err)
+			// Ollama down is a whole-run condition, not a per-article one. Once
+			// twoaiGenerate has marked it down every further call fails the same
+			// way, so stop rather than print the same line 120 times.
+			if strings.Contains(err.Error(), "marked down") || strings.Contains(err.Error(), "unreachable") {
+				fmt.Fprintf(os.Stderr, "twoai_case_studies: ollama is down, %d candidates left for the next run\n", len(cands)-counts["case_study"]-counts["vendor_news"]-counts["other"])
+				break
+			}
 			continue // stays unclassified, does not render
 		}
 		db.Exec(`UPDATE twoai_case_studies SET classification=$2, classified_on=current_date
@@ -237,7 +250,7 @@ func twoaiCaseStudyClassify(db *sql.DB) error {
 // its own gets a generous answer and a generous answer is how the page fills
 // up with product launches.
 func twoaiClassifyCaseStudy(title, summary, publisher string) (string, error) {
-	key := os.Getenv("ANTHROPIC_API_KEY")
+	system := "You classify news articles. Answer with exactly one word from the list given and nothing else. No punctuation, no explanation."
 	prompt := "Classify this article into exactly one category. Answer with one word and nothing else.\n\n" +
 		"case_study: a reported account of one or more named organisations actually using or deploying AI, " +
 		"describing what they did and what happened. Includes interview-based accounts of a real deployment.\n" +
@@ -246,50 +259,37 @@ func twoaiClassifyCaseStudy(title, summary, publisher string) (string, error) {
 		"and anything where no specific organisation's use of AI is reported.\n\n" +
 		"If it is a close call between case_study and anything else, answer with the other category.\n\n" +
 		"Publisher: " + publisher + "\nHeadline: " + title + "\nAbstract: " + summary
-	body, _ := json.Marshal(map[string]any{
-		"model":      "claude-haiku-4-5",
-		"max_tokens": 10,
-		"messages":   []map[string]string{{"role": "user", "content": prompt}},
-	})
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	v, _, err := twoaiGenerate("case_studies", system, prompt)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("content-type", "application/json")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
-		return "", fmt.Errorf("anthropic %d: %s", resp.StatusCode, b)
-	}
-	var out struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	v := ""
-	for _, c := range out.Content {
-		v += c.Text
-	}
+	// A local model is chattier than the one this was written for. It may wrap
+	// the word in quotes or markdown, or lead with "Category:". So the verdict
+	// is found anywhere in the reply, AS A WHOLE WORD, which matters because
+	// "other" hides inside "another".
+	//
+	// And a reply that names MORE THAN ONE category is refused. "Not a
+	// case_study, this is vendor_news" names case_study first, and taking the
+	// first word would publish a product launch as a case study. The rule this
+	// stage was built on is that being wrong costs a missing entry, never a
+	// mislabelled one, so an ambiguous reply leaves the row unclassified.
 	v = strings.ToLower(strings.TrimSpace(v))
-	switch {
-	case strings.HasPrefix(v, "case_study"):
-		return "case_study", nil
-	case strings.HasPrefix(v, "vendor_news"):
-		return "vendor_news", nil
-	case strings.HasPrefix(v, "other"):
-		return "other", nil
+	seen := map[string]bool{}
+	for _, m := range twoaiCaseVerdictRe.FindAllString(v, -1) {
+		seen[m] = true
+	}
+	if len(seen) == 1 {
+		for m := range seen {
+			return m, nil
+		}
+	}
+	if len(seen) > 1 {
+		return "", fmt.Errorf("ambiguous verdict, names %d categories: %q", len(seen), v)
 	}
 	return "", fmt.Errorf("unrecognised verdict %q", v)
 }
+
+var twoaiCaseVerdictRe = regexp.MustCompile(`\b(case_study|vendor_news|other)\b`)
 
 // twoaiCaseStudies renders the section page from whatever the harvest holds.
 // An empty table renders nothing at all rather than an empty page promising
