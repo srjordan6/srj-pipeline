@@ -53,7 +53,7 @@ const (
 // AI in a federal bill title or description. "AI" is matched case
 // sensitively as a whole word, since Congress titles use it as a proper
 // noun ("AI LEAD Act") and lower-case "ai" never means it.
-var polAIWordsRe = regexp.MustCompile(`(?i)artificial intelligence|machine learning|deepfake|deep fake|generative model|large language model|chatbot|algorithmic|automated decision|facial recognition|digital replica|synthetic media|foundation model|frontier model`)
+var polAIWordsRe = regexp.MustCompile(`(?i)artificial intelligence|machine learning|deepfake|deep fake|generative model|large language model|chatbot|algorithmic|automated decision|facial recognition|digital replica|synthetic media|foundation model|frontier model|data ?cent(?:er|re)s?|hyperscale|large load`)
 var polAICapsRe = regexp.MustCompile(`\bAI\b`)
 
 // Fixed issue patterns for From Issue to Law. Order is display order.

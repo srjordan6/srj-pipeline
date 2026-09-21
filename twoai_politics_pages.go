@@ -51,13 +51,18 @@ func twoaiPoliticsPages(db *sql.DB) error {
 	} else if n > 0 {
 		fmt.Printf("twoai_politics_pages: %d new client to company matches proposed\n", n)
 	}
-	confirmed := map[int64]string{}
-	if r, err := db.Query(`SELECT client_id, company_uid FROM twoai_pol_client_matches WHERE status = 'confirmed'`); err == nil {
+	confirmed := map[int64]string{} // client_id -> page href; a company page wins over an operator page
+	if r, err := db.Query(`SELECT client_id, company_uid, target_kind FROM twoai_pol_client_matches
+		WHERE status = 'confirmed' ORDER BY (target_kind = 'company')`); err == nil {
 		for r.Next() {
 			var id int64
-			var uid string
-			if r.Scan(&id, &uid) == nil {
-				confirmed[id] = uid
+			var uid, kind string
+			if r.Scan(&id, &uid, &kind) == nil {
+				if kind == "dc_operator" {
+					confirmed[id] = "/ai-ecosystem/technology-and-core-infrastructure/" + uid + "/"
+				} else {
+					confirmed[id] = "/companies/" + uid + "/"
+				}
 			}
 		}
 		r.Close()
@@ -67,6 +72,11 @@ func twoaiPoliticsPages(db *sql.DB) error {
 	// the member pages that exist this run.
 	if err := twoaiPoliticsExports(db, today); err != nil {
 		fmt.Println("twoai_politics_exports:", err)
+	}
+	// Bills, firms and lobbyists as pages, cross referenced with members,
+	// companies and AI people.
+	if err := twoaiPoliticsDirectory(db, today); err != nil {
+		fmt.Println("twoai_politics_directory:", err)
 	}
 	type memberPoint struct {
 		Name   string `json:"name"`
@@ -167,8 +177,8 @@ func twoaiPoliticsPages(db *sql.DB) error {
 		// company's page, which lists every filing with its lda.gov link. An
 		// unconfirmed client links to its latest filing directly.
 		src := url
-		if cu, ok := confirmed[id]; ok {
-			src = "/companies/" + cu + "/"
+		if h, ok := confirmed[id]; ok {
+			src = h
 		}
 		points = append(points, point{Name: name, Desc: d, Source: src})
 	}
@@ -201,7 +211,10 @@ func twoaiPoliticsPages(db *sql.DB) error {
 	"summary": hubSummary, "blurb": hubBlurb, "points": memberPts,
 		"children": []map[string]any{
 			{"name": "Lobbying on AI", "href": polBase + polLobbyUID + "/", "desc": lobbySummary, "sort": 1},
-			{"name": "Press room and data downloads", "href": "/press/", "desc": "Every dataset behind this hub as JSON and CSV, a daily digest feed, and how the data is collected and cited.", "sort": 2},
+			{"name": "AI Bills in Congress", "href": polBase + polBillsUID + "/", "desc": "Every AI bill in the current Congress with its sponsors, recorded votes and the lobbying filings that name it.", "sort": 2},
+			{"name": "Lobbying Firms on AI", "href": polBase + polFirmsUID + "/", "desc": "Every firm and in-house team filing AI lobbying reports, with its clients, lobbyists and the bills named.", "sort": 3},
+			{"name": "Lobbyists on AI", "href": polBase + polLobbyistsUID + "/", "desc": "Registered lobbyists named on AI filings, with their firms, clients, bills and disclosed prior government positions.", "sort": 4},
+			{"name": "Press room and data downloads", "href": "/press/", "desc": "Every dataset behind this hub as JSON and CSV, a daily digest feed, and how the data is collected and cited.", "sort": 5},
 		},
 		"total": 1, "generated": today, "verified": today, "built_at": time.Now().Format(time.RFC3339),
 		"refresh_every_days": 1, "category": polCategory,

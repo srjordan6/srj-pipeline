@@ -344,7 +344,7 @@ func twoaiPoliticsExports(db *sql.DB, today string) error {
 					if st == 1 {
 						role = "Sponsor"
 					}
-					ev = append(ev, polEvent{Date: d, Kind: "bill", Title: role + " of " + num, Detail: title + ". Date shown is the bill's latest status date.", Source: src, UID: uid})
+					ev = append(ev, polEvent{Date: d, Kind: "bill", Title: role + " of " + polBillLabel(num), Detail: title + ". Date shown is the bill's latest status date.", Source: polBase + uid + "/", UID: uid})
 				}
 			}
 			r.Close()
@@ -356,7 +356,7 @@ func twoaiPoliticsExports(db *sql.DB, today string) error {
 			for r.Next() {
 				var d, vt, num, desc, uid, src string
 				if r.Scan(&d, &vt, &num, &desc, &uid, &src) == nil {
-					ev = append(ev, polEvent{Date: d, Kind: "vote", Title: "Voted " + vt + " on " + num, Detail: desc, Source: src, UID: uid})
+					ev = append(ev, polEvent{Date: d, Kind: "vote", Title: "Voted " + vt + " on " + polBillLabel(num), Detail: desc, Source: src, UID: uid})
 				}
 			}
 			r.Close()
@@ -394,7 +394,19 @@ func twoaiPoliticsExports(db *sql.DB, today string) error {
 			Desc   string `json:"desc"`
 			Source string `json:"source"`
 		}
-		pts := make([]point, 0, len(ev))
+		pts := make([]point, 0, len(ev)+1)
+		// The member's AI People profile, when one exists, by Wikidata id from
+		// congress-legislators against a Wikidata id this site holds for the
+		// person. A hard identifier, so no confirmation step is needed.
+		var personUID string
+		db.QueryRow(`SELECT i.entity_uid FROM twoai_pol_legislators l JOIN twoai_identifiers i
+				ON i.scheme IN ('wikidata','wikidata_qid') AND i.value = l.wikidata AND i.entity_kind = 'person' AND i.superseded_at IS NULL
+			WHERE l.people_id = $1 AND l.wikidata IS NOT NULL
+			  AND EXISTS (SELECT 1 FROM twoai_pages p WHERE p.path LIKE 'people/%' AND p.data->>'uid' = i.entity_uid) LIMIT 1`, m.pid).Scan(&personUID)
+		if personUID != "" {
+			pts = append(pts, point{Name: "Profile in the AI People Directory", Desc: "Matched by Wikidata identifier.",
+				Source: "/ai-ecosystem/ecosystem-entities-market-and-operations/" + personUID + "/"})
+		}
 		for _, e := range ev {
 			d := e.Date
 			if d == "" {
@@ -417,10 +429,15 @@ func twoaiPoliticsExports(db *sql.DB, today string) error {
 		}
 		b, _ := json.Marshal(doc)
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, taxonomy_slug, data, updated_at)
-			VALUES ($1,'tech-section','pol-member',$2,now())
+			VALUES ($1,'tech-section','politics-of-ai',$2,now())
 			ON CONFLICT (path) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
 			"industries/pol-member-"+m.uid+".json", ldaRaw(b)); err == nil {
 			pages++
+		} else {
+			// Printed, because the first run wrote 0 of these silently: the
+			// taxonomy slug pol-member does not exist and the column is a
+			// foreign key.
+			fmt.Printf("twoai_politics_exports: member page %s: %v\n", m.uid, err)
 		}
 	}
 	fmt.Printf("twoai_politics_exports: lobbying=%d money=%d bills=%d members=%d digest=%d member_pages=%d ok=true\n",

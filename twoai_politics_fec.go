@@ -79,7 +79,11 @@ func polFECGet(client *http.Client, key, path string, v url.Values, calls *int) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 429 {
-		return nil, fmt.Errorf("rate limited")
+		// Say which limit was hit. api.data.gov keys are shared across every
+		// api.data.gov service, so govinfo or another stage using the same key
+		// spends the same hourly allowance.
+		return nil, fmt.Errorf("rate limited (limit %s, remaining %s, retry after %ss)",
+			resp.Header.Get("X-RateLimit-Limit"), resp.Header.Get("X-RateLimit-Remaining"), resp.Header.Get("Retry-After"))
 	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("%s: http %d", path, resp.StatusCode)

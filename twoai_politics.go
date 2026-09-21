@@ -50,7 +50,10 @@ const ldaFilingsURL = "https://lda.gov/api/v1/filings/"
 
 // Two phrases, because the text search is literal and filers write both.
 // A bare "AI" is not searched: it matches inside unrelated words and codes.
-var ldaQueries = []string{"artificial intelligence", "machine learning"}
+// "data center" added 2026-09-21: an operator lobbying on power, permitting
+// or water rarely writes the word AI, and the data center registry is one of
+// the site's core sections.
+var ldaQueries = []string{"artificial intelligence", "machine learning", "data center"}
 
 const ldaMaxPages = 40 // per query per run, 25 filings a page
 
@@ -59,6 +62,13 @@ const ldaMaxPages = 40 // per query per run, 25 filings a page
 // unrelated ones with it; only the matching activities are kept as the
 // filing's AI issue text.
 var ldaAIRe = regexp.MustCompile(`(?i)artificial intelligence|machine learning|\bA\.?I\.?\b|generative|large language model|deepfake|algorithmic|automated decision|facial recognition`)
+
+// Data center activity, kept alongside AI activity. Law-shaped, like the
+// Federal Register data center pairings: the facility, its power and siting.
+var ldaDCRe = regexp.MustCompile(`(?i)data ?cent(?:er|re)s?|hyperscale|large load|colocation facilit`)
+
+// ldaKeep is the one test of whether a lobbying activity belongs on the site.
+func ldaKeep(desc string) bool { return ldaAIRe.MatchString(desc) || ldaDCRe.MatchString(desc) }
 
 // Bill numbers written in the activity text: H.R. 7334, S. 4686, H.Res. 12.
 var ldaBillRe = regexp.MustCompile(`(?i)\b(H\.?\s?R(?:es)?\.?|S\.?\s?(?:Res\.?)?|S\.)\s?(\d{1,5})\b`)
@@ -221,7 +231,7 @@ func twoaiPoliticsLDA(db *sql.DB) error {
 				lob := 0
 				entSeen := map[string]bool{}
 				for _, a := range f.Activities {
-					if !ldaAIRe.MatchString(a.Description) {
+					if !ldaKeep(a.Description) {
 						continue
 					}
 					issues = append(issues, ldaClean(a.Description))

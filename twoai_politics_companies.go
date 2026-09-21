@@ -51,11 +51,28 @@ func polNormOrg(s string) string {
 }
 
 func polProposeClientMatches(db *sql.DB) (int, error) {
-	rows, err := db.Query(`
-		SELECT e.uid, e.name, COALESCE(e.aliases, '[]'::jsonb)
-		FROM twoai_entities e
-		WHERE e.kind = 'company'
-		  AND EXISTS (SELECT 1 FROM twoai_pages p WHERE p.path = 'companies/' || e.uid || '.json')`)
+	// Two kinds of target: a company with a /companies/ page, and a data center
+	// operator with a registry page (tech/dc-op-<uid>.json), 2026-09-21. The
+	// same client can be proposed for both, since CoreWeave is both.
+	kinds := []struct{ kind, sql string }{
+		{"company", `SELECT e.uid, e.name, COALESCE(e.aliases, '[]'::jsonb) FROM twoai_entities e
+			WHERE e.kind = 'company' AND EXISTS (SELECT 1 FROM twoai_pages p WHERE p.path = 'companies/' || e.uid || '.json')`},
+		{"dc_operator", `SELECT e.uid, e.name, COALESCE(e.aliases, '[]'::jsonb) FROM twoai_entities e
+			WHERE e.kind = 'dc_operator' AND EXISTS (SELECT 1 FROM twoai_pages p WHERE p.path = 'tech/dc-op-' || e.uid || '.json')`},
+	}
+	total := 0
+	for _, k := range kinds {
+		n, err := polProposeKind(db, k.kind, k.sql)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func polProposeKind(db *sql.DB, kind, entitySQL string) (int, error) {
+	rows, err := db.Query(entitySQL)
 	if err != nil {
 		return 0, err
 	}
@@ -86,8 +103,8 @@ func polProposeClientMatches(db *sql.DB) (int, error) {
 	cr, err := db.Query(`SELECT client_id, (array_agg(client_name ORDER BY dt_posted DESC))[1]
 		FROM twoai_pol_lobbying l
 		WHERE retired_reason IS NULL
-		  AND NOT EXISTS (SELECT 1 FROM twoai_pol_client_matches m WHERE m.client_id = l.client_id)
-		GROUP BY client_id`)
+		  AND NOT EXISTS (SELECT 1 FROM twoai_pol_client_matches m WHERE m.client_id = l.client_id AND m.target_kind = $1)
+		GROUP BY client_id`, kind)
 	if err != nil {
 		return 0, err
 	}
@@ -110,9 +127,9 @@ func polProposeClientMatches(db *sql.DB) (int, error) {
 	cr.Close()
 	n := 0
 	for _, p := range props {
-		if _, err := db.Exec(`INSERT INTO twoai_pol_client_matches (client_id, client_name, company_uid, basis, status)
-			VALUES ($1,$2,$3,'normalised name equals company name or alias','proposed') ON CONFLICT (client_id) DO NOTHING`,
-			p.id, p.name, p.uid); err == nil {
+		if _, err := db.Exec(`INSERT INTO twoai_pol_client_matches (client_id, client_name, company_uid, basis, status, target_kind)
+			VALUES ($1,$2,$3,'normalised name equals name or alias','proposed',$4) ON CONFLICT (client_id, target_kind) DO NOTHING`,
+			p.id, p.name, p.uid, kind); err == nil {
 			n++
 		}
 	}
@@ -125,13 +142,14 @@ type polLobbyist struct {
 }
 
 type polCompanyFiling struct {
-	UID        string        `json:"uid"`
-	URL        string        `json:"url"`
-	Period     string        `json:"period"`
-	Posted     string        `json:"posted"`
-	Registrant string        `json:"registrant"`
-	Bills      []string      `json:"bills"`
-	Lobbyists  []polLobbyist `json:"lobbyists"`
+	UID            string        `json:"uid"`
+	URL            string        `json:"url"`
+	Period         string        `json:"period"`
+	Posted         string        `json:"posted"`
+	Registrant     string        `json:"registrant"`
+	RegistrantHref string        `json:"registrant_href,omitempty"`
+	Bills          []string      `json:"bills"`
+	Lobbyists      []polLobbyist `json:"lobbyists"`
 }
 
 func polTitle(s string) string {
@@ -157,19 +175,19 @@ func twoaiPoliticsCompanyPatch(db *sql.DB) error {
 		r.Close()
 	}
 
-	rows, err := db.Query(`SELECT company_uid, array_agg(client_id) FROM twoai_pol_client_matches
-		WHERE status = 'confirmed' GROUP BY company_uid`)
+	rows, err := db.Query(`SELECT company_uid, target_kind, array_agg(client_id) FROM twoai_pol_client_matches
+		WHERE status = 'confirmed' GROUP BY company_uid, target_kind`)
 	if err != nil {
 		return err
 	}
 	type co struct {
-		uid     string
-		clients []int64
+		uid, kind string
+		clients   []int64
 	}
 	var cos []co
 	for rows.Next() {
 		var c co
-		if rows.Scan(&c.uid, pq.Array(&c.clients)) == nil {
+		if rows.Scan(&c.uid, &c.kind, pq.Array(&c.clients)) == nil {
 			cos = append(cos, c)
 		}
 	}
@@ -182,7 +200,7 @@ func twoaiPoliticsCompanyPatch(db *sql.DB) error {
 					WHEN 'third_quarter' THEN 'Q3' WHEN 'fourth_quarter' THEN 'Q4'
 					WHEN 'mid_year' THEN 'Mid-year' WHEN 'year_end' THEN 'Year-end'
 					ELSE COALESCE(filing_type_display, 'LDA') END || ' ' || COALESCE(filing_year::text, ''),
-				dt_posted, COALESCE(registrant_name, ''), bill_refs, raw
+				dt_posted, COALESCE(registrant_name, ''), bill_refs, raw, COALESCE(registrant_id, 0)
 			FROM twoai_pol_lobbying l
 			WHERE client_id = ANY($1) AND retired_reason IS NULL AND dt_posted IS NOT NULL
 			ORDER BY dt_posted DESC`, pq.Array(c.clients))
@@ -197,8 +215,13 @@ func twoaiPoliticsCompanyPatch(db *sql.DB) error {
 			var posted sql.NullTime
 			var bills []string
 			var raw []byte
-			if fr.Scan(&f.UID, &f.URL, &f.Period, &posted, &f.Registrant, pq.Array(&bills), &raw) != nil {
+			var regID int64
+			if fr.Scan(&f.UID, &f.URL, &f.Period, &posted, &f.Registrant, pq.Array(&bills), &raw, &regID) != nil {
 				continue
+			}
+			if regID > 0 {
+				// Every firm with an AI filing has a page, keyed on its LDA id.
+				f.RegistrantHref = polBase + polUID("lda-firm", fmt.Sprint(regID)) + "/"
 			}
 			total++
 			if latest == "" && posted.Valid {
@@ -219,7 +242,7 @@ func twoaiPoliticsCompanyPatch(db *sql.DB) error {
 					Description string `json:"description"`
 					Lobbyists   []struct {
 						Lobbyist struct {
-							ID        any    `json:"id"`
+							ID        json.Number `json:"id"`
 							FirstName string `json:"first_name"`
 							LastName  string `json:"last_name"`
 						} `json:"lobbyist"`
@@ -228,7 +251,7 @@ func twoaiPoliticsCompanyPatch(db *sql.DB) error {
 			}
 			if json.Unmarshal(raw, &rawAct) == nil {
 				for _, a := range rawAct.Activities {
-					if !ldaAIRe.MatchString(a.Description) {
+					if !ldaKeep(a.Description) {
 						continue
 					}
 					for _, l := range a.Lobbyists {
@@ -238,7 +261,13 @@ func twoaiPoliticsCompanyPatch(db *sql.DB) error {
 							continue
 						}
 						seen[id] = true
-						f.Lobbyists = append(f.Lobbyists, polLobbyist{Name: name, Href: people[id]})
+						// A confirmed AI People profile wins; otherwise the lobbyist's
+						// own page, keyed on the LDA lobbyist id.
+						href := people[id]
+						if href == "" {
+							href = polBase + polUID("lda-lobbyist", id) + "/"
+						}
+						f.Lobbyists = append(f.Lobbyists, polLobbyist{Name: name, Href: href})
 					}
 				}
 			}
@@ -253,8 +282,12 @@ func twoaiPoliticsCompanyPatch(db *sql.DB) error {
 			"section_href": polBase + polLobbyUID + "/",
 		}
 		b, _ := json.Marshal(lob)
+		path := "companies/" + c.uid + ".json"
+		if c.kind == "dc_operator" {
+			path = "tech/dc-op-" + c.uid + ".json"
+		}
 		res, err := db.Exec(`UPDATE twoai_pages SET data = data || jsonb_build_object('lobbying', $2::jsonb), updated_at = now()
-			WHERE path = 'companies/' || $1 || '.json'`, c.uid, string(ldaRaw(b)))
+			WHERE path = $1`, path, string(ldaRaw(b)))
 		if err == nil {
 			if n, _ := res.RowsAffected(); n > 0 {
 				patched++
