@@ -62,30 +62,24 @@ func twoaiLawsuitClassify(db *sql.DB) error {
 	tok := os.Getenv("COURTLISTENER_TOKEN")
 	read, classified, left := 0, 0, 0
 	for _, x := range cs {
-		q := url.Values{"type": {"r"}, "q": {"docket_id:" + x.id}}
-		req, _ := http.NewRequest("GET", "https://www.courtlistener.com/api/rest/v4/search/?"+q.Encode(), nil)
-		req.Header.Set("User-Agent", "theworldofai.org lawsuit tracker (srj@srjconsultingservices.com)")
-		if tok != "" {
-			req.Header.Set("Authorization", "Token "+tok)
+		// The docket endpoint is the direct read and needs the token the
+		// pipeline already holds; the search endpoint is the fallback. The
+		// first run used search only and 12 of 22 came back empty, most likely
+		// throttled, which the old code could not tell from no data.
+		nos, status := lawsuitNOSFromDocket(client, tok, x.id)
+		if nos == "" {
+			var s2 int
+			nos, s2 = lawsuitNOSFromSearch(client, tok, x.id)
+			if status == 0 {
+				status = s2
+			}
 		}
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		var d struct {
-			Results []struct {
-				SuitNature string `json:"suitNature"`
-				Cause      string `json:"cause"`
-			} `json:"results"`
-		}
-		json.NewDecoder(resp.Body).Decode(&d)
-		resp.Body.Close()
 		time.Sleep(700 * time.Millisecond)
 		read++
-		if len(d.Results) == 0 {
+		if nos == "" {
+			fmt.Printf("twoai_lawsuit_classify: %s: no nature of suit returned (http %d)\n", x.slug, status)
 			continue
 		}
-		nos := strings.TrimSpace(d.Results[0].SuitNature)
 		code := strings.SplitN(nos, " ", 2)[0]
 		cat, ok := lawsuitNOSCategory[code]
 		if !ok {
@@ -102,4 +96,54 @@ func twoaiLawsuitClassify(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_lawsuit_classify: unclassified=%d read=%d classified=%d left_for_review=%d ok=true\n", len(cs), read, classified, left)
 	return nil
+}
+
+func lawsuitCLGet(client *http.Client, tok, u string, into any) int {
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("User-Agent", "theworldofai.org lawsuit tracker (srj@srjconsultingservices.com)")
+	if tok != "" {
+		req.Header.Set("Authorization", "Token "+tok)
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0
+		}
+		if resp.StatusCode == 429 {
+			resp.Body.Close()
+			time.Sleep(time.Duration(5*(attempt+1)) * time.Second)
+			continue
+		}
+		if resp.StatusCode == 200 {
+			json.NewDecoder(resp.Body).Decode(into)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	return 429
+}
+
+func lawsuitNOSFromDocket(client *http.Client, tok, id string) (string, int) {
+	if tok == "" {
+		return "", 0
+	}
+	var d struct {
+		NatureOfSuit string `json:"nature_of_suit"`
+	}
+	s := lawsuitCLGet(client, tok, "https://www.courtlistener.com/api/rest/v4/dockets/"+id+"/?fields=nature_of_suit", &d)
+	return strings.TrimSpace(d.NatureOfSuit), s
+}
+
+func lawsuitNOSFromSearch(client *http.Client, tok, id string) (string, int) {
+	var d struct {
+		Results []struct {
+			SuitNature string `json:"suitNature"`
+		} `json:"results"`
+	}
+	q := url.Values{"type": {"r"}, "q": {"docket_id:" + id}}
+	s := lawsuitCLGet(client, tok, "https://www.courtlistener.com/api/rest/v4/search/?"+q.Encode(), &d)
+	if len(d.Results) == 0 {
+		return "", s
+	}
+	return strings.TrimSpace(d.Results[0].SuitNature), s
 }
