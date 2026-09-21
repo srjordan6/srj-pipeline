@@ -154,6 +154,14 @@ func twoaiPoliticsFEC(db *sql.DB) error {
 	}
 	_ = db.QueryRow(`SELECT count(*) FROM twoai_pol_committees WHERE status = 'proposed'`).Scan(&proposed)
 
+	// Member candidate ids to their campaign committees, sharing this run's
+	// call budget, so contributions can be placed beside the member's votes.
+	if n, err := polFECCandidateCommittees(db, client, key, &calls); err != nil {
+		fmt.Println("twoai_politics_fec: candidate committees:", err)
+	} else {
+		fmt.Printf("twoai_politics_fec: candidate committee links added=%d\n", n)
+	}
+
 	// 2. Money, confirmed committees only.
 	rows, err := db.Query(`SELECT committee_id, committee_type FROM twoai_pol_committees WHERE status = 'confirmed' ORDER BY committee_id`)
 	if err != nil {

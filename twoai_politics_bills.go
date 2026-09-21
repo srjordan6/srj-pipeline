@@ -403,6 +403,11 @@ func twoaiPoliticsBills(db *sql.DB) error {
 	}
 
 	var bills, members, rolls int
+	// Hard-identifier crosswalk to congress-legislators, which gives each
+	// member their FEC candidate ids. One request, once a day with this stage.
+	if err := twoaiPoliticsLegislators(db); err != nil {
+		fmt.Println("twoai_politics_legislators:", err)
+	}
 	_ = db.QueryRow(`SELECT (SELECT count(*) FROM twoai_pol_bills), (SELECT count(*) FROM twoai_pol_members),
 		(SELECT count(*) FROM twoai_pol_rollcalls)`).Scan(&bills, &members, &rolls)
 	fmt.Printf("twoai_politics_bills: session_bills=%d ai=%d changed=%d fetched=%d roll_calls_fetched=%d people_fetched=%d failed=%d | held bills=%d members=%d roll_calls=%d ok=true\n",
