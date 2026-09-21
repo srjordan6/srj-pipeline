@@ -131,7 +131,7 @@ var twoaiDailyOnly = map[string]bool{
 	// day. A second build in one day spent 930 and every one of 117 tickers
 	// failed with a 429, so the run reported ok=false and wrote nothing. The
 	// data does not change often enough to be worth paying for twice.
-	"twoai_stocks": true,
+	"twoai_stocks": true, "twoai_fred": true,
 }
 
 // stageDueToday reports whether a once-a-day stage still owes a run today.
@@ -278,7 +278,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_gaps", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_gaps", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -833,6 +833,14 @@ func main() {
 	if src == "twoai_point_briefs" {
 		if err := twoaiPointBriefs(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_point_briefs:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_fred" {
+		if err := twoaiFred(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_fred:", err)
 			os.Exit(1)
 		}
 		return
