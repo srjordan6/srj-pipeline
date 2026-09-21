@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -111,7 +112,9 @@ func ldaRaw(b []byte) []byte {
 
 func ldaBills(text string) []string {
 	seen := map[string]bool{}
-	var out []string
+	// Never nil: pq sends a nil slice as NULL, and bill_refs is NOT NULL.
+	// That was every filing without a bill number on the first live run.
+	out := []string{}
 	// "U.S. 3" is not Senate bill 3. Go's regexp has no lookbehind, so the
 	// country abbreviation is neutralised before matching.
 	text = ldaUSRe.ReplaceAllString(text, "US ")
@@ -134,7 +137,15 @@ func ldaBills(text string) []string {
 
 func twoaiPoliticsLDA(db *sql.DB) error {
 	client := &http.Client{Timeout: 45 * time.Second}
+	// Pace to the access level. Anonymous was cut off after 15 pages at 0.7s
+	// apart on the first live run, so without a key the stage slows to one
+	// page every four seconds, which trades minutes for a complete backfill.
+	pace := 4 * time.Second
+	if os.Getenv("LDA_API_KEY") != "" {
+		pace = 700 * time.Millisecond
+	}
 	stored, skipped, pages := 0, 0, 0
+	retried := map[string]bool{}
 	for _, q := range ldaQueries {
 		var newest sql.NullTime
 		_ = db.QueryRow(`SELECT max(dt_posted) FROM twoai_pol_lobbying WHERE $1 = ANY(matched_queries)`, q).Scan(&newest)
@@ -153,14 +164,34 @@ func twoaiPoliticsLDA(db *sql.DB) error {
 			req, _ := http.NewRequest("GET", next, nil)
 			req.Header.Set("Accept", "application/json")
 			req.Header.Set("User-Agent", "theworldofai.org pipeline (theworldofai@inkboxmail.com)")
+			// Anonymous access is rate limited hard: the first run was cut off
+			// after 15 pages. A registered key raises the limit. Optional, so the
+			// stage still runs without one, only slower.
+			if k := os.Getenv("LDA_API_KEY"); k != "" {
+				req.Header.Set("Authorization", "Token "+k)
+			}
 			resp, err := client.Do(req)
 			if err != nil {
 				return fmt.Errorf("%q page %d: %w", q, p, err)
 			}
 			if resp.StatusCode == 429 {
 				resp.Body.Close()
-				fmt.Printf("twoai_politics_lda: %q rate limited at page %d, resuming next run from the cursor\n", q, p)
-				break
+				// One wait, if the server says it is short, then give up for
+				// the run; the cursor resumes tomorrow.
+				wait := 60 * time.Second
+				if ra := resp.Header.Get("Retry-After"); ra != "" {
+					if d, e := time.ParseDuration(ra + "s"); e == nil {
+						wait = d
+					}
+				}
+				if retried[q] || wait > 90*time.Second {
+					fmt.Printf("twoai_politics_lda: %q rate limited at page %d, resuming next run from the cursor\n", q, p)
+					break
+				}
+				retried[q] = true
+				time.Sleep(wait)
+				p--
+				continue
 			}
 			if resp.StatusCode != 200 {
 				resp.Body.Close()
@@ -182,7 +213,7 @@ func twoaiPoliticsLDA(db *sql.DB) error {
 					skipped++
 					continue
 				}
-				var issues, codes, ents []string
+				issues, codes, ents := []string{}, []string{}, []string{}
 				lob := 0
 				entSeen := map[string]bool{}
 				for _, a := range f.Activities {
@@ -245,7 +276,7 @@ func twoaiPoliticsLDA(db *sql.DB) error {
 			if pg.Next != nil {
 				next = *pg.Next
 			}
-			time.Sleep(700 * time.Millisecond)
+			time.Sleep(pace)
 		}
 		fmt.Printf("twoai_politics_lda: %q after=%s matching=%d more_pages_pending=%v\n", q, after, total, next != "")
 	}

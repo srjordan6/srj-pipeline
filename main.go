@@ -1422,8 +1422,16 @@ func mentionsDC(s string) bool { return s != "" && dcTerm.MatchString(s) }
 // do not count; that is what the source queries already over-return.
 func onSubject(title, abstract string) bool {
 	return mentionsAI(title) || mentionsAI(abstract) || mentionsDC(title) || mentionsDC(abstract) ||
-		mentionsPrivacy(title) || mentionsPrivacy(abstract)
+		mentionsPrivacy(title) || mentionsPrivacy(abstract) ||
+		mentionsExport(title) || mentionsExport(abstract)
 }
+
+// exportTerm is the export control vocabulary for AI compute, 2026-09-21.
+// Law-shaped like privacyTerm: named instruments and item classes, not the
+// bare word export, which matches trade statistics and fishery notices.
+var exportTerm = regexp.MustCompile(`(?i)export administration regulations|advanced computing|foreign direct product|semiconductor manufacturing items|model weights|supercomputer|integrated circuits?\b.*export|export controls? on (?:advanced|semiconductor|chips|computing)`)
+
+func mentionsExport(s string) bool { return s != "" && exportTerm.MatchString(s) }
 
 // SOURCE QUERIES: WHAT WE ASK FOR, NOT ONLY WHAT WE KEEP.
 //
@@ -1466,6 +1474,14 @@ var frQueries = []struct{ label, term string }{
 	{"data broker", `"data broker"`},
 	{"biometric", `biometric`},
 	{"children's privacy", `"children's online privacy"`},
+	// Export controls and compute sovereignty, 2026-09-21, for The Politics
+	// of AI. BIS writes AI chip and model-weight rules into the Export
+	// Administration Regulations; Entity List additions are paired with
+	// semiconductor because most additions have nothing to do with AI.
+	{"advanced computing", `"advanced computing"`},
+	{"model weights", `"model weights"`},
+	{"EAR + semiconductor", `"Export Administration Regulations" AND semiconductor`},
+	{"Entity List + semiconductor", `"Entity List" AND semiconductor`},
 }
 
 // insertDoc appends one document to the corpus with change_hash dedupe.

@@ -46,7 +46,7 @@ import (
 )
 
 const (
-	polBillBudget = 60
+	polBillBudget = 150 // 289 AI bills on the first run; clears the backlog in two runs
 	polVoteBudget = 60
 )
 

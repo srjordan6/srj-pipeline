@@ -55,7 +55,7 @@ const (
 var polFECSeeds = []string{
 	"Microsoft", "Alphabet", "Google", "Meta Platforms", "Amazon", "Apple", "NVIDIA",
 	"OpenAI", "Anthropic", "IBM", "Oracle", "Palantir", "Intel", "Qualcomm", "Salesforce",
-	"Andreessen Horowitz", "artificial intelligence",
+	"Andreessen Horowitz", "artificial intelligence", "Leading the Future",
 }
 
 type polFECPage struct {
@@ -122,6 +122,13 @@ func twoaiPoliticsFEC(db *sql.DB) error {
 			}
 			if json.Unmarshal(raw, &c) != nil || c.ID == "" {
 				continue
+			}
+			// pq sends a nil slice as NULL; both columns are NOT NULL.
+			if c.Candidates == nil {
+				c.Candidates = []string{}
+			}
+			if c.Cycles == nil {
+				c.Cycles = []int{}
 			}
 			// Candidate campaigns and parties are not AI money sources.
 			switch c.Type {
@@ -217,7 +224,7 @@ func twoaiPoliticsFEC(db *sql.DB) error {
 		}
 
 		// Schedule E: independent expenditures, which is how a super PAC spends.
-		if c.typ != "O" && c.typ != "U" && c.typ != "I" {
+		if c.typ != "O" && c.typ != "U" && c.typ != "I" && c.typ != "V" && c.typ != "W" {
 			continue
 		}
 		newest = sql.NullTime{}
