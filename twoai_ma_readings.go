@@ -249,17 +249,34 @@ func twoaiMAReadings(db *sql.DB) error {
 		return err
 	}
 	type job struct {
-		acc, cik, company, items, dir string
-		filed                         time.Time
+		// filed is a STRING, not a time.Time. twoai_ma_filings.filed is a text
+		// column holding 'YYYY-MM-DD'. Declaring it as time.Time made every
+		// Scan fail, and because a row is only appended when Scan returns nil,
+		// all 351 filings were discarded without a word: the first two runs
+		// reported written=0 nothing=0 failed=0 and read like an empty queue
+		// rather than a broken one. A silent skip on scan error is what made a
+		// one-line type bug look like a working stage with nothing to do.
+		acc, cik, company, items, dir, filed string
 	}
 	var jobs []job
+	scanFailed := 0
 	for rows.Next() {
 		var j job
-		if rows.Scan(&j.acc, &j.cik, &j.company, &j.filed, &j.items, &j.dir) == nil {
-			jobs = append(jobs, j)
+		if err := rows.Scan(&j.acc, &j.cik, &j.company, &j.filed, &j.items, &j.dir); err != nil {
+			// Counted and reported. A row this stage cannot read is a gap, and a
+			// gap that says nothing is the defect above.
+			scanFailed++
+			if scanFailed == 1 {
+				fmt.Fprintf(os.Stderr, "twoai_ma_readings: cannot read filing rows: %v\n", err)
+			}
+			continue
 		}
+		jobs = append(jobs, j)
 	}
 	rows.Close()
+	if scanFailed > 0 {
+		fmt.Fprintf(os.Stderr, "twoai_ma_readings: %d filing row(s) could not be read at all\n", scanFailed)
+	}
 
 	client := &http.Client{Timeout: 45 * time.Second}
 	written, nothing, failed := 0, 0, 0
@@ -290,7 +307,7 @@ func twoaiMAReadings(db *sql.DB) error {
 			fail(j, "no substantive item text")
 			continue
 		}
-		user := "Company: " + j.company + "\nFiled: " + j.filed.Format("2006-01-02") +
+		user := "Company: " + j.company + "\nFiled: " + j.filed +
 			"\nItems reported: " + j.items + "\n\nFILING TEXT:\n" + text
 		reply, model, gerr := twoaiGenerate("ma_readings", maReadingSystem, user)
 		if gerr != nil {
@@ -326,7 +343,7 @@ func twoaiMAReadings(db *sql.DB) error {
 		}
 		written++
 		fmt.Printf("twoai_ma_readings: %s %s <- %s (%d chars of filing)\n",
-			j.filed.Format("2006-01-02"), j.company, model, len(text))
+			j.filed, j.company, model, len(text))
 		time.Sleep(700 * time.Millisecond)
 	}
 	var have, total int
