@@ -223,7 +223,7 @@ func twoaiPointBriefs(db *sql.DB) error {
 		  -- Certification and course issuer pages share this harvest but are read
 		  -- by twoai_learning_readings, which writes a whole page from them. A
 		  -- brief here would be a second model call for text nothing renders.
-		  AND COALESCE(h.sector_slug,'') NOT IN ('certifications','courses')
+		  AND COALESCE(h.sector_slug,'') NOT IN ('certifications','courses','benchmarks')
 		ORDER BY h.fetched_on DESC, h.url
 		LIMIT $1`, limit)
 	if err != nil {
@@ -359,7 +359,7 @@ func twoaiPointBriefs(db *sql.DB) error {
 	db.QueryRow(`SELECT count(*) FILTER (WHERE brief IS NOT NULL AND brief <> ''), count(*) FROM twoai_point_briefs`).Scan(&have, &total)
 	db.QueryRow(`SELECT count(*) FROM twoai_source_harvest h LEFT JOIN twoai_point_briefs b ON b.url=h.url
 		WHERE h.extract <> '' AND h.http_status=200 AND (b.url IS NULL OR b.content_hash <> h.content_hash)
-		  AND COALESCE(h.sector_slug,'') NOT IN ('certifications','courses')`).Scan(&stale)
+		  AND COALESCE(h.sector_slug,'') NOT IN ('certifications','courses','benchmarks')`).Scan(&stale)
 	fmt.Printf("twoai_point_briefs: written=%d internal_links=%d nothing_to_say=%d failed=%d | %d briefs held, %d sources still to write\n",
 		written, linked, nothing, failed, have, stale)
 	return nil

@@ -141,8 +141,12 @@ func twoaiPoliticsLDA(db *sql.DB) error {
 	// apart on the first live run, so without a key the stage slows to one
 	// page every four seconds, which trades minutes for a complete backfill.
 	pace := 4 * time.Second
+	maxPages := ldaMaxPages
 	if os.Getenv("LDA_API_KEY") != "" {
 		pace = 700 * time.Millisecond
+		// 120 requests a minute with a key. 150 pages is about two minutes
+		// a query and finishes the 2023 backfill in about four runs.
+		maxPages = 150
 	}
 	stored, skipped, pages := 0, 0, 0
 	retried := map[string]bool{}
@@ -160,7 +164,7 @@ func twoaiPoliticsLDA(db *sql.DB) error {
 		v.Set("page_size", "25")
 		next := ldaFilingsURL + "?" + v.Encode()
 		total := -1
-		for p := 0; next != "" && p < ldaMaxPages; p++ {
+		for p := 0; next != "" && p < maxPages; p++ {
 			req, _ := http.NewRequest("GET", next, nil)
 			req.Header.Set("Accept", "application/json")
 			req.Header.Set("User-Agent", "theworldofai.org pipeline (theworldofai@inkboxmail.com)")

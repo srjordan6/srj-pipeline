@@ -136,6 +136,7 @@ var twoaiDailyOnly = map[string]bool{
 	// filings post during the day and cluster at quarter end; once a day
 	// reads every new one through its cursor.
 	"twoai_politics_lda": true, "twoai_politics_bills": true, "twoai_politics_fec": true,
+	"twoai_benchmark_readings": true,
 }
 
 // stageDueToday reports whether a once-a-day stage still owes a run today.
@@ -282,7 +283,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_gaps", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_gaps", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -909,6 +910,14 @@ func main() {
 	if src == "twoai_politics_lda" {
 		if err := twoaiPoliticsLDA(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_politics_lda:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if src == "twoai_benchmark_readings" {
+		if err := twoaiBenchmarkReadings(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_benchmark_readings:", err)
 			os.Exit(1)
 		}
 		return
@@ -3706,7 +3715,13 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		// Policy, regulation, standards
 		{"European Commission AI", "https://digital-strategy.ec.europa.eu/en/rss.xml"},
 		{"UK DSIT", "https://www.gov.uk/government/organisations/department-for-science-innovation-and-technology.atom"},
-		{"UK AI Safety Institute (coverage)", "https://news.google.com/rss/search?q=%22AI+Safety+Institute%22+UK&hl=en-US&gl=US&ceid=US:en"},
+		// Renamed from AI Safety Institute on 2025-02-14; the old query missed
+		// every story that used the new name. Both names, OR works on Google
+		// News RSS. First-party publications come in through twoai_vendor_feeds.
+		{"UK AI Security Institute (coverage)", "https://news.google.com/rss/search?q=%22AI+Security+Institute%22+OR+%22AI+Safety+Institute%22+UK&hl=en-US&gl=US&ceid=US:en"},
+		// Apollo Research publishes no feed (probed 2026-09-21: /feed, /rss.xml,
+		// /blog/rss.xml all 404, no feed link in the blog page).
+		{"Apollo Research (coverage)", "https://news.google.com/rss/search?q=%22Apollo+Research%22+AI&hl=en-US&gl=US&ceid=US:en"},
 		{"UNESCO (coverage)", "https://news.google.com/rss/search?q=UNESCO+%22artificial+intelligence%22&hl=en-US&gl=US&ceid=US:en"},
 		{"CIFAR", "https://cifar.ca/feed/"},
 		// Media and industry

@@ -364,7 +364,14 @@ func twoaiHarvestSources(db *sql.DB) error {
 		-- twoai_point_briefs can leave these to their own stage.
 		SELECT l.section_slug, l.name, l.source_url
 		FROM twoai_learning l
-		WHERE l.section_slug IN ('certifications','courses') AND l.source_url LIKE 'http%'`)
+		WHERE l.section_slug IN ('certifications','courses') AND l.source_url LIKE 'http%'
+		UNION
+		-- Benchmarks waiting to be written by twoai_benchmark_readings from the
+		-- maintainer's own page, 2026-09-21 (METR time horizon, HCAST, RE-Bench).
+		-- Only unpromoted candidates: a promoted row is reviewed on its own cycle.
+		SELECT 'benchmarks', c.name, c.url
+		FROM twoai_benchmark_candidates c
+		WHERE c.promoted_on IS NULL AND c.url LIKE 'http%'`)
 	if err != nil {
 		return err
 	}
