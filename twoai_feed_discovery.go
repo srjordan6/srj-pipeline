@@ -199,6 +199,9 @@ func twoaiFeedProbe(db *sql.DB, limit int) error {
 			req, _ := http.NewRequest("GET", u.String(), nil)
 			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org company directory; info@srjconsultingservices.com)")
 			req.Header.Set("Accept", "application/rss+xml, application/atom+xml, application/xml;q=0.9")
+			// Sent because a real browser sends it, not as a fix for anything
+			// measured. See the note in twoai_company_harvest.go.
+			req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 			resp, ferr := client.Do(req)
 			if ferr != nil {
 				continue
@@ -266,6 +269,7 @@ func twoaiFeedSample(db *sql.DB, limit int) error {
 	for _, j := range jobs {
 		req, _ := http.NewRequest("GET", j.feed, nil)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org company directory; info@srjconsultingservices.com)")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 		resp, ferr := client.Do(req)
 		if ferr != nil || resp.StatusCode != 200 {
 			if resp != nil {

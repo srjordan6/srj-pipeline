@@ -269,6 +269,14 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 			req, _ := http.NewRequest("GET", site, nil)
 			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org company directory; info@srjconsultingservices.com)")
 			req.Header.Set("Accept", "text/html,application/xhtml+xml")
+			// A real browser always sends this. twoaiHarvestSources has sent it
+			// since it was written; this harvester never did. Added 2026-09-20 as
+			// hygiene, NOT as a fix for the 17 sites that fail here: those were
+			// measured with and without the header and not one changed. AMD,
+			// Qualcomm, PayPal and Snap already answer 200, Uber stays 406 and
+			// Meta stays 400, and the failures logged as (0) are connection
+			// level, where no header can help.
+			req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 			resp, ferr := client.Do(req)
 			status, extract := 0, ""
 			feedURL := ""
