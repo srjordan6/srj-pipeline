@@ -756,6 +756,11 @@ func main() {
 	}
 
 	if src == "twoai_lawsuit_fill" {
+		// Court case type first, so a case promoted by intel today is
+		// categorised before its page is written.
+		if err := twoaiLawsuitClassify(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_lawsuit_classify:", err)
+		}
 		if err := twoaiLawsuitFill(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_lawsuit_fill:", err)
 			os.Exit(1)
