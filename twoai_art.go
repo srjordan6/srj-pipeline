@@ -41,7 +41,7 @@ import (
 
 // twoaiArtCap bounds the model work in one run; fifty topics fill in over a
 // few days rather than in one long stage.
-const twoaiArtCap = 12
+const twoaiArtCap = 18
 
 // A section's pages are written to the content folder its category route
 // reads: the ecosystem-entities route sweeps content/ecosystem, the
@@ -101,6 +101,25 @@ func (f twoaiArtFacts) line(section string) string {
 		f.ImageModels, f.VideoModels, f.AudioModels, f.Tools, f.IPCases, f.MusicCases, f.GlossaryTerms)
 }
 
+// twoaiArtHubSystem writes the landing pages. A hub that is a heading and ten
+// links is a thin page, which is the thing this site refuses to publish, so
+// each hub and sub-hub gets an opening that says what the field is, what is
+// actually changing in it, and how its pages fit together.
+const twoaiArtHubSystem = `You write the opening of a reference section for The World of AI, an atlas of artificial intelligence.
+
+You are given the section name, what it covers, and the pages under it. Write three paragraphs of four to six sentences each:
+- what: what this field is and what artificial intelligence is actually doing in it now, not in theory.
+- state: where the work stands, what is solved, what is not, and what the honest limits are.
+- map: how the pages listed below fit together and what a reader would go to each for. Name them inside your own sentences rather than listing them.
+
+Rules:
+- Plain English. Commas, not dashes. No em dashes. No marketing language, no "in today's landscape", no exclamation.
+- Use a figure from the site facts ONLY where it genuinely belongs. Never invent a number, a company, a product version, a case name or a date.
+- Nothing here is advice, legal or otherwise. Describe the work.
+
+Answer with one JSON object and nothing else:
+{"what": "", "state": "", "map": ""}`
+
 const twoaiArtSystem = `You write reference pages for The World of AI, an atlas of artificial intelligence.
 
 You are given a topic, the field it sits in, and sometimes short seed lines from the site's editor. Write ONE paragraph of three to five sentences for each of the five sections, in this order: scope, what it runs on, how the work is done, rights and risk and provenance, where it is going.
@@ -114,6 +133,25 @@ Rules:
 
 Answer with one JSON object and nothing else:
 {"scope": "", "infra": "", "method": "", "governance": "", "horizon": ""}`
+
+// twoaiArtJSON pulls the object out of a reply that may still carry a fence or
+// a sentence around it.
+func twoaiArtJSON(raw string) (map[string]string, error) {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "```json"), "```")
+	s = strings.TrimSuffix(strings.TrimSpace(s), "```")
+	if i := strings.Index(s, "{"); i > 0 {
+		s = s[i:]
+	}
+	if j := strings.LastIndex(s, "}"); j >= 0 {
+		s = s[:j+1]
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(s)), &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
 
 func twoaiArtHash(n twoaiArtNode, facts string) string {
 	h := sha256.Sum256([]byte(strings.Join([]string{n.Name, n.Scope, n.Infra, n.Method, n.Gov, n.Horizon, facts}, "|")))
@@ -129,6 +167,50 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 		if p.Kind == "hub" {
 			rootFor[p.Section] = p.Slug
 		}
+	}
+	// The landing pages come first. A hub or sub-hub that is a heading and a
+	// list of links is exactly the thin page this site refuses to publish, so
+	// its opening is written before any more topics are.
+	kidsOf := map[string][]string{}
+	for _, c := range nodes {
+		if c.Parent != "" {
+			kidsOf[c.Parent] = append(kidsOf[c.Parent], c.Name)
+		}
+	}
+	for _, n := range nodes {
+		if n.Kind == "topic" || written >= twoaiArtCap {
+			continue
+		}
+		want := twoaiArtHash(n, facts.line(n.Section)+strings.Join(kidsOf[n.Slug], ","))
+		var have string
+		db.QueryRow(`SELECT data_hash FROM twoai_art_readings WHERE slug = $1 AND block = 'hub'`, n.Slug).Scan(&have)
+		if have == want {
+			continue
+		}
+		user := fmt.Sprintf("Section: %s\nPart of: %s\nWhat it covers: %s\nSite facts: %s\n\nPages under it:\n%s\n\nAnswer now.",
+			n.Name, parentName[rootFor[n.Section]], n.Blurb, facts.line(n.Section),
+			"- "+strings.Join(kidsOf[n.Slug], "\n- "))
+		out, model, err := twoaiGenerate("art", twoaiArtHubSystem, user)
+		if err != nil {
+			failed++
+			fmt.Printf("twoai_art: %s: %v\n", n.Slug, err)
+			continue
+		}
+		got, perr := twoaiArtJSON(out)
+		if perr != nil || len(got["what"]) < 120 || len(got["map"]) < 120 {
+			failed++
+			fmt.Printf("twoai_art: %s: opening not usable, nothing written\n", n.Slug)
+			continue
+		}
+		b, _ := json.Marshal(got)
+		if _, err := db.Exec(`INSERT INTO twoai_art_readings (slug, block, body, data_hash, model, generated_on)
+			VALUES ($1,'hub',$2,$3,$4,current_date)
+			ON CONFLICT (slug, block) DO UPDATE SET body = EXCLUDED.body, data_hash = EXCLUDED.data_hash,
+				model = EXCLUDED.model, generated_on = current_date`, n.Slug, string(b), want, model); err != nil {
+			failed++
+			continue
+		}
+		written++
 	}
 	for _, n := range nodes {
 		if n.Kind != "topic" || written >= twoaiArtCap {
@@ -162,10 +244,10 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 		if j := strings.LastIndex(s, "}"); j >= 0 {
 			s = s[:j+1]
 		}
-		var got map[string]string
-		if err := json.Unmarshal([]byte(strings.TrimSpace(s)), &got); err != nil {
+		got, jerr := twoaiArtJSON(s)
+		if jerr != nil {
 			failed++
-			fmt.Printf("twoai_art: %s: unreadable answer: %v\n", n.Slug, err)
+			fmt.Printf("twoai_art: %s: unreadable answer: %v\n", n.Slug, jerr)
 			continue
 		}
 		if len(got["scope"]) < 80 || len(got["governance"]) < 80 {
@@ -215,18 +297,39 @@ func twoaiArt(db *sql.DB, today string) error {
 	written, failed := twoaiArtExpand(db, nodes, facts)
 
 	readings := map[string]map[string]string{}
-	rrows, err := db.Query(`SELECT slug, body FROM twoai_art_readings WHERE block = 'all'`)
+	hubReadings := map[string]map[string]string{}
+	rrows, err := db.Query(`SELECT slug, block, body FROM twoai_art_readings WHERE block IN ('all','hub')`)
 	if err == nil {
 		for rrows.Next() {
-			var slug, body string
-			if rrows.Scan(&slug, &body) == nil {
+			var slug, block, body string
+			if rrows.Scan(&slug, &block, &body) == nil {
 				var m map[string]string
 				if json.Unmarshal([]byte(body), &m) == nil {
-					readings[slug] = m
+					if block == "hub" {
+						hubReadings[slug] = m
+					} else {
+						readings[slug] = m
+					}
 				}
 			}
 		}
 		rrows.Close()
+	}
+	// A child's line in a list is the first sentence of its own scope, so a
+	// landing page says what each page under it is about instead of listing
+	// names. Written once the child has been written, never invented here.
+	firstSentence := func(s string) string {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return ""
+		}
+		if i := strings.Index(s, ". "); i > 40 {
+			return s[:i+1]
+		}
+		if len(s) > 220 {
+			return s[:220] + "..."
+		}
+		return s
 	}
 
 	uid := func(slug string) string { return twoaiUID("art:" + slug) }
@@ -287,13 +390,37 @@ func twoaiArt(db *sql.DB, today string) error {
 					if blurb == "" {
 						blurb = c.Scope
 					}
+					if blurb == "" {
+						if r := readings[c.Slug]; r != nil {
+							blurb = firstSentence(r["scope"])
+						} else if h := hubReadings[c.Slug]; h != nil {
+							blurb = firstSentence(h["what"])
+						}
+					}
 					kids = append(kids, kid{Name: c.Name, Path: path(c.Slug), Blurb: blurb})
+				}
+			}
+			h := hubReadings[n.Slug]
+			var opening []map[string]string
+			if h != nil {
+				if h["what"] != "" {
+					opening = append(opening, map[string]string{"heading": "What this covers", "body": h["what"]})
+				}
+				if h["state"] != "" {
+					opening = append(opening, map[string]string{"heading": "Where the work stands", "body": h["state"]})
+				}
+				if h["map"] != "" {
+					opening = append(opening, map[string]string{"heading": "How these pages fit together", "body": h["map"]})
 				}
 			}
 			doc := map[string]any{
 				"uid": uid(n.Slug), "slug": n.Slug, "shape": "art-hub", "category": n.Category,
 				"name": n.Name, "title": n.Name, "blurb": n.Blurb, "answer": n.Blurb,
-				"children": kids, "generated": today,
+				"children": kids, "sections": opening, "expanded": h != nil,
+				// A page still waiting for its opening is live and linked, and out
+				// of the search index until it has something to say.
+				"noindex":     h == nil,
+				"child_count": len(kids), "generated": today, "refresh_every_days": 90,
 			}
 			if n.Kind == "subhub" {
 				root := rootOf[n.Section]
@@ -337,7 +464,8 @@ func twoaiArt(db *sql.DB, today string) error {
 					{"heading": "Rights, risk and provenance", "body": pick("governance", n.Gov)},
 					{"heading": "Where it is going", "body": pick("horizon", n.Horizon)},
 				},
-				"expanded": r != nil, "parent_name": parentName, "parent_path": parentPath,
+				"expanded": r != nil, "noindex": r == nil,
+				"parent_name": parentName, "parent_path": parentPath,
 				"siblings": siblings, "hub_path": path(rootOf[n.Section]), "generated": today,
 				"refresh_every_days": 90,
 			}
