@@ -414,6 +414,17 @@ func twoaiPoliticsExports(db *sql.DB, today string) error {
 			}
 			pts = append(pts, point{Name: d + " · " + e.Title, Desc: e.Detail + " uid " + e.UID + ".", Source: e.Source})
 		}
+		// Stories in this site's own news archive that name this member, matched
+		// by twoai_news_link. Stephen, 2026-09-22: a member page that does not
+		// show the news we published about them is two systems not talking.
+		newsPts := twoaiNewsLinksFor(db, "member", m.uid, 12)
+		for _, n := range newsPts {
+			pts = append(pts, point{Name: n.Name, Desc: n.Desc, Source: n.Source})
+		}
+		newsNote := ""
+		if len(newsPts) > 0 {
+			newsNote = fmt.Sprintf(", and %d news stories that name them", len(newsPts))
+		}
 		who := m.name
 		if m.party != "" || m.st != "" {
 			who += " (" + strings.Trim(m.party+", "+m.st, ", ") + ")"
@@ -422,7 +433,7 @@ func twoaiPoliticsExports(db *sql.DB, today string) error {
 			"tax": "pol-member", "uid": m.uid, "page_uid": m.uid, "slug": "pol-member-" + m.uid,
 			"name": who + ": AI record", "shape": "tech-section", "is_hub": true, "draft": false,
 			"parent_name": "The Politics of AI", "parent_href": polBase + polHubUID + "/",
-			"summary": fmt.Sprintf("Every dated AI event this site holds for %s: bills sponsored or cosponsored, recorded votes on AI bills, and money from AI company and AI-focused political committees, newest first. %d events.", m.name, len(ev)),
+			"summary": fmt.Sprintf("Every dated AI event this site holds for %s: bills sponsored or cosponsored, recorded votes on AI bills, and money from AI company and AI-focused political committees, newest first. %d events%s.", m.name, len(ev), newsNote),
 			"blurb": "Events are placed in date order so they can be read together. Placement is not a claim that one event caused another, and this page draws no conclusion about any person's motives. Each event links to the filing or record it comes from.",
 			"points": pts, "children": []any{}, "total": len(ev), "generated": today, "verified": today,
 			"refresh_every_days": 1, "category": polCategory,

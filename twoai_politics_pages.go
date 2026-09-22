@@ -68,6 +68,11 @@ func twoaiPoliticsPages(db *sql.DB) error {
 		r.Close()
 	}
 
+	// The news archive is matched to members and bills before either page is
+	// written, so a story this site published shows up on the record it names.
+	if err := twoaiNewsLink(db); err != nil {
+		fmt.Println("twoai_news_link:", err)
+	}
 	// Downloads, digest and member timelines first, so the hub below can list
 	// the member pages that exist this run.
 	if err := twoaiPoliticsExports(db, today); err != nil {

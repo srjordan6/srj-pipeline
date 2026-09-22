@@ -309,6 +309,12 @@ func twoaiPoliticsDirectory(db *sql.DB, today string) error {
 			sum += " Its text uses preemption language about state law."
 		}
 		sum += fmt.Sprintf(" %d lobbying filing(s) for 2025 or later name it.", lobbyN)
+		// Stories in this site's news archive that name this bill, matched by
+		// twoai_news_link on the bill's exact title or its number as reported.
+		if news := twoaiNewsLinksFor(db, "bill", b.uid, 12); len(news) > 0 {
+			pts = append(pts, news...)
+			sum += fmt.Sprintf(" %d news story or stories in this archive name it.", len(news))
+		}
 		doc := polPage("pol-bill", b.uid, b.num+": "+b.title, sum,
 			"Sponsors, recorded votes and the lobbying filings that name this bill, each linked to its source. A filing that names a bill shows the bill was an issue in the lobbying, not the position taken on it.",
 			today, pts, nil)
