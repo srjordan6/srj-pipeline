@@ -23,6 +23,15 @@ var twoaiSecuritySections = []string{
 	"sec-shadow-ai", "sec-ai-malware", "sec-deepfakes", "sec-ai-phishing",
 	"sec-tooling", "sec-agent-identity", "sec-agent-security",
 	"sec-ai-soc", "sec-ai-privacy", "sec-red-teaming",
+	// Added 2026-09-21 at Stephen's request, beside Application and Product
+	// Security: the secure SDLC and the Agent Development Lifecycle.
+	"sec-secure-sdlc", "sec-adlc",
+}
+
+// twoaiSecDomainPath is the page each of the six security domains now has of
+// its own. Until 2026-09-21 a domain was only an anchor on the hub.
+func twoaiSecDomainPath(slug string) string {
+	return "/ai-ecosystem/enterprise-applications-governance-and-tools/" + twoaiUID("secdomain:"+slug) + "/"
 }
 
 func twoaiSecurity(db *sql.DB, today string) (int, error) {
@@ -197,6 +206,7 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 			Slug   string     `json:"slug"`
 			Label  string     `json:"label"`
 			Blurb  string     `json:"blurb"`
+			Href   string     `json:"href"`
 			Topics []topicRef `json:"topics"`
 		}
 		var groups []domGroup
@@ -207,6 +217,7 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 		for grows.Next() {
 			var g domGroup
 			if grows.Scan(&g.Slug, &g.Label, &g.Blurb) == nil {
+				g.Href = twoaiSecDomainPath(g.Slug)
 				groups = append(groups, g)
 			}
 		}
@@ -248,6 +259,56 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 		}
 		if owasp := twoaiOwaspDoc(db); owasp != nil {
 			hub["owasp"] = owasp
+		}
+		// ONE PAGE PER SECURITY DOMAIN, Stephen 2026-09-21. Each page carries
+		// the domain's own curated read of every topic it touches, the prose
+		// in twoai_security_domains, so the page is the domain's program in
+		// full rather than a list of links.
+		for _, g := range groups {
+			type domTopic struct {
+				Name  string `json:"name"`
+				Path  string `json:"path"`
+				Blurb string `json:"blurb"`
+				Body  string `json:"body"`
+			}
+			var dts []domTopic
+			drows, derr := db.Query(`SELECT t.name, COALESCE(t.live_path,''), COALESCE(t.blurb,''), sd.body
+				FROM twoai_security_domains sd JOIN twoai_taxonomy t ON t.slug = sd.section_slug
+				WHERE sd.domain_slug = $1 AND COALESCE(t.live_path,'') <> '' ORDER BY t.sort`, g.Slug)
+			if derr != nil {
+				return count, derr
+			}
+			for drows.Next() {
+				var dt domTopic
+				if drows.Scan(&dt.Name, &dt.Path, &dt.Blurb, &dt.Body) == nil {
+					dts = append(dts, dt)
+				}
+			}
+			drows.Close()
+			if len(dts) == 0 {
+				continue
+			}
+			var others []map[string]string
+			for _, o := range groups {
+				if o.Slug != g.Slug {
+					others = append(others, map[string]string{"label": o.Label, "href": o.Href})
+				}
+			}
+			dd := map[string]any{
+				"uid": twoaiUID("secdomain:" + g.Slug), "tax": "ai-security-risk", "shape": "security-domain",
+				"slug": g.Slug, "name": g.Label, "blurb": g.Blurb, "generated": today,
+				"hub_name": hn, "hub_path": "/ai-ecosystem/enterprise-applications-governance-and-tools/" + twoaiUID("section:ai-security-risk") + "/",
+				"topics": dts, "topic_count": len(dts), "other_domains": others,
+			}
+			dj, _ := json.Marshal(dd)
+			if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
+				VALUES ($1,'security-domain',$2::jsonb,'ai-security-risk',1)
+				ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+					taxonomy_slug=EXCLUDED.taxonomy_slug, url_count=1, updated_at=now()`,
+				"security/domain-"+g.Slug+".json", string(dj)); err != nil {
+				return count, err
+			}
+			count++
 		}
 		hj, _ := json.Marshal(hub)
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)

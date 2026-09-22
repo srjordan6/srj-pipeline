@@ -9234,7 +9234,7 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 				var slug, label, blurb string
 				if grows.Scan(&slug, &label, &blurb) == nil {
 					six = append(six, domain{Slug: "secdom-" + slug, Name: label, Blurb: blurb,
-						Status: "live", Path: d.Path + "#" + slug})
+						Status: "live", Path: twoaiSecDomainPath(slug)})
 				}
 			}
 			grows.Close()
