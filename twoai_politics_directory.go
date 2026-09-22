@@ -52,7 +52,16 @@ func polPutPage(db *sql.DB, path, tax string, doc map[string]any) error {
 	// tax must be a real twoai_taxonomy slug: twoai_pages.taxonomy_slug has a
 	// foreign key to it. The first version passed pol-member and wrote zero
 	// member pages without a word, because the error was not printed.
+	// PUBLISHED, Stephen 2026-09-22. Every politics page is live. A page
+	// whose document is under polThinBytes is kept out of search (noindex,
+	// so the postbuild sitemap step drops it) until its data grows, because
+	// AdSense flagged the site for low value content the day before.
+	doc["noindex"] = false
 	b, _ := json.Marshal(doc)
+	if len(b) < polThinBytes {
+		doc["noindex"] = true
+		b, _ = json.Marshal(doc)
+	}
 	_, err := db.Exec(`INSERT INTO twoai_pages (path, kind, taxonomy_slug, data, updated_at)
 		VALUES ($1,'tech-section',$2,$3,now())
 		ON CONFLICT (path) DO UPDATE SET data = EXCLUDED.data, taxonomy_slug = EXCLUDED.taxonomy_slug, updated_at = now()`,
@@ -63,6 +72,10 @@ func polPutPage(db *sql.DB, path, tax string, doc map[string]any) error {
 	return err
 }
 
+// polThinBytes is the document size below which a politics page is live but
+// not indexed. Entity pages with one or two filings sit around 1.5 to 2.7 kB.
+const polThinBytes = 4000
+
 func polPage(tax, uid, name, summary, blurb, today string, points []polPt, children []map[string]any) map[string]any {
 	if points == nil {
 		points = []polPt{}
@@ -72,7 +85,7 @@ func polPage(tax, uid, name, summary, blurb, today string, points []polPt, child
 	}
 	return map[string]any{
 		"tax": tax, "uid": uid, "page_uid": uid, "slug": tax + "-" + uid, "name": name,
-		"shape": "tech-section", "is_hub": true, "draft": true,
+		"shape": "tech-section", "is_hub": true, "draft": false,
 		"parent_name": "The Politics of AI", "parent_href": polBase + polHubUID + "/",
 		"summary": summary, "blurb": blurb, "points": points, "children": children,
 		"total": len(points), "generated": today, "verified": today, "refresh_every_days": 1, "category": polCategory,

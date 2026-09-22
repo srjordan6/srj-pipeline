@@ -195,7 +195,7 @@ func twoaiPoliticsPages(db *sql.DB) error {
 
 	lobby := map[string]any{
 		"tax": "pol-lobbying", "uid": polLobbyUID, "page_uid": polLobbyUID, "slug": "pol-lobbying",
-		"name": "Lobbying on AI", "shape": "tech-section", "is_hub": true, "draft": true,
+		"name": "Lobbying on AI", "shape": "tech-section", "is_hub": true, "draft": false,
 		"parent_name": "The Politics of AI", "parent_href": polBase + polHubUID + "/",
 		"summary": lobbySummary, "blurb": lobbyBlurb, "points": points, "children": []any{},
 		"total": filings, "generated": today, "verified": today, "built_at": time.Now().Format(time.RFC3339),
@@ -207,7 +207,7 @@ func twoaiPoliticsPages(db *sql.DB) error {
 		"Lobbying on AI is the first section. Below it, each member of Congress with an AI bill, a recorded AI vote or money from an AI company or AI-focused committee has a timeline page listing every dated event with its source. Money beside votes by issue and the preemption watch follow as the Congress and Federal Election Commission data finish loading. Reporters will find every dataset in the press room."
 	hub := map[string]any{
 		"tax": "politics-of-ai", "uid": polHubUID, "page_uid": polHubUID, "slug": "politics-of-ai",
-		"name": "The Politics of AI", "shape": "tech-section", "is_hub": true, "draft": true,
+		"name": "The Politics of AI", "shape": "tech-section", "is_hub": true, "draft": false,
 	"summary": hubSummary, "blurb": hubBlurb, "points": memberPts,
 		"children": []map[string]any{
 			{"name": "Lobbying on AI", "href": polBase + polLobbyUID + "/", "desc": lobbySummary, "sort": 1},

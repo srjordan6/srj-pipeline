@@ -420,14 +420,19 @@ func twoaiPoliticsExports(db *sql.DB, today string) error {
 		}
 		doc := map[string]any{
 			"tax": "pol-member", "uid": m.uid, "page_uid": m.uid, "slug": "pol-member-" + m.uid,
-			"name": who + ": AI record", "shape": "tech-section", "is_hub": true, "draft": true,
+			"name": who + ": AI record", "shape": "tech-section", "is_hub": true, "draft": false,
 			"parent_name": "The Politics of AI", "parent_href": polBase + polHubUID + "/",
 			"summary": fmt.Sprintf("Every dated AI event this site holds for %s: bills sponsored or cosponsored, recorded votes on AI bills, and money from AI company and AI-focused political committees, newest first. %d events.", m.name, len(ev)),
 			"blurb": "Events are placed in date order so they can be read together. Placement is not a claim that one event caused another, and this page draws no conclusion about any person's motives. Each event links to the filing or record it comes from.",
 			"points": pts, "children": []any{}, "total": len(ev), "generated": today, "verified": today,
 			"refresh_every_days": 1, "category": polCategory,
 		}
+		doc["noindex"] = false
 		b, _ := json.Marshal(doc)
+		if len(b) < polThinBytes {
+			doc["noindex"] = true
+			b, _ = json.Marshal(doc)
+		}
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, taxonomy_slug, data, updated_at)
 			VALUES ($1,'tech-section','politics-of-ai',$2,now())
 			ON CONFLICT (path) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
