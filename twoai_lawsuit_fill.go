@@ -45,7 +45,10 @@ import (
 )
 
 var lawsuitWhy = map[string]string{
-	"copyright":                          "Training data copyright suits decide whether building a model on protected work without a licence is infringement or fair use, which sets the cost of every future model and the licensing market around it.",
+	// ONE INTELLECTUAL PROPERTY FAMILY, Stephen 2026-09-21: copyright, patent
+	// and trademark are one category, because intellectual property insurance
+	// answers all three. The kind of right is kept as a tag on each case.
+	"intellectual property":              "Intellectual property suits over AI decide who owns what a model learned from and what it produces, whether copyrighted training data, patented methods or a protected name, which sets the licensing cost of every future model.",
 	"hiring discrimination":              "Hiring discrimination suits test whether an employer, a vendor, or both answer for a screening tool that disadvantages a protected group, which decides who carries the liability in every automated hiring stack.",
 	"product liability & wrongful death": "Product liability suits over chatbots ask a court to treat conversational output as a defective product, which would move AI harms out of speech law and into the law that governs unsafe goods.",
 	"biometric privacy":                  "Biometric privacy suits apply statutes with fixed damages per violation to face and voice data collected at scale, which is why a single case can threaten a company's existence.",
@@ -58,7 +61,7 @@ var lawsuitWhy = map[string]string{
 }
 
 var lawsuitCatSignals = map[string]*regexp.Regexp{
-	"copyright":                          regexp.MustCompile(`(?i)copyright|ao 121|infring|dmca`),
+	"intellectual property":              regexp.MustCompile(`(?i)copyright|ao 121|infring|dmca|patent|trademark|trade dress`),
 	"hiring discrimination":              regexp.MustCompile(`(?i)title vii|adea|disparate impact|employment discrimination|eeoc`),
 	"product liability & wrongful death": regexp.MustCompile(`(?i)wrongful death|product liability|failure to warn|strict liability`),
 	"biometric privacy":                  regexp.MustCompile(`(?i)bipa|biometric`),
@@ -77,7 +80,7 @@ var lawsuitCatSignals = map[string]*regexp.Regexp{
 var lawsuitCatOrder = []string{
 	"product liability & wrongful death", "biometric privacy", "hiring discrimination",
 	"securities fraud", "trade secrets", "platform access & scraping", "defamation",
-	"right of publicity", "consumer protection", "copyright",
+	"right of publicity", "consumer protection", "intellectual property",
 }
 
 var (

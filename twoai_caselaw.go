@@ -87,32 +87,37 @@ func twoaiCaselaw(db *sql.DB, today string, upsert func(path, kind string, v any
 	// cases in its doctrine's lane, newest first, labelled as exactly that:
 	// tracker classification, not a citation count. Wrong-but-plausible here
 	// would be claiming Sony is quoted in a docket nobody checked.
+	// A lane names either a whole category or, as "intellectual property#copyright",
+	// one kind of right inside it. Copyright, patent and trademark became one
+	// category on 2026-09-21; a fair use page must still list copyright cases
+	// only, so the kind of right is read from the case's tags.
 	laneFor := map[string][]string{
-		"Fair use":                            {"copyright"},
-		"Fair use and secondary liability":    {"copyright"},
-		"Fair use and intermediate copying":   {"copyright"},
-		"Copyrightability":                    {"copyright"},
-		"Secondary liability":                 {"copyright"},
-		"DMCA safe harbour":                   {"copyright"},
+		"Fair use":                            {"intellectual property#copyright"},
+		"Fair use and secondary liability":    {"intellectual property#copyright"},
+		"Fair use and intermediate copying":   {"intellectual property#copyright"},
+		"Copyrightability":                    {"intellectual property#copyright"},
+		"Secondary liability":                 {"intellectual property#copyright"},
+		"DMCA safe harbour":                   {"intellectual property#copyright"},
 		"Computer Fraud and Abuse Act":        {"platform access & scraping"},
 		"Section 230":                         {"product liability & wrongful death"},
 		"Product liability and platform duty": {"product liability & wrongful death"},
 		"Defamation fault standards":          {"product liability & wrongful death"},
 		"Biometric privacy":                   {"biometric privacy"},
-		"Patent eligibility":                  {"patent"},
-		"Authorship and inventorship":         {"patent"},
+		"Patent eligibility":                  {"intellectual property#patent"},
+		"Authorship and inventorship":         {"intellectual property#patent"},
 	}
 	laneCases := map[string][]liveCase{}
 	laneTotal := map[string]int{}
+	const laneMatch = `(category = ANY($1) OR EXISTS (SELECT 1 FROM unnest(COALESCE(tags,'{}')) t WHERE category || '#' || t = ANY($1)))`
 	for doctrine, cats := range laneFor {
 		var total int
 		if err := db.QueryRow(`SELECT count(*) FROM ai_lawsuits
-			WHERE is_active AND category = ANY($1)`, pq.Array(cats)).Scan(&total); err != nil || total == 0 {
+			WHERE is_active AND `+laneMatch, pq.Array(cats)).Scan(&total); err != nil || total == 0 {
 			continue
 		}
 		laneTotal[doctrine] = total
 		lr, err := db.Query(`SELECT case_name, slug FROM ai_lawsuits
-			WHERE is_active AND category = ANY($1)
+			WHERE is_active AND `+laneMatch+`
 			ORDER BY filed_date DESC NULLS LAST, slug LIMIT 8`, pq.Array(cats))
 		if err != nil {
 			continue

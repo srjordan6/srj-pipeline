@@ -31,13 +31,18 @@ import (
 
 var lawsuitNOSCategory = map[string]string{
 	"410": "antitrust",
-	"820": "copyright",
-	"830": "patent", "835": "patent",
+	// One intellectual property category since 2026-09-21; the kind of right
+	// is written as a tag, from lawsuitNOSTag below.
+	"820": "intellectual property",
+	"830": "intellectual property", "835": "intellectual property",
+	"840": "intellectual property",
 	"880": "trade secrets",
 	"365": "product liability & wrongful death", "367": "product liability & wrongful death", "385": "product liability & wrongful death",
 	"850": "securities fraud",
 	"370": "consumer protection", "371": "consumer protection", "480": "consumer protection", "485": "consumer protection",
 }
+
+var lawsuitNOSTag = map[string]string{"820": "copyright", "830": "patent", "835": "patent", "840": "trademark"}
 
 var lawsuitDocketIDRe = regexp.MustCompile(`courtlistener\.com/docket/(\d+)`)
 
@@ -86,8 +91,10 @@ func twoaiLawsuitClassify(db *sql.DB) error {
 			left++
 			continue
 		}
-		if _, err := db.Exec(`UPDATE ai_lawsuits SET category = $2, updated_at = now()
-			WHERE slug = $1 AND category = 'unclassified'`, x.slug, cat); err == nil {
+		if _, err := db.Exec(`UPDATE ai_lawsuits SET category = $2,
+			tags = CASE WHEN $3::text = '' OR $3::text = ANY(COALESCE(tags,'{}')) THEN tags ELSE array_append(COALESCE(tags,'{}'), $3::text) END,
+			updated_at = now()
+			WHERE slug = $1 AND category = 'unclassified'`, x.slug, cat, lawsuitNOSTag[code]); err == nil {
 			classified++
 			fmt.Printf("twoai_lawsuit_classify: %s -> %s (nature of suit %s)\n", x.slug, cat, nos)
 		} else {
