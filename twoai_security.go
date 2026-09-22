@@ -299,6 +299,10 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 			// twoai_security_program_topics. Only rows marked ready render; a
 			// topic the books do not yet cover stays out rather than going
 			// up thin. Each carries the volume and chapter it was drawn from.
+			// FROM THE BOOK, Stephen 2026-09-21: each topic links the volumes it
+			// draws on, to the book page on srjconsultingservices.com and to
+			// Amazon. The standing rule allows srjconsultingservices.com links
+			// only when directing a reader to an SRJ service or book; this is that.
 			type progTopic struct {
 				Name  string          `json:"name"`
 				Scope string          `json:"scope"`
@@ -308,9 +312,12 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 			}
 			var prog []progTopic
 			if prows, perr := db.Query(`SELECT p.name, p.scope, p.body, COALESCE(p.note,''),
-					COALESCE((SELECT jsonb_agg(r || jsonb_build_object('title', b.title) ORDER BY o)
+					COALESCE((SELECT jsonb_agg(r || jsonb_build_object('title', COALESCE(pb.title, b.title),
+							'book_url', CASE WHEN pb.url_path IS NOT NULL THEN 'https://srjconsultingservices.com' || pb.url_path END,
+							'amazon_url', pb.amazon_url) ORDER BY o)
 						FROM jsonb_array_elements(p.book_refs) WITH ORDINALITY x(r, o)
-						LEFT JOIN books b ON b.volume_number = (r->>'volume')::int), '[]'::jsonb)
+						LEFT JOIN books b ON b.volume_number = (r->>'volume')::int
+						LEFT JOIN press_books pb ON pb.book_number = (r->>'volume')::int AND pb.status = 'available'), '[]'::jsonb)
 				FROM twoai_security_program_topics p
 				WHERE p.domain_slug = $1 AND p.status = 'ready' AND COALESCE(p.body,'') <> ''
 				ORDER BY p.sort`, g.Slug); perr == nil {
