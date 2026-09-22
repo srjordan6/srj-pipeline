@@ -3184,6 +3184,7 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 		db.Exec(`UPDATE ai_lawsuits SET docket_checked_at = now() WHERE id = $1`, c.id)
 		var docket struct {
 			DateLastFiling string `json:"date_last_filing"`
+			AbsoluteURL    string `json:"absolute_url"`
 		}
 		if err := clGet("/dockets/"+did+"/", nil, &docket); err != nil {
 			fmt.Fprintln(os.Stderr, "intel refresh", c.slug, "docket fetch:", err)
@@ -3201,6 +3202,21 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 			}
 			time.Sleep(2 * time.Second)
 			continue
+		}
+		// THE LINK A READER CAN OPEN. CourtListener refuses /docket/<id>/ and
+		// answers only /docket/<id>/<slug>/. Stephen, 2026-09-21: none of the
+		// docket links work. 13 cases held the bare form and every timeline row
+		// on 110 cases was built as the bare form below. The docket record
+		// carries its own absolute_url, so the case URL heals itself here and
+		// every new timeline row links to it.
+		caseURL := c.clURL
+		if docket.AbsoluteURL != "" {
+			caseURL = twoaiCourtListenerURL(docket.AbsoluteURL, 0)
+			if caseURL != c.clURL {
+				db.Exec(`UPDATE ai_lawsuits SET courtlistener_url = $2,
+					source_url = CASE WHEN source_url = $3 THEN $2 ELSE source_url END, updated_at = now() WHERE id = $1`,
+					c.id, caseURL, c.clURL)
+			}
 		}
 		if docket.DateLastFiling == "" || (c.since != "" && docket.DateLastFiling <= c.since) {
 			time.Sleep(2 * time.Second)
@@ -3239,7 +3255,7 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 				"date":   en.DateFiled,
 				"title":  trunc(desc, 300),
 				"doc_no": docNo,
-				"url":    "https://www.courtlistener.com/docket/" + did + "/",
+				"url":    caseURL,
 			})
 		}
 		if len(fresh) > 0 {
