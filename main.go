@@ -755,7 +755,23 @@ func main() {
 		return
 	}
 
+	if src == "twoai_news_mine" {
+		if err := twoaiNewsMine(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_news_mine:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "twoai_lawsuit_fill" {
+		// The news intake proposes cases no tracker knows about yet, before
+		// the classifier and the page writer run, so a case found in this
+		// morning's news can be promoted and written in the same sequence.
+		// Never fatal: a model that cannot answer costs candidates, not the
+		// lawsuit pages that already exist.
+		if err := twoaiNewsMine(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_news_mine:", err)
+		}
 		// Court case type first, so a case promoted by intel today is
 		// categorised before its page is written.
 		if err := twoaiLawsuitClassify(db); err != nil {
