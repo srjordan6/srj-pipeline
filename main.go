@@ -4464,6 +4464,15 @@ func twoaiBuild(db *sql.DB) error {
 		})
 	}
 	lr.Close()
+	// How insurance would respond, by case category, published texts only.
+	// See twoai_lawsuit_insurance.go.
+	if ins := twoaiLawsuitInsurance(db); len(ins) > 0 {
+		for _, c := range cases {
+			if cat, _ := c["category"].(string); ins[cat] != nil {
+				c["insurance"] = ins[cat]
+			}
+		}
+	}
 	if err := upsert("lawsuits/lawsuits.json", "lawsuits", map[string]any{
 		"cases": cases, "count": len(cases), "generated": today,
 	}); err != nil {
@@ -4608,6 +4617,15 @@ func twoaiBuild(db *sql.DB) error {
 			}
 			pm["slug"] = slug
 			pm["generated"] = today
+			// EVERY TOOL CARRIES ITS UID, 2026-09-21: the tool pages showed
+			// none, though twoai_entities already held one per tool under
+			// "tool:" + slug. Same key, so the uid is the one already minted.
+			pm["uid"] = twoaiUID("tool:" + slug)
+			// A tool whose name is also a glossary term points across to the
+			// other meaning. See twoai_search_terms.go.
+			if sa := toolSeeAlso[slug]; sa != nil {
+				pm["see_also"] = sa
+			}
 			if err := upsert("tools/"+slug+".json", "tool", pm); err != nil {
 				return err
 			}
@@ -9091,6 +9109,10 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 	// current children so it cannot drift.
 	if err := twoaiEnsureHubPages(db); err != nil {
 		fmt.Fprintln(os.Stderr, "twoai_ecosystem: hub pages:", err)
+	}
+	// Understand AI (d2390ba3), rebuilt from live figures every run.
+	if err := twoaiUnderstandAI(db); err != nil {
+		fmt.Fprintln(os.Stderr, "twoai_understand_ai:", err)
 	}
 
 	rows, err := db.Query(`SELECT t.slug, t.name, COALESCE(t.blurb,''), t.status,
