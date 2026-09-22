@@ -68,11 +68,15 @@ type twoaiArtFacts struct {
 	IPCases, MusicCases                          int
 	GlossaryTerms                                int
 	AllCases, Compliance, CaseLaw, Bills         int
+	SECCos, MAFilings, Tickers                   int
 }
 
 func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 	var f twoaiArtFacts
-	db.QueryRow(`SELECT
+	// One row of counts. If any sub-select is wrong the whole row fails, so the
+	// error is printed rather than swallowed: a section written against zeroes
+	// would read as a site that holds nothing.
+	if err := db.QueryRow(`SELECT
 		(SELECT count(*) FROM twoai_model_catalog WHERE section = 'image-generation-models' AND delisted_at IS NULL),
 		(SELECT count(*) FROM twoai_model_catalog WHERE section = 'video-models' AND delisted_at IS NULL),
 		(SELECT count(*) FROM twoai_model_catalog WHERE section IN ('audio-speech-models','music-models') AND delisted_at IS NULL),
@@ -82,10 +86,15 @@ func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 		(SELECT jsonb_array_length(data->'terms') FROM site_content WHERE path = 'resources/glossary.json'),
 		(SELECT count(*) FROM ai_lawsuits WHERE is_active),
 		(SELECT count(*) FROM twoai_pages WHERE path LIKE 'compliance/%'),
-		(SELECT count(*) FROM twoai_caselaw),
-		(SELECT count(*) FROM pipeline.documents WHERE source = 'legiscan')`).
+		(SELECT count(*) FROM twoai_pages WHERE path LIKE 'caselaw/%'),
+		(SELECT count(*) FROM pipeline.documents d JOIN pipeline.sources s ON s.id = d.source_id WHERE s.name LIKE 'LegiScan%'),
+		(SELECT count(*) FROM twoai_pages WHERE path LIKE 'companies/%'),
+		(SELECT count(*) FROM twoai_ma_filings),
+		(SELECT count(*) FROM twoai_stock_instruments)`).
 		Scan(&f.ImageModels, &f.VideoModels, &f.AudioModels, &f.Tools, &f.IPCases, &f.MusicCases, &f.GlossaryTerms,
-			&f.AllCases, &f.Compliance, &f.CaseLaw, &f.Bills)
+			&f.AllCases, &f.Compliance, &f.CaseLaw, &f.Bills, &f.SECCos, &f.MAFilings, &f.Tickers); err != nil {
+		fmt.Println("twoai_art: facts:", err)
+	}
 	return f
 }
 
@@ -93,6 +102,10 @@ func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 // figures that bear on it, because a number that does not belong on the page
 // is a number the model will reach for anyway.
 func (f twoaiArtFacts) line(section string) string {
+	if section == "fin" {
+		return fmt.Sprintf("This site currently tracks %d company pages, %d merger and acquisition filings, %d listed AI-related instruments, %d compliance and regulation pages, %d active AI lawsuits, %d AI tools and %d glossary terms.",
+			f.SECCos, f.MAFilings, f.Tickers, f.Compliance, f.AllCases, f.Tools, f.GlossaryTerms)
+	}
 	if section == "law" {
 		return fmt.Sprintf("This site currently tracks %d active AI lawsuits (%d of them intellectual property), %d AI case law precedents, %d compliance and regulation pages, %d state AI bills, %d AI tools and %d glossary terms.",
 			f.AllCases, f.IPCases, f.CaseLaw, f.Compliance, f.Bills, f.Tools, f.GlossaryTerms)
@@ -337,10 +350,12 @@ func twoaiArt(db *sql.DB, today string) error {
 	// row with no parent in that section.
 	catOf := map[string]string{}
 	rootOf := map[string]string{}
+	rootName := map[string]string{}
 	for _, n := range nodes {
 		catOf[n.Slug] = n.Category
 		if n.Kind == "hub" {
 			rootOf[n.Section] = n.Slug
+			rootName[n.Section] = n.Name
 		}
 	}
 	path := func(slug string) string {
@@ -378,7 +393,7 @@ func twoaiArt(db *sql.DB, today string) error {
 	}
 	// Each section has its own taxonomy row, so the category page lists it and
 	// the freshness contract can find its pages.
-	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer"}
+	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant"}
 
 	for _, n := range nodes {
 		switch n.Kind {
@@ -421,6 +436,7 @@ func twoaiArt(db *sql.DB, today string) error {
 				// of the search index until it has something to say.
 				"noindex":     h == nil,
 				"child_count": len(kids), "generated": today, "refresh_every_days": 90,
+				"hub_name": rootName[n.Section],
 			}
 			if n.Kind == "subhub" {
 				root := rootOf[n.Section]
@@ -466,7 +482,8 @@ func twoaiArt(db *sql.DB, today string) error {
 				},
 				"expanded": r != nil, "noindex": r == nil,
 				"parent_name": parentName, "parent_path": parentPath,
-				"siblings": siblings, "hub_path": path(rootOf[n.Section]), "generated": today,
+				"siblings": siblings, "hub_path": path(rootOf[n.Section]),
+				"hub_name": rootName[n.Section], "generated": today,
 				"refresh_every_days": 90,
 			}
 			if err := write(fileFor(n), taxFor[n.Section], doc); err != nil {
