@@ -294,11 +294,43 @@ func twoaiSecurity(db *sql.DB, today string) (int, error) {
 					others = append(others, map[string]string{"label": o.Label, "href": o.Href})
 				}
 			}
+			// THE PROGRAM, Stephen 2026-09-21: ten topics per domain, sixty in
+			// all, written from Volumes VI to VIII of his library and held in
+			// twoai_security_program_topics. Only rows marked ready render; a
+			// topic the books do not yet cover stays out rather than going
+			// up thin. Each carries the volume and chapter it was drawn from.
+			type progTopic struct {
+				Name  string          `json:"name"`
+				Scope string          `json:"scope"`
+				Body  string          `json:"body"`
+				Note  string          `json:"note,omitempty"`
+				Refs  json.RawMessage `json:"refs"`
+			}
+			var prog []progTopic
+			if prows, perr := db.Query(`SELECT p.name, p.scope, p.body, COALESCE(p.note,''),
+					COALESCE((SELECT jsonb_agg(r || jsonb_build_object('title', b.title) ORDER BY o)
+						FROM jsonb_array_elements(p.book_refs) WITH ORDINALITY x(r, o)
+						LEFT JOIN books b ON b.volume_number = (r->>'volume')::int), '[]'::jsonb)
+				FROM twoai_security_program_topics p
+				WHERE p.domain_slug = $1 AND p.status = 'ready' AND COALESCE(p.body,'') <> ''
+				ORDER BY p.sort`, g.Slug); perr == nil {
+				for prows.Next() {
+					var pt progTopic
+					var refs []byte
+					if prows.Scan(&pt.Name, &pt.Scope, &pt.Body, &pt.Note, &refs) == nil {
+						pt.Refs = refs
+						prog = append(prog, pt)
+					}
+				}
+				prows.Close()
+			} else {
+				fmt.Printf("twoai_build: security program topics: %v\n", perr)
+			}
 			dd := map[string]any{
 				"uid": twoaiUID("secdomain:" + g.Slug), "tax": "ai-security-risk", "shape": "security-domain",
 				"slug": g.Slug, "name": g.Label, "blurb": g.Blurb, "generated": today,
 				"hub_name": hn, "hub_path": "/ai-ecosystem/enterprise-applications-governance-and-tools/" + twoaiUID("section:ai-security-risk") + "/",
-				"topics": dts, "topic_count": len(dts), "other_domains": others,
+				"topics": dts, "topic_count": len(dts), "other_domains": others, "program": prog,
 			}
 			dj, _ := json.Marshal(dd)
 			if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
