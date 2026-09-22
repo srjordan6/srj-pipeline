@@ -5103,6 +5103,13 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_build: security sections=%d\n", secPages)
 
+	// THE ART OF AI, Stephen 2026-09-22: a hub, ten sub-hubs and fifty topics
+	// under the ecosystem-entities category, listed in twoai_art_nodes and
+	// written by the model against this site's own counts. Never fatal.
+	if err := twoaiArt(db, today); err != nil {
+		fmt.Println("twoai_art:", err)
+	}
+
 	// Staleness tripwire for benchmark results. The result snapshots in
 	// twoai_benchmarks.results are hand-curated from named evaluators, not
 	// scraped: the source leaderboards are JS-rendered and re-baseline
