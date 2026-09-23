@@ -73,6 +73,7 @@ type twoaiArtFacts struct {
 	GlossaryTerms                                int
 	AllCases, Compliance, CaseLaw, Bills         int
 	SECCos, MAFilings, Tickers                   int
+	MedModels, SciModels, PLCases                int
 }
 
 func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
@@ -94,9 +95,13 @@ func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 		(SELECT count(*) FROM pipeline.documents d JOIN pipeline.sources s ON s.id = d.source_id WHERE s.name LIKE 'LegiScan%'),
 		(SELECT count(*) FROM twoai_pages WHERE path LIKE 'companies/%'),
 		(SELECT count(*) FROM twoai_ma_filings),
-		(SELECT count(*) FROM twoai_stock_instruments)`).
+		(SELECT count(*) FROM twoai_stock_instruments),
+		(SELECT count(*) FROM twoai_model_catalog WHERE section = 'medical-models' AND delisted_at IS NULL),
+		(SELECT count(*) FROM twoai_model_catalog WHERE section = 'scientific-models' AND delisted_at IS NULL),
+		(SELECT count(*) FROM ai_lawsuits WHERE is_active AND category LIKE 'product liability%')`).
 		Scan(&f.ImageModels, &f.VideoModels, &f.AudioModels, &f.Tools, &f.IPCases, &f.MusicCases, &f.GlossaryTerms,
-			&f.AllCases, &f.Compliance, &f.CaseLaw, &f.Bills, &f.SECCos, &f.MAFilings, &f.Tickers); err != nil {
+			&f.AllCases, &f.Compliance, &f.CaseLaw, &f.Bills, &f.SECCos, &f.MAFilings, &f.Tickers,
+			&f.MedModels, &f.SciModels, &f.PLCases); err != nil {
 		fmt.Println("twoai_art: facts:", err)
 	}
 	return f
@@ -106,6 +111,10 @@ func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 // figures that bear on it, because a number that does not belong on the page
 // is a number the model will reach for anyway.
 func (f twoaiArtFacts) line(section string) string {
+	if section == "med" {
+		return fmt.Sprintf("This site currently tracks %d medical AI models, %d scientific models, %d active product liability and wrongful death lawsuits against AI companies, %d compliance and regulation pages, %d AI tools and %d glossary terms.",
+			f.MedModels, f.SciModels, f.PLCases, f.Compliance, f.Tools, f.GlossaryTerms)
+	}
 	if section == "fin" {
 		return fmt.Sprintf("This site currently tracks %d company pages, %d merger and acquisition filings, %d listed AI-related instruments, %d compliance and regulation pages, %d active AI lawsuits, %d AI tools and %d glossary terms.",
 			f.SECCos, f.MAFilings, f.Tickers, f.Compliance, f.AllCases, f.Tools, f.GlossaryTerms)
@@ -132,7 +141,7 @@ You are given the section name, what it covers, and the pages under it. Write th
 Rules:
 - Plain English. Commas, not dashes. No em dashes. No marketing language, no "in today's landscape", no exclamation.
 - Use a figure from the site facts ONLY where it genuinely belongs. Never invent a number, a company, a product version, a case name or a date.
-- Nothing here is advice, legal or otherwise. Describe the work.
+- Nothing here is advice, legal, financial or medical. Describe the work. On medical topics, never tell a reader what to do about their own health.
 
 Answer with one JSON object and nothing else:
 {"what": "", "state": "", "map": ""}`
@@ -146,7 +155,7 @@ Rules:
 - Plain English. Commas, not dashes. No em dashes. No marketing language, no "in today's landscape", no exclamation.
 - Use a figure from the site facts ONLY where it genuinely belongs. Never invent a number, a company, a product version, a case name or a date.
 - Name tools only where the seed names them or where the tool is unambiguous and well known.
-- Write for a working professional in the field who is competent but not a machine learning engineer. Nothing here is legal advice, and a page about law describes practice rather than advising a reader.
+- Write for a working professional in the field who is competent but not a machine learning engineer. Nothing here is legal, financial or medical advice: describe practice, never advise a reader, and on medical topics never tell a reader what to do about their own health or treatment.
 
 Answer with one JSON object and nothing else:
 {"scope": "", "infra": "", "method": "", "governance": "", "horizon": ""}`
@@ -427,7 +436,7 @@ func twoaiArt(db *sql.DB, today string) error {
 	}
 	// Each section has its own taxonomy row, so the category page lists it and
 	// the freshness contract can find its pages.
-	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant"}
+	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician"}
 
 	for _, n := range nodes {
 		switch n.Kind {
