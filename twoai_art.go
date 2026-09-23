@@ -508,6 +508,30 @@ func twoaiArt(db *sql.DB, today string) error {
 	// the freshness contract can find its pages.
 	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician", "res": "ai-researcher", "eco": "ai-economist", "fut": "ai-future-professions"}
 
+	// BREADCRUMBS. Stephen, 2026-09-22, on Financial Reporting and Synthesis:
+	// the trail stopped at the category, so a reader three levels down could
+	// not see they were inside The AI Accountant, inside Knowledge Based
+	// Professions and their Future. Each page now carries its full chain of
+	// ancestors, nearest last, walked through parent_slug.
+	byNode := map[string]twoaiArtNode{}
+	for _, x := range nodes {
+		byNode[x.Slug] = x
+	}
+	crumbsFor := func(n twoaiArtNode) []kid {
+		var chain []kid
+		seen := map[string]bool{n.Slug: true}
+		for p := n.Parent; p != "" && !seen[p]; {
+			seen[p] = true
+			pn, ok := byNode[p]
+			if !ok {
+				break
+			}
+			chain = append([]kid{{Name: pn.Name, Path: path(pn.Slug)}}, chain...)
+			p = pn.Parent
+		}
+		return chain
+	}
+
 	for _, n := range nodes {
 		switch n.Kind {
 		case "hub", "subhub":
@@ -573,7 +597,7 @@ func twoaiArt(db *sql.DB, today string) error {
 				// of the search index until it has something to say.
 				"noindex":     h == nil,
 				"child_count": len(kids), "generated": today, "refresh_every_days": 90,
-				"hub_name": rootName[n.Section],
+				"hub_name": rootName[n.Section], "crumbs": crumbsFor(n),
 			}
 			if n.Kind == "subhub" {
 				root := rootOf[n.Section]
@@ -620,7 +644,7 @@ func twoaiArt(db *sql.DB, today string) error {
 				"expanded": r != nil, "noindex": r == nil,
 				"parent_name": parentName, "parent_path": parentPath,
 				"siblings": siblings, "hub_path": path(rootOf[n.Section]),
-				"hub_name": rootName[n.Section], "generated": today,
+				"hub_name": rootName[n.Section], "generated": today, "crumbs": crumbsFor(n),
 				"refresh_every_days": 90,
 			}
 			if err := write(fileFor(n), taxFor[n.Section], doc); err != nil {
