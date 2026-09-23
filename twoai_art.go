@@ -36,7 +36,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -192,10 +194,45 @@ func twoaiArtJSON(raw string) (map[string]string, error) {
 	return m, nil
 }
 
+// twoaiArtHash decides when a page is rewritten. It covers the page's own
+// seed and the site figures handed to the model, with every figure rounded to
+// two significant figures first. Before 2026-09-22 the figures went in raw, so
+// a single new glossary term or lawsuit changed the hash of every page in a
+// section and the daily build would have rewritten all 366 pages forever,
+// twelve at a time. Rounded, a page is rewritten when a figure it was given
+// moves by roughly a tenth, which is when its text could be wrong.
 func twoaiArtHash(n twoaiArtNode, facts string) string {
+	facts = twoaiArtNumRe.ReplaceAllStringFunc(facts, twoaiArtRound)
 	h := sha256.Sum256([]byte(strings.Join([]string{n.Name, n.Scope, n.Infra, n.Method, n.Gov, n.Horizon, facts}, "|")))
 	return hex.EncodeToString(h[:])[:16]
 }
+
+var twoaiArtNumRe = regexp.MustCompile(`\d+`)
+
+// twoaiArtLegacyHash is the hash as it was computed before figures were
+// rounded, kept only to recognise pages written under it.
+func twoaiArtLegacyHash(n twoaiArtNode, facts string) string {
+	h := sha256.Sum256([]byte(strings.Join([]string{n.Name, n.Scope, n.Infra, n.Method, n.Gov, n.Horizon, facts}, "|")))
+	return hex.EncodeToString(h[:])[:16]
+}
+
+// twoaiArtRound rounds an integer to two significant figures: 92 stays 92,
+// 732 becomes 730, 6789 becomes 6800.
+func twoaiArtRound(s string) string {
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 100 {
+		return s
+	}
+	p := 1
+	for v/p >= 100 {
+		p *= 10
+	}
+	return strconv.Itoa(((v + p/2) / p) * p)
+}
+
+// twoaiArtStale says a page is due for rewriting because of its age alone:
+// the field it describes has moved on even if none of its figures have.
+const twoaiArtMaxAgeDays = 90
 
 func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int, int) {
 	written, failed := 0, 0
@@ -222,9 +259,17 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 		}
 		want := twoaiArtHash(n, facts.line(n.Section)+strings.Join(kidsOf[n.Slug], ","))
 		var have, haveModel string
-		db.QueryRow(`SELECT data_hash, model FROM twoai_art_readings WHERE slug = $1 AND block = 'hub'`, n.Slug).Scan(&have, &haveModel)
+		var ageDays int
+		db.QueryRow(`SELECT data_hash, model, current_date - generated_on FROM twoai_art_readings WHERE slug = $1 AND block = 'hub'`, n.Slug).Scan(&have, &haveModel, &ageDays)
 		// An opening written by hand is never overwritten by the model.
-		if have == want || haveModel == "curated" {
+		if haveModel == "curated" {
+			continue
+		}
+		if have != want && have == twoaiArtLegacyHash(n, facts.line(n.Section)+strings.Join(kidsOf[n.Slug], ",")) {
+			db.Exec(`UPDATE twoai_art_readings SET data_hash = $2 WHERE slug = $1 AND block = 'hub'`, n.Slug, want)
+			have = want
+		}
+		if have == want && ageDays < twoaiArtMaxAgeDays {
 			continue
 		}
 		user := fmt.Sprintf("Section: %s\nPart of: %s\nWhat it covers: %s\nSite facts: %s\n\nPages under it:\n%s\n\nAnswer now.",
@@ -288,8 +333,19 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 		}
 		want := twoaiArtHash(n, facts.line(n.Section))
 		var have, haveModel string
-		db.QueryRow(`SELECT data_hash, model FROM twoai_art_readings WHERE slug = $1 AND block = 'all'`, n.Slug).Scan(&have, &haveModel)
-		if have == want || haveModel == "curated" {
+		var ageDays int
+		db.QueryRow(`SELECT data_hash, model, current_date - generated_on FROM twoai_art_readings WHERE slug = $1 AND block = 'all'`, n.Slug).Scan(&have, &haveModel, &ageDays)
+		if haveModel == "curated" {
+			continue
+		}
+		// Pages written before the figures were rounded carry the old hash. They
+		// are current, so the hash is brought forward rather than the page
+		// rewritten.
+		if have != want && have == twoaiArtLegacyHash(n, facts.line(n.Section)) {
+			db.Exec(`UPDATE twoai_art_readings SET data_hash = $2 WHERE slug = $1 AND block = 'all'`, n.Slug, want)
+			have = want
+		}
+		if have == want && ageDays < twoaiArtMaxAgeDays {
 			continue
 		}
 		seeds := "(none: write all five sections yourself)"
