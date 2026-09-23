@@ -85,18 +85,44 @@ func twoaiNewsMineJSON(raw string) (*twoaiMinedCase, error) {
 }
 
 // twoaiNewsMineKnown asks whether the tracker or the queue already holds this
-// case. Matching is on a defendant name plus a plaintiff surname rather than
-// the full case name, because outlets write "B.C. sues OpenAI" where the
-// docket reads "His Majesty the King in Right of the Province of British
-// Columbia v. Altman".
+// case. Matching is on the most distinctive word of the defendant plus the
+// most distinctive word of the plaintiff, searched across the case name AND
+// the snippet, because the press and the docket name the same case
+// differently. The first run, on 2026-09-22, proposed the British Columbia
+// suit twice while the queue already held it as "His Majesty the King in
+// Right of the Province of British Columbia v. Altman"; no pair of those
+// three shares words in the case name alone, and all three share them once
+// the snippet is searched too.
 func twoaiNewsMineKnown(db *sql.DB, m *twoaiMinedCase) (bool, string) {
-	def := strings.ToLower(strings.TrimSpace(m.Defendants))
-	if def == "" {
-		return false, ""
+	// pickWord returns the longest word that is not corporate or legal
+	// furniture, which is the one worth searching on.
+	pickWord := func(s string, skip map[string]bool) string {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if i := strings.IndexAny(s, ",;"); i > 0 {
+			s = strings.TrimSpace(s[:i])
+		}
+		out := ""
+		for _, w := range strings.Fields(s) {
+			w = strings.Trim(w, ".,()'\"")
+			if skip[w] {
+				continue
+			}
+			if len(w) > len(out) {
+				out = w
+			}
+		}
+		return out
 	}
-	first := def
-	if i := strings.IndexAny(first, ",;"); i > 0 {
-		first = strings.TrimSpace(first[:i])
+	corporate := map[string]bool{"inc": true, "llc": true, "corp": true, "corporation": true, "co": true,
+		"ltd": true, "plc": true, "pbc": true, "the": true, "and": true, "group": true, "holdings": true,
+		"sam": true, "other": true, "entities": true}
+	public := map[string]bool{"the": true, "of": true, "in": true, "and": true, "government": true,
+		"province": true, "state": true, "district": true, "his": true, "her": true, "majesty": true,
+		"king": true, "right": true, "people": true, "united": true, "states": true}
+
+	defWord := pickWord(m.Defendants, corporate)
+	if len(defWord) < 3 {
+		return false, ""
 	}
 	if m.Docket != "" {
 		var slug string
@@ -104,30 +130,22 @@ func twoaiNewsMineKnown(db *sql.DB, m *twoaiMinedCase) (bool, string) {
 			return true, "tracked:" + slug
 		}
 	}
-	plain := strings.ToLower(strings.TrimSpace(m.Plaintiffs))
-	if i := strings.IndexAny(plain, ",;"); i > 0 {
-		plain = strings.TrimSpace(plain[:i])
-	}
-	if plain == "" {
-		return false, ""
-	}
-	last := plain
-	if parts := strings.Fields(plain); len(parts) > 0 {
-		last = parts[len(parts)-1]
-	}
-	if len(last) < 3 {
+	plainWord := pickWord(m.Plaintiffs, public)
+	if len(plainWord) < 4 {
 		return false, ""
 	}
 	var slug string
 	if db.QueryRow(`SELECT slug FROM ai_lawsuits
-		WHERE lower(defendants) LIKE '%' || $1 || '%' AND lower(case_name) LIKE '%' || $2 || '%' LIMIT 1`,
-		first, last).Scan(&slug) == nil && slug != "" {
+		WHERE lower(coalesce(case_name,'') || ' ' || coalesce(defendants,'') || ' ' || coalesce(plaintiffs,'')) LIKE '%' || $1 || '%'
+		  AND lower(coalesce(case_name,'') || ' ' || coalesce(defendants,'') || ' ' || coalesce(plaintiffs,'')) LIKE '%' || $2 || '%'
+		LIMIT 1`, defWord, plainWord).Scan(&slug) == nil && slug != "" {
 		return true, "tracked:" + slug
 	}
 	var cid int64
 	if db.QueryRow(`SELECT id FROM ai_lawsuit_candidates
-		WHERE lower(case_name) LIKE '%' || $1 || '%' AND lower(case_name) LIKE '%' || $2 || '%' LIMIT 1`,
-		first, last).Scan(&cid) == nil && cid > 0 {
+		WHERE lower(coalesce(case_name,'') || ' ' || coalesce(snippet,'')) LIKE '%' || $1 || '%'
+		  AND lower(coalesce(case_name,'') || ' ' || coalesce(snippet,'')) LIKE '%' || $2 || '%'
+		LIMIT 1`, defWord, plainWord).Scan(&cid) == nil && cid > 0 {
 		return true, fmt.Sprintf("queued:%d", cid)
 	}
 	return false, ""
