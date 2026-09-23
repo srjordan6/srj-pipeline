@@ -220,9 +220,10 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 			continue
 		}
 		want := twoaiArtHash(n, facts.line(n.Section)+strings.Join(kidsOf[n.Slug], ","))
-		var have string
-		db.QueryRow(`SELECT data_hash FROM twoai_art_readings WHERE slug = $1 AND block = 'hub'`, n.Slug).Scan(&have)
-		if have == want {
+		var have, haveModel string
+		db.QueryRow(`SELECT data_hash, model FROM twoai_art_readings WHERE slug = $1 AND block = 'hub'`, n.Slug).Scan(&have, &haveModel)
+		// An opening written by hand is never overwritten by the model.
+		if have == want || haveModel == "curated" {
 			continue
 		}
 		user := fmt.Sprintf("Section: %s\nPart of: %s\nWhat it covers: %s\nSite facts: %s\n\nPages under it:\n%s\n\nAnswer now.",
@@ -285,9 +286,9 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 			break
 		}
 		want := twoaiArtHash(n, facts.line(n.Section))
-		var have string
-		db.QueryRow(`SELECT data_hash FROM twoai_art_readings WHERE slug = $1 AND block = 'all'`, n.Slug).Scan(&have)
-		if have == want {
+		var have, haveModel string
+		db.QueryRow(`SELECT data_hash, model FROM twoai_art_readings WHERE slug = $1 AND block = 'all'`, n.Slug).Scan(&have, &haveModel)
+		if have == want || haveModel == "curated" {
 			continue
 		}
 		seeds := "(none: write all five sections yourself)"
@@ -448,7 +449,7 @@ func twoaiArt(db *sql.DB, today string) error {
 	}
 	// Each section has its own taxonomy row, so the category page lists it and
 	// the freshness contract can find its pages.
-	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician", "res": "ai-researcher", "eco": "ai-economist"}
+	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician", "res": "ai-researcher", "eco": "ai-economist", "fut": "ai-future-professions"}
 
 	for _, n := range nodes {
 		switch n.Kind {
@@ -472,7 +473,17 @@ func twoaiArt(db *sql.DB, today string) error {
 			}
 			h := hubReadings[n.Slug]
 			var opening []map[string]string
-			if h != nil {
+			if h != nil && h["s1"] != "" {
+				// A hand-written opening carries its own headings, t1..t9 with
+				// bodies s1..s9, in order.
+				for i := 1; i <= 9; i++ {
+					b := h[fmt.Sprintf("s%d", i)]
+					if b == "" {
+						continue
+					}
+					opening = append(opening, map[string]string{"heading": h[fmt.Sprintf("t%d", i)], "body": b})
+				}
+			} else if h != nil {
 				if h["what"] != "" {
 					opening = append(opening, map[string]string{"heading": "What this covers", "body": h["what"]})
 				}
