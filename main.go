@@ -755,6 +755,18 @@ func main() {
 		return
 	}
 
+	if src == "twoai_art" {
+		// The sectioned reference pages written on their own, without the
+		// build's deadline, so a new section can be finished in one sitting.
+		// The pages still publish through the next full run.
+		twoaiArtCap = twoaiArtCapAlone
+		if err := twoaiArt(db, time.Now().UTC().Format("2006-01-02")); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_art:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if src == "twoai_news_mine" {
 		if err := twoaiNewsMine(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_news_mine:", err)

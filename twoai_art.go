@@ -39,9 +39,13 @@ import (
 	"strings"
 )
 
-// twoaiArtCap bounds the model work in one run; fifty topics fill in over a
-// few days rather than in one long stage.
-const twoaiArtCap = 18
+// twoaiArtCap bounds the model work inside the daily build, where the whole
+// build has a deadline. Run on its own (pipeline.exe twoai_art) the stage
+// takes twoaiArtCapAlone instead, so a new section can be written in one sitting
+// rather than over ten days. Stephen, 2026-09-22.
+var twoaiArtCap = 18
+
+const twoaiArtCapAlone = 400
 
 // A section's pages are written to the content folder its category route
 // reads: the ecosystem-entities route sweeps content/ecosystem, the
@@ -225,9 +229,39 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 		}
 		written++
 	}
-	for _, n := range nodes {
-		if n.Kind != "topic" || written >= twoaiArtCap {
-			continue
+	// Topics are taken one section at a time in turn, so a new section is not
+	// left waiting behind every topic of an older one. Before 2026-09-22 they
+	// ran in table order and the fifty law and fifty finance topics sat behind
+	// the fifty art topics.
+	var ordered []twoaiArtNode
+	{
+		bySection := map[string][]twoaiArtNode{}
+		var sections []string
+		for _, n := range nodes {
+			if n.Kind != "topic" {
+				continue
+			}
+			if _, ok := bySection[n.Section]; !ok {
+				sections = append(sections, n.Section)
+			}
+			bySection[n.Section] = append(bySection[n.Section], n)
+		}
+		for i := 0; ; i++ {
+			added := false
+			for _, s := range sections {
+				if i < len(bySection[s]) {
+					ordered = append(ordered, bySection[s][i])
+					added = true
+				}
+			}
+			if !added {
+				break
+			}
+		}
+	}
+	for _, n := range ordered {
+		if written >= twoaiArtCap {
+			break
 		}
 		want := twoaiArtHash(n, facts.line(n.Section))
 		var have string
