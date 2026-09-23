@@ -115,6 +115,10 @@ func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 // figures that bear on it, because a number that does not belong on the page
 // is a number the model will reach for anyway.
 func (f twoaiArtFacts) line(section string) string {
+	if section == "eco" {
+		return fmt.Sprintf("This site currently tracks %d listed AI-related instruments with daily prices, %d merger and acquisition filings, %d company pages, %d active AI lawsuits, %d compliance and regulation pages, %d AI tools and %d glossary terms.",
+			f.Tickers, f.MAFilings, f.SECCos, f.AllCases, f.Compliance, f.Tools, f.GlossaryTerms)
+	}
 	if section == "res" {
 		return fmt.Sprintf("This site currently holds %d research papers in its library, %d claims extracted from research works, %d AI books in its catalogue, %d scientific models, %d AI tools and %d glossary terms. Content on this site never links to the Consensus search tool; it links to the original paper.",
 			f.Papers, f.Claims, f.BookTitles, f.SciModels, f.Tools, f.GlossaryTerms)
@@ -163,7 +167,7 @@ Rules:
 - Plain English. Commas, not dashes. No em dashes. No marketing language, no "in today's landscape", no exclamation.
 - Use a figure from the site facts ONLY where it genuinely belongs. Never invent a number, a company, a product version, a case name or a date.
 - Name tools only where the seed names them or where the tool is unambiguous and well known.
-- Write for a working professional in the field who is competent but not a machine learning engineer. Nothing here is legal, financial or medical advice: describe practice, never advise a reader, and on medical topics never tell a reader what to do about their own health or treatment.
+- Write for a working professional in the field who is competent but not a machine learning engineer. Nothing here is legal, financial, investment or medical advice: describe practice, never advise a reader, never recommend a security, trade or allocation, and on medical topics never tell a reader what to do about their own health or treatment.
 
 Answer with one JSON object and nothing else:
 {"scope": "", "infra": "", "method": "", "governance": "", "horizon": ""}`
@@ -444,7 +448,7 @@ func twoaiArt(db *sql.DB, today string) error {
 	}
 	// Each section has its own taxonomy row, so the category page lists it and
 	// the freshness contract can find its pages.
-	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician", "res": "ai-researcher"}
+	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician", "res": "ai-researcher", "eco": "ai-economist"}
 
 	for _, n := range nodes {
 		switch n.Kind {
