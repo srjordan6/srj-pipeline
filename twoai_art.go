@@ -36,6 +36,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -470,6 +471,20 @@ func twoaiArt(db *sql.DB, today string) error {
 					}
 					kids = append(kids, kid{Name: c.Name, Path: path(c.Slug), Blurb: blurb})
 				}
+			}
+			// A hub whose children are themselves sections, such as Knowledge
+			// Based Professions and their Future, lists them alphabetically.
+			// Stephen, 2026-09-22. Sub-hubs and topics keep their editorial order.
+			allHubs := len(kids) > 0
+			for _, c := range nodes {
+				if c.Parent == n.Slug && c.Kind != "hub" {
+					allHubs = false
+				}
+			}
+			if allHubs {
+				sort.SliceStable(kids, func(i, j int) bool {
+					return strings.TrimPrefix(kids[i].Name, "The ") < strings.TrimPrefix(kids[j].Name, "The ")
+				})
 			}
 			h := hubReadings[n.Slug]
 			var opening []map[string]string
