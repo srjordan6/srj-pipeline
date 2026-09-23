@@ -74,6 +74,7 @@ type twoaiArtFacts struct {
 	AllCases, Compliance, CaseLaw, Bills         int
 	SECCos, MAFilings, Tickers                   int
 	MedModels, SciModels, PLCases                int
+	Papers, Claims, BookTitles                   int
 }
 
 func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
@@ -98,10 +99,13 @@ func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 		(SELECT count(*) FROM twoai_stock_instruments),
 		(SELECT count(*) FROM twoai_model_catalog WHERE section = 'medical-models' AND delisted_at IS NULL),
 		(SELECT count(*) FROM twoai_model_catalog WHERE section = 'scientific-models' AND delisted_at IS NULL),
-		(SELECT count(*) FROM ai_lawsuits WHERE is_active AND category LIKE 'product liability%')`).
+		(SELECT count(*) FROM ai_lawsuits WHERE is_active AND category LIKE 'product liability%'),
+		(SELECT count(*) FROM twoai_research_papers),
+		(SELECT count(*) FROM twoai_claims),
+		(SELECT count(*) FROM twoai_book_catalog)`).
 		Scan(&f.ImageModels, &f.VideoModels, &f.AudioModels, &f.Tools, &f.IPCases, &f.MusicCases, &f.GlossaryTerms,
 			&f.AllCases, &f.Compliance, &f.CaseLaw, &f.Bills, &f.SECCos, &f.MAFilings, &f.Tickers,
-			&f.MedModels, &f.SciModels, &f.PLCases); err != nil {
+			&f.MedModels, &f.SciModels, &f.PLCases, &f.Papers, &f.Claims, &f.BookTitles); err != nil {
 		fmt.Println("twoai_art: facts:", err)
 	}
 	return f
@@ -111,6 +115,10 @@ func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 // figures that bear on it, because a number that does not belong on the page
 // is a number the model will reach for anyway.
 func (f twoaiArtFacts) line(section string) string {
+	if section == "res" {
+		return fmt.Sprintf("This site currently holds %d research papers in its library, %d claims extracted from research works, %d AI books in its catalogue, %d scientific models, %d AI tools and %d glossary terms. Content on this site never links to the Consensus search tool; it links to the original paper.",
+			f.Papers, f.Claims, f.BookTitles, f.SciModels, f.Tools, f.GlossaryTerms)
+	}
 	if section == "med" {
 		return fmt.Sprintf("This site currently tracks %d medical AI models, %d scientific models, %d active product liability and wrongful death lawsuits against AI companies, %d compliance and regulation pages, %d AI tools and %d glossary terms.",
 			f.MedModels, f.SciModels, f.PLCases, f.Compliance, f.Tools, f.GlossaryTerms)
@@ -436,7 +444,7 @@ func twoaiArt(db *sql.DB, today string) error {
 	}
 	// Each section has its own taxonomy row, so the category page lists it and
 	// the freshness contract can find its pages.
-	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician"}
+	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician", "res": "ai-researcher"}
 
 	for _, n := range nodes {
 		switch n.Kind {
