@@ -50,6 +50,10 @@ func askLogPull(db *sql.DB) error {
 		return fmt.Errorf("ask_pull create table: %w", err)
 	}
 
+	// The page each question was asked from, recorded by the Worker since
+	// 2026-09-23 so ask box placements can be judged by the questions they earn.
+	db.Exec(`ALTER TABLE twoai_ask_log ADD COLUMN IF NOT EXISTS from_path text`)
+
 	var since int64
 	if err := db.QueryRow(`SELECT COALESCE(max(d1_rowid),0) FROM twoai_ask_log`).Scan(&since); err != nil {
 		return fmt.Errorf("ask_pull watermark: %w", err)
@@ -132,14 +136,23 @@ func askLogPull(db *sql.DB) error {
 		if q == "" {
 			continue
 		}
+		// The Worker's table names the column asked_at. Until 2026-09-23 this
+		// read r["ts"], a name the table never had, so all 137 rows arrived with
+		// no time and usage could only be guessed from when each was copied
+		// (backfilled from D1 the same day). ts stays as a fallback.
+		askedAt := str(r["asked_at"])
+		if askedAt == nil {
+			askedAt = str(r["ts"])
+		}
 		if _, err := db.Exec(`INSERT INTO twoai_ask_log
 			(d1_rowid, asked_at, question, question_norm, answered, best_score,
-			 top_url, guard_verdict, guard_categories, model_used, model_errors)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			 top_url, guard_verdict, guard_categories, model_used, model_errors, from_path)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 			ON CONFLICT (d1_rowid) DO NOTHING`,
-			int64(rowid), str(r["ts"]), q, str(r["question_norm"]), boolish(r["answered"]),
+			int64(rowid), askedAt, q, str(r["question_norm"]), boolish(r["answered"]),
 			num(r["best_score"]), str(r["top_url"]), str(r["guard_verdict"]),
-			str(r["guard_categories"]), str(r["model_used"]), str(r["model_errors"])); err != nil {
+			str(r["guard_categories"]), str(r["model_used"]), str(r["model_errors"]),
+			str(r["from_path"])); err != nil {
 			fmt.Fprintln(os.Stderr, "ask_pull insert:", err)
 			continue
 		}
