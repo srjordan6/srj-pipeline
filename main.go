@@ -4325,9 +4325,72 @@ func twoaiBuild(db *sql.DB) error {
 				}
 			}
 			nrows.Close()
+			// ONE LINE PER EVENT, FOUR EVENTS. Stephen, 2026-09-24: cap at 4.
+			// Eight outlets covering one executive order were eight lines, so
+			// stories are grouped into events first: two stories are the same
+			// event when they fall within 14 days of each other and share at
+			// least half the distinctive words of the shorter headline. Each
+			// event shows one story, a pinned one if an editor pinned it
+			// (twoai_state_news_pins), otherwise the earliest report.
+			pins := map[string]map[string]bool{}
+			db.Exec(`CREATE TABLE IF NOT EXISTS twoai_state_news_pins (
+				state_slug text NOT NULL, story_uid text NOT NULL, note text,
+				pinned_on date NOT NULL DEFAULT current_date, PRIMARY KEY (state_slug, story_uid))`)
+			if pr, err := db.Query(`SELECT state_slug, story_uid FROM twoai_state_news_pins`); err == nil {
+				for pr.Next() {
+					var sl, su string
+					if pr.Scan(&sl, &su) == nil {
+						if pins[sl] == nil {
+							pins[sl] = map[string]bool{}
+						}
+						pins[sl][su] = true
+					}
+				}
+				pr.Close()
+			}
+			stop := map[string]bool{"the": true, "a": true, "an": true, "of": true, "to": true, "in": true, "on": true, "for": true,
+				"and": true, "amid": true, "with": true, "as": true, "by": true, "at": true, "is": true, "new": true, "gov": true}
+			wordsOf := func(h string) map[string]bool {
+				if i := strings.Index(h, " - "); i > 0 {
+					h = h[:i]
+				}
+				h = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(h, "Artificial Intelligence", "AI"), "artificial intelligence", "AI"))
+				out := map[string]bool{}
+				for _, w := range strings.FieldsFunc(h, func(r rune) bool { return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') }) {
+					if !stop[w] && len(w) > 1 {
+						out[w] = true
+					}
+				}
+				return out
+			}
+			sameEvent := func(a, b nstory) bool {
+				ta, e1 := time.Parse("2006-01-02", a.date[:min(10, len(a.date))])
+				tb, e2 := time.Parse("2006-01-02", b.date[:min(10, len(b.date))])
+				if e1 != nil || e2 != nil || ta.Sub(tb) > 14*24*time.Hour || tb.Sub(ta) > 14*24*time.Hour {
+					return false
+				}
+				wa, wb := wordsOf(a.head), wordsOf(b.head)
+				shared := 0
+				for w := range wa {
+					if wb[w] {
+						shared++
+					}
+				}
+				small := len(wa)
+				if len(wb) < small {
+					small = len(wb)
+				}
+				return small > 0 && shared*2 >= small
+			}
 			for _, name := range twoaiStates {
 				slug := twoaiSlug(name)
 				nameRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
+				type event struct {
+					rep    nstory
+					members []nstory
+					pinned bool
+				}
+				var events []*event
 				for _, s := range all {
 					text := s.head + " " + s.sum
 					// "Virginia" must not match inside "West Virginia".
@@ -4339,18 +4402,54 @@ func twoaiBuild(db *sql.DB) error {
 					if name == "Washington" && !regexp.MustCompile(`(?i)washington state|state of washington|olympia|gov\. ferguson|governor ferguson`).MatchString(text) {
 						continue
 					}
-					if !nameRe.MatchString(text) || !policy.MatchString(text) {
+					if !pins[slug][s.uid] && (!nameRe.MatchString(text) || !policy.MatchString(text)) {
 						continue
 					}
-					if len(stateNews[slug]) >= 12 {
+					var home *event
+					for _, e := range events {
+						if sameEvent(e.rep, s) {
+							home = e
+							break
+						}
+					}
+					if home == nil {
+						events = append(events, &event{rep: s, members: []nstory{s}, pinned: pins[slug][s.uid]})
+						continue
+					}
+					home.members = append(home.members, s)
+					// The shown story: a pinned one always wins; otherwise the
+					// earliest report, since stories arrive newest first.
+					if pins[slug][s.uid] {
+						home.rep, home.pinned = s, true
+					} else if !home.pinned {
+						home.rep = s
+					}
+				}
+				// Four events: pinned ones first, then the most recent, then
+				// shown newest first.
+				var chosen []*event
+				for _, e := range events {
+					if e.pinned {
+						chosen = append(chosen, e)
+					}
+				}
+				for _, e := range events {
+					if len(chosen) >= 4 {
 						break
 					}
-					d := s.date
+					if !e.pinned {
+						chosen = append(chosen, e)
+					}
+				}
+				sort.SliceStable(chosen, func(i, j int) bool { return chosen[i].rep.date > chosen[j].rep.date })
+				for _, e := range chosen {
+					d := e.rep.date
 					if len(d) > 10 {
 						d = d[:10]
 					}
 					stateNews[slug] = append(stateNews[slug], map[string]any{
-						"uid": s.uid, "headline": s.head, "date": d, "url": "/ai-news/" + s.uid + "/"})
+						"uid": e.rep.uid, "headline": e.rep.head, "date": d, "url": "/ai-news/" + e.rep.uid + "/",
+						"also_reported": len(e.members) - 1})
 				}
 			}
 		}
