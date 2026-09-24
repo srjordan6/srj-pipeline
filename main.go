@@ -4302,6 +4302,59 @@ func twoaiBuild(db *sql.DB) error {
 		}
 		cr.Close()
 	}
+	// NEWS ON STATE PAGES. Stephen, 2026-09-24, on Illinois: the story of
+	// Governor Pritzker creating an AI Cabinet by executive order was in the
+	// news archive and nowhere on the Illinois page, because state pages were
+	// built from bills alone. Each state now carries the stories from the
+	// archive that name it AND are about government action on AI: a law, a
+	// bill, an executive order, a governor, a regulator, an attorney general.
+	// Both tests matter: "Georgia" alone pulls in data center deals and the
+	// country; the policy words alone pull in every other state.
+	stateNews := map[string][]map[string]any{}
+	{
+		policy := regexp.MustCompile(`(?i)\b(law|laws|bill|bills|legislat\w*|executive order|governor|gov\.|attorney general|regulat\w*|statute|ban|lawmakers|general assembly|senate|house)\b`)
+		nrows, err := db.Query(`SELECT uid, headline, published_on::text, COALESCE(story->>'Summary','')
+			FROM twoai_news_stories WHERE published_on > current_date - 365 ORDER BY published_on DESC`)
+		if err == nil {
+			type nstory struct{ uid, head, date, sum string }
+			var all []nstory
+			for nrows.Next() {
+				var s nstory
+				if nrows.Scan(&s.uid, &s.head, &s.date, &s.sum) == nil {
+					all = append(all, s)
+				}
+			}
+			nrows.Close()
+			for _, name := range twoaiStates {
+				slug := twoaiSlug(name)
+				nameRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
+				for _, s := range all {
+					text := s.head + " " + s.sum
+					// "Virginia" must not match inside "West Virginia".
+					if name == "Virginia" {
+						text = strings.ReplaceAll(text, "West Virginia", "")
+					}
+					// Washington the state, not the capital: require "state"
+					// nearby or a state office, which a D.C. story does not have.
+					if name == "Washington" && !regexp.MustCompile(`(?i)washington state|state of washington|olympia|gov\. ferguson|governor ferguson`).MatchString(text) {
+						continue
+					}
+					if !nameRe.MatchString(text) || !policy.MatchString(text) {
+						continue
+					}
+					if len(stateNews[slug]) >= 12 {
+						break
+					}
+					d := s.date
+					if len(d) > 10 {
+						d = d[:10]
+					}
+					stateNews[slug] = append(stateNews[slug], map[string]any{
+						"uid": s.uid, "headline": s.head, "date": d, "url": "/ai-news/" + s.uid + "/"})
+				}
+			}
+		}
+	}
 
 	for code, name := range twoaiStates {
 		bills := byState[code]
@@ -4318,6 +4371,9 @@ func twoaiBuild(db *sql.DB) error {
 		}
 		for k, v := range stateCtx[slug] {
 			stateDoc[k] = v
+		}
+		if n := stateNews[slug]; len(n) > 0 {
+			stateDoc["news"] = n
 		}
 		if err := upsert("laws/"+slug+".json", "state-law", stateDoc); err != nil {
 			return err
