@@ -142,21 +142,54 @@ func twoaiNewsLink(db *sql.DB) error {
 	}
 
 	newMembers, newBills := 0, 0
+	// A surname shared by two tracked members cannot identify either from a
+	// chamber title alone: "Sen. Scott" is Tim Scott or Rick Scott.
+	surnameCount := map[string]int{}
+	for _, m := range members {
+		surnameCount[strings.ToLower(m.last)]++
+	}
+	// hasWord reports whether a whole word appears in s, so "harris" does not
+	// match "harrison" and "amodei" in "dario amodei" is a word, but the
+	// person named is still not Mark Amodei unless "mark" is there too.
+	hasWord := func(s, w string) bool {
+		for _, f := range strings.FieldsFunc(s, func(r rune) bool { return r == ' ' || r == '.' || r == ',' || r == '-' }) {
+			if f == w {
+				return true
+			}
+		}
+		return false
+	}
+	// hasFirst also accepts the short form, "rob" for Robert, when one is a
+	// prefix of the other and at least three letters long.
+	hasFirst := func(s, first string) bool {
+		for _, f := range strings.FieldsFunc(s, func(r rune) bool { return r == ' ' || r == '.' || r == ',' || r == '-' }) {
+			if f == first || (len(f) >= 3 && len(first) >= 3 && (strings.HasPrefix(first, f) || strings.HasPrefix(f, first))) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, s := range stories {
 		low := strings.ToLower(s.text)
 		for _, m := range members {
 			lastLow := strings.ToLower(m.last)
+			firstLow := strings.ToLower(m.first)
 			how := ""
+			// FIXED 2026-09-23. The first version accepted any person whose name
+			// merely contained the surname, which linked Dario Amodei's stories
+			// to Rep. Mark Amodei and Harrison Keller's to Mark Harris: 636 of
+			// 680 person-list links were wrong and were retired. Both the first
+			// and the last name must now be whole words of the same person.
 			for _, p := range s.persons {
-				if strings.Contains(p, lastLow) && (strings.Contains(p, strings.ToLower(m.first)) || strings.Count(p, " ") >= 1) {
+				if hasWord(p, lastLow) && hasFirst(p, firstLow) {
 					how = "named in the story's person list as " + p
 					break
 				}
 			}
-			if how == "" && strings.Contains(low, lastLow) {
-				if honorific(m.last).MatchString(s.text) {
+			if how == "" && hasWord(low, lastLow) {
+				if surnameCount[lastLow] == 1 && honorific(m.last).MatchString(s.text) {
 					how = "chamber title in front of the surname"
-				} else if strings.Contains(low, strings.ToLower(m.first+" "+m.last)) {
+				} else if strings.Contains(low, firstLow+" "+lastLow) {
 					how = "first and last name together"
 				}
 			}
