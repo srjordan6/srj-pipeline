@@ -243,7 +243,7 @@ func twoaiPoliticsPages(db *sql.DB) error {
 	db.Exec(`UPDATE twoai_taxonomy SET live_path = $2, updated_at = now() WHERE slug = $1 AND live_path IS NULL`, "politics-of-ai", polBase+polHubUID+"/")
 	db.Exec(`UPDATE twoai_taxonomy SET live_path = $2, updated_at = now() WHERE slug = $1 AND live_path IS NULL`, "pol-lobbying", polBase+polLobbyUID+"/")
 
-	fmt.Printf("twoai_politics_pages: hub %s and lobbying %s written as drafts, %d filings, %d clients, %d points ok=true\n",
+	fmt.Printf("twoai_politics_pages: hub %s and lobbying %s written and published, %d filings, %d clients, %d points ok=true\n",
 		polHubUID, polLobbyUID, filings, clients, len(points))
 	return nil
 }
