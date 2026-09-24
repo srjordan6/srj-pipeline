@@ -68,6 +68,9 @@ func twoaiPoliticsPages(db *sql.DB) error {
 		r.Close()
 	}
 
+	// Pages the live-site audit measured thin are held out of search before
+	// any politics page is written this run.
+	polRecordMeasuredThin(db)
 	// The news archive is matched to members and bills before either page is
 	// written, so a story this site published shows up on the record it names.
 	if err := twoaiNewsLink(db); err != nil {

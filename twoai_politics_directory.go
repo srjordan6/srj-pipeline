@@ -58,7 +58,8 @@ func polPutPage(db *sql.DB, path, tax string, doc map[string]any) error {
 	// AdSense flagged the site for low value content the day before.
 	doc["noindex"] = false
 	b, _ := json.Marshal(doc)
-	if len(b) < polThinBytes {
+	uid, _ := doc["uid"].(string)
+	if polKeepOutOfSearch(db, uid, len(b)) {
 		doc["noindex"] = true
 		b, _ = json.Marshal(doc)
 	}
@@ -75,6 +76,55 @@ func polPutPage(db *sql.DB, path, tax string, doc map[string]any) error {
 // polThinBytes is the document size below which a politics page is live but
 // not indexed. Entity pages with one or two filings sit around 1.5 to 2.7 kB.
 const polThinBytes = 4000
+
+// THE SIZE RULE LET THIN PAGES THROUGH. Stephen, 2026-09-23: the site-wide
+// thin audit found 88 member timelines and about 60 lobbyist and firm pages
+// indexable with under 300 words of their own, because their documents were
+// over 4,000 bytes of structure but rendered little text. So a page is also
+// kept out of search when it was MEASURED thin, recorded in twoai_pol_thin by
+// uid from the live-page audit. The hold is sticky: a noindex page leaves the
+// sitemap and so leaves the audit, and without a sticky record it would flip
+// back to indexable days later and fall out again. It lifts when the page's
+// document has grown half again past the size it had when it was judged thin,
+// the point at which there is plausibly more to read.
+func polKeepOutOfSearch(db *sql.DB, uid string, size int) bool {
+	if size < polThinBytes {
+		return true
+	}
+	if uid == "" {
+		return false
+	}
+	var bytesAt int
+	if db.QueryRow(`SELECT bytes_at FROM twoai_pol_thin WHERE uid = $1`, uid).Scan(&bytesAt) != nil {
+		return false
+	}
+	return size < bytesAt*3/2
+}
+
+// polRecordMeasuredThin copies the audit's verdict into the sticky hold for
+// every politics page it measured under the floor, before the pages are
+// written. Runs once per politics build.
+func polRecordMeasuredThin(db *sql.DB) {
+	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_pol_thin (
+		uid text PRIMARY KEY, words int NOT NULL, bytes_at int NOT NULL, decided_on date NOT NULL DEFAULT current_date)`)
+	res, err := db.Exec(`INSERT INTO twoai_pol_thin (uid, words, bytes_at)
+		SELECT substring(a.url from '/([0-9a-f]{8})/$'), a.words, length(p.data::text)
+		FROM twoai_page_audit a
+		JOIN twoai_pages p ON p.data->>'uid' = substring(a.url from '/([0-9a-f]{8})/$')
+		  AND p.taxonomy_slug LIKE 'pol%'
+		WHERE a.status = 200 AND a.words < $1 AND a.url LIKE '%/enterprise-applications-governance-and-tools/%'
+		ON CONFLICT (uid) DO NOTHING`, thinAuditFloorPolitics)
+	if err == nil {
+		n, _ := res.RowsAffected()
+		if n > 0 {
+			fmt.Printf("twoai_politics: %d page(s) measured thin by the audit, held out of search\n", n)
+		}
+	}
+}
+
+// thinAuditFloorPolitics is the page-specific word count below which a
+// politics entity page is held out of search.
+const thinAuditFloorPolitics = 300
 
 func polPage(tax, uid, name, summary, blurb, today string, points []polPt, children []map[string]any) map[string]any {
 	if points == nil {

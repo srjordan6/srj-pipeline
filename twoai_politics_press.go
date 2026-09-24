@@ -440,7 +440,7 @@ func twoaiPoliticsExports(db *sql.DB, today string) error {
 		}
 		doc["noindex"] = false
 		b, _ := json.Marshal(doc)
-		if len(b) < polThinBytes {
+		if polKeepOutOfSearch(db, m.uid, len(b)) {
 			doc["noindex"] = true
 			b, _ = json.Marshal(doc)
 		}

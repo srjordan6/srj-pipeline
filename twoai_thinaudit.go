@@ -84,6 +84,28 @@ func twoaiThinEnsureAudit(db *sql.DB) {
 		title text NOT NULL DEFAULT '',
 		h1 text NOT NULL DEFAULT '',
 		audited_on date NOT NULL DEFAULT current_date)`)
+	db.Exec(`ALTER TABLE twoai_page_audit ADD COLUMN IF NOT EXISTS raw_words int NOT NULL DEFAULT 0`)
+}
+
+// auditChunks splits page text into sentences, the unit compared across pages
+// to find template text. Fragments of 20 characters or fewer are dropped:
+// "Read more" and a date are too short to tell template from content.
+func auditChunks(txt string) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(txt); i++ {
+		c := txt[i]
+		if (c == '.' || c == '!' || c == '?' || c == ':') && (i+1 == len(txt) || txt[i+1] == ' ') {
+			if s := strings.TrimSpace(txt[start : i+1]); len(s) > 20 {
+				out = append(out, s)
+			}
+			start = i + 1
+		}
+	}
+	if s := strings.TrimSpace(txt[start:]); len(s) > 20 {
+		out = append(out, s)
+	}
+	return out
 }
 
 func twoaiThinAudit(db *sql.DB) {
@@ -103,6 +125,8 @@ func twoaiThinAudit(db *sql.DB) {
 		faq, dated              bool
 		links                   int
 		targets                 []string // internal hrefs this page points at
+		raw                     int      // every word in <main>, template included
+		chunks                  []string // sentences, to tell page text from template
 	}
 	results := make(chan row, len(urls))
 	var wg sync.WaitGroup
@@ -136,6 +160,8 @@ func twoaiThinAudit(db *sql.DB) {
 			txt = strings.TrimSpace(auditWS.ReplaceAllString(txt, " "))
 			if txt != "" {
 				r.words = len(strings.Split(txt, " "))
+				r.raw = r.words
+				r.chunks = auditChunks(txt)
 			}
 			for _, m := range auditH2Re.FindAllStringSubmatch(core, -1) {
 				r.h2++
@@ -175,11 +201,50 @@ func twoaiThinAudit(db *sql.DB) {
 	}
 	wg.Wait()
 	close(results)
+
+	// PAGE-SPECIFIC WORDS, NOT ALL WORDS. Stephen, 2026-09-23. Counting every
+	// word inside <main> credited each page with about 900 words it shares with
+	// every other page, including the comments of the inline translation
+	// script, so the thinnest page on the site measured 875 and the 500 floor
+	// passed everything. A sentence that appears on at least one page in a
+	// hundred (and never fewer than 40) is template, and is not counted. The
+	// all-words figure is kept as raw_words for comparison.
+	var all []row
+	for r := range results {
+		all = append(all, r)
+	}
+	seenOn := map[string]int{}
+	for _, r := range all {
+		uniq := map[string]bool{}
+		for _, c := range r.chunks {
+			uniq[c] = true
+		}
+		for c := range uniq {
+			seenOn[c]++
+		}
+	}
+	templateAt := len(all) / 100
+	if templateAt < 40 {
+		templateAt = 40
+	}
+	for i := range all {
+		if all[i].status != 200 {
+			continue
+		}
+		n := 0
+		for _, c := range all[i].chunks {
+			if seenOn[c] < templateAt {
+				n += len(strings.Fields(c))
+			}
+		}
+		all[i].words = n
+	}
+	resultsAll := all
 	n, thin, failed := 0, 0, 0
 	// Where each internal link points, and one page that points there, so a
 	// broken target names a page to fix rather than a bare path.
 	linkFrom := map[string]string{}
-	for r := range results {
+	for _, r := range resultsAll {
 		for _, t := range r.targets {
 			if _, seen := linkFrom[t]; !seen {
 				linkFrom[t] = r.url
@@ -191,13 +256,13 @@ func twoaiThinAudit(db *sql.DB) {
 			thin++
 		}
 		if _, err := db.Exec(`INSERT INTO twoai_page_audit
-			(url, status, words, h2_count, question_h2, faq_schema, schema_types, dated, internal_links, title, h1, audited_on)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,current_date)
+			(url, status, words, h2_count, question_h2, faq_schema, schema_types, dated, internal_links, title, h1, audited_on, raw_words)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,current_date,$12)
 			ON CONFLICT (url) DO UPDATE SET status=EXCLUDED.status, words=EXCLUDED.words,
 				h2_count=EXCLUDED.h2_count, question_h2=EXCLUDED.question_h2, faq_schema=EXCLUDED.faq_schema,
 				schema_types=EXCLUDED.schema_types, dated=EXCLUDED.dated, internal_links=EXCLUDED.internal_links,
-				title=EXCLUDED.title, h1=EXCLUDED.h1, audited_on=current_date`,
-			r.url, r.status, r.words, r.h2, r.qh2, r.faq, r.types, r.dated, r.links, r.title, r.h1); err == nil {
+				title=EXCLUDED.title, h1=EXCLUDED.h1, audited_on=current_date, raw_words=EXCLUDED.raw_words`,
+			r.url, r.status, r.words, r.h2, r.qh2, r.faq, r.types, r.dated, r.links, r.title, r.h1, r.raw); err == nil {
 			n++
 		}
 	}
