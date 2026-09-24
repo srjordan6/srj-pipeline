@@ -6665,7 +6665,23 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		if name == "" {
 			continue
 		}
-		uid := twoaiEntityID(db, "person", name)
+		// A PERSON KEEPS THE FIRST UID THEY WERE PUBLISHED UNDER. Stephen,
+		// 2026-09-24. The uid used to be a hash of the name alone, so Karrie
+		// Dixon becoming Karrie G. Dixon minted a second uid and a second live
+		// page, against the rule that uids never change. The site_people slug
+		// is the stable key, so the first uid seen for a slug is recorded in
+		// twoai_person_uid and reused for every later spelling of the name;
+		// the new spelling is kept as an alias on that uid.
+		uid := ""
+		if db.QueryRow(`SELECT uid FROM twoai_person_uid WHERE slug = $1`, slug).Scan(&uid) != nil || uid == "" {
+			uid = twoaiEntityID(db, "person", name)
+			db.Exec(`INSERT INTO twoai_person_uid (slug, uid, first_name) VALUES ($1,$2,$3) ON CONFLICT (slug) DO NOTHING`,
+				slug, uid, strings.TrimSpace(name))
+		} else {
+			db.Exec(`UPDATE twoai_entities SET last_seen = now(),
+				aliases = CASE WHEN aliases ? $2 THEN aliases ELSE aliases || jsonb_build_array($2::text) END
+				WHERE uid = $1`, uid, strings.TrimSpace(name))
+		}
 		d["uid"] = uid
 		d["generated"] = today
 		uidBySlug[slug] = uid
