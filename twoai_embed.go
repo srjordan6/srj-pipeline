@@ -103,6 +103,11 @@ func twoaiFlatten(v any, out *strings.Builder, depth int) {
 		for k, x := range t {
 			switch k {
 			case "uid", "slug", "url", "href", "generated", "updated_at", "data_hash",
+				// built_at, 2026-09-24: the precise build timestamp changes every
+				// time a row is rewritten, so with it in the text 25,755 of 37,285
+				// chunks re-embedded every day on unchanged words, past the free
+				// Workers AI allowance. It is a stamp, not content.
+				"built_at", "page_uid", "built",
 				"name", "title", "heading", "term", "case_name":
 				continue
 			}
