@@ -447,6 +447,14 @@ func twoaiHarvestSources(db *sql.DB) error {
 			resp.Body.Close()
 		}
 		h := sha256.Sum256([]byte(hashSrc))
+		// A source page served in Windows-1252 carries bytes that are not UTF-8,
+		// and Postgres refuses the whole insert ("invalid byte sequence for
+		// encoding UTF8: 0x89", the twoai run of 2026-09-24 23:29), which
+		// returned an error and stopped every section after the industry hub
+		// from building. Invalid bytes become the replacement character, as
+		// twoai_company_harvest already does; the hash is taken before the
+		// substitution so a page's identity does not change with it.
+		extract = strings.ToValidUTF8(extract, "\uFFFD")
 		if status == 200 && extract != "" {
 			fetched++
 			if _, err := db.Exec(`INSERT INTO twoai_source_harvest (url, sector_slug, source_name, http_status, extract, content_hash, fetched_on, content_changed_on)
