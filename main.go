@@ -198,7 +198,13 @@ func runSequence(stages []string) {
 		ctx, cancel := context.WithTimeout(context.Background(), limit)
 		cmd := exec.CommandContext(ctx, os.Args[0], s)
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		// Timed, 2026-09-25: the build was killed three runs running and the
+		// log could not say where the 45 minutes went. One line each side of
+		// every stage answers that from the next run on.
+		started := time.Now()
+		fmt.Printf("[stage %s started %s]\n", s, started.Format("15:04:05"))
 		runErr := cmd.Run() // a failing source must not block the others
+		fmt.Printf("[stage %s ended after %s]\n", s, time.Since(started).Round(time.Second))
 		if ctx.Err() == context.DeadlineExceeded {
 			fmt.Fprintf(os.Stderr, "%s: KILLED after %s deadline, continuing the run\n", s, limit)
 		} else if runErr == nil {
@@ -5105,6 +5111,8 @@ func twoaiBuild(db *sql.DB) error {
 		wlCreated, err := twoaiWorklistCompanies(db, today)
 		if err != nil {
 			fmt.Println("twoai_worklist_companies:", err)
+		} else {
+			stageRanToday("twoai_worklist_companies")
 		}
 		_ = wlCreated
 	} else {
@@ -5208,6 +5216,13 @@ func twoaiBuild(db *sql.DB) error {
 		if err != nil {
 			return err
 		}
+		// RECORD IT. Found 2026-09-25: these three in-build daily gates asked
+		// stageDueToday but nothing ever called stageRanToday for them (only
+		// runSequence does, for top-level stages), so "once a day" meant
+		// every run: 421 EDGAR and 381 USPTO lookups eight times a day, and
+		// the build ran past its 45 minute deadline three runs in a row,
+		// leaving every section after company profiles unrefreshed.
+		stageRanToday("twoai_companyfacts")
 		fmt.Printf("twoai_build: company fact sections=%d\n", factPages)
 	} else {
 		fmt.Println("twoai_companyfacts: skipped, already ran today (once-a-day stage)")
@@ -5224,6 +5239,7 @@ func twoaiBuild(db *sql.DB) error {
 		if err != nil {
 			return err
 		}
+		stageRanToday("twoai_orgfacts")
 		fmt.Printf("twoai_build: org fact sections=%d\n", orgPages)
 	} else {
 		fmt.Println("twoai_orgfacts: skipped, already ran today (once-a-day stage)")
