@@ -3809,6 +3809,27 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"KAIST AI (coverage)", "https://news.google.com/rss/search?q=KAIST+AI&hl=en-US&gl=US&ceid=US:en"},
 		{"OECD AI (coverage)", "https://news.google.com/rss/search?q=%22OECD%22+AI+policy&hl=en-US&gl=US&ceid=US:en"},
 		{"Canada AI policy (coverage)", "https://news.google.com/rss/search?q=Canada+ISED+OR+CIFAR+AI&hl=en-US&gl=US&ceid=US:en"},
+		// ASIA NEWS OUTLETS. Stephen, 2026-09-25: do the publishers in China,
+		// Singapore, Macau and Hong Kong offer feeds; yes, and the briefing
+		// had none of them. Watched the same way as the coverage queries
+		// above, one Google News RSS query per outlet restricted to that
+		// outlet's domain and to AI, so the outlet's own feed layout never
+		// has to be maintained and every item arrives in English or with an
+		// English headline. Each outlet's terms allow headline and link
+		// syndication; nothing here reproduces an article.
+		{"South China Morning Post (coverage)", "https://news.google.com/rss/search?q=site:scmp.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"Hong Kong Free Press (coverage)", "https://news.google.com/rss/search?q=site:hongkongfp.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"RTHK (coverage)", "https://news.google.com/rss/search?q=site:news.rthk.hk+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"Channel NewsAsia (coverage)", "https://news.google.com/rss/search?q=site:channelnewsasia.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"The Straits Times (coverage)", "https://news.google.com/rss/search?q=site:straitstimes.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"The Business Times Singapore (coverage)", "https://news.google.com/rss/search?q=site:businesstimes.com.sg+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"Macau Daily Times (coverage)", "https://news.google.com/rss/search?q=site:macaudailytimes.com.mo+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"Macao News (coverage)", "https://news.google.com/rss/search?q=site:macaonews.org+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"Xinhua (coverage)", "https://news.google.com/rss/search?q=site:english.news.cn+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"China Daily (coverage)", "https://news.google.com/rss/search?q=site:chinadaily.com.cn+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"Global Times (coverage)", "https://news.google.com/rss/search?q=site:globaltimes.cn+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"Sixth Tone (coverage)", "https://news.google.com/rss/search?q=site:sixthtone.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"Caixin Global (coverage)", "https://news.google.com/rss/search?q=site:caixinglobal.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
 	}
 	for _, f := range feeds {
 		req, _ := http.NewRequest("GET", f.url, nil)
