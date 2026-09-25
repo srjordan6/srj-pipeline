@@ -100,7 +100,20 @@ func twoaiFlatten(v any, out *strings.Builder, depth int) {
 				out.WriteString("\n")
 			}
 		}
-		for k, x := range t {
+		// SORTED KEYS, 2026-09-24. Go visits a map's keys in a random order on
+		// every run, so the same page flattened to the same words in a
+		// different sequence each time, its hash changed, and about 26,000 of
+		// 37,000 chunks re-embedded daily with nothing new in them. Removing
+		// built_at earlier the same day did not help because this was the
+		// cause. Walking the keys in sorted order makes the text, and so the
+		// hash, depend only on the content.
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			x := t[k]
 			switch k {
 			case "uid", "slug", "url", "href", "generated", "updated_at", "data_hash",
 				// built_at, 2026-09-24: the precise build timestamp changes every
