@@ -78,6 +78,7 @@ type twoaiArtFacts struct {
 	SECCos, MAFilings, Tickers                   int
 	MedModels, SciModels, PLCases                int
 	Papers, Claims, BookTitles                   int
+	DBMCP, MCPTotal                              int
 }
 
 func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
@@ -111,6 +112,10 @@ func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 			&f.MedModels, &f.SciModels, &f.PLCases, &f.Papers, &f.Claims, &f.BookTitles); err != nil {
 		fmt.Println("twoai_art: facts:", err)
 	}
+	// AI and SQL, 2026-09-24: the database MCP servers this site tracks, by
+	// the engines their pages name.
+	db.QueryRow(`SELECT count(*) FILTER (WHERE data::text ~* '\m(postgres|postgresql|mysql|sqlite|sql server|snowflake|bigquery|clickhouse|duckdb|supabase)\M'),
+		count(*) FROM twoai_pages WHERE path LIKE 'mcp/%' AND path NOT LIKE 'mcp/index%'`).Scan(&f.DBMCP, &f.MCPTotal)
 	return f
 }
 
@@ -118,6 +123,10 @@ func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 // figures that bear on it, because a number that does not belong on the page
 // is a number the model will reach for anyway.
 func (f twoaiArtFacts) line(section string) string {
+	if section == "sql" {
+		return fmt.Sprintf("This site currently tracks %d active Model Context Protocol servers, %d of them for SQL databases and warehouses, %d research papers in its library, %d AI tools and %d glossary terms. Every page on this site is itself built from a PostgreSQL database.",
+			f.MCPTotal, f.DBMCP, f.Papers, f.Tools, f.GlossaryTerms)
+	}
 	if section == "eco" {
 		return fmt.Sprintf("This site currently tracks %d listed AI-related instruments with daily prices, %d merger and acquisition filings, %d company pages, %d active AI lawsuits, %d compliance and regulation pages, %d AI tools and %d glossary terms.",
 			f.Tickers, f.MAFilings, f.SECCos, f.AllCases, f.Compliance, f.Tools, f.GlossaryTerms)
@@ -506,7 +515,7 @@ func twoaiArt(db *sql.DB, today string) error {
 	}
 	// Each section has its own taxonomy row, so the category page lists it and
 	// the freshness contract can find its pages.
-	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician", "res": "ai-researcher", "eco": "ai-economist", "fut": "ai-future-professions"}
+	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician", "res": "ai-researcher", "eco": "ai-economist", "fut": "ai-future-professions", "sql": "ai-sql"}
 
 	// BREADCRUMBS. Stephen, 2026-09-22, on Financial Reporting and Synthesis:
 	// the trail stopped at the category, so a reader three levels down could
