@@ -52,6 +52,49 @@ type discoverHit struct {
 // twoaiSearchWeb queries whichever licensed search API is configured. Absent a
 // key the stage does nothing at all rather than falling back to scraping.
 func twoaiSearchWeb(client *http.Client, q string) ([]discoverHit, error) {
+	// OLLAMA FIRST, 2026-09-25. The same key the pipeline already uses for
+	// every model call also buys web search, metered from the plan's
+	// included usage, so no new provider and no new card. It returns URLs
+	// and titles, which is all this stage is allowed to take from a search;
+	// the domain rule below still decides which result may be read.
+	if k := strings.TrimSpace(os.Getenv("OLLAMA_API_KEY")); k != "" {
+		qb, _ := json.Marshal(struct {
+			Query      string `json:"query"`
+			MaxResults int    `json:"max_results"`
+		}{Query: q, MaxResults: 10})
+		req, _ := http.NewRequest("POST", "https://ollama.com/api/web_search", bytes.NewReader(qb))
+		req.Header.Set("Authorization", "Bearer "+k)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if resp.StatusCode != 200 {
+			snippet := strings.TrimSpace(string(b))
+			if len(snippet) > 220 {
+				snippet = snippet[:220]
+			}
+			return nil, fmt.Errorf("ollama web_search HTTP %d: %s", resp.StatusCode, snippet)
+		}
+		var out struct {
+			Results []struct {
+				Title string `json:"title"`
+				URL   string `json:"url"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(b, &out); err != nil {
+			return nil, err
+		}
+		var hits []discoverHit
+		for _, r := range out.Results {
+			if r.URL != "" {
+				hits = append(hits, discoverHit{url: r.URL, title: r.Title})
+			}
+		}
+		return hits, nil
+	}
 	// Firecrawl first, because Brave withdrew its card-free tier in February
 	// 2026 and now meters every query past a $5 credit with NO SPENDING CAP.
 	// I recommended Brave on a free allowance that had not existed for six
@@ -232,7 +275,7 @@ func twoaiPickFacilityURL(hits []discoverHit, operatorURL string) string {
 // hold is an operator index. The picking and matching above are pure functions
 // so they stay testable without a database or a network.
 func twoaiThinDiscover(db *sql.DB) {
-	if os.Getenv("FIRECRAWL_API_KEY") == "" && os.Getenv("BRAVE_SEARCH_KEY") == "" &&
+	if os.Getenv("OLLAMA_API_KEY") == "" && os.Getenv("FIRECRAWL_API_KEY") == "" && os.Getenv("BRAVE_SEARCH_KEY") == "" &&
 		(os.Getenv("GOOGLE_CSE_KEY") == "" || os.Getenv("GOOGLE_CSE_CX") == "") {
 		fmt.Println("thinpages: discover: no search API key set, skipped")
 		return
