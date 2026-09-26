@@ -3840,7 +3840,9 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 	for _, f := range feeds {
 		req, _ := http.NewRequest("GET", f.url, nil)
 		req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
-		resp, ferr := http.DefaultClient.Do(req)
+		// A feed that does not answer in 20 seconds is skipped, not waited
+		// on: heise.de alone was costing a full TCP timeout every run.
+		resp, ferr := (&http.Client{Timeout: 20 * time.Second}).Do(req)
 		if ferr != nil {
 			fmt.Fprintln(os.Stderr, "intel ai_watch feed", f.vendor, ":", ferr)
 			continue
@@ -3896,9 +3898,24 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 			fmt.Fprintf(os.Stderr, "intel ai_watch feed %s parse: %v (recovered %d items without the parser)\n",
 				f.vendor, derr, recovered)
 		}
-		for _, it := range feed.Items {
+		for idx, it := range feed.Items {
+			// NEWEST 30 PER FEED. Google News hands back 100 items a query, and
+			// with thirteen outlet queries added on 2026-09-25 the loop below
+			// spent the whole intel budget resolving redirects for stories it
+			// had already filed. Feeds are newest first; thirty covers a day.
+			if idx >= 30 {
+				break
+			}
 			title, link := strings.TrimSpace(it.Title), strings.TrimSpace(it.Link)
 			if title == "" || link == "" || !mentionsAI(title) {
+				continue
+			}
+			// ALREADY FILED? Ask before resolving. The redirect resolution and
+			// the 700 ms pause below are per item, and the insert that would
+			// have caught the duplicate came after both, so every run paid for
+			// every story it had seen before.
+			var seen bool
+			if db.QueryRow(`SELECT EXISTS(SELECT 1 FROM ai_intel_candidates WHERE source_id = $1)`, "rss-"+link).Scan(&seen); seen {
 				continue
 			}
 			// Google News coverage-proxy feeds hand us an opaque redirect
@@ -5265,7 +5282,12 @@ func twoaiBuild(db *sql.DB) error {
 
 	ihPages, err := twoaiIndustryHub(db, today)
 	if err != nil {
-		return err
+		// Do not let one bad source page stop every section after this one:
+		// three runs on 2026-09-24 and 25 built nothing past the industry
+		// hub over a single byte in a harvested page. The hub keeps its last
+		// good pages, the error is in the log, and the build goes on.
+		fmt.Println("twoai_build: industry hub FAILED, continuing:", err)
+		ihPages = 0
 	}
 	fmt.Printf("twoai_build: industry hub sections=%d\n", ihPages)
 

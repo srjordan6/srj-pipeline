@@ -454,7 +454,11 @@ func twoaiHarvestSources(db *sql.DB) error {
 		// from building. Invalid bytes become the replacement character, as
 		// twoai_company_harvest already does; the hash is taken before the
 		// substitution so a page's identity does not change with it.
-		extract = strings.ToValidUTF8(extract, "\uFFFD")
+		extract = strings.ReplaceAll(strings.ToValidUTF8(extract, "\uFFFD"), "\x00", "")
+		// A NUL byte is valid UTF-8 and still refused by Postgres text ("0x00",
+		// the runs of 2026-09-25 12:05 and 15:05, a PDF or binary served as a
+		// page), so it goes too. Same source pages, same stage, same effect:
+		// nothing after the industry hub was built.
 		if status == 200 && extract != "" {
 			fetched++
 			if _, err := db.Exec(`INSERT INTO twoai_source_harvest (url, sector_slug, source_name, http_status, extract, content_hash, fetched_on, content_changed_on)
