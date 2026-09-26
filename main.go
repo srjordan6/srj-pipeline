@@ -5291,6 +5291,15 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_build: industry hub sections=%d\n", ihPages)
 
+	// A page of our own for every source the industry pages cite, 2026-09-25.
+	// Runs after the hub so the industry documents it patches are this
+	// run's; a failure here is logged and does not stop the build.
+	if spPages, sperr := twoaiSourcePages(db, today); sperr != nil {
+		fmt.Println("twoai_build: source pages FAILED, continuing:", sperr)
+	} else {
+		fmt.Printf("twoai_build: source pages=%d\n", spPages)
+	}
+
 	obsPages, err := twoaiObservatory(db, today)
 	if err != nil {
 		return err
