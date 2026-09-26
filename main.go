@@ -140,6 +140,9 @@ var twoaiDailyOnly = map[string]bool{
 	// twoai_thinaudit added 2026-09-25: the self-audit's 16,000 fetches a
 	// pass, four passes a day, were three quarters of the site's traffic.
 	"twoai_thinaudit": true,
+	// twoai_state_case_watch added 2026-09-26: one news query a day per
+	// state court case on the tracker.
+	"twoai_state_case_watch": true,
 }
 
 // stageDueToday reports whether a once-a-day stage still owes a run today.
@@ -792,6 +795,14 @@ func main() {
 		// lawsuit pages that already exist.
 		if err := twoaiNewsMine(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_news_mine:", err)
+		}
+		// Reporting as the docket for state court cases, once a day, 2026-09-26.
+		if stageDueToday("twoai_state_case_watch") {
+			if err := twoaiStateCaseWatch(db); err != nil {
+				fmt.Fprintln(os.Stderr, "twoai_state_case_watch:", err)
+			} else {
+				stageRanToday("twoai_state_case_watch")
+			}
 		}
 		// Court case type first, so a case promoted by intel today is
 		// categorised before its page is written.
@@ -3415,6 +3426,14 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 		`(deepfake OR "digital replica" OR "voice clone" OR "AI-generated likeness") AND ("right of publicity" OR defamation OR Lanham)`,
 		`("facial recognition" OR biometric OR "face template") AND (BIPA OR "biometric privacy" OR "Illinois Biometric")`,
 		`("artificial intelligence" OR "AI-powered") AND ("securities fraud" OR "materially false" OR "misled investors" OR "AI washing")`,
+		// PRIVACY, 2026-09-26. Stephen: cover privacy cases in the tracker. Data
+		// practices are upstream of model training, and the platforms being
+		// sued over them are the same companies training the models. Two
+		// families: privacy claims against AI and platform companies over
+		// collection, scraping, tracking and disclosure; and state attorney
+		// general consumer protection actions against them.
+		`("data privacy" OR "consumer privacy" OR "privacy violation" OR wiretap OR "unauthorized collection" OR scraping) AND (openai OR anthropic OR "meta platforms" OR google OR microsoft OR tiktok OR bytedance OR clearview OR "character technologies" OR perplexity OR "data broker")`,
+		`("attorney general" OR "state of" OR "people of the state") AND ("meta platforms" OR tiktok OR openai OR google OR "character technologies" OR snap) AND (privacy OR "unfair practices" OR "consumer protection" OR minors OR children)`,
 	}
 
 	// Relevance scoring. "Artificial intelligence" appears in patent and
@@ -3423,8 +3442,8 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 	// signals that separate AI-subject litigation from passing mentions,
 	// and queue only what clears the bar. The score is stored so review
 	// can sort by it.
-	aiParty := regexp.MustCompile(`(?i)openai|anthropic|meta platforms|midjourney|stability ai|suno|uncharted labs|udio|perplexity|x\.?ai|google|alphabet|microsoft|nvidia|hugging face|character\.?ai|character technologies|deepseek|mistral|runway|eleven ?labs|minimax|clearview|workday|hirevue|scale ai|cohere`)
-	aiSubject := regexp.MustCompile(`(?i)training data|generative|large language|chatbot|machine learning|neural|copyright|infring|scrap(e|ing)|dataset|deepfake|right of publicity|biometric|wrongful death|product liability|disparate impact|securities fraud|ai washing|facial recognition|automated decision`)
+	aiParty := regexp.MustCompile(`(?i)openai|anthropic|meta platforms|midjourney|stability ai|suno|uncharted labs|udio|perplexity|x\.?ai|google|alphabet|microsoft|nvidia|hugging face|character\.?ai|character technologies|deepseek|mistral|runway|eleven ?labs|minimax|clearview|workday|hirevue|scale ai|cohere|tiktok|bytedance|snap inc`)
+	aiSubject := regexp.MustCompile(`(?i)training data|generative|large language|chatbot|machine learning|neural|copyright|infring|scrap(e|ing)|dataset|deepfake|right of publicity|biometric|wrongful death|product liability|disparate impact|securities fraud|ai washing|facial recognition|automated decision|data privacy|consumer privacy|privacy violation|wiretap|unauthorized collection|consumer protection|deceptive`)
 	patentNoise := regexp.MustCompile(`(?i)patent|'\d{3} patent|licensing, llc|innovations ltd|ip pty|technology licensing`)
 
 	queue := func(h struct {
@@ -3839,6 +3858,13 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"Global Times (coverage)", "https://news.google.com/rss/search?q=site:globaltimes.cn+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
 		{"Sixth Tone (coverage)", "https://news.google.com/rss/search?q=site:sixthtone.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
 		{"Caixin Global (coverage)", "https://news.google.com/rss/search?q=site:caixinglobal.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		// STATE ATTORNEYS GENERAL, 2026-09-26. The offices that bring the state
+		// privacy and consumer protection actions announce every filing and
+		// verdict themselves; two coverage queries catch those announcements
+		// before the case is anywhere else, and the news intake proposes the
+		// case to the tracker.
+		{"State AG AI actions (coverage)", "https://news.google.com/rss/search?q=%22attorney+general%22+(%22artificial+intelligence%22+OR+chatbot+OR+algorithm)+(lawsuit+OR+sues+OR+settlement+OR+verdict)&hl=en-US&gl=US&ceid=US:en"},
+		{"State AG privacy actions (coverage)", "https://news.google.com/rss/search?q=%22attorney+general%22+privacy+(Meta+OR+TikTok+OR+OpenAI+OR+Google+OR+Snap+OR+%22Character.AI%22)+(lawsuit+OR+sues+OR+settlement+OR+verdict)&hl=en-US&gl=US&ceid=US:en"},
 	}
 	for _, f := range feeds {
 		req, _ := http.NewRequest("GET", f.url, nil)
