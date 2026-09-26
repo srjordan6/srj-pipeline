@@ -284,7 +284,12 @@ func twoaiThinSensePages(db *sql.DB) {
 }
 
 func twoaiThinSense(db *sql.DB) {
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
+	// The Anthropic key gate stayed after the calls were routed to Ollama
+	// (twoaiClaudeCall), so since the key was cut on 2026-09-17 every run
+	// printed "readings skipped" and no data centre facility reading was
+	// written. Found in the thinpages log of 2026-09-25. The gate now only
+	// applies when Anthropic is actually the configured route.
+	if os.Getenv("ANTHROPIC_API_KEY") == "" && twoaiLLMFor("") == "anthropic" {
 		fmt.Println("thinpages: sense: ANTHROPIC_API_KEY not set, readings skipped")
 		return
 	}
