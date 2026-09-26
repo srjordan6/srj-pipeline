@@ -137,6 +137,9 @@ var twoaiDailyOnly = map[string]bool{
 	// reads every new one through its cursor.
 	"twoai_politics_lda": true, "twoai_politics_bills": true, "twoai_politics_fec": true,
 	"twoai_benchmark_readings": true,
+	// twoai_thinaudit added 2026-09-25: the self-audit's 16,000 fetches a
+	// pass, four passes a day, were three quarters of the site's traffic.
+	"twoai_thinaudit": true,
 }
 
 // stageDueToday reports whether a once-a-day stage still owes a run today.

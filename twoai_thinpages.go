@@ -94,7 +94,17 @@ func twoaiThinPages(db *sql.DB) {
 	thinRunStart = time.Now()
 	twoaiThinEnsureTables(db)
 	twoaiThinCompanyProfiles(db)
-	twoaiThinAudit(db)
+	// ONCE A DAY, 2026-09-25. The self-audit fetches every published page
+	// and every internal link to measure words and find broken links, about
+	// 16,000 requests a pass, and thinpages runs four times a day: three
+	// quarters of the site's daily traffic was this PC checking itself.
+	// Pages change on a daily rhythm, so one pass a day loses nothing.
+	if stageDueToday("twoai_thinaudit") {
+		twoaiThinAudit(db)
+		stageRanToday("twoai_thinaudit")
+	} else {
+		fmt.Println("thinpages: audit: skipped, already ran today (once-a-day)")
+	}
 
 	// The hard sites Cowork could not read, worked with Firecrawl's heavier
 	// tiers. Escalation rather than duplication: Cowork reads with a plain
