@@ -299,7 +299,7 @@ func twoaiCapexMA(db *sql.DB, today string) (int, error) {
 	}
 	if len(comps) > 0 {
 		if err := writeDoc("obs-gpu-availability", "observatory/obs-gpu-availability.json", "obs-section", map[string]any{
-			"companies": comps, "latest_total": latestTotal,
+			"companies": comps, "latest_total": latestTotal, "total": len(comps),
 			"lambda_tracked": true, "shapekind": "capex",
 			"refs": []map[string]string{
 				{"name": "MLCommons MLPerf datacenter results", "url": "https://mlcommons.org/benchmarks/inference-datacenter/", "note": "Verified hardware configurations and cluster sizes from actual vendor submissions"},

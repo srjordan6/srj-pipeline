@@ -115,6 +115,11 @@ func twoaiObservatory(db *sql.DB, today string) (int, error) {
 	snap("models_tracked", float64(modelsTracked))
 	if err := write("obs-release-cadence", row{
 		"models": modelsTracked, "by_month": cadence, "newest": newest,
+		// "total" is what the category listing shows beside a section. Stephen,
+		// 2026-09-25: every observatory section showed 1, the page count, while
+		// the section tracks thousands of records. Each now reports what it
+		// tracks.
+		"total":  modelsTracked,
 		"series": series("models_tracked"),
 	}); err != nil {
 		return count, err
@@ -150,7 +155,7 @@ func twoaiObservatory(db *sql.DB, today string) (int, error) {
 	snap("repos_pushed_7d", float64(pushed7))
 	snap("repos_stars_total", starSum)
 	if err := write("obs-github-activity", row{
-		"repos": repoN, "pushed_7d": pushed7, "pushed_30d": pushed30,
+		"repos": repoN, "pushed_7d": pushed7, "pushed_30d": pushed30, "total": repoN,
 		"stars_total": int64(starSum), "top": topRepos,
 		"series": series("repos_stars_total"),
 	}); err != nil {
@@ -182,7 +187,7 @@ func twoaiObservatory(db *sql.DB, today string) (int, error) {
 		GROUP BY 1 ORDER BY 2 DESC LIMIT 12`)
 	snap("hf_downloads_total", dlTotal)
 	if err := write("obs-huggingface", row{
-		"models": modelsTracked, "downloads_total": int64(dlTotal),
+		"models": modelsTracked, "downloads_total": int64(dlTotal), "total": modelsTracked,
 		"leaders": leaders, "licences": licences,
 		"series": series("hf_downloads_total"),
 	}); err != nil {
@@ -202,7 +207,7 @@ func twoaiObservatory(db *sql.DB, today string) (int, error) {
 	snap("providers_healthy", float64(provHealthy))
 	snap("providers_total", float64(provTotal))
 	if err := write("obs-api-uptime", row{
-		"providers": provTotal, "healthy_now": provHealthy, "table": uptime,
+		"providers": provTotal, "healthy_now": provHealthy, "table": uptime, "total": provTotal,
 		"series": series("providers_healthy"),
 	}); err != nil {
 		return count, err
@@ -218,7 +223,7 @@ func twoaiObservatory(db *sql.DB, today string) (int, error) {
 		WHERE f.filed <> '' ORDER BY f.filed DESC LIMIT 12`)
 	snap("formd_filings", float64(formdTotal))
 	if err := write("obs-funding-activity", row{
-		"filings": formdTotal, "companies": formdCompanies,
+		"filings": formdTotal, "companies": formdCompanies, "total": formdTotal,
 		"by_month": byMonth, "recent": recentF,
 		"series": series("formd_filings"),
 	}); err != nil {
@@ -234,7 +239,7 @@ func twoaiObservatory(db *sql.DB, today string) (int, error) {
 	snap("patented_companies", float64(patCompanies))
 	snap("patents_total", patTotal)
 	if err := write("obs-patent-filings", row{
-		"companies": patCompanies, "patents_total": int64(patTotal), "top": topPat,
+		"companies": patCompanies, "patents_total": int64(patTotal), "top": topPat, "total": patCompanies,
 		"series": series("patents_total"),
 	}); err != nil {
 		return count, err
@@ -253,11 +258,20 @@ func twoaiObservatory(db *sql.DB, today string) (int, error) {
 		HAVING max(open_incidents) > 0 ORDER BY 2 DESC`)
 	snap("open_incidents", openNow)
 	if err := write("obs-security-incidents", row{
-		"open_now": int64(openNow), "providers": provTotal, "by_provider": incByProv,
+		"open_now": int64(openNow), "providers": provTotal, "by_provider": incByProv, "total": provTotal,
 		"series": series("open_incidents"),
 	}); err != nil {
 		return count, err
 	}
+
+	// The hub's badge is the sum of what its sections track, not its page
+	// count. Both copies of the hub document (industries and ecosystem) carry
+	// it; the category listing reads "total" from whichever it finds.
+	db.Exec(`UPDATE twoai_pages SET data = jsonb_set(data, '{total}', to_jsonb((
+			SELECT COALESCE(sum(NULLIF(p.data->>'total','')::int), 0)
+			FROM twoai_pages p JOIN twoai_taxonomy c ON c.slug = p.taxonomy_slug
+			WHERE c.parent_slug = 'ai-observatory' AND p.path LIKE 'observatory/%'))), updated_at = now()
+		WHERE taxonomy_slug = 'ai-observatory' AND path IN ('industries/ai-observatory.json', 'ecosystem/ai-observatory.json')`)
 
 	return count, nil
 }
