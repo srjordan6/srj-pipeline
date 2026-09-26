@@ -5043,6 +5043,12 @@ func twoaiBuild(db *sql.DB) error {
 	if err := twoaiStateLawPages(db); err != nil {
 		fmt.Println("twoai_state_law_pages:", err)
 	}
+	// The AI Policy Ledger, 2026-09-25: every tracked instrument in one
+	// table, built from the law pages above plus the fixed EU, China and
+	// federal rows.
+	if err := twoaiPolicyLedger(db, today); err != nil {
+		fmt.Println("twoai_policy_ledger:", err)
+	}
 
 	// THE REFRESH CONTRACT USED TO BE STAMPED HERE, part way through the build.
 	// Everything the build wrote after this point, companies, people, the MCP
