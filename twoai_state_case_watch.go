@@ -57,7 +57,9 @@ func twoaiStateCaseWatch(db *sql.DB) error {
 	}
 	client := &http.Client{Timeout: 20 * time.Second}
 	newArticles, moved := 0, 0
+	movedThis := map[string]bool{}
 	for _, x := range cases {
+		defWords := stateCaseDefendantWords(x.name)
 		// The query is the two sides of the caption and the word lawsuit:
 		// "New Mexico" "Meta" lawsuit finds the reporting without the
 		// procedural words that vary between outlets.
@@ -123,6 +125,22 @@ func twoaiStateCaseWatch(db *sql.DB) error {
 			if words == "" || pub == "" {
 				continue
 			}
+			// One move per case per run, only from a trusted outlet, and only
+			// when the headline names the defendant.
+			if movedThis[x.slug] || !stateCaseTrusted.MatchString(domain) {
+				continue
+			}
+			named := false
+			lt := strings.ToLower(title)
+			for _, w := range defWords {
+				if w != "" && strings.Contains(lt, w) {
+					named = true
+					break
+				}
+			}
+			if !named {
+				continue
+			}
 			// A status word in a headline moves the case: latest development
 			// and a timeline entry, both marked as reporting, never a badge.
 			dev := fmt.Sprintf("%s (%s, %s; reporting, not a docket entry)", title, domain, pub)
@@ -138,6 +156,7 @@ func twoaiStateCaseWatch(db *sql.DB) error {
 				return err
 			}
 			if n, _ := res.RowsAffected(); n > 0 {
+				movedThis[x.slug] = true
 				moved++
 				fmt.Printf("twoai_state_case_watch: %s moved by reporting: %s [%s]\n", x.slug, trunc(title, 90), words)
 			}
@@ -174,6 +193,34 @@ func stateCaseQuery(caseName string) string {
 	}
 	return strings.Join(q, " ") + " lawsuit"
 }
+
+// A headline may move a case only if it names the defendant, by the
+// caption's own word or a well-known alias. Found 2026-09-27: "GEMA" "OpenAI"
+// lawsuit returned a story on GEMA's separate case against Suno, whose
+// headline never names OpenAI, and the watch filed it on the wrong case.
+var stateCaseAliases = map[string][]string{
+	"meta": {"facebook", "instagram", "whatsapp"}, "alphabet": {"google", "youtube"},
+	"google": {"alphabet", "youtube"}, "bytedance": {"tiktok"}, "tiktok": {"bytedance"},
+	"x": {"twitter"}, "character": {"character.ai", "characterai"},
+}
+
+func stateCaseDefendantWords(caseName string) []string {
+	parts := regexp.MustCompile(`(?i)\s+v(s|\.)?\s+`).Split(caseName, 2)
+	if len(parts) < 2 {
+		return nil
+	}
+	q := stateCaseQuery("x v. " + parts[1])
+	side := strings.Trim(strings.TrimSuffix(strings.SplitN(q, `" "`, 2)[len(strings.SplitN(q, `" "`, 2))-1], `" lawsuit`), `"`)
+	first := strings.ToLower(strings.Fields(side + " x")[0])
+	out := []string{first}
+	out = append(out, stateCaseAliases[first]...)
+	return out
+}
+
+// Only established news organisations move a case; everything else is still
+// filed, so nothing is lost, but a content farm or an aggregator's rewrite
+// ("The Math Behind It Is Wild") never becomes a case's latest development.
+var stateCaseTrusted = regexp.MustCompile(`(?i)(^|\.)(reuters|apnews|bloomberg|nytimes|wsj|washingtonpost|ft|bbc|cnbc|npr|pbs|law360|courthousenews|politico|axios|theverge|engadget|techcrunch|arstechnica|wired|cnn|nbcnews|cbsnews|abcnews|theguardian|latimes|usatoday|forbes|fortune|thehill|abajournal|law\.com|lexology|sourcenm|santafenewmexican|abqjournal)\.(com|org|co\.uk|net)$`)
 
 func uniqueLower(in []string) []string {
 	seen := map[string]bool{}
