@@ -85,8 +85,24 @@ func legiscanAdd(db *sql.DB, args []string) error {
 			break
 		}
 	}
+	// A session that has adjourned is no longer "current" to getSearch, so a
+	// bill from it cannot be found by number (Colorado HB 26-1263, 2026-09-27,
+	// adjourned in May). The corpus may already hold its bill_id from an
+	// earlier search row; if so, hydrate by id. A third argument can also
+	// supply the id directly: legiscan_add CO HB1263 2121012.
+	if billID == 0 && len(args) >= 3 {
+		fmt.Sscanf(strings.TrimSpace(args[2]), "%d", &billID)
+	}
 	if billID == 0 {
-		return fmt.Errorf("LegiScan has no %s %s in the current session", state, bill)
+		db.QueryRow(`SELECT (raw->>'bill_id')::int FROM pipeline.documents
+			WHERE source_id=$1 AND url ILIKE $2 AND raw ? 'bill_id' ORDER BY fetched_at DESC LIMIT 1`,
+			sourceID, "%/"+state+"/bill/"+bill+"/%").Scan(&billID)
+		if billID != 0 {
+			fmt.Printf("legiscan_add: %s %s not in the current session; using bill_id %d from the corpus\n", state, bill, billID)
+		}
+	}
+	if billID == 0 {
+		return fmt.Errorf("LegiScan has no %s %s in the current session; pass its LegiScan bill_id as a third argument", state, bill)
 	}
 
 	var exists bool
