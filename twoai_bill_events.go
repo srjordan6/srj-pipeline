@@ -67,7 +67,7 @@ var twoaiGovVetoedRe = regexp.MustCompile(`(?i)(vetoed by (the )?governor|govern
 // AI once in passing. Publishing those as AI laws would be worse than
 // publishing nothing: it teaches a reader that the tracker cannot tell the
 // difference. Title and description must carry real AI subject matter.
-var twoaiAIRelevanceRe = regexp.MustCompile(`(?i)(artificial intelligence|\bAI\b|algorithmic|automated decision|automated employment|machine learning|deepfake|synthetic media|generative)`)
+var twoaiAIRelevanceRe = regexp.MustCompile(`(?i)(artificial intelligence|\bAI\b|algorithmic|automated decision|automated employment|machine learning|deepfake|synthetic media|generative|chatbot|companion chatbot|digital replica|conversational artificial)`)
 
 // Explicit exclusions for the shapes that survive the relevance test on a
 // stray word but are not AI legislation.
