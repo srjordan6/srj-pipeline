@@ -143,6 +143,8 @@ var twoaiDailyOnly = map[string]bool{
 	// twoai_state_case_watch added 2026-09-26: one news query a day per
 	// state court case on the tracker.
 	"twoai_state_case_watch": true,
+	// twoai_enforcement_watch added 2026-09-27: FTC and SEC feeds, daily.
+	"twoai_enforcement_watch": true,
 }
 
 // stageDueToday reports whether a once-a-day stage still owes a run today.
@@ -5077,6 +5079,14 @@ func twoaiBuild(db *sql.DB) error {
 	// federal rows.
 	if err := twoaiPolicyLedger(db, today); err != nil {
 		fmt.Println("twoai_policy_ledger:", err)
+	}
+	// FTC and SEC AI enforcement actions, once a day, 2026-09-27.
+	if stageDueToday("twoai_enforcement_watch") {
+		if err := twoaiEnforcementWatch(db, today); err != nil {
+			fmt.Println("twoai_enforcement_watch:", err)
+		} else {
+			stageRanToday("twoai_enforcement_watch")
+		}
 	}
 
 	// THE REFRESH CONTRACT USED TO BE STAMPED HERE, part way through the build.
