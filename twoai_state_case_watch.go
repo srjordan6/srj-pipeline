@@ -220,7 +220,7 @@ func stateCaseDefendantWords(caseName string) []string {
 // Only established news organisations move a case; everything else is still
 // filed, so nothing is lost, but a content farm or an aggregator's rewrite
 // ("The Math Behind It Is Wild") never becomes a case's latest development.
-var stateCaseTrusted = regexp.MustCompile(`(?i)(^|\.)(reuters|apnews|bloomberg|nytimes|wsj|washingtonpost|ft|bbc|cnbc|npr|pbs|law360|courthousenews|politico|axios|theverge|engadget|techcrunch|arstechnica|wired|cnn|nbcnews|cbsnews|abcnews|theguardian|latimes|usatoday|forbes|fortune|thehill|abajournal|law\.com|lexology|sourcenm|santafenewmexican|abqjournal)\.(com|org|co\.uk|net)$`)
+var stateCaseTrusted = regexp.MustCompile(`(?i)(^|\.)(reuters|apnews|bloomberg|nytimes|wsj|washingtonpost|ft|bbc|cnbc|npr|pbs|law360|courthousenews|politico|axios|theverge|engadget|techcrunch|arstechnica|wired|cnn|nbcnews|cbsnews|abcnews|theguardian|latimes|usatoday|forbes|fortune|thehill|abajournal|law\.com|lexology|sourcenm|santafenewmexican|abqjournal|aljazeera|musicweek|billboard|variety|hollywoodreporter)\.(com|org|co\.uk|net)$`)
 
 func uniqueLower(in []string) []string {
 	seen := map[string]bool{}
