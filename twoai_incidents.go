@@ -150,9 +150,9 @@ type incidentOut struct {
 	TitleEN   string `json:"title_en,omitempty"`
 	TitleLang string `json:"title_lang,omitempty"`
 	URL       string `json:"url"`
-	Domain     string `json:"domain"`
-	Published  string `json:"published"`
-	CiteURL    string `json:"cite_url"`
+	Domain    string `json:"domain"`
+	Published string `json:"published"`
+	CiteURL   string `json:"cite_url"`
 	// An incident is a story, not a link. These carry the same treatment the
 	// daily briefing gives a news story: an original summary written from the
 	// reporting, and every outlet that carried it.
@@ -328,7 +328,76 @@ func twoaiIncidentsEnrich(db *sql.DB, out []incidentOut) {
 			out[i].Summary, out[i].SummaryDomain, out[i].SummaryURL = sum, r.Domain, r.URL
 			break
 		}
+		// FALLBACK TO THE DATABASE'S OWN DESCRIPTION. Stephen, 2026-09-28, on
+		// incident 1713: the page gave no account of what happened. Its only
+		// report was a McClatchy paper that refuses our fetcher; 9 of 66
+		// incidents were in the same state, every one reported only by an
+		// outlet behind a paywall or a bot wall (Reuters, NYT, WSJ, FT, the
+		// Washington Post). The AI Incident Database writes a description of
+		// every incident on its cite page, which the page already links, so
+		// when no report can be read the summary is written from that, in our
+		// own words, and attributed to it.
+		if out[i].Summary == "" {
+			cite := fmt.Sprintf("https://incidentdatabase.ai/cite/%d", out[i].IncidentID)
+			var cached string
+			db.QueryRow(`SELECT COALESCE(summary,'') FROM pipeline.documents WHERE url=$1`, cite).Scan(&cached)
+			if cached == "" {
+				if desc := twoaiIncidentDescription(cite); len(desc) >= 150 {
+					title := out[i].Title
+					if len(out[i].Reports) > 0 {
+						title = out[i].Reports[0].Title
+					}
+					prompt := "Rewrite this incident description as one short paragraph of 60 to 110 words, entirely in your own words, for a news reference page. " +
+						"State what happened, who was involved and what followed, using only the facts in the description; add nothing, and do not speculate. " +
+						"Plain English, commas rather than dashes, no quotation longer than five words. Output only the paragraph.\n\n" +
+						"Headline: " + title + "\n\nDescription:\n" + desc
+					sum, _, err := twoaiGenerate("news_summary", "", prompt)
+					sum = strings.TrimSpace(sum)
+					if err == nil && sum != "" {
+						db.Exec(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, summary)
+							SELECT id, $1, md5($2), $2, $3, $4 FROM pipeline.sources WHERE key='aiid'
+							ON CONFLICT DO NOTHING`, fmt.Sprint("aiid-desc:", out[i].IncidentID), cite, title, sum)
+						db.Exec(`UPDATE pipeline.documents SET summary=$1 WHERE url=$2 AND COALESCE(summary,'')=''`, sum, cite)
+						cached = sum
+					}
+				}
+			}
+			if cached != "" {
+				out[i].Summary, out[i].SummaryDomain, out[i].SummaryURL = cached, "incidentdatabase.ai", cite
+			}
+		}
 	}
+}
+
+// twoaiIncidentDescription reads the editor-written Description section of an
+// AI Incident Database cite page. Empty when the page or the section is
+// missing; the caller then leaves the summary empty, as before.
+func twoaiIncidentDescription(cite string) string {
+	client := &http.Client{Timeout: 25 * time.Second}
+	req, _ := http.NewRequest("GET", cite, nil)
+	req.Header.Set("User-Agent", "theworldofai.org incident watch (contact: stephen@srjconsultingservices.com)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return ""
+	}
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	page := string(b)
+	if m := regexp.MustCompile(`(?is)description-section[^>]*>(.*?)</(?:section|div)>`).FindStringSubmatch(page); m != nil {
+		txt := html.UnescapeString(regexp.MustCompile(`(?s)<[^>]+>`).ReplaceAllString(m[1], " "))
+		txt = strings.TrimSpace(regexp.MustCompile(`\s+`).ReplaceAllString(txt, " "))
+		txt = strings.TrimLeft(strings.TrimSpace(strings.TrimPrefix(txt, "Description")), ": ")
+		if len(txt) >= 150 {
+			return txt
+		}
+	}
+	if m := regexp.MustCompile(`(?i)<meta name="description" content="([^"]{150,})"`).FindStringSubmatch(page); m != nil {
+		return html.UnescapeString(m[1])
+	}
+	return ""
 }
 
 // Reads one report page as text. Publisher prose never leaves this function:
