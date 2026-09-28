@@ -5110,6 +5110,10 @@ func twoaiBuild(db *sql.DB) error {
 	if err := twoaiPolicyLedger(db, today); err != nil {
 		fmt.Println("twoai_policy_ledger:", err)
 	}
+	// The public Data Quality page, /data-quality/, 2026-09-28.
+	if err := twoaiQualityPage(db, today); err != nil {
+		fmt.Println("twoai_quality:", err)
+	}
 	// Accounting trade press to the AI Accountant section, 2026-09-28.
 	if err := twoaiAccountingNews(db); err != nil {
 		fmt.Println("twoai_accounting_news:", err)
