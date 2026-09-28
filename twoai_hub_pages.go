@@ -65,6 +65,14 @@ func twoaiEnsureHubPages(db *sql.DB) error {
 		FROM twoai_taxonomy t
 		WHERE t.level = 2 AND COALESCE(t.status,'') <> 'retired'
 		  AND (t.live_path IS NULL
+		       -- REWRITTEN EVERY RUN, AS THE HEADER SAYS, 2026-09-28. The query
+		       -- only ever matched hubs with no ecosystem page yet, so a hub
+		       -- page, once written, kept the list of sections it had on
+		       -- 2026-09-20: AI Insurance never showed Health Insurance, Law and
+		       -- Compliance never showed the Policy Ledger. A page this stage
+		       -- wrote (is_hub) is now regenerated from the taxonomy each run.
+		       OR EXISTS (SELECT 1 FROM twoai_pages p WHERE p.path = 'ecosystem/' || t.slug || '.json'
+		                  AND p.kind = 'ecosystem-section' AND p.data->>'is_hub' = 'true')
 		       OR (t.live_path LIKE '/ai-ecosystem/%'
 		           AND NOT EXISTS (SELECT 1 FROM twoai_pages p WHERE p.path = 'ecosystem/' || t.slug || '.json')
 		           AND EXISTS (SELECT 1 FROM twoai_pages p WHERE p.path = 'industries/' || t.slug || '.json' AND p.data->>'is_hub' = 'true')

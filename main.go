@@ -5098,6 +5098,10 @@ func twoaiBuild(db *sql.DB) error {
 	// once and redone only when LegiScan reports it changed.
 	if err := twoaiEnactedLaws(db); err != nil {
 		fmt.Println("twoai_enacted_laws:", err)
+	} else if !stageDueToday("legiscan") {
+		// Today's LegiScan sweep ran and the stage above rewrote every law
+		// whose bill changed; every other law page was confirmed unchanged.
+		twoaiRecordChecks(db, "compliance/law-%", "LegiScan sweep, bill unchanged")
 	}
 	// A page for every state that has enacted AI law, built from the law
 	// pages above; the parent's list of states is the set that has law.

@@ -53,23 +53,23 @@ func twoaiQualityPage(db *sql.DB, today string) error {
 	add("What this page is", `<p>How this site is kept accurate, in numbers, taken from the site's own records each time this page is rebuilt. It shows what each section is built from, how often it is supposed to be rebuilt, when it last was, what is overdue, what could not be verified, and every correction we have made. Nothing here is estimated; a figure that could not be measured on a run says so.</p>`)
 
 	add("Terms used on this page", `<p><b>Refresh schedule</b>: how often a page is supposed to be rebuilt from its sources. A news hub is rebuilt daily, a compliance page every 14 days, a company profile every 90 days.</p>
-<p><b>Last rebuilt</b>: the most recent date a page in the section was rebuilt from its sources.</p>
-<p><b>Overdue</b>: a page not rebuilt within its refresh schedule. Overdue means we have not re-checked it on time. It does <em>not</em> mean the page is wrong; most overdue pages are unchanged because their sources are unchanged.</p>
+<p><b>Last checked</b>: the most recent date a page in the section was rebuilt from its sources, reviewed by the editor, or confirmed against a source that had not changed.</p>
+<p><b>Overdue</b>: a page not checked within its refresh schedule. Overdue means we have not re-checked it on time. It does <em>not</em> mean the page is wrong; most overdue pages are unchanged because their sources are unchanged.</p>
 <p><b>Not verified</b>: a fact we could not confirm from a primary source. The page shows it as unverified rather than stating it.</p>
 <p><b>Correction</b>: a published fact we later found to be wrong. Every correction is listed below with what was wrong and what replaced it.</p>`)
 
 	// Sections table.
 	sb.Reset()
-	sb.WriteString(`<table class="srjgov-table"><thead><tr><th>Section</th><th>Built from</th><th>Pages</th><th>Refresh schedule</th><th>Last rebuilt</th><th>Overdue</th></tr></thead><tbody>`)
+	sb.WriteString(`<table class="srjgov-table"><thead><tr><th>Section</th><th>Built from</th><th>Pages</th><th>Refresh schedule</th><th>Last checked</th><th>Overdue</th></tr></thead><tbody>`)
 	totalPages, totalOver := 0, 0
 	for _, s := range qualSections {
 		var n, over, cmin, cmax int
 		var last sql.NullString
 		err := db.QueryRow(`SELECT count(*),
-				count(*) FILTER (WHERE (current_date - NULLIF(left(data->>'generated',10),'')::date) > (data->>'refresh_every_days')::int),
-				COALESCE(min((data->>'refresh_every_days')::int),0), COALESCE(max((data->>'refresh_every_days')::int),0),
-				max(left(data->>'generated',10))
-			FROM twoai_pages WHERE kind = ANY($1)`, pq.Array(s.kinds)).Scan(&n, &over, &cmin, &cmax, &last)
+				count(*) FILTER (WHERE (current_date - `+twoaiLastCheckedSQL+`) > (p.data->>'refresh_every_days')::int),
+				COALESCE(min((p.data->>'refresh_every_days')::int),0), COALESCE(max((p.data->>'refresh_every_days')::int),0),
+				max(`+twoaiLastCheckedSQL+`)::text
+			FROM twoai_pages p WHERE p.kind = ANY($1)`, pq.Array(s.kinds)).Scan(&n, &over, &cmin, &cmax, &last)
 		if err != nil || n == 0 {
 			continue
 		}

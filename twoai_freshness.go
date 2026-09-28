@@ -81,21 +81,51 @@ func twoaiCadenceDays(path, kind, shape string) int {
 // a person does still move.
 const twoaiSettledCadenceDays = 365
 
+// twoaiLastCheckedSQL is the date a page was last confirmed against its
+// sources, for a query over twoai_pages aliased p: the latest of when it was
+// rebuilt, when a person last reviewed it, and when a stage last checked it
+// against an unchanged source (twoai_page_checks). A law page rewritten on
+// 2026-09-17 and confirmed unchanged by every LegiScan sweep since is current,
+// not eleven days overdue. 2026-09-28.
+const twoaiLastCheckedSQL = `GREATEST(NULLIF(left(p.data->>'generated',10),'')::date,
+	NULLIF(left(p.data->>'last_reviewed',10),'')::date,
+	(SELECT pc.checked_on FROM twoai_page_checks pc WHERE pc.path = p.path))`
+
+// twoaiRecordChecks notes that pages were confirmed against their sources
+// today without being rewritten. Kept in its own table so the page documents,
+// and everything hashed from them, do not change when nothing changed.
+func twoaiRecordChecks(db *sql.DB, pathLike, why string) {
+	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_page_checks (path text PRIMARY KEY, checked_on date NOT NULL, how text)`)
+	res, err := db.Exec(`INSERT INTO twoai_page_checks (path, checked_on, how)
+		SELECT path, current_date, $2 FROM twoai_pages WHERE path LIKE $1
+		ON CONFLICT (path) DO UPDATE SET checked_on = EXCLUDED.checked_on, how = EXCLUDED.how
+		WHERE twoai_page_checks.checked_on < EXCLUDED.checked_on`, pathLike, why)
+	if err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			fmt.Printf("twoai_freshness: %d pages under %s confirmed today (%s)\n", n, pathLike, why)
+		}
+	}
+}
+
 // twoaiStampFreshness writes the contract onto every page document. Runs
 // inside the publish step, so a page cannot be published without one.
 func twoaiStampFreshness(db *sql.DB) error {
-	rows, err := db.Query(`SELECT path, COALESCE(kind,''), COALESCE(data->>'shape',''), COALESCE(data->>'died',''), COALESCE(data->>'archived','') = 'true' FROM twoai_pages`)
+	rows, err := db.Query(`SELECT path, COALESCE(kind,''), COALESCE(data->>'shape',''), COALESCE(data->>'died',''),
+		COALESCE(data->>'archived','') = 'true', COALESCE(NULLIF(data->>'review_interval_days','')::int, 0),
+		kind = 'week' AND path < (SELECT max(path) FROM twoai_pages WHERE kind = 'week')
+		FROM twoai_pages`)
 	if err != nil {
 		return err
 	}
 	type pg struct {
 		path, kind, shape, died string
-		archived                bool
+		archived, pastWeek      bool
+		review                  int
 	}
 	var pages []pg
 	for rows.Next() {
 		var p pg
-		if rows.Scan(&p.path, &p.kind, &p.shape, &p.died, &p.archived) == nil {
+		if rows.Scan(&p.path, &p.kind, &p.shape, &p.died, &p.archived, &p.review, &p.pastWeek) == nil {
 			pages = append(pages, p)
 		}
 	}
@@ -107,9 +137,19 @@ func twoaiStampFreshness(db *sql.DB) error {
 		// An archived page, such as an incident that has left the AI
 		// Incident Database's recent window (2026-09-28), is a closed record:
 		// yearly, like a person who has died.
-		if (p.kind == "person" && strings.TrimSpace(p.died) != "") || p.archived {
+		//
+		// A weekly recap for a week that has ended is a closed record too
+		// (2026-09-28: four past weeks were listed as overdue every day).
+		if (p.kind == "person" && strings.TrimSpace(p.died) != "") || p.archived || p.pastWeek {
 			c = twoaiSettledCadenceDays
 			settled++
+		} else if p.review > 0 {
+			// HAND-REVIEWED PAGES KEEP THEIR OWN CYCLE, 2026-09-28. The
+			// benchmark and prompt guides declare review_interval_days (90 and
+			// 180) and a last_reviewed date; this stamp overwrote the cycle
+			// with the kind default of 30, so the Data Quality page reported
+			// 38 pages overdue that were inside their review period.
+			c = p.review
 		}
 		byCadence[c] = append(byCadence[c], p.path)
 	}
@@ -137,11 +177,11 @@ func twoaiStampFreshness(db *sql.DB) error {
 // Called from the weekly watch and available on its own.
 func twoaiFreshnessReport(db *sql.DB) error {
 	rows, err := db.Query(`
-		SELECT path, COALESCE(data->>'generated',''), (data->>'refresh_every_days')::int,
-		       (current_date - NULLIF(data->>'generated','')::date) - (data->>'refresh_every_days')::int AS overdue_days
-		FROM twoai_pages
-		WHERE data ? 'refresh_every_days' AND NULLIF(data->>'generated','') IS NOT NULL
-		  AND (current_date - NULLIF(data->>'generated','')::date) > (data->>'refresh_every_days')::int
+		SELECT p.path, COALESCE(` + twoaiLastCheckedSQL + `::text,''), (p.data->>'refresh_every_days')::int,
+		       (current_date - ` + twoaiLastCheckedSQL + `) - (p.data->>'refresh_every_days')::int AS overdue_days
+		FROM twoai_pages p
+		WHERE p.data ? 'refresh_every_days' AND NULLIF(p.data->>'generated','') IS NOT NULL
+		  AND (current_date - ` + twoaiLastCheckedSQL + `) > (p.data->>'refresh_every_days')::int
 		ORDER BY overdue_days DESC LIMIT 40`)
 	if err != nil {
 		return err
