@@ -84,15 +84,18 @@ const twoaiSettledCadenceDays = 365
 // twoaiStampFreshness writes the contract onto every page document. Runs
 // inside the publish step, so a page cannot be published without one.
 func twoaiStampFreshness(db *sql.DB) error {
-	rows, err := db.Query(`SELECT path, COALESCE(kind,''), COALESCE(data->>'shape',''), COALESCE(data->>'died','') FROM twoai_pages`)
+	rows, err := db.Query(`SELECT path, COALESCE(kind,''), COALESCE(data->>'shape',''), COALESCE(data->>'died',''), COALESCE(data->>'archived','') = 'true' FROM twoai_pages`)
 	if err != nil {
 		return err
 	}
-	type pg struct{ path, kind, shape, died string }
+	type pg struct {
+		path, kind, shape, died string
+		archived                bool
+	}
 	var pages []pg
 	for rows.Next() {
 		var p pg
-		if rows.Scan(&p.path, &p.kind, &p.shape, &p.died) == nil {
+		if rows.Scan(&p.path, &p.kind, &p.shape, &p.died, &p.archived) == nil {
 			pages = append(pages, p)
 		}
 	}
@@ -101,7 +104,10 @@ func twoaiStampFreshness(db *sql.DB) error {
 	settled := 0
 	for _, p := range pages {
 		c := twoaiCadenceDays(p.path, p.kind, p.shape)
-		if p.kind == "person" && strings.TrimSpace(p.died) != "" {
+		// An archived page, such as an incident that has left the AI
+		// Incident Database's recent window (2026-09-28), is a closed record:
+		// yearly, like a person who has died.
+		if (p.kind == "person" && strings.TrimSpace(p.died) != "") || p.archived {
 			c = twoaiSettledCadenceDays
 			settled++
 		}

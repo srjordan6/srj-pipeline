@@ -338,35 +338,45 @@ func twoaiIncidentsEnrich(db *sql.DB, out []incidentOut) {
 		// when no report can be read the summary is written from that, in our
 		// own words, and attributed to it.
 		if out[i].Summary == "" {
-			cite := fmt.Sprintf("https://incidentdatabase.ai/cite/%d", out[i].IncidentID)
-			var cached string
-			db.QueryRow(`SELECT COALESCE(summary,'') FROM pipeline.documents WHERE url=$1`, cite).Scan(&cached)
-			if cached == "" {
-				if desc := twoaiIncidentDescription(cite); len(desc) >= 150 {
-					title := out[i].Title
-					if len(out[i].Reports) > 0 {
-						title = out[i].Reports[0].Title
-					}
-					prompt := "Rewrite this incident description as one short paragraph of 60 to 110 words, entirely in your own words, for a news reference page. " +
-						"State what happened, who was involved and what followed, using only the facts in the description; add nothing, and do not speculate. " +
-						"Plain English, commas rather than dashes, no quotation longer than five words. Output only the paragraph.\n\n" +
-						"Headline: " + title + "\n\nDescription:\n" + desc
-					sum, _, err := twoaiGenerate("news_summary", "", prompt)
-					sum = strings.TrimSpace(sum)
-					if err == nil && sum != "" {
-						db.Exec(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, summary)
-							SELECT id, $1, md5($2), $2, $3, $4 FROM pipeline.sources WHERE key='aiid'
-							ON CONFLICT DO NOTHING`, fmt.Sprint("aiid-desc:", out[i].IncidentID), cite, title, sum)
-						db.Exec(`UPDATE pipeline.documents SET summary=$1 WHERE url=$2 AND COALESCE(summary,'')=''`, sum, cite)
-						cached = sum
-					}
-				}
+			title := out[i].Title
+			if len(out[i].Reports) > 0 {
+				title = out[i].Reports[0].Title
 			}
-			if cached != "" {
-				out[i].Summary, out[i].SummaryDomain, out[i].SummaryURL = cached, "incidentdatabase.ai", cite
+			if sum, cite := twoaiIncidentDescSummary(db, out[i].IncidentID, title); sum != "" {
+				out[i].Summary, out[i].SummaryDomain, out[i].SummaryURL = sum, "incidentdatabase.ai", cite
 			}
 		}
 	}
+}
+
+// twoaiIncidentDescSummary returns a summary written from the AI Incident
+// Database's own description of an incident, cached on the cite URL, and the
+// cite URL. Empty when there is no usable description.
+func twoaiIncidentDescSummary(db *sql.DB, id int, title string) (string, string) {
+	cite := fmt.Sprintf("https://incidentdatabase.ai/cite/%d", id)
+	var cached string
+	db.QueryRow(`SELECT COALESCE(summary,'') FROM pipeline.documents WHERE url=$1`, cite).Scan(&cached)
+	if cached != "" {
+		return cached, cite
+	}
+	desc := twoaiIncidentDescription(cite)
+	if len(desc) < 150 {
+		return "", cite
+	}
+	prompt := "Rewrite this incident description as one short paragraph of 60 to 110 words, entirely in your own words, for a news reference page. " +
+		"State what happened, who was involved and what followed, using only the facts in the description; add nothing, and do not speculate. " +
+		"Plain English, commas rather than dashes, no quotation longer than five words. Output only the paragraph.\n\n" +
+		"Headline: " + title + "\n\nDescription:\n" + desc
+	sum, _, err := twoaiGenerate("news_summary", "", prompt)
+	sum = strings.TrimSpace(sum)
+	if err != nil || sum == "" {
+		return "", cite
+	}
+	db.Exec(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, summary)
+		SELECT id, $1, md5($2), $2, $3, $4 FROM pipeline.sources WHERE key='aiid'
+		ON CONFLICT DO NOTHING`, fmt.Sprint("aiid-desc:", id), cite, title, sum)
+	db.Exec(`UPDATE pipeline.documents SET summary=$1 WHERE url=$2 AND COALESCE(summary,'')=''`, sum, cite)
+	return sum, cite
 }
 
 // twoaiIncidentDescription reads the editor-written Description section of an
@@ -490,7 +500,10 @@ func twoaiIncidentPages(db *sql.DB, incidents []incidentOut, today string) int {
 		var reading, rModel, rOn string
 		db.QueryRow(`SELECT body, model, generated_on::text FROM twoai_industry_analysis
 			WHERE metric=$1 AND data_hash=$2`, metric, hash).Scan(&reading, &rModel, &rOn)
-		if reading == "" && inc.Summary != "" && os.Getenv("ANTHROPIC_API_KEY") != "" {
+		// The Anthropic key gate stayed after twoaiClaudeCall was routed to
+		// Ollama, so no incident reading had been written since the key was
+		// cut on 2026-09-17; found 2026-09-28. Same fix as twoaiThinSense.
+		if reading == "" && inc.Summary != "" && (os.Getenv("ANTHROPIC_API_KEY") != "" || twoaiLLMFor("") != "anthropic") {
 			if body, err := twoaiClaudeCall(model, incidentReadingSystem,
 				"The incident:\n"+string(facts)+"\n\nWrite it now."); err == nil && len(body) > 150 {
 				db.Exec(`INSERT INTO twoai_industry_analysis (metric, data_hash, model, body, generated_on)
@@ -522,6 +535,52 @@ func twoaiIncidentPages(db *sql.DB, incidents []incidentOut, today string) int {
 	// An incident that drops out of the window keeps its page: a URL that has
 	// been published never moves, and the record of a harm should not vanish
 	// because newer ones arrived.
+	//
+	// ARCHIVED PAGES, 2026-09-28. Those pages were never touched again, so
+	// the staleness report listed them daily as weeks overdue, and the six
+	// with no summary (reported only behind paywalls) stayed empty after the
+	// database description fallback arrived. Each out-of-window page is now
+	// marked archived with a yearly refresh contract, and one with no summary
+	// gets one from the database's description, a few a run.
+	inWindow := map[string]bool{}
+	for _, inc := range incidents {
+		inWindow[fmt.Sprintf("news/incident-%d.json", inc.IncidentID)] = true
+	}
+	rows, err := db.Query(`SELECT path, (data->>'incident_id')::int, COALESCE(data->>'title',''),
+			COALESCE(data->'reports'->0->>'title',''), COALESCE(data->>'summary','')
+		FROM twoai_pages WHERE path LIKE 'news/incident-%' AND kind='incident'`)
+	if err == nil {
+		type old struct {
+			path, title, rtitle, summary string
+			id                           int
+		}
+		var olds []old
+		for rows.Next() {
+			var o old
+			if rows.Scan(&o.path, &o.id, &o.title, &o.rtitle, &o.summary) == nil && !inWindow[o.path] {
+				olds = append(olds, o)
+			}
+		}
+		rows.Close()
+		filled := 0
+		for _, o := range olds {
+			patch := map[string]any{"archived": true, "refresh_every_days": 365}
+			if o.summary == "" && filled < 6 {
+				t := o.rtitle
+				if t == "" {
+					t = o.title
+				}
+				if sum, cite := twoaiIncidentDescSummary(db, o.id, t); sum != "" {
+					patch["summary"], patch["summary_domain"], patch["summary_url"] = sum, "incidentdatabase.ai", cite
+					filled++
+				}
+			}
+			pj, _ := json.Marshal(patch)
+			db.Exec(`UPDATE twoai_pages SET data = data || $2::jsonb, updated_at = now()
+				WHERE path = $1 AND (data || $2::jsonb)::text IS DISTINCT FROM data::text`, o.path, string(pj))
+		}
+		fmt.Printf("publish_news: archived incident pages=%d summaries filled=%d\n", len(olds), filled)
+	}
 	fmt.Printf("publish_news: incident pages built=%d\n", built)
 	return built
 }
