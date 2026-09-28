@@ -1405,6 +1405,9 @@ var aiTerm = regexp.MustCompile(`(?i)\b(` +
 
 func mentionsAI(s string) bool { return s != "" && aiTerm.MatchString(s) }
 
+// computeTerm: the hardware AI runs on, for the (compute) coverage feeds only.
+var computeTerm = regexp.MustCompile(`(?i)\b(glass (substrates?|core)|advanced packaging|CoWoS|SoIC|HBM\d*e?|high[- ]bandwidth memory|chiplets?|hybrid bonding|interposers?|substrates?|semiconductors?|chipmakers?|foundr(y|ies)|wafers?|GPUs?|accelerators?|TSMC|SK hynix|Nvidia|Micron)\b`)
+
 // privacyTerm is the privacy-law vocabulary, added 2026-09-13 at Stephen's
 // direction: privacy laws belong on this site alongside AI laws, in every
 // search, the news, the laws tracker, everything.
@@ -3860,6 +3863,15 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"Global Times (coverage)", "https://news.google.com/rss/search?q=site:globaltimes.cn+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
 		{"Sixth Tone (coverage)", "https://news.google.com/rss/search?q=site:sixthtone.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
 		{"Caixin Global (coverage)", "https://news.google.com/rss/search?q=site:caixinglobal.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		// AI COMPUTE SUPPLY CHAIN, 2026-09-28: advanced packaging, glass
+		// substrates, HBM and chiplets, plus the Korean and Taiwanese outlets that
+		// break most of it first (the SCHMID story began in the Seoul Economic
+		// Daily). Tagged (compute) so the title filter also accepts computeTerm.
+		{"AI compute supply chain (compute)", "https://news.google.com/rss/search?q=%22glass+substrate%22+OR+%22glass+core%22+OR+%22advanced+packaging%22+OR+CoWoS+OR+HBM+OR+%22high+bandwidth+memory%22+OR+chiplet+OR+%22hybrid+bonding%22&hl=en-US&gl=US&ceid=US:en"},
+		{"Seoul Economic Daily (compute)", "https://news.google.com/rss/search?q=site:en.sedaily.com+HBM+OR+semiconductor+OR+substrate+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"TheElec (compute)", "https://news.google.com/rss/search?q=site:thelec.net+HBM+OR+substrate+OR+packaging+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"BusinessKorea (compute)", "https://news.google.com/rss/search?q=site:businesskorea.co.kr+HBM+OR+semiconductor+OR+substrate+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		{"DigiTimes (compute)", "https://news.google.com/rss/search?q=site:digitimes.com+CoWoS+OR+HBM+OR+substrate+OR+packaging&hl=en-US&gl=US&ceid=US:en"},
 		// STATE ATTORNEYS GENERAL, 2026-09-26. The offices that bring the state
 		// privacy and consumer protection actions announce every filing and
 		// verdict themselves; two coverage queries catch those announcements
@@ -3938,7 +3950,13 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 				break
 			}
 			title, link := strings.TrimSpace(it.Title), strings.TrimSpace(it.Link)
-			if title == "" || link == "" || !mentionsAI(title) {
+			// AI COMPUTE SUPPLY CHAIN, 2026-09-28. Stephen found the SCHMID glass
+			// substrate story missing: packaging, HBM and substrate news is about
+			// AI compute but rarely says "AI" in the headline. Feeds tagged
+			// (compute) also pass on the hardware terms; every other feed keeps
+			// the AI-only rule.
+			keep := mentionsAI(title) || (strings.Contains(f.vendor, "(compute)") && computeTerm.MatchString(title))
+			if title == "" || link == "" || !keep {
 				continue
 			}
 			// ALREADY FILED? Ask before resolving. The redirect resolution and
