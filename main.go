@@ -3863,6 +3863,13 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"Global Times (coverage)", "https://news.google.com/rss/search?q=site:globaltimes.cn+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
 		{"Sixth Tone (coverage)", "https://news.google.com/rss/search?q=site:sixthtone.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
 		{"Caixin Global (coverage)", "https://news.google.com/rss/search?q=site:caixinglobal.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		// ACCOUNTING TRADE PRESS, 2026-09-28. Tagged (accounting):
+		// twoai_accounting_news turns each new AI story from these into a
+		// one-outlet story pinned to the AI Accountant section.
+		{"Accounting Today (accounting)", "https://news.google.com/rss/search?q=site:accountingtoday.com+AI+OR+%22artificial+intelligence%22&hl=en-US&gl=US&ceid=US:en"},
+		{"Journal of Accountancy (accounting)", "https://news.google.com/rss/search?q=site:journalofaccountancy.com+AI+OR+%22artificial+intelligence%22&hl=en-US&gl=US&ceid=US:en"},
+		{"CPA Practice Advisor (accounting)", "https://news.google.com/rss/search?q=site:cpapracticeadvisor.com+AI+OR+%22artificial+intelligence%22&hl=en-US&gl=US&ceid=US:en"},
+		{"Big Four on AI (accounting)", "https://news.google.com/rss/search?q=(PwC+OR+Deloitte+OR+KPMG+OR+%22Ernst+%26+Young%22)+(AI+OR+%22artificial+intelligence%22)+(audit+OR+assurance+OR+tax)&hl=en-US&gl=US&ceid=US:en"},
 		// AI COMPUTE SUPPLY CHAIN, 2026-09-28: advanced packaging, glass
 		// substrates, HBM and chiplets, plus the Korean and Taiwanese outlets that
 		// break most of it first (the SCHMID story began in the Seoul Economic
@@ -5098,6 +5105,10 @@ func twoaiBuild(db *sql.DB) error {
 	if err := twoaiPolicyLedger(db, today); err != nil {
 		fmt.Println("twoai_policy_ledger:", err)
 	}
+	// Accounting trade press to the AI Accountant section, 2026-09-28.
+	if err := twoaiAccountingNews(db); err != nil {
+		fmt.Println("twoai_accounting_news:", err)
+	}
 	// FTC and SEC AI enforcement actions, once a day, 2026-09-27.
 	if stageDueToday("twoai_enforcement_watch") {
 		if err := twoaiEnforcementWatch(db, today); err != nil {
@@ -5606,8 +5617,20 @@ func twoaiPublishR2(db *sql.DB) error {
 			                           'generated_on', a.generated_on::text))
 			 END
 			 || CASE WHEN b.m IS NULL THEN '{}'::jsonb
-			         ELSE jsonb_build_object('readings', b.m) END)::text
+			         ELSE jsonb_build_object('readings', b.m) END
+			 || CASE WHEN n.m IS NULL THEN '{}'::jsonb
+			         ELSE jsonb_build_object('pinned_news', n.m) END)::text
 		FROM twoai_pages p
+		LEFT JOIN LATERAL (
+			-- PINNED NEWS, 2026-09-28. twoai_page_news held a story chosen for a
+			-- page (by Stephen, or by the accounting feed) and nothing read it,
+			-- so the pins never showed. Merged here for any page, like readings.
+			SELECT jsonb_agg(jsonb_build_object('headline', pn.headline,
+			         'date', pn.published_on::text, 'url', '/ai-news/' || pn.story_uid || '/',
+			         'reason', pn.reason) ORDER BY pn.published_on DESC) AS m
+			FROM (SELECT * FROM twoai_page_news WHERE page_path = p.path AND active
+			      ORDER BY published_on DESC LIMIT 12) pn
+		) n ON true
 		LEFT JOIN LATERAL (
 			SELECT model, body, generated_on FROM twoai_industry_analysis
 			WHERE metric = 'page:' || p.path ORDER BY generated_on DESC LIMIT 1
@@ -9762,8 +9785,18 @@ func twoaiPublish(db *sql.DB) error {
 			                           'generated_on', a.generated_on::text))
 			 END
 			 || CASE WHEN b.m IS NULL THEN '{}'::jsonb
-			         ELSE jsonb_build_object('readings', b.m) END))
+			         ELSE jsonb_build_object('readings', b.m) END
+			 || CASE WHEN n.m IS NULL THEN '{}'::jsonb
+			         ELSE jsonb_build_object('pinned_news', n.m) END))
 		FROM twoai_pages p
+		LEFT JOIN LATERAL (
+			-- PINNED NEWS, 2026-09-28; see the first publisher's query.
+			SELECT jsonb_agg(jsonb_build_object('headline', pn.headline,
+			         'date', pn.published_on::text, 'url', '/ai-news/' || pn.story_uid || '/',
+			         'reason', pn.reason) ORDER BY pn.published_on DESC) AS m
+			FROM (SELECT * FROM twoai_page_news WHERE page_path = p.path AND active
+			      ORDER BY published_on DESC LIMIT 12) pn
+		) n ON true
 		LEFT JOIN LATERAL (
 			SELECT model, body, generated_on FROM twoai_industry_analysis
 			WHERE metric = 'page:' || p.path ORDER BY generated_on DESC LIMIT 1
