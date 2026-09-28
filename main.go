@@ -1039,6 +1039,11 @@ func main() {
 		if err := twoaiBuildWatch(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_buildwatch:", err)
 		}
+		// Database backup watch, 2026-09-28: the dump failed silently for
+		// three days. Same tick, same outbox, same one-alert rule.
+		if err := twoaiBackupWatch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_backupwatch:", err)
+		}
 		if err := inkboxPull(db); err != nil {
 			fmt.Fprintln(os.Stderr, "inkbox_tick: pull:", err)
 		}
