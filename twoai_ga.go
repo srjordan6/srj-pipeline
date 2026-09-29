@@ -269,7 +269,7 @@ func twoaiGATop(db *sql.DB) error {
 			continue
 		}
 		p := r.DimensionValues[0].Value
-		if skip(p) {
+		if skip(p) || gaIsIndexPage(p) {
 			continue
 		}
 		var v int
@@ -341,4 +341,23 @@ func twoaiGATop(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_ga_top: stored top %d for %s window\n", len(top), start)
 	return nil
+}
+
+// gaIsIndexPage: section front pages already in the main navigation.
+// Stephen, 2026-09-29: "the most visited on the front page footer is not being
+// updated". It was, daily, but the same four section indexes (AI News, the
+// Lawsuit Tracker, Vendor News, MCP Servers) took four of the five places
+// every day, so the list looked frozen. The footer now shows the pages
+// readers actually go to inside the sections: cases, laws, stories, profiles.
+func gaIsIndexPage(p string) bool {
+	segs := strings.Split(strings.Trim(p, "/"), "/")
+	if len(segs) <= 1 {
+		return true
+	}
+	switch strings.TrimSuffix(p, "/") + "/" {
+	case "/ai-news/vendor/", "/ai-news/incident/", "/ai-news/archive/", "/this-week-in-ai/archive/":
+		return true
+	}
+	// /ai-ecosystem/<category>/ is a category front page.
+	return segs[0] == "ai-ecosystem" && len(segs) == 2
 }
