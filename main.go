@@ -3868,6 +3868,25 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"Global Times (coverage)", "https://news.google.com/rss/search?q=site:globaltimes.cn+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
 		{"Sixth Tone (coverage)", "https://news.google.com/rss/search?q=site:sixthtone.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
 		{"Caixin Global (coverage)", "https://news.google.com/rss/search?q=site:caixinglobal.com+%22artificial+intelligence%22+OR+AI&hl=en-US&gl=US&ceid=US:en"},
+		// AI SAFETY AND SECURITY EVALUATIONS, 2026-09-29. Stephen found the
+		// Gemini cybersecurity test and the UK warning on GPT-6 Astra's supply
+		// chain attack ability missing or late: evaluations published by the
+		// safety institutes and the labs, and the security press that reports
+		// them, were thin in the feeds.
+		{"UK AI Security Institute (coverage)", "https://news.google.com/rss/search?q=%22AI+Security+Institute%22+OR+site:aisi.gov.uk&hl=en-GB&gl=GB&ceid=GB:en"},
+		{"US CAISI and NIST AI evaluations (coverage)", "https://news.google.com/rss/search?q=%22Center+for+AI+Standards+and+Innovation%22+OR+CAISI+OR+(NIST+%22AI+evaluation%22)&hl=en-US&gl=US&ceid=US:en"},
+		{"Frontier model safety evaluations (coverage)", "https://news.google.com/rss/search?q=(%22system+card%22+OR+%22red+team%22+OR+%22safety+evaluation%22+OR+%22cyber+evaluation%22+OR+%22dangerous+capabilities%22)+(OpenAI+OR+Anthropic+OR+%22Google+DeepMind%22+OR+Gemini+OR+Claude+OR+GPT)&hl=en-US&gl=US&ceid=US:en"},
+		{"The Record AI security (coverage)", "https://news.google.com/rss/search?q=site:therecord.media+AI+OR+%22artificial+intelligence%22&hl=en-US&gl=US&ceid=US:en"},
+		{"Dark Reading AI security (coverage)", "https://news.google.com/rss/search?q=site:darkreading.com+AI+OR+%22artificial+intelligence%22+OR+agent&hl=en-US&gl=US&ceid=US:en"},
+		{"SecurityWeek AI (coverage)", "https://news.google.com/rss/search?q=site:securityweek.com+AI+OR+%22artificial+intelligence%22+OR+agent&hl=en-US&gl=US&ceid=US:en"},
+		// INDIAN TECH PRESS, 2026-09-29, beside the Asian outlets of 2026-09-24.
+		// Mostly company and product news; the briefing's top stories still need
+		// several outlets on one event, so these widen coverage without
+		// crowding the front of the news.
+		{"ET CIO (coverage)", "https://news.google.com/rss/search?q=site:cio.economictimes.indiatimes.com+AI&hl=en-IN&gl=IN&ceid=IN:en"},
+		{"Analytics India Magazine (coverage)", "https://news.google.com/rss/search?q=site:analyticsindiamag.com+AI&hl=en-IN&gl=IN&ceid=IN:en"},
+		{"Inc42 (coverage)", "https://news.google.com/rss/search?q=site:inc42.com+AI&hl=en-IN&gl=IN&ceid=IN:en"},
+		{"TechGig (coverage)", "https://news.google.com/rss/search?q=site:techgig.com+AI&hl=en-IN&gl=IN&ceid=IN:en"},
 		// ACCOUNTING TRADE PRESS, 2026-09-28. Tagged (accounting):
 		// twoai_accounting_news turns each new AI story from these into a
 		// one-outlet story pinned to the AI Accountant section.
