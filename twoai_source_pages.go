@@ -25,7 +25,9 @@ package main
 // point, so the industry page links to our summary beside the source link.
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -123,12 +125,28 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 		spr.Close()
 	}
 
-	written, skipped, unusable := 0, 0, 0
+	// READ THE WHOLE SITE FIRST, 2026-09-29. Stephen: crawl it, digest all
+	// it has to offer, and only then make a page. Crawling and digesting run
+	// here, a few sites a run; a page is written only from a finished digest.
+	cited := map[string][]string{}
+	industryOf := map[string]string{}
 	for _, j := range jobs {
-		if j.status != 200 || len(j.extract) < 500 {
-			unusable++
+		d := crawlHost(j.url)
+		if d == "" {
 			continue
 		}
+		cited[d] = append(cited[d], j.url)
+		if industryOf[d] == "" {
+			industryOf[d] = j.industry
+		}
+	}
+	twoaiSiteCrawlStep(db, cited, industryOf)
+
+	written, skipped, unusable := 0, 0, 0
+	for _, j := range jobs {
+		// The cited page alone no longer decides anything: a broken or thin
+		// cited address on a site with real material still gets a page, from
+		// the site's digest.
 		juid := twoaiUID("source:" + j.url)
 		if withdrawn[juid] {
 			unusable++
@@ -139,11 +157,27 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 			unusable++
 			continue
 		}
-		if sourceErrorPage.MatchString(trunc(j.extract, 1500)) {
-			withdraw(juid, j.url, "the source address returns an error or access page", "rule")
+
+		// The digest, not the single cited page, is what the page is written
+		// from. No finished digest yet: wait. A digest with no substantive
+		// page: the site gets no page.
+		dom := crawlHost(j.url)
+		var digestRaw sql.NullString
+		var useful, pagesRead int
+		var digestedOn sql.NullString
+		db.QueryRow(`SELECT digest::text, COALESCE(useful_pages,0), COALESCE(pages_fetched,0), digested_on::text FROM twoai_site_crawl
+			WHERE domain=$1 AND digested_on IS NOT NULL AND digested_on >= crawled_on`, dom).Scan(&digestRaw, &useful, &pagesRead, &digestedOn)
+		if !digestRaw.Valid {
 			unusable++
 			continue
 		}
+		if useful == 0 {
+			withdraw(juid, j.url, "a reading of the whole website found nothing substantive about AI in this industry", "site-crawl")
+			unusable++
+			continue
+		}
+		dh := sha256.Sum256([]byte(digestRaw.String))
+		j.hash = "site:" + hex.EncodeToString(dh[:8])
 		if j.hasDoc && j.oldHash == j.hash {
 			skipped++
 			continue
@@ -152,8 +186,8 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 			continue
 		}
 		uid := twoaiUID("source:" + j.url)
-		system := "You write a reference page for theworldofai.org that summarises ONE outside source for a reader interested in artificial intelligence in the " + j.industry + " industry. " +
-			"Use only the source text supplied. Do not add facts, names or numbers the text does not contain. " +
+		system := "You write a reference page for theworldofai.org about what ONE organisation's website offers a reader interested in artificial intelligence in the " + j.industry + " industry. " +
+			"You are given what a full reading of the website found, page by page. Use only those findings. Do not add facts, names or numbers they do not contain. Write in full, readable editorial prose, the way a well edited trade publication would, not in notes or slogans. " +
 			"First decide whether the source deserves a page. It does only if the text itself contains substantive information a reader following AI in this industry would learn from: findings, data, rules, guidance, programmes, or described uses of AI. " +
 			"It does not if the text is an error, not found, login, cookie or access page; belongs to a different organisation than the one cited; is a home or landing page that is mainly navigation, membership, events or marketing; or says nothing about AI in this industry. " +
 			"If it does not, return only {\"publishable\": false, \"reason\": \"<one short phrase>\"} and nothing else. Never write a page whose subject is that the source is thin, broken or promotional. " +
@@ -165,8 +199,32 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 			"{\"heading\": \"Figures and claims worth noting\", \"body\": \"<specific numbers, definitions or positions the text gives, each attributed to the source; or one sentence saying the text gives none>\"}, " +
 			"{\"heading\": \"What it means for AI in " + j.industry + "\", \"body\": \"<why a reader following AI in this industry would use this source, grounded in what it actually contains>\"}, " +
 			"{\"heading\": \"Limits of this source\", \"body\": \"<what it does not cover, whether it is commercial, dated or partial, from the text itself>\"}]}"
-		user := fmt.Sprintf("Industry: %s\nThe point on our industry page that cites this source: %s. %s\nSource URL: %s\n\nSource text (harvested %s):\n\n%s",
-			j.industry, j.name, j.desc, j.url, today, trunc(j.extract, 9000))
+		var fs []siteFinding
+		json.Unmarshal([]byte(digestRaw.String), &fs)
+		var fb strings.Builder
+		var usedPages []map[string]string
+		titles := map[string]string{}
+		if tr, terr := db.Query(`SELECT url, COALESCE(title,'') FROM twoai_site_crawl_pages WHERE domain=$1`, dom); terr == nil {
+			for tr.Next() {
+				var u, t string
+				if tr.Scan(&u, &t) == nil {
+					titles[u] = t
+				}
+			}
+			tr.Close()
+		}
+		for _, f := range fs {
+			if !f.Useful || len(f.Facts) == 0 {
+				continue
+			}
+			fmt.Fprintf(&fb, "PAGE %s (%s%s): %s\n", f.URL, f.Kind, map[bool]string{true: ", " + f.Date, false: ""}[f.Date != ""], f.What)
+			for _, x := range f.Facts {
+				fmt.Fprintf(&fb, "  - %s\n", x)
+			}
+			usedPages = append(usedPages, map[string]string{"url": f.URL, "title": titles[f.URL], "date": f.Date})
+		}
+		user := fmt.Sprintf("Industry: %s\nThe point on our industry page that cites this organisation: %s. %s\nWebsite: %s, %d pages read on %s.\n\nWhat the website's pages say about AI, page by page:\n\n%s",
+			j.industry, j.name, j.desc, dom, pagesRead, digestedOn.String, trunc(fb.String(), 14000))
 		out, model, gerr := twoaiGenerate("twoai_source_pages", system, user)
 		if gerr != nil {
 			db.Exec(`INSERT INTO twoai_source_pages (url, uid, industry_slug, industry_name, point_name, error)
@@ -221,7 +279,8 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 			"hub_name":    "Industry Use Cases",
 			"parent_name": j.industry, "parent_path": sectionPath[j.slug],
 			"crumbs":     []map[string]string{{"name": "Industry Use Cases", "path": base + twoaiUID("section:industry-use-cases") + "/"}, {"name": j.industry, "path": sectionPath[j.slug]}},
-			"source_url": j.url, "source_name": j.name, "source_read_on": today,
+			"source_url": j.url, "source_name": j.name, "source_read_on": digestedOn.String,
+			"built_from": "site-crawl", "site_domain": dom, "site_pages_read": pagesRead, "site_pages": usedPages,
 			"kind": "source-summary", "industry_slug": j.slug,
 			"generated": today, "built_at": time.Now().Format(time.RFC3339),
 			"refresh_every_days": 90, "noindex": false, "expanded": true,
@@ -247,7 +306,7 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 	var rvs []rv
 	if rr, rerr := db.Query(`SELECT sp.uid, sp.url, sp.industry_name, COALESCE(h.extract,'')
 			FROM twoai_source_pages sp LEFT JOIN twoai_source_harvest h ON h.url = sp.url
-			WHERE sp.doc IS NOT NULL
+			WHERE sp.doc IS NOT NULL AND sp.doc->>'built_from' = 'site-crawl'
 			  AND NOT EXISTS (SELECT 1 FROM twoai_source_reviews r WHERE r.uid = sp.uid)
 			  AND NOT EXISTS (SELECT 1 FROM twoai_source_withdrawals w WHERE w.uid = sp.uid)
 			ORDER BY sp.uid LIMIT 20`); rerr == nil {
@@ -297,6 +356,7 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 	// in the same industry) filled in fresh each run so new pages appear on
 	// old ones.
 	sib, err := db.Query(`SELECT industry_slug, uid, doc->>'name' FROM twoai_source_pages sp WHERE doc IS NOT NULL
+		AND doc->>'built_from' = 'site-crawl'
 		AND NOT EXISTS (SELECT 1 FROM twoai_source_withdrawals w WHERE w.uid = sp.uid) ORDER BY industry_slug, doc->>'name'`)
 	if err != nil {
 		return written, err
@@ -326,6 +386,25 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 	for _, p := range pubs {
 		var doc map[string]any
 		if json.Unmarshal([]byte(p.raw), &doc) != nil {
+			continue
+		}
+		if bf, _ := doc["built_from"].(string); bf != "site-crawl" && !withdrawn[p.uid] {
+			// Written from one page before the whole-site rule; held back
+			// until its site has been read, then rewritten.
+			doc["noindex"] = true
+			doc["redirect_to"] = sectionPath[p.slug]
+			doc["held_until_site_read"] = true
+			raw, _ := json.Marshal(doc)
+			db.Exec(`INSERT INTO twoai_pages (path, kind, taxonomy_slug, data, url_count, updated_at)
+				VALUES ($1, 'tech-section', $2, $3::jsonb, 1, now())
+				ON CONFLICT (path) DO UPDATE SET data = EXCLUDED.data, updated_at = now()
+				WHERE twoai_pages.data::text IS DISTINCT FROM EXCLUDED.data::text`,
+				"industries/source-"+p.uid+".json", p.slug, string(raw))
+			db.Exec(`UPDATE twoai_pages SET data = jsonb_set(data, '{points}', (
+					SELECT jsonb_agg(CASE WHEN pt->>'reading_path' = $2 THEN pt - 'reading_path' ELSE pt END)
+					FROM jsonb_array_elements(data->'points') pt)), updated_at = now()
+				WHERE path = $1 AND EXISTS (SELECT 1 FROM jsonb_array_elements(data->'points') q WHERE q->>'reading_path' = $2)`,
+				"industries/"+p.slug+".json", base+p.uid+"/")
 			continue
 		}
 		if withdrawn[p.uid] {
