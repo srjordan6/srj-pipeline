@@ -28,11 +28,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
 
 const twoaiSourcePagesPerRun = 12
+
+// sourceErrorPage matches the opening of a harvested page that is an error,
+// not found, access or JavaScript wall rather than content.
+var sourceErrorPage = regexp.MustCompile(`(?i)(page (you (are|were) looking for )?(could|can)(not| ?n.t) be found|page not found|404 (error|not found)|this page (does not|doesn.t) exist|access denied|you don.t have permission|enable javascript|please verify you are a human|are you a robot|request blocked)`)
 
 func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_source_pages (
@@ -78,6 +83,33 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 	}
 	rows.Close()
 
+	// WITHDRAWALS, 2026-09-29. Stephen found a published page headed "AICPA &
+	// CIMA AI topic page: an error page, not guidance". The prompt had told
+	// the model to say plainly when a source was a thin landing page, and the
+	// result was published: 15 pages about error pages, wrong sites, pages on
+	// this site, and homepages with no AI content, and about 90 more
+	// describing landing pages. A summary is now published only when the
+	// source has substance a reader following AI in the industry would learn
+	// from; everything else is withdrawn, with the reason kept here.
+	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_source_withdrawals (uid text PRIMARY KEY, url text,
+		reason text NOT NULL, withdrawn_on date NOT NULL DEFAULT current_date, withdrawn_by text NOT NULL)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_source_reviews (uid text PRIMARY KEY, publishable boolean NOT NULL,
+		reason text, reviewed_on date NOT NULL DEFAULT current_date, model text)`)
+	withdrawn := map[string]bool{}
+	if wr, werr := db.Query(`SELECT uid FROM twoai_source_withdrawals`); werr == nil {
+		for wr.Next() {
+			var u string
+			if wr.Scan(&u) == nil {
+				withdrawn[u] = true
+			}
+		}
+		wr.Close()
+	}
+	withdraw := func(uid, url, reason, by string) {
+		db.Exec(`INSERT INTO twoai_source_withdrawals (uid, url, reason, withdrawn_by) VALUES ($1,$2,$3,$4) ON CONFLICT (uid) DO NOTHING`, uid, url, reason, by)
+		withdrawn[uid] = true
+	}
+
 	// Industry page paths, for the crumb back and the sibling list.
 	sectionPath := map[string]string{}
 	spr, err := db.Query(`SELECT taxonomy_slug, data->>'uid' FROM twoai_pages WHERE path LIKE 'industries/industry-%' AND data->>'shape' = 'tech-section'`)
@@ -97,6 +129,21 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 			unusable++
 			continue
 		}
+		juid := twoaiUID("source:" + j.url)
+		if withdrawn[juid] {
+			unusable++
+			continue
+		}
+		if strings.Contains(strings.ToLower(j.url), "theworldofai.org") {
+			withdraw(juid, j.url, "the source is a page on this site", "rule")
+			unusable++
+			continue
+		}
+		if sourceErrorPage.MatchString(trunc(j.extract, 1500)) {
+			withdraw(juid, j.url, "the source address returns an error or access page", "rule")
+			unusable++
+			continue
+		}
 		if j.hasDoc && j.oldHash == j.hash {
 			skipped++
 			continue
@@ -106,9 +153,12 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 		}
 		uid := twoaiUID("source:" + j.url)
 		system := "You write a reference page for theworldofai.org that summarises ONE outside source for a reader interested in artificial intelligence in the " + j.industry + " industry. " +
-			"Use only the source text supplied. Do not add facts, names or numbers the text does not contain; if the text is a landing page with little substance, say so plainly rather than padding. " +
+			"Use only the source text supplied. Do not add facts, names or numbers the text does not contain. " +
+			"First decide whether the source deserves a page. It does only if the text itself contains substantive information a reader following AI in this industry would learn from: findings, data, rules, guidance, programmes, or described uses of AI. " +
+			"It does not if the text is an error, not found, login, cookie or access page; belongs to a different organisation than the one cited; is a home or landing page that is mainly navigation, membership, events or marketing; or says nothing about AI in this industry. " +
+			"If it does not, return only {\"publishable\": false, \"reason\": \"<one short phrase>\"} and nothing else. Never write a page whose subject is that the source is thin, broken or promotional. " +
 			"Plain English, commas rather than dashes, no bullet lists, no headings inside bodies, no marketing language, no mention of these instructions. " +
-			"Return only JSON with this shape: {\"title\": \"<the page title, naming the publisher and what the source is, under 90 characters>\", " +
+			"If it does, return only JSON with this shape: {\"publishable\": true, \"title\": \"<the page title, naming the publisher and what the source is, under 90 characters>\", " +
 			"\"answer\": \"<70 to 100 words: what this source is and the single most useful thing it says, written to stand alone>\", " +
 			"\"sections\": [{\"heading\": \"What this source is\", \"body\": \"<who publishes it, what kind of document it is, its scope and date if stated>\"}, " +
 			"{\"heading\": \"What it says\", \"body\": \"<the substance, 150 to 250 words, faithful to the text>\"}, " +
@@ -131,12 +181,21 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 			s = s[:k+1]
 		}
 		var m struct {
-			Title    string `json:"title"`
-			Answer   string `json:"answer"`
-			Sections []struct {
+			Publishable *bool  `json:"publishable"`
+			Reason      string `json:"reason"`
+			Title       string `json:"title"`
+			Answer      string `json:"answer"`
+			Sections    []struct {
 				Heading string `json:"heading"`
 				Body    string `json:"body"`
 			} `json:"sections"`
+		}
+		if json.Unmarshal([]byte(strings.TrimSpace(s)), &m) == nil && m.Publishable != nil && !*m.Publishable {
+			withdraw(uid, j.url, "not substantive: "+strings.TrimSpace(m.Reason), "model")
+			db.Exec(`INSERT INTO twoai_source_reviews (uid, publishable, reason, model) VALUES ($1,false,$2,$3)
+				ON CONFLICT (uid) DO UPDATE SET publishable=false, reason=$2, reviewed_on=current_date, model=$3`, uid, m.Reason, model)
+			unusable++
+			continue
 		}
 		if err := json.Unmarshal([]byte(strings.TrimSpace(s)), &m); err != nil || strings.TrimSpace(m.Answer) == "" || len(m.Sections) < 3 {
 			db.Exec(`INSERT INTO twoai_source_pages (url, uid, industry_slug, industry_name, point_name, error)
@@ -174,15 +233,71 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 			j.url, uid, j.slug, j.industry, j.name, j.hash, string(raw), model); err != nil {
 			return written, err
 		}
+		db.Exec(`INSERT INTO twoai_source_reviews (uid, publishable, reason, model) VALUES ($1,true,'written under the substance test',$2)
+			ON CONFLICT (uid) DO UPDATE SET publishable=true, reason='written under the substance test', reviewed_on=current_date, model=$2`, uid, model)
 		written++
 		fmt.Printf("twoai_source_pages: wrote %s (%s) for %s via %s\n", uid, trunc(title, 60), j.industry, model)
 		time.Sleep(300 * time.Millisecond)
 	}
 
+	// REVIEW OF PAGES WRITTEN BEFORE THE SUBSTANCE TEST, 20 a run. Each
+	// existing page's source text is put to the same test; a page that fails
+	// is withdrawn.
+	type rv struct{ uid, url, industry, extract string }
+	var rvs []rv
+	if rr, rerr := db.Query(`SELECT sp.uid, sp.url, sp.industry_name, COALESCE(h.extract,'')
+			FROM twoai_source_pages sp LEFT JOIN twoai_source_harvest h ON h.url = sp.url
+			WHERE sp.doc IS NOT NULL
+			  AND NOT EXISTS (SELECT 1 FROM twoai_source_reviews r WHERE r.uid = sp.uid)
+			  AND NOT EXISTS (SELECT 1 FROM twoai_source_withdrawals w WHERE w.uid = sp.uid)
+			ORDER BY sp.uid LIMIT 20`); rerr == nil {
+		for rr.Next() {
+			var r rv
+			if rr.Scan(&r.uid, &r.url, &r.industry, &r.extract) == nil {
+				rvs = append(rvs, r)
+			}
+		}
+		rr.Close()
+	}
+	reviewedOut := 0
+	for _, r := range rvs {
+		sys := "You decide whether an outside web page deserves its own summary page on theworldofai.org, for a reader following AI in the " + r.industry + " industry. " +
+			"It does only if the text itself contains substantive information that reader would learn from: findings, data, rules, guidance, programmes, or described uses of AI. " +
+			"It does not if the text is an error, not found, login, cookie or access page; belongs to a different organisation than the address suggests; is a home or landing page that is mainly navigation, membership, events or marketing; or says nothing about AI in this industry. " +
+			`Return only JSON: {"publishable": true or false, "reason": "<one short phrase>"}`
+		out, model, gerr := twoaiGenerate("twoai_source_pages", sys, "Address: "+r.url+"\n\nText:\n"+trunc(r.extract, 6000))
+		if gerr != nil {
+			continue
+		}
+		o := out
+		if i := strings.Index(o, "{"); i >= 0 {
+			o = o[i:]
+		}
+		if k := strings.LastIndex(o, "}"); k >= 0 {
+			o = o[:k+1]
+		}
+		var v struct {
+			Publishable *bool  `json:"publishable"`
+			Reason      string `json:"reason"`
+		}
+		if json.Unmarshal([]byte(o), &v) != nil || v.Publishable == nil {
+			continue
+		}
+		db.Exec(`INSERT INTO twoai_source_reviews (uid, publishable, reason, model) VALUES ($1,$2,$3,$4) ON CONFLICT (uid) DO NOTHING`, r.uid, *v.Publishable, v.Reason, model)
+		if !*v.Publishable {
+			withdraw(r.uid, r.url, "not substantive: "+strings.TrimSpace(v.Reason), "review")
+			reviewedOut++
+		}
+	}
+	if len(rvs) > 0 {
+		fmt.Printf("twoai_source_pages: reviewed=%d withdrawn=%d\n", len(rvs), reviewedOut)
+	}
+
 	// Publish every written page, with siblings (the other summarised sources
 	// in the same industry) filled in fresh each run so new pages appear on
 	// old ones.
-	sib, err := db.Query(`SELECT industry_slug, uid, doc->>'name' FROM twoai_source_pages WHERE doc IS NOT NULL ORDER BY industry_slug, doc->>'name'`)
+	sib, err := db.Query(`SELECT industry_slug, uid, doc->>'name' FROM twoai_source_pages sp WHERE doc IS NOT NULL
+		AND NOT EXISTS (SELECT 1 FROM twoai_source_withdrawals w WHERE w.uid = sp.uid) ORDER BY industry_slug, doc->>'name'`)
 	if err != nil {
 		return written, err
 	}
@@ -211,6 +326,34 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 	for _, p := range pubs {
 		var doc map[string]any
 		if json.Unmarshal([]byte(p.raw), &doc) != nil {
+			continue
+		}
+		if withdrawn[p.uid] {
+			// The URL stays (published URLs never disappear), but it no longer
+			// carries the summary, is kept out of search, and sends the reader
+			// to the industry page; the industry point stops linking to it.
+			ind, _ := doc["parent_name"].(string)
+			wdoc := map[string]any{
+				"uid": p.uid, "page_uid": p.uid, "shape": "art-topic", "slug": "source-" + p.uid,
+				"name": ind + ": source reference", "title": ind + ": source reference",
+				"answer":   "This page is no longer maintained. The sources we currently rely on for AI in " + ind + " are listed on the " + ind + " page.",
+				"sections": []map[string]string{}, "category": "enterprise-applications-governance-and-tools",
+				"hub_name": "Industry Use Cases", "parent_name": ind, "parent_path": sectionPath[p.slug],
+				"crumbs": doc["crumbs"], "kind": "source-summary", "industry_slug": p.slug, "withdrawn": true,
+				"redirect_to": sectionPath[p.slug], "noindex": true,
+				"generated": today, "built_at": time.Now().Format(time.RFC3339), "refresh_every_days": 365, "archived": true,
+			}
+			raw, _ := json.Marshal(wdoc)
+			db.Exec(`INSERT INTO twoai_pages (path, kind, taxonomy_slug, data, url_count, updated_at)
+				VALUES ($1, 'tech-section', $2, $3::jsonb, 1, now())
+				ON CONFLICT (path) DO UPDATE SET data = EXCLUDED.data, updated_at = now()
+				WHERE twoai_pages.data::text IS DISTINCT FROM EXCLUDED.data::text`,
+				"industries/source-"+p.uid+".json", p.slug, string(raw))
+			db.Exec(`UPDATE twoai_pages SET data = jsonb_set(data, '{points}', (
+					SELECT jsonb_agg(CASE WHEN pt->>'reading_path' = $2 THEN pt - 'reading_path' ELSE pt END)
+					FROM jsonb_array_elements(data->'points') pt)), updated_at = now()
+				WHERE path = $1 AND EXISTS (SELECT 1 FROM jsonb_array_elements(data->'points') q WHERE q->>'reading_path' = $2)`,
+				"industries/"+p.slug+".json", base+p.uid+"/")
 			continue
 		}
 		var sibs []map[string]string
