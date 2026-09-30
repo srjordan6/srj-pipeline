@@ -53,6 +53,12 @@ var crawlUA = "theworldofai.org site reader (+https://theworldofai.org/editorial
 var crawlSkipExt = regexp.MustCompile(`(?i)\.(pdf|jpe?g|png|gif|svg|webp|ico|zip|gz|mp4|mp3|mov|avi|docx?|xlsx?|pptx?|css|js|json|xml|rss|woff2?|ttf)(\?|$)`)
 var crawlSkipPath = regexp.MustCompile(`(?i)/(login|signin|sign-in|register|cart|checkout|account|my-account|search|wp-admin|wp-login|subscribe|unsubscribe|privacy|cookie|terms|careers?|jobs?|donate|shop|store|tag|author|feed)(/|$)|mailto:|tel:|javascript:`)
 var crawlPriority = regexp.MustCompile(`(?i)(artificial-intelligence|/ai[/-]|-ai[/-]|/ai$|machine-learning|automation|autonomous|generative|agentic|algorithm|analytics|data-science|innovation|technology|digital|research|report|insight|study|survey|guidance|standard|framework|policy|publication|whitepaper|white-paper|case-stud|resource)`)
+
+// crawlStrongAI marks addresses that are about AI itself. A path that says
+// only "technology" or "insights" is a general section; on aicpa-cima.com,
+// 2026-09-29, sixty such pages filled the budget and none of them mentioned AI.
+var crawlStrongAI = regexp.MustCompile(`(?i)(artificial-intelligence|artificial_intelligence|/ai[/-]|-ai[/-]|-ai$|/ai$|machine-learning|generative|genai|gen-ai|agentic|llm|large-language)`)
+
 var crawlHrefRe = regexp.MustCompile(`(?is)<a\s[^>]*href\s*=\s*["']([^"'#]+)["'][^>]*>(.*?)</a>`)
 var crawlBlockRe = regexp.MustCompile(`(?i)</(p|div|li|h1|h2|h3|h4|h5|td|tr|section|article|blockquote)>|<br\s*/?>`)
 
@@ -225,7 +231,9 @@ func twoaiCrawlSite(db *sql.DB, domain string, starts []string) (int, int) {
 		}
 		seen[k] = true
 		sc := base
-		if crawlPriority.MatchString(p.Path) {
+		if crawlStrongAI.MatchString(p.Path) {
+			sc += 30
+		} else if crawlPriority.MatchString(p.Path) {
 			sc += 10
 		}
 		if aiTermRe.MatchString(anchor) {
@@ -238,11 +246,13 @@ func twoaiCrawlSite(db *sql.DB, domain string, starts []string) (int, int) {
 	}
 	push(root+"/", "", 50)
 	for _, s := range crawlSitemap(client, root) {
-		if crawlPriority.MatchString(s) {
+		if crawlStrongAI.MatchString(s) {
 			push(s, "", 20)
+		} else if crawlPriority.MatchString(s) {
+			push(s, "", 0)
 		}
 	}
-	fetched, relevant := 0, 0
+	fetched, relevant, okPages, okChars := 0, 0, 0, 0
 	for len(queue) > 0 && fetched < twoaiCrawlMaxPages {
 		sort.SliceStable(queue, func(i, j int) bool { return queue[i].score > queue[j].score })
 		c := queue[0]
@@ -266,6 +276,10 @@ func twoaiCrawlSite(db *sql.DB, domain string, starts []string) (int, int) {
 			VALUES ($1,$2,$3,$4,$5,$6,current_date,$7)
 			ON CONFLICT (url) DO UPDATE SET title=$3, text=$4, ai_score=$5, http_status=$6, fetched_on=current_date, content_hash=$7`,
 			final, domain, title, text, score, st, hex.EncodeToString(h[:8]))
+		if st == 200 {
+			okPages++
+			okChars += len(text)
+		}
 		if st == 200 && score >= 3 && len(text) > 800 {
 			relevant++
 		}
@@ -281,10 +295,19 @@ func twoaiCrawlSite(db *sql.DB, domain string, starts []string) (int, int) {
 			push(base.ResolveReference(ref).String(), enfPlain(string(m[2])), 0)
 		}
 	}
-	db.Exec(`INSERT INTO twoai_site_crawl (domain, start_url, pages_fetched, pages_relevant, crawled_on)
-		VALUES ($1,$2,$3,$4,current_date)
-		ON CONFLICT (domain) DO UPDATE SET start_url=$2, pages_fetched=$3, pages_relevant=$4, crawled_on=current_date`,
-		domain, starts[0], fetched, relevant)
+	// UNREADABLE IS NOT EMPTY. A site that serves a script shell, or blocks
+	// the reader after a page or two, has not been read, so its lack of AI
+	// material proves nothing. aicpa-cima.com gave sixty pages of about 650
+	// characters each; airbus.com gave two. Such a site is marked unreadable
+	// and gets no page, and no judgement is recorded against it.
+	status := "read"
+	if relevant == 0 && (okPages < 10 || okChars/max(okPages, 1) < 1200) {
+		status = "unreadable"
+	}
+	db.Exec(`INSERT INTO twoai_site_crawl (domain, start_url, pages_fetched, pages_relevant, crawled_on, crawl_status)
+		VALUES ($1,$2,$3,$4,current_date,$5)
+		ON CONFLICT (domain) DO UPDATE SET start_url=$2, pages_fetched=$3, pages_relevant=$4, crawled_on=current_date, crawl_status=$5`,
+		domain, starts[0], fetched, relevant, status)
 	return fetched, relevant
 }
 
@@ -377,6 +400,7 @@ func twoaiSiteCrawlStep(db *sql.DB, cited map[string][]string, industryOf map[st
 		pages_fetched int, pages_relevant int, crawled_on date, digest jsonb, digested_on date, useful_pages int, model text)`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_site_crawl_pages (url text PRIMARY KEY, domain text NOT NULL, title text,
 		text text, ai_score int, http_status int, fetched_on date, content_hash text)`)
+	db.Exec(`ALTER TABLE twoai_site_crawl ADD COLUMN IF NOT EXISTS crawl_status text`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS twoai_site_crawl_pages_domain ON twoai_site_crawl_pages (domain)`)
 	var domains []string
 	for d := range cited {

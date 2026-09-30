@@ -98,7 +98,9 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_source_reviews (uid text PRIMARY KEY, publishable boolean NOT NULL,
 		reason text, reviewed_on date NOT NULL DEFAULT current_date, model text)`)
 	withdrawn := map[string]bool{}
-	if wr, werr := db.Query(`SELECT uid FROM twoai_source_withdrawals`); werr == nil {
+	// A site-crawl verdict is not a permanent withdrawal: the site is read
+	// again every 90 days and the digest decides afresh each time.
+	if wr, werr := db.Query(`SELECT uid FROM twoai_source_withdrawals WHERE withdrawn_by <> 'site-crawl'`); werr == nil {
 		for wr.Next() {
 			var u string
 			if wr.Scan(&u) == nil {
@@ -172,7 +174,8 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 			continue
 		}
 		if useful == 0 {
-			withdraw(juid, j.url, "a reading of the whole website found nothing substantive about AI in this industry", "site-crawl")
+			// No page while the latest reading finds nothing substantive, or
+			// could not read the site at all; decided again at the next read.
 			unusable++
 			continue
 		}
