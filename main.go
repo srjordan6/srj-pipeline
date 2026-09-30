@@ -7166,6 +7166,10 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 					twoaiUID("section:"+catTax[key]) + "/"
 			}
 		}
+		// What the site holds about this person, and a reading of it.
+		if nm, _ := d["name"].(string); nm != "" {
+			twoaiPersonContext(db, uid, nm, d)
+		}
 		if err := upsert("people/"+uid+".json", "person", d); err != nil {
 			return count, err
 		}
