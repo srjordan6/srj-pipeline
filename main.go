@@ -3879,6 +3879,16 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"The Record AI security (coverage)", "https://news.google.com/rss/search?q=site:therecord.media+AI+OR+%22artificial+intelligence%22&hl=en-US&gl=US&ceid=US:en"},
 		{"Dark Reading AI security (coverage)", "https://news.google.com/rss/search?q=site:darkreading.com+AI+OR+%22artificial+intelligence%22+OR+agent&hl=en-US&gl=US&ceid=US:en"},
 		{"SecurityWeek AI (coverage)", "https://news.google.com/rss/search?q=site:securityweek.com+AI+OR+%22artificial+intelligence%22+OR+agent&hl=en-US&gl=US&ceid=US:en"},
+		// DEVELOPER AND ENTERPRISE IT PRESS, 2026-09-29. Stephen asked for the
+		// developer stories a newsletter carried and the site missed: agent
+		// standards, AI in software teams, infrastructure for AI workloads, AI
+		// and the changing threat picture. The AI-in-the-headline rule still
+		// applies, so framework release notes with no AI in them stay out.
+		{"DevOps.com (coverage)", "https://news.google.com/rss/search?q=site:devops.com+AI+OR+agent+OR+%22artificial+intelligence%22&hl=en-US&gl=US&ceid=US:en"},
+		{"InfoQ (coverage)", "https://news.google.com/rss/search?q=site:infoq.com+AI+OR+agent+OR+LLM&hl=en-US&gl=US&ceid=US:en"},
+		{"The New Stack (coverage)", "https://news.google.com/rss/search?q=site:thenewstack.io+AI+OR+agent+OR+LLM&hl=en-US&gl=US&ceid=US:en"},
+		{"SD Times (coverage)", "https://news.google.com/rss/search?q=site:sdtimes.com+AI+OR+agent&hl=en-US&gl=US&ceid=US:en"},
+		{"TechDay IT Brief (coverage)", "https://news.google.com/rss/search?q=site:itbrief.com.au+OR+site:techday.com+AI+OR+agent&hl=en-US&gl=US&ceid=US:en"},
 		// INDIAN TECH PRESS, 2026-09-29, beside the Asian outlets of 2026-09-24.
 		// Mostly company and product news; the briefing's top stories still need
 		// several outlets on one event, so these widen coverage without
