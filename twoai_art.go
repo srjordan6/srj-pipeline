@@ -192,6 +192,57 @@ Rules:
 Answer with one JSON object and nothing else:
 {"scope": "", "infra": "", "method": "", "governance": "", "horizon": ""}`
 
+// eduChapterPapers: the research behind one chapter of The AI Ready School,
+// from srj_edu_research (Stephen loaded 350 papers on 2026-09-29, each
+// tagged with the chapter it speaks to and a key finding in our own words).
+// Only the finding, the caveat and the citation record are published; the
+// link goes to the paper's own home (DOI, then the paper's URL), never to an
+// aggregator, and abstracts and full text are never reproduced.
+type eduPaper struct {
+	Title    string `json:"title"`
+	Venue    string `json:"venue,omitempty"`
+	Year     int    `json:"year,omitempty"`
+	URL      string `json:"url,omitempty"`
+	Finding  string `json:"finding,omitempty"`
+	Why      string `json:"why,omitempty"`
+	Caveat   string `json:"caveat,omitempty"`
+	Theme    string `json:"theme,omitempty"`
+	Cites    int    `json:"citations,omitempty"`
+	ReadDeep string `json:"read_depth,omitempty"`
+}
+
+func eduChapterPapers(db *sql.DB, chapter int) []eduPaper {
+	rows, err := db.Query(`SELECT title, COALESCE(venue,''), COALESCE(pub_year,0),
+			CASE WHEN COALESCE(doi,'') <> '' THEN 'https://doi.org/' || regexp_replace(doi, '^https?://(dx\.)?doi\.org/', '')
+			     WHEN COALESCE(url,'') <> '' AND url NOT ILIKE '%consensus.app%' THEN url ELSE '' END,
+			COALESCE(key_finding,''), COALESCE(why_it_matters,''), COALESCE(caveat,''), COALESCE(theme,''),
+			COALESCE(citations_at_capture,0), COALESCE(read_depth,'')
+		FROM srj_edu_research
+		WHERE COALESCE(theme,'') <> 'low-k12-relevance' AND COALESCE(key_finding,'') <> ''
+		  AND $1 = ANY (regexp_split_to_array(COALESCE(book_chapter,''), '\s*,\s*'))
+		ORDER BY citations_at_capture DESC NULLS LAST, pub_year DESC LIMIT 40`, strconv.Itoa(chapter))
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []eduPaper
+	for rows.Next() {
+		var p eduPaper
+		if rows.Scan(&p.Title, &p.Venue, &p.Year, &p.URL, &p.Finding, &p.Why, &p.Caveat, &p.Theme, &p.Cites, &p.ReadDeep) == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func eduChapterOf(slug string) int {
+	if len(slug) == 8 && strings.HasPrefix(slug, "edu-ch") {
+		n, _ := strconv.Atoi(slug[6:])
+		return n
+	}
+	return 0
+}
+
 // Book-built sections. The page is written from the foundation text alone:
 // the book is the source, the model is the writer, and nothing the text does
 // not support goes on the page.
@@ -315,7 +366,13 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 		if n.Kind == "topic" || written >= twoaiArtCap {
 			continue
 		}
-		want := twoaiArtHash(n, facts.line(n.Section)+strings.Join(kidsOf[n.Slug], ","))
+		hubExtra := facts.line(n.Section) + strings.Join(kidsOf[n.Slug], ",")
+		if ch := eduChapterOf(n.Slug); ch > 0 {
+			for _, p := range eduChapterPapers(db, ch) {
+				hubExtra += "|" + p.Title
+			}
+		}
+		want := twoaiArtHash(n, hubExtra)
 		var have, haveModel string
 		var ageDays int
 		db.QueryRow(`SELECT data_hash, model, current_date - generated_on FROM twoai_art_readings WHERE slug = $1 AND block = 'hub'`, n.Slug).Scan(&have, &haveModel, &ageDays)
@@ -323,7 +380,7 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 		if haveModel == "curated" {
 			continue
 		}
-		if have != want && have == twoaiArtLegacyHash(n, facts.line(n.Section)+strings.Join(kidsOf[n.Slug], ",")) {
+		if have != want && have == twoaiArtLegacyHash(n, hubExtra) {
 			db.Exec(`UPDATE twoai_art_readings SET data_hash = $2 WHERE slug = $1 AND block = 'hub'`, n.Slug, want)
 			have = want
 		}
@@ -336,8 +393,21 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 		hubSys := twoaiArtHubSystem
 		if n.Source != "" {
 			hubSys = twoaiArtEduHubSystem
-			user = fmt.Sprintf("Section: %s\nPart of: %s\n\nThe book's text for this section:\n%s\n\nPages under it:\n%s\n\nAnswer now.",
-				n.Name, parentName[rootFor[n.Section]], trunc(n.Source, 9000), "- "+strings.Join(kidsOf[n.Slug], "\n- "))
+			research := ""
+			if ch := eduChapterOf(n.Slug); ch > 0 {
+				var rb strings.Builder
+				for i, p := range eduChapterPapers(db, ch) {
+					if i >= 20 {
+						break
+					}
+					fmt.Fprintf(&rb, "- %s (%s, %d): %s\n", p.Title, p.Venue, p.Year, p.Finding)
+				}
+				if rb.Len() > 0 {
+					research = "\n\nResearch this site holds for this chapter, each with its key finding in our words (use these as evidence where they fit; cite by title, never invent):\n" + rb.String()
+				}
+			}
+			user = fmt.Sprintf("Section: %s\nPart of: %s\n\nThe book's text for this section:\n%s%s\n\nPages under it:\n%s\n\nAnswer now.",
+				n.Name, parentName[rootFor[n.Section]], trunc(n.Source, 9000), research, "- "+strings.Join(kidsOf[n.Slug], "\n- "))
 		}
 		out, model, err := twoaiGenerate("art", hubSys, user)
 		if err != nil {
@@ -708,6 +778,16 @@ func twoaiArt(db *sql.DB, today string) error {
 			}
 			if n.Section == "edu" {
 				doc["book"] = map[string]string{"title": "The AI Ready School", "volume": "Volume X of The Operating Discipline for AI Library", "author": "Stephen R. Jordan"}
+				if ch := eduChapterOf(n.Slug); ch > 0 {
+					if papers := eduChapterPapers(db, ch); len(papers) > 0 {
+						doc["papers"] = papers
+					}
+				}
+				if n.Kind == "hub" {
+					var total, chapters int
+					db.QueryRow(`SELECT count(*), count(DISTINCT book_chapter) FROM srj_edu_research WHERE COALESCE(theme,'') <> 'low-k12-relevance' AND COALESCE(key_finding,'') <> ''`).Scan(&total, &chapters)
+					doc["research_total"] = total
+				}
 			}
 			if err := write(fileFor(n), taxFor[n.Section], doc); err != nil {
 				return err
