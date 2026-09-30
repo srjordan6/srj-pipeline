@@ -220,7 +220,7 @@ func eduChapterPapers(db *sql.DB, chapter int) []eduPaper {
 		FROM srj_edu_research
 		WHERE COALESCE(theme,'') <> 'low-k12-relevance' AND COALESCE(key_finding,'') <> ''
 		  AND $1 = ANY (regexp_split_to_array(COALESCE(book_chapter,''), '\s*,\s*'))
-		ORDER BY citations_at_capture DESC NULLS LAST, pub_year DESC LIMIT 40`, strconv.Itoa(chapter))
+		ORDER BY citations_at_capture DESC NULLS LAST, pub_year DESC`, strconv.Itoa(chapter))
 	if err != nil {
 		return nil
 	}
