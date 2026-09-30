@@ -36,6 +36,7 @@ func twoaiLiveCounts(db *sql.DB) map[string]string {
 	one("works_with_abstract", `SELECT count(*) FROM twoai_works WHERE duplicate_of IS NULL AND COALESCE(abstract,'') <> ''`)
 	one("works_earliest_year", `SELECT min(pub_year) FROM twoai_works WHERE pub_year > 1000`)
 	one("shelf_papers", `SELECT COALESCE(NULLIF(data->>'total','')::int, 0) FROM twoai_pages WHERE path = 'research/index.json'`)
+	one("shelf_topics", `SELECT count(*) FROM twoai_pages WHERE kind = 'research-topic'`)
 	one("companies_total", `SELECT count(*) FROM twoai_company_profiles`)
 	one("people_total", `SELECT count(*) FROM site_people`)
 	one("lawsuits_total", `SELECT count(*) FROM twoai_lawsuits`)

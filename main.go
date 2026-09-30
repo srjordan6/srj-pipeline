@@ -9539,10 +9539,18 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 
 	rows, err := db.Query(`SELECT t.slug, t.name, COALESCE(t.blurb,''), t.status,
 			COALESCE(t.live_path,''), COALESCE(t.parent_slug,''), t.level,
-			(SELECT GREATEST(
-				COALESCE(max(COALESCE(NULLIF(p.data->>'total',''), NULLIF(p.data->>'total_points',''))::int),0),
-				COALESCE(sum(p.url_count),0))
-			 FROM twoai_pages p WHERE p.taxonomy_slug = t.slug)
+			-- THE DATA COUNT WINS OVER THE PAGE COUNT. Stephen, 2026-09-29: the
+			-- Research Library read 149 beside a blurb saying 135 papers. The 149
+			-- was 135 paper pages plus the hub, eleven topic pages, the watch and
+			-- the sources page. When a section declares its total, that is the
+			-- number of the thing it holds; the page count is used only where no
+			-- total is declared, or where the pages far outnumber the declared
+			-- total because each page is itself one of the things (the lobbyist
+			-- registry declares its top 300 and publishes 4,342 pages).
+			(SELECT CASE WHEN tot > 0 AND pg <= tot * 2 THEN tot ELSE GREATEST(tot, pg) END FROM (
+				SELECT COALESCE(max(COALESCE(NULLIF(p.data->>'total',''), NULLIF(p.data->>'total_points',''))::int),0) AS tot,
+				       COALESCE(sum(p.url_count),0)::int AS pg
+				FROM twoai_pages p WHERE p.taxonomy_slug = t.slug) c)
 			-- Downloads are assets, not pages, and live in their own table keyed
 			-- by section. Stephen, 2026-09-17: the Downloads section showed no
 			-- counts at all, because it has eight assets and zero pages. A
