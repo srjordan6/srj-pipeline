@@ -66,6 +66,10 @@ type twoaiArtNode struct {
 	Blurb                              string
 	Scope, Infra, Method, Gov, Horizon string
 	Section, Category                  string
+	// Source is the foundation text a page is written from, when a section is
+	// built on a book (twoai_art_sources). AI in Education, 2026-09-29, is
+	// built on Stephen's Volume X, The AI Ready School.
+	Source string
 }
 
 // twoaiArtFacts is what the site knows that bears on creative AI. Everything
@@ -127,6 +131,10 @@ func (f twoaiArtFacts) line(section string) string {
 		return fmt.Sprintf("This site currently tracks %d active Model Context Protocol servers, %d of them for SQL databases and warehouses, %d research papers in its library, %d AI tools and %d glossary terms. Every page on this site is itself built from a PostgreSQL database.",
 			f.MCPTotal, f.DBMCP, f.Papers, f.Tools, f.GlossaryTerms)
 	}
+	if section == "edu" {
+		return fmt.Sprintf("This site currently holds %d compliance and regulation pages (student privacy law among them), %d research papers in its library, %d AI tools and %d glossary terms.",
+			f.Compliance, f.Papers, f.Tools, f.GlossaryTerms)
+	}
 	if section == "eco" {
 		return fmt.Sprintf("This site currently tracks %d listed AI-related instruments with daily prices, %d merger and acquisition filings, %d company pages, %d active AI lawsuits, %d compliance and regulation pages, %d AI tools and %d glossary terms.",
 			f.Tickers, f.MAFilings, f.SECCos, f.AllCases, f.Compliance, f.Tools, f.GlossaryTerms)
@@ -184,6 +192,43 @@ Rules:
 Answer with one JSON object and nothing else:
 {"scope": "", "infra": "", "method": "", "governance": "", "horizon": ""}`
 
+// Book-built sections. The page is written from the foundation text alone:
+// the book is the source, the model is the writer, and nothing the text does
+// not support goes on the page.
+const twoaiArtEduSystem = `You write reference pages for The World of AI, an atlas of artificial intelligence, in its AI in Education section.
+
+You are given one idea from the book The AI Ready School (Volume X of The Operating Discipline for AI Library, by Stephen R. Jordan) and the book's own text for it. Write a web page from that text for teachers, school leaders and parents.
+
+Return five parts:
+- answer: two or three sentences that stand alone as the complete answer to what this idea is and why it matters.
+- idea: one paragraph of four to five sentences on what the idea is and the problem it solves.
+- practice: one paragraph of four to five sentences on how it works in a school or classroom, by grade band where the text gives them.
+- evidence: one paragraph on what the evidence says, keeping the book's own evidence label and any study, figure or finding exactly as the text states it. If the text gives no evidence, say plainly that this idea rests on practice rather than research.
+- guardrails: one paragraph on the limits, risks and the decisions that stay with a person, as the text sets them out.
+
+Rules:
+- Use only the text supplied. Do not add studies, numbers, products, laws or dates it does not contain.
+- Write in your own words. Do not copy sentences from the text.
+- Full, readable editorial prose, never notes or slogans. Plain English. Commas, not dashes. No em dashes. No marketing language. No paragraph longer than five sentences.
+- Nothing here is legal advice; describe practice.
+
+Answer with one JSON object and nothing else:
+{"answer": "", "idea": "", "practice": "", "evidence": "", "guardrails": ""}`
+
+const twoaiArtEduHubSystem = `You write the opening of a section of The World of AI's AI in Education pages, built on the book The AI Ready School (Volume X of The Operating Discipline for AI Library, by Stephen R. Jordan).
+
+You are given the section name, the book's own text that introduces it, and the pages under it. Write three paragraphs of four to five sentences each:
+- what: what this part of school life is and what AI is actually doing in it, as the book describes it.
+- state: what the book finds works, what does not, and the rule it holds to.
+- map: how the pages listed below fit together and what a teacher, leader or parent would go to each for. Name them inside your own sentences rather than listing them.
+
+Rules:
+- Use only the text supplied. Do not add studies, numbers, products, laws or dates it does not contain. Write in your own words; do not copy sentences.
+- Plain English. Commas, not dashes. No em dashes. No marketing language.
+
+Answer with one JSON object and nothing else:
+{"what": "", "state": "", "map": ""}`
+
 // twoaiArtJSON pulls the object out of a reply that may still carry a fence or
 // a sentence around it.
 func twoaiArtJSON(raw string) (map[string]string, error) {
@@ -212,7 +257,11 @@ func twoaiArtJSON(raw string) (map[string]string, error) {
 // moves by roughly a tenth, which is when its text could be wrong.
 func twoaiArtHash(n twoaiArtNode, facts string) string {
 	facts = twoaiArtNumRe.ReplaceAllStringFunc(facts, twoaiArtRound)
-	h := sha256.Sum256([]byte(strings.Join([]string{n.Name, n.Scope, n.Infra, n.Method, n.Gov, n.Horizon, facts}, "|")))
+	parts := []string{n.Name, n.Scope, n.Infra, n.Method, n.Gov, n.Horizon, facts}
+	if n.Source != "" {
+		parts = append(parts, n.Source)
+	}
+	h := sha256.Sum256([]byte(strings.Join(parts, "|")))
 	return hex.EncodeToString(h[:])[:16]
 }
 
@@ -284,7 +333,13 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 		user := fmt.Sprintf("Section: %s\nPart of: %s\nWhat it covers: %s\nSite facts: %s\n\nPages under it:\n%s\n\nAnswer now.",
 			n.Name, parentName[rootFor[n.Section]], n.Blurb, facts.line(n.Section),
 			"- "+strings.Join(kidsOf[n.Slug], "\n- "))
-		out, model, err := twoaiGenerate("art", twoaiArtHubSystem, user)
+		hubSys := twoaiArtHubSystem
+		if n.Source != "" {
+			hubSys = twoaiArtEduHubSystem
+			user = fmt.Sprintf("Section: %s\nPart of: %s\n\nThe book's text for this section:\n%s\n\nPages under it:\n%s\n\nAnswer now.",
+				n.Name, parentName[rootFor[n.Section]], trunc(n.Source, 9000), "- "+strings.Join(kidsOf[n.Slug], "\n- "))
+		}
+		out, model, err := twoaiGenerate("art", hubSys, user)
 		if err != nil {
 			failed++
 			fmt.Printf("twoai_art: %s: %v\n", n.Slug, err)
@@ -364,7 +419,13 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 		}
 		user := fmt.Sprintf("Topic: %s\nField: %s, part of %s\nSite facts: %s\n\nEditor seed lines:\n%s\n\nAnswer now.",
 			n.Name, parentName[n.Parent], parentName[rootFor[n.Section]], facts.line(n.Section), seeds)
-		out, model, err := twoaiGenerate("art", twoaiArtSystem, user)
+		topicSys := twoaiArtSystem
+		if n.Source != "" {
+			topicSys = twoaiArtEduSystem
+			user = fmt.Sprintf("Idea: %s\nChapter: %s\n\nThe book's text for this idea:\n%s\n\nAnswer now.",
+				n.Name, parentName[n.Parent], trunc(n.Source, 9000))
+		}
+		out, model, err := twoaiGenerate("art", topicSys, user)
 		if err != nil {
 			failed++
 			fmt.Printf("twoai_art: %s: %v\n", n.Slug, err)
@@ -385,7 +446,13 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 			fmt.Printf("twoai_art: %s: unreadable answer: %v\n", n.Slug, jerr)
 			continue
 		}
-		if len(got["scope"]) < 80 || len(got["governance"]) < 80 {
+		if n.Source != "" {
+			if len(got["answer"]) < 80 || len(got["idea"]) < 120 || len(got["practice"]) < 120 || len(got["guardrails"]) < 80 {
+				failed++
+				fmt.Printf("twoai_art: %s: answer too short, nothing written\n", n.Slug)
+				continue
+			}
+		} else if len(got["scope"]) < 80 || len(got["governance"]) < 80 {
 			failed++
 			fmt.Printf("twoai_art: %s: answer too short, nothing written\n", n.Slug)
 			continue
@@ -423,6 +490,20 @@ func twoaiArt(db *sql.DB, today string) error {
 		}
 	}
 	rows.Close()
+	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_art_sources (slug text PRIMARY KEY, source_title text, source_text text NOT NULL, book text, updated_at timestamptz DEFAULT now())`)
+	srcOf := map[string]string{}
+	if sr, serr := db.Query(`SELECT slug, source_text FROM twoai_art_sources`); serr == nil {
+		for sr.Next() {
+			var k, v string
+			if sr.Scan(&k, &v) == nil {
+				srcOf[k] = v
+			}
+		}
+		sr.Close()
+	}
+	for i := range nodes {
+		nodes[i].Source = srcOf[nodes[i].Slug]
+	}
 	if len(nodes) == 0 {
 		fmt.Println("twoai_art: no nodes, nothing to build")
 		return nil
@@ -515,7 +596,7 @@ func twoaiArt(db *sql.DB, today string) error {
 	}
 	// Each section has its own taxonomy row, so the category page lists it and
 	// the freshness contract can find its pages.
-	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician", "res": "ai-researcher", "eco": "ai-economist", "fut": "ai-future-professions", "sql": "ai-sql"}
+	taxFor := map[string]string{"art": "ai-art", "law": "ai-lawyer", "fin": "ai-accountant", "med": "ai-physician", "res": "ai-researcher", "eco": "ai-economist", "fut": "ai-future-professions", "sql": "ai-sql", "edu": "ai-education"}
 
 	// BREADCRUMBS. Stephen, 2026-09-22, on Financial Reporting and Synthesis:
 	// the trail stopped at the category, so a reader three levels down could
@@ -552,7 +633,9 @@ func twoaiArt(db *sql.DB, today string) error {
 						blurb = c.Scope
 					}
 					if blurb == "" {
-						if r := readings[c.Slug]; r != nil {
+						if r := readings[c.Slug]; r != nil && r["answer"] != "" {
+							blurb = firstSentence(r["answer"])
+						} else if r := readings[c.Slug]; r != nil {
 							blurb = firstSentence(r["scope"])
 						} else if h := hubReadings[c.Slug]; h != nil {
 							blurb = firstSentence(h["what"])
@@ -609,13 +692,22 @@ func twoaiArt(db *sql.DB, today string) error {
 				"hub_name": rootName[n.Section], "crumbs": crumbsFor(n),
 			}
 			if n.Kind == "subhub" {
-				root := rootOf[n.Section]
+				// The parent is the row's own parent, so a sub-hub nested in
+				// another (a chapter inside a part, AI in Education) points up
+				// one level, not straight to the section root.
+				root := n.Parent
+				if root == "" {
+					root = rootOf[n.Section]
+				}
 				for _, p := range nodes {
 					if p.Slug == root {
 						doc["parent_name"] = p.Name
 					}
 				}
 				doc["parent_path"] = path(root)
+			}
+			if n.Section == "edu" {
+				doc["book"] = map[string]string{"title": "The AI Ready School", "volume": "Volume X of The Operating Discipline for AI Library", "author": "Stephen R. Jordan"}
 			}
 			if err := write(fileFor(n), taxFor[n.Section], doc); err != nil {
 				return err
@@ -655,6 +747,21 @@ func twoaiArt(db *sql.DB, today string) error {
 				"siblings": siblings, "hub_path": path(rootOf[n.Section]),
 				"hub_name": rootName[n.Section], "generated": today, "crumbs": crumbsFor(n),
 				"refresh_every_days": 90,
+			}
+			if n.Section == "edu" {
+				doc["book"] = map[string]string{"title": "The AI Ready School", "volume": "Volume X of The Operating Discipline for AI Library", "author": "Stephen R. Jordan"}
+				if r != nil && r["idea"] != "" {
+					doc["answer"] = r["answer"]
+					doc["sections"] = []map[string]string{
+						{"heading": "The idea", "body": r["idea"]},
+						{"heading": "How it works in school", "body": r["practice"]},
+						{"heading": "What the evidence says", "body": r["evidence"]},
+						{"heading": "Guardrails", "body": r["guardrails"]},
+					}
+				} else {
+					doc["answer"] = n.Blurb
+					doc["sections"] = []map[string]string{}
+				}
 			}
 			if err := write(fileFor(n), taxFor[n.Section], doc); err != nil {
 				return err
