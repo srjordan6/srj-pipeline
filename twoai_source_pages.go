@@ -116,7 +116,10 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 
 	// Industry page paths, for the crumb back and the sibling list.
 	sectionPath := map[string]string{}
-	spr, err := db.Query(`SELECT taxonomy_slug, data->>'uid' FROM twoai_pages WHERE path LIKE 'industries/industry-%' AND data->>'shape' = 'tech-section'`)
+	// The industry pages carry shape 'industry'. This read 'tech-section'
+	// from 2026-09-25 to 2026-09-29, so the map was empty: every source page
+	// had no parent path, and the withdrawn pages had no redirect target.
+	spr, err := db.Query(`SELECT taxonomy_slug, data->>'uid' FROM twoai_pages WHERE path LIKE 'industries/industry-%' AND data->>'shape' IN ('industry','tech-section')`)
 	if err == nil {
 		for spr.Next() {
 			var s, u string
