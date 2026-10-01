@@ -4721,7 +4721,8 @@ func twoaiBuild(db *sql.DB) error {
 			// Merged here rather than into site_content because site_content is
 			// the shared library both sites read, and the lenses are ours.
 			lensRows, lerr := db.Query(`SELECT term_slug, audience, body
-				FROM twoai_glossary_lenses ORDER BY term_slug, audience`)
+				FROM twoai_glossary_lenses
+				ORDER BY term_slug, CASE audience WHEN 'child' THEN 0 WHEN 'executive' THEN 1 WHEN 'small-business' THEN 2 ELSE 3 END, audience`)
 			if lerr == nil {
 				byTerm := map[string][]map[string]string{}
 				for lensRows.Next() {
@@ -5175,6 +5176,11 @@ func twoaiBuild(db *sql.DB) error {
 	// The public Data Quality page, /data-quality/, 2026-09-28.
 	if err := twoaiQualityPage(db, today); err != nil {
 		fmt.Println("twoai_quality:", err)
+	}
+	// Glossary lenses for a child, an executive and a small business owner
+	// on every term, 2026-09-30.
+	if err := twoaiGlossaryLenses(db); err != nil {
+		fmt.Println("twoai_glossary_lenses:", err)
 	}
 	// Accounting trade press to the AI Accountant section, 2026-09-28.
 	if err := twoaiAccountingNews(db); err != nil {
