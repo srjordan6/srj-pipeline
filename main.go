@@ -3895,6 +3895,8 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		// site-scoped news search, and outside coverage through a second.
 		{"NTT DATA press releases (coverage)", "https://news.google.com/rss/search?q=site:nttdata.com/global/en/news/press-release&hl=en-US&gl=US&ceid=US:en"},
 		{"NTT DATA (coverage)", "https://news.google.com/rss/search?q=%22NTT+DATA%22+AI&hl=en-US&gl=US&ceid=US:en"},
+		// LTM (formerly LTIMindtree), 2026-10-01. Stephen: need this one.
+		{"LTM (coverage)", "https://news.google.com/rss/search?q=%22LTM+Limited%22+OR+LTIMindtree&hl=en-US&gl=US&ceid=US:en"},
 		// DEVELOPER AND ENTERPRISE IT PRESS, 2026-09-29. Stephen asked for the
 		// developer stories a newsletter carried and the site missed: agent
 		// standards, AI in software teams, infrastructure for AI workloads, AI
