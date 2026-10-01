@@ -3753,7 +3753,10 @@ func intelPromote(db *sql.DB) (int, error) {
 
 // intelAIWatch queues new Hugging Face models and AI vendor news as intel
 // candidates, reusing the pipeline's aiTerm subject filter for the feeds.
+var intelPubRe = regexp.MustCompile(`(?is)<pubDate>\s*(.*?)\s*</pubDate>`)
+
 func intelAIWatch(db *sql.DB) (added int, err error) {
+	db.Exec(`ALTER TABLE ai_intel_candidates ADD COLUMN IF NOT EXISTS published_on date`)
 	req, _ := http.NewRequest("GET", "https://huggingface.co/api/models?sort=createdAt&direction=-1&limit=25", nil)
 	req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
 	if resp, herr := http.DefaultClient.Do(req); herr == nil {
@@ -3951,6 +3954,7 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 			Items []struct {
 				Title string `xml:"title"`
 				Link  string `xml:"link"`
+				Pub   string `xml:"pubDate"`
 			} `xml:"channel>item"`
 		}
 		// RSS in the wild is full of HTML entities (&mdash;) and sloppy
@@ -3977,10 +3981,15 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 				if t == nil || l == nil {
 					continue
 				}
+				pub := ""
+				if pm := intelPubRe.FindSubmatch(m[1]); pm != nil {
+					pub = strings.TrimSpace(string(pm[1]))
+				}
 				feed.Items = append(feed.Items, struct {
 					Title string `xml:"title"`
 					Link  string `xml:"link"`
-				}{Title: stripCDATA(string(t[1])), Link: stripCDATA(string(l[1]))})
+					Pub   string `xml:"pubDate"`
+				}{Title: stripCDATA(string(t[1])), Link: stripCDATA(string(l[1])), Pub: pub})
 				recovered++
 			}
 			if recovered == 0 {
@@ -4035,10 +4044,22 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 				}
 				time.Sleep(700 * time.Millisecond)
 			}
-			r, ierr := db.Exec(`INSERT INTO ai_intel_candidates (kind, name, vendor, url, source, source_id)
-				VALUES ('vendor-news', $1, $2, $3, 'rss', $4)
+			// THE FEED'S OWN DATE, 2026-09-30. Stephen found the vendor
+			// section leading with the UK AI Security Institute's o1
+			// evaluation from December 2024, dated the day it was surfaced,
+			// because the pipeline kept only the discovery time. The item's
+			// pubDate is stored and governs the published date downstream.
+			pubOn := ""
+			for _, layout := range []string{time.RFC1123Z, time.RFC1123, "Mon, 2 Jan 2006 15:04:05 -0700", "Mon, 02 Jan 2006 15:04:05 MST", "2006-01-02T15:04:05Z07:00", "2006-01-02"} {
+				if t, perr := time.Parse(layout, strings.TrimSpace(it.Pub)); perr == nil {
+					pubOn = t.UTC().Format("2006-01-02")
+					break
+				}
+			}
+			r, ierr := db.Exec(`INSERT INTO ai_intel_candidates (kind, name, vendor, url, source, source_id, published_on)
+				VALUES ('vendor-news', $1, $2, $3, 'rss', $4, NULLIF($5,'')::date)
 				ON CONFLICT (source_id) DO NOTHING`,
-				trunc(title, 300), vendorLabel, link, sourceID)
+				trunc(title, 300), vendorLabel, link, sourceID, pubOn)
 			if ierr != nil {
 				continue
 			}
@@ -7880,10 +7901,13 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 		"stability.ai": "Stability AI",
 		"aisi.gov.uk":  "UK AI Security Institute",
 	}
+	// aisi.gov.uk left the list on 2026-09-30: the UK AI Security Institute
+	// is a government evaluator, not a company building AI, and Stephen said
+	// its posts are not vendor news. Its feed stays in the intel watch.
 	allowed := []string{
 		"OpenAI", "Google DeepMind", "Hugging Face", "Mistral AI",
 		"European Commission AI", "CIFAR", "AI Singapore",
-		"stability.ai", "aisi.gov.uk",
+		"stability.ai",
 	}
 	const windowDays = 30
 	const perVendor = 25
@@ -7956,7 +7980,7 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 			FROM twoai_company_profiles WHERE COALESCE(website,'') <> ''
 		)
 		SELECT DISTINCT ON (c.url) c.vendor, c.name, c.url,
-			to_char(c.discovered_at at time zone 'UTC','YYYY-MM-DD'),
+			to_char(COALESCE(c.published_on, (c.discovered_at at time zone 'UTC')::date),'YYYY-MM-DD'),
 			CASE WHEN length(trim(coalesce(c.summary,''))) >= 40 THEN c.summary ELSE '' END
 		FROM ai_intel_candidates c
 		WHERE c.url IS NOT NULL AND c.url <> '' AND c.url NOT LIKE '%news.google%'
@@ -8014,6 +8038,7 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 					vendor=EXCLUDED.vendor, title=EXCLUDED.title, url=EXCLUDED.url,
 					summary=CASE WHEN EXCLUDED.summary <> '' THEN EXCLUDED.summary
 					             ELSE twoai_vendor_posts.summary END,
+					posted_on=LEAST(twoai_vendor_posts.posted_on, EXCLUDED.posted_on),
 					last_seen=now()`,
 				it.Slug, vendor, it.Title, it.URL, it.Summary, it.Date); err != nil {
 				fmt.Fprintln(os.Stderr, "twoai_build: vendor post upsert:", err)
