@@ -192,6 +192,9 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 	if err := twoaiDcResearch(db); err != nil {
 		fmt.Println("twoai_dc_research:", err)
 	}
+	// Datacenters.com news through the browser, 2026-10-01, ahead of the
+	// announcement extractor so today's articles are read today.
+	twoaiDatacentersComWatch(db)
 	// Announcements in the news intake become press: facility rows with
 	// exactly what the report states. Never fatal.
 	if err := twoaiDcAnnouncements(db); err != nil {
@@ -357,6 +360,12 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 				cname = c.Name
 			}
 		}
+		// Countries that reach the section through announcements rather than
+		// the OSM harvest (Japan's Chiba campus, 2026-10-01) get their name
+		// here; the harvest rotation list is left as it is.
+		if n, ok := twoaiDcCountryNames[cc]; ok && cname == cc {
+			cname = n
+		}
 		u := twoaiUID("dc-country:" + cc)
 		path := "tech/dc-country-" + strings.ToLower(cc) + ".json"
 		keepPaths[path] = true
@@ -401,8 +410,8 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			"nearest_airport": twoaiNearestAirport(airports, ef.Lat, ef.Lon),
 			"operator_uid":    operatorUIDs[ef.Op],
 			"suitability":     twoaiComputeSuitability(ef.Profile, ef.MW, operatorTypes[ef.Op]),
-			"state_page": map[string]any{"uid": stateUID, "code": ef.State},
-			"parent":     map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+			"state_page":      map[string]any{"uid": stateUID, "code": ef.State},
+			"parent":          map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
 		}
 		// WHY A NUMBER IS MISSING IS ITSELF A FACT. A facility page with no
 		// capacity used to look identical whether nobody publishes one, the
@@ -705,7 +714,7 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		"generated": today, "name": "Data centers by operator",
 		"operators": opIdx, "operator_count": len(opIdx), "facility_count": facTotal,
 		"states_index_uid": twoaiUID("dc-states-index"),
-		"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+		"parent":           map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
 	}
 	if oj, err := json.Marshal(opIdxDoc); err == nil {
 		db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
@@ -717,7 +726,7 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		"generated": today, "name": "Data centers by state",
 		"state_pages": statePages, "intl_pages": intlPages, "facility_count": facTotal,
 		"operators_index_uid": twoaiUID("dc-operators-index"),
-		"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+		"parent":              map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
 	}
 	if sj, err := json.Marshal(stIdxDoc); err == nil {
 		db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
@@ -731,12 +740,12 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		"metrics": metrics, "sources": srcs, "capex": capex, "filings": filings,
 		"operators":    operators,
 		"metric_pages": metricPages, "builder_pages": builderPages,
-		"operator_pages": operatorPages,
+		"operator_pages":      operatorPages,
 		"operators_index_uid": twoaiUID("dc-operators-index"),
 		"states_index_uid":    twoaiUID("dc-states-index"),
-		"state_pages": statePages, "intl_pages": intlPages, "fac_total": facTotal, "fac_ops": facOps,
+		"state_pages":         statePages, "intl_pages": intlPages, "fac_total": facTotal, "fac_ops": facOps,
 		"fac_mw": facMW, "fac_profiled": len(enriched),
-		"smr":  map[string]any{"uid": smrUID, "count": len(smrProjects)},
+		"smr":     map[string]any{"uid": smrUID, "count": len(smrProjects)},
 		"grid":    map[string]any{"uid": twoaiUID("dc-grid")},
 		"indexes": twoaiDcIndexes(db),
 		"index_uids": map[string]any{
@@ -780,6 +789,14 @@ var twoaiDcCountries = []struct{ ISO, Name string }{
 	{"FR", "France"}, {"NL", "Netherlands"}, {"IE", "Ireland"},
 	{"SE", "Sweden"}, {"NO", "Norway"}, {"ES", "Spain"}, {"IT", "Italy"},
 	{"PL", "Poland"}, {"FI", "Finland"}, {"DK", "Denmark"},
+}
+
+var twoaiDcCountryNames = map[string]string{
+	"JP": "Japan", "IN": "India", "AU": "Australia", "SG": "Singapore", "KR": "South Korea",
+	"CA": "Canada", "BR": "Brazil", "MX": "Mexico", "AE": "United Arab Emirates", "SA": "Saudi Arabia",
+	"MY": "Malaysia", "ID": "Indonesia", "TH": "Thailand", "TW": "Taiwan", "HK": "Hong Kong",
+	"CL": "Chile", "ZA": "South Africa", "IL": "Israel", "QA": "Qatar", "NZ": "New Zealand",
+	"PT": "Portugal", "BE": "Belgium", "CH": "Switzerland", "AT": "Austria", "IS": "Iceland",
 }
 
 func twoaiDcHarvest(db *sql.DB) {
