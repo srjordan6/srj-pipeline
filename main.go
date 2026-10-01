@@ -3890,6 +3890,11 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"The Record AI security (coverage)", "https://news.google.com/rss/search?q=site:therecord.media+AI+OR+%22artificial+intelligence%22&hl=en-US&gl=US&ceid=US:en"},
 		{"Dark Reading AI security (coverage)", "https://news.google.com/rss/search?q=site:darkreading.com+AI+OR+%22artificial+intelligence%22+OR+agent&hl=en-US&gl=US&ceid=US:en"},
 		{"SecurityWeek AI (coverage)", "https://news.google.com/rss/search?q=site:securityweek.com+AI+OR+%22artificial+intelligence%22+OR+agent&hl=en-US&gl=US&ceid=US:en"},
+		// NTT DATA, 2026-10-01. Stephen: we absolutely must follow NTT DATA.
+		// It publishes no RSS feed; its press releases are read through a
+		// site-scoped news search, and outside coverage through a second.
+		{"NTT DATA press releases (coverage)", "https://news.google.com/rss/search?q=site:nttdata.com/global/en/news/press-release&hl=en-US&gl=US&ceid=US:en"},
+		{"NTT DATA (coverage)", "https://news.google.com/rss/search?q=%22NTT+DATA%22+AI&hl=en-US&gl=US&ceid=US:en"},
 		// DEVELOPER AND ENTERPRISE IT PRESS, 2026-09-29. Stephen asked for the
 		// developer stories a newsletter carried and the site missed: agent
 		// standards, AI in software teams, infrastructure for AI workloads, AI
