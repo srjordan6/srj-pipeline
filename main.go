@@ -4769,6 +4769,13 @@ func twoaiBuild(db *sql.DB) error {
 				fmt.Printf("twoai_build: glossary lenses attached to %d terms, %d without\n",
 					attached, missing)
 			}
+			// LINKS ON EVERY TERM, 2026-09-30. Stephen, on the vLLM page: "there
+			// are no links in any of this information". A term that names a
+			// tool, repository or company this site covers now links to that
+			// page (see_also, rendered under the definition), and the related
+			// terms are the terms whose definitions mention this one or that
+			// this definition names, before category neighbours.
+			twoaiGlossaryLinks(db, g)
 			if err := upsert("glossary/glossary.json", "glossary", g); err != nil {
 				return err
 			}
