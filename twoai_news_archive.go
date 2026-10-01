@@ -88,7 +88,27 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 	// Fetch what publish_news wrote earlier this run. A failure here is not
 	// fatal: the archive already holds everything published before today, and
 	// losing one day's capture is far better than failing the build.
-	body, err := twoaiJobsGet(twoaiNewsJSONURL, nil)
+	// READ THE COMMIT, NOT THE CACHE, 2026-10-01. raw.githubusercontent.com
+	// serves a cached copy for several minutes. On 2026-10-01 the 9:05 PM run
+	// published two stories at 02:25 UTC, the archive read the cached earlier
+	// news.json a minute later and missed them, the next publish dropped them
+	// from news.json, and the site's URL guard then refused every deploy for
+	// fifteen hours because two published story pages were gone. The archive
+	// now reads news.json at the exact newest commit, which no cache serves
+	// stale, falling back to the plain address only if the commit lookup fails.
+	newsURL := twoaiNewsJSONURL
+	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+		if cb, cerr := twoaiJobsGet("https://api.github.com/repos/srjordan6/srj-content/commits?path=news/news.json&per_page=1",
+			map[string]string{"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json"}); cerr == nil {
+			var cs []struct {
+				SHA string `json:"sha"`
+			}
+			if json.Unmarshal(cb, &cs) == nil && len(cs) == 1 && cs[0].SHA != "" {
+				newsURL = "https://raw.githubusercontent.com/srjordan6/srj-content/" + cs[0].SHA + "/news/news.json"
+			}
+		}
+	}
+	body, err := twoaiJobsGet(newsURL, nil)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "twoai_build: news archive fetch:", err, "(keeping the existing archive)")
 	} else {
