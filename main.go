@@ -8106,7 +8106,8 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 			COALESCE(p.entity_uid, f.entity_uid, ''),
 			COALESCE(p.entity_kind, f.entity_kind, ''),
 			(length(p.summary) >= $1 OR p.source = 'intel') AS has_page,
-			COALESCE(p.reader_note, '')
+			COALESCE(p.reader_note, ''),
+			p.retired_at IS NOT NULL
 		FROM twoai_vendor_posts p
 		LEFT JOIN twoai_vendor_feeds f ON lower(f.vendor) = lower(p.vendor)
 		ORDER BY p.posted_on DESC NULLS LAST, p.slug`, summaryFloor)
@@ -8124,13 +8125,17 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 		// this is not. Empty on most posts, and the template renders nothing
 		// rather than inventing one.
 		ReaderNote string `json:"reader_note,omitempty"`
+		// Retired: the permalink stays (published URLs never disappear) but
+		// the post is not listed as vendor news and its page is noindex.
+		// First use: the UK AI Security Institute's 69 posts, 2026-09-30.
+		Retired bool `json:"retired,omitempty"`
 	}
 	archiveOut := []archived{}
 	pageCount := 0
 	for arows.Next() {
 		var a archived
 		if err := arows.Scan(&a.Slug, &a.Vendor, &a.Title, &a.URL, &a.Summary, &a.Date,
-			&a.EntityUID, &a.EntityKind, &a.HasPage, &a.ReaderNote); err != nil {
+			&a.EntityUID, &a.EntityKind, &a.HasPage, &a.ReaderNote, &a.Retired); err != nil {
 			arows.Close()
 			return 0, err
 		}
