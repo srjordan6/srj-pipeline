@@ -1,12 +1,12 @@
 package main
 
 import (
-	"context"
 	"archive/tar"
 	"archive/zip"
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha1"
@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lib/pq"
 )
@@ -49,16 +50,16 @@ import (
 // either idempotent or cursor-persisted, so being killed mid-flight costs at
 // most the batch in progress.
 var twoaiStageDeadline = map[string]time.Duration{
-	"twoai_build":     45 * time.Minute, // renders every page document
-	"twoai_embed":     45 * time.Minute, // embeds every changed chunk
-	"twoai_vectorize": 30 * time.Minute,
-	"openalex_pull":   25 * time.Minute, // 150 pages plus backoff on 504s
-	"twoai_claims":    25 * time.Minute,
+	"twoai_build":        45 * time.Minute, // renders every page document
+	"twoai_embed":        45 * time.Minute, // embeds every changed chunk
+	"twoai_vectorize":    30 * time.Minute,
+	"openalex_pull":      25 * time.Minute, // 150 pages plus backoff on 504s
+	"twoai_claims":       25 * time.Minute,
 	"twoai_lawsuit_fill": 30 * time.Minute, // up to 40 cases a run through Ollama
-	"twoai_jobs":      25 * time.Minute,
-	"intel":           10 * time.Minute, // the stage that proved the need
-	"twoai_recap":     8 * time.Minute,  // RECAP filing harvest, 12 dockets a run
-	"export_corpus":   20 * time.Minute,
+	"twoai_jobs":         25 * time.Minute,
+	"intel":              10 * time.Minute, // the stage that proved the need
+	"twoai_recap":        8 * time.Minute,  // RECAP filing harvest, 12 dockets a run
+	"export_corpus":      20 * time.Minute,
 	// twoai_publish pushes the whole changed set as ONE commit through the git
 	// data API: read the ref, build trees from it, commit, move the ref. About
 	// nine requests whatever the day looks like, so it finishes in seconds.
@@ -1910,11 +1911,18 @@ func gdelt(db *sql.DB, sourceID int) (fetched, added int, err error) {
 	return fetched, added, nil
 }
 
+// trunc cuts to at most n bytes without splitting a multi-byte character.
+// A byte cut left a half character at the end of an FTC release summary and
+// Postgres refused the row ("invalid byte sequence for encoding UTF8: 0xe2")
+// on every run from 2026-09-27 to 2026-09-30.
 func trunc(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
+	if len(s) <= n {
+		return s
 	}
-	return s
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return strings.ToValidUTF8(s[:n], "")
 }
 
 // twoaiAIWordRe holds the surface forms an AI story actually uses in its
@@ -3181,10 +3189,10 @@ type clSearch struct {
 		// /docket/<id>/ answers 404. The API gives the real path here and
 		// this must be used rather than one built from the id - see
 		// twoaiCourtListenerURL.
-		AbsoluteURL  string `json:"docket_absolute_url"`
-		Court        string `json:"court"`
-		DateFiled    string `json:"dateFiled"`
-		Snippet      string `json:"snippet"`
+		AbsoluteURL string `json:"docket_absolute_url"`
+		Court       string `json:"court"`
+		DateFiled   string `json:"dateFiled"`
+		Snippet     string `json:"snippet"`
 	} `json:"results"`
 }
 
@@ -4520,9 +4528,9 @@ func twoaiBuild(db *sql.DB) error {
 				slug := twoaiSlug(name)
 				nameRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
 				type event struct {
-					rep    nstory
+					rep     nstory
 					members []nstory
-					pinned bool
+					pinned  bool
 				}
 				var events []*event
 				for _, s := range all {
@@ -9458,12 +9466,12 @@ func twoaiCompliance(db *sql.DB, today string, upsert func(path, kind string, v 
 // to a domain is the number of pages actually published under it.
 func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
 	type domain struct {
-		Slug     string   `json:"slug"`
-		Name     string   `json:"name"`
-		Blurb    string   `json:"blurb"`
-		Status   string   `json:"status"`
-		Path     string   `json:"path,omitempty"`
-		Pages    int      `json:"pages"`
+		Slug   string `json:"slug"`
+		Name   string `json:"name"`
+		Blurb  string `json:"blurb"`
+		Status string `json:"status"`
+		Path   string `json:"path,omitempty"`
+		Pages  int    `json:"pages"`
 		// WithSections is Pages plus every section beneath it. Kept apart from
 		// Pages because the two answer different questions and conflating them
 		// published a contradiction: on 2026-09-12 the AI Companies domain read
