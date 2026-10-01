@@ -36,6 +36,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -132,6 +133,57 @@ func crawlFetch(client *http.Client, u string) (int, []byte, string, error) {
 	return resp.StatusCode, b, resp.Request.URL.String(), nil
 }
 
+// BROWSER READING, 2026-09-30. Five of the first thirteen cited sites gave
+// the plain reader a script shell or blocked it after a page or two
+// (Airbus, Amadeus, AM Best, the ABA, AgGateway). Stephen approved reading
+// those through Cloudflare Browser Run, a real Chrome that renders the page
+// and returns its HTML; included in the Workers Paid plan up to ten browser
+// hours a month, then $0.09 an hour. One such site per run, and never more
+// than crawlBrowserMonthlyPages pages a month, keeps it inside the included
+// hours. Browser Run still presents itself as a bot, so a site that refuses
+// bots stays unreadable; this is for pages drawn by script.
+const crawlBrowserMonthlyPages = 6000
+
+func crawlFetchBrowser(client *http.Client, u string) (int, []byte, string, error) {
+	acct := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+	tok := os.Getenv("CLOUDFLARE_BROWSER_TOKEN")
+	if tok == "" {
+		tok = os.Getenv("CLOUDFLARE_API_TOKEN")
+	}
+	if acct == "" || tok == "" {
+		return 0, nil, "", fmt.Errorf("browser reader: CLOUDFLARE_ACCOUNT_ID or token not set")
+	}
+	body, _ := json.Marshal(map[string]any{
+		"url":                 u,
+		"rejectResourceTypes": []string{"image", "media", "font"},
+		"gotoOptions":         map[string]any{"waitUntil": "networkidle2", "timeout": 30000},
+	})
+	req, _ := http.NewRequest("POST", "https://api.cloudflare.com/client/v4/accounts/"+acct+"/browser-run/content", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	var out struct {
+		Success bool   `json:"success"`
+		Result  string `json:"result"`
+		Errors  []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if json.Unmarshal(raw, &out) != nil || !out.Success {
+		msg := strings.TrimSpace(string(raw))
+		if len(out.Errors) > 0 {
+			msg = out.Errors[0].Message
+		}
+		return resp.StatusCode, nil, "", fmt.Errorf("browser reader: %s", trunc(msg, 160))
+	}
+	return 200, []byte(out.Result), u, nil
+}
+
 func crawlRobots(client *http.Client, root string) robotsRules {
 	var r robotsRules
 	st, b, _, err := crawlFetch(client, root+"/robots.txt")
@@ -194,8 +246,11 @@ func crawlHost(u string) string {
 }
 
 // twoaiCrawlSite walks one website and stores its pages.
-func twoaiCrawlSite(db *sql.DB, domain string, starts []string) (int, int) {
+func twoaiCrawlSite(db *sql.DB, domain string, starts []string, browser bool) (int, int) {
 	client := &http.Client{Timeout: 20 * time.Second}
+	if browser {
+		client = &http.Client{Timeout: 60 * time.Second}
+	}
 	scheme := "https://"
 	if p, err := url.Parse(starts[0]); err == nil && p.Scheme != "" {
 		scheme = p.Scheme + "://"
@@ -257,9 +312,21 @@ func twoaiCrawlSite(db *sql.DB, domain string, starts []string) (int, int) {
 		sort.SliceStable(queue, func(i, j int) bool { return queue[i].score > queue[j].score })
 		c := queue[0]
 		queue = queue[1:]
-		st, body, final, err := crawlFetch(client, c.u)
+		var st int
+		var body []byte
+		var final string
+		var err error
+		if browser {
+			st, body, final, err = crawlFetchBrowser(client, c.u)
+		} else {
+			st, body, final, err = crawlFetch(client, c.u)
+		}
 		time.Sleep(1 * time.Second)
 		if err != nil {
+			if browser {
+				fmt.Printf("twoai_site_crawl: %s: %v\n", domain, err)
+				break
+			}
 			continue
 		}
 		fetched++
@@ -272,10 +339,14 @@ func twoaiCrawlSite(db *sql.DB, domain string, starts []string) (int, int) {
 			st = 404
 		}
 		h := sha256.Sum256([]byte(text))
-		db.Exec(`INSERT INTO twoai_site_crawl_pages (url, domain, title, text, ai_score, http_status, fetched_on, content_hash)
-			VALUES ($1,$2,$3,$4,$5,$6,current_date,$7)
-			ON CONFLICT (url) DO UPDATE SET title=$3, text=$4, ai_score=$5, http_status=$6, fetched_on=current_date, content_hash=$7`,
-			final, domain, title, text, score, st, hex.EncodeToString(h[:8]))
+		via := "plain"
+		if browser {
+			via = "browser"
+		}
+		db.Exec(`INSERT INTO twoai_site_crawl_pages (url, domain, title, text, ai_score, http_status, fetched_on, content_hash, fetched_via)
+			VALUES ($1,$2,$3,$4,$5,$6,current_date,$7,$8)
+			ON CONFLICT (url) DO UPDATE SET title=$3, text=$4, ai_score=$5, http_status=$6, fetched_on=current_date, content_hash=$7, fetched_via=$8`,
+			final, domain, title, text, score, st, hex.EncodeToString(h[:8]), via)
 		if st == 200 {
 			okPages++
 			okChars += len(text)
@@ -304,10 +375,16 @@ func twoaiCrawlSite(db *sql.DB, domain string, starts []string) (int, int) {
 	if relevant == 0 && (okPages < 10 || okChars/max(okPages, 1) < 1200) {
 		status = "unreadable"
 	}
+	if browser {
+		status += "-browser"
+	}
 	db.Exec(`INSERT INTO twoai_site_crawl (domain, start_url, pages_fetched, pages_relevant, crawled_on, crawl_status)
 		VALUES ($1,$2,$3,$4,current_date,$5)
 		ON CONFLICT (domain) DO UPDATE SET start_url=$2, pages_fetched=$3, pages_relevant=$4, crawled_on=current_date, crawl_status=$5`,
 		domain, starts[0], fetched, relevant, status)
+	if browser {
+		db.Exec(`UPDATE twoai_site_crawl SET browser_tried_on = current_date WHERE domain=$1`, domain)
+	}
 	return fetched, relevant
 }
 
@@ -401,6 +478,8 @@ func twoaiSiteCrawlStep(db *sql.DB, cited map[string][]string, industryOf map[st
 	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_site_crawl_pages (url text PRIMARY KEY, domain text NOT NULL, title text,
 		text text, ai_score int, http_status int, fetched_on date, content_hash text)`)
 	db.Exec(`ALTER TABLE twoai_site_crawl ADD COLUMN IF NOT EXISTS crawl_status text`)
+	db.Exec(`ALTER TABLE twoai_site_crawl ADD COLUMN IF NOT EXISTS browser_tried_on date`)
+	db.Exec(`ALTER TABLE twoai_site_crawl_pages ADD COLUMN IF NOT EXISTS fetched_via text`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS twoai_site_crawl_pages_domain ON twoai_site_crawl_pages (domain)`)
 	var domains []string
 	for d := range cited {
@@ -417,9 +496,21 @@ func twoaiSiteCrawlStep(db *sql.DB, cited map[string][]string, industryOf map[st
 		if last.Valid && time.Since(last.Time) < twoaiCrawlRefreshDays*24*time.Hour {
 			continue
 		}
-		f, r := twoaiCrawlSite(db, d, cited[d])
+		f, r := twoaiCrawlSite(db, d, cited[d], false)
 		fmt.Printf("twoai_site_crawl: %s fetched=%d relevant=%d\n", d, f, r)
 		crawled++
+	}
+	// One site the plain reader could not read gets the browser, if the
+	// month's page budget allows.
+	var monthPages int
+	db.QueryRow(`SELECT count(*) FROM twoai_site_crawl_pages WHERE fetched_via='browser' AND fetched_on >= date_trunc('month', current_date)`).Scan(&monthPages)
+	if monthPages < crawlBrowserMonthlyPages && os.Getenv("CLOUDFLARE_ACCOUNT_ID") != "" {
+		var d string
+		db.QueryRow(`SELECT domain FROM twoai_site_crawl WHERE crawl_status = 'unreadable' AND browser_tried_on IS NULL ORDER BY crawled_on, domain LIMIT 1`).Scan(&d)
+		if d != "" && len(cited[d]) > 0 {
+			f, r := twoaiCrawlSite(db, d, cited[d], true)
+			fmt.Printf("twoai_site_crawl: %s read through the browser fetched=%d relevant=%d (browser pages this month: %d)\n", d, f, r, monthPages+f)
+		}
 	}
 	digested := 0
 	for _, d := range domains {
