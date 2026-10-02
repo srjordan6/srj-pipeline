@@ -210,6 +210,24 @@ Never include exploit detail, proof of concept, payloads or steps an attacker co
 
 		// THE CHECKS. Each one is a thing the request forbade in so many words.
 		headline := strings.TrimSpace(strings.Trim(got.Headline, `"`))
+		// A headline over the limit is the one hold the writer can mend
+		// itself. Stephen, 2026-10-02 evening: CVE-2026-51883 and 51882 sat
+		// on the front page as "CVE-...: LangChain" after three long
+		// headlines in a row. One more short call asks for the same claim
+		// in fewer words; if that is still long, the hold stands as before.
+		if len([]rune(headline)) > 90 {
+			short, _, serr := twoaiGenerate("cve_writer", `Shorten this CVE headline to under 80 characters. Keep the product name, the version if present, and what an attacker can do. Drop everything else. Do not add any claim that is not in the original. Return only the shortened headline, no quotes, no prose.`, headline)
+			if serr == nil {
+				short = strings.TrimSpace(strings.Trim(strings.TrimSpace(short), `"`))
+				if i := strings.Index(short, "\n"); i >= 0 {
+					short = strings.TrimSpace(short[:i])
+				}
+				if n := len([]rune(short)); n >= 20 && n <= 90 {
+					fmt.Printf("twoai_cve_write: %s: headline shortened from %d to %d characters\n", r.id, len([]rune(headline)), n)
+					headline = short
+				}
+			}
+		}
 		low := strings.ToLower(headline)
 		why := ""
 		switch {
