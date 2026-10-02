@@ -103,10 +103,55 @@ func twoaiOllamaModel(stage string) string {
 	// turns it on, so Pro without thinking is still a fast intuitive answer.
 	// Local keeps Mistral Small, which fits a 12GB card, for anyone running
 	// without the cloud.
+	// Stephen, 2026-10-02: the ask box on the site keeps Pro (twoai-site
+	// worker.ts, its own default), everything in the pipeline runs Flash.
+	// OLLAMA_MODEL and OLLAMA_MODEL_<STAGE> in pipeline.env still win, so a
+	// stage that must have Pro names it there.
 	if strings.Contains(twoaiOllamaHost(), "ollama.com") {
-		return "deepseek-v4-pro"
+		return "deepseek-v4.1-flash"
 	}
 	return "mistral-small"
+}
+
+// PEAK HOURS. Stephen, 2026-10-02: off-peak pricing applies outside 12:00 to
+// 18:00 UTC on weekdays and all day at weekends, and the bulk work should
+// stay in those hours. twoaiPeakAt says whether a moment is inside the
+// weekday peak window.
+func twoaiPeakAt(t time.Time) bool {
+	u := t.UTC()
+	if u.Weekday() == time.Saturday || u.Weekday() == time.Sunday {
+		return false
+	}
+	return u.Hour() >= 12 && u.Hour() < 18
+}
+
+// twoaiBulkStages are the stages that work through a backlog a few items a
+// run and lose nothing by waiting: the next off-peak run picks up where
+// this one would have. Daily news, the weekly recap and the mail router
+// are not here, because their value is in being on time. TWOAI_PEAK_OK=1
+// runs everything regardless, for a day when the backlog matters more than
+// the price.
+var twoaiBulkStages = map[string]bool{
+	"page_readings": true, "sector_analysis": true, "twoai_source_pages": true, "art": true, "twoai_lang_pages": true,
+	"point_briefs": true, "paper_explain": true, "news_mine": true, "ma_readings": true, "learning_readings": true,
+	"benchmark_readings": true, "lawsuit_fill": true, "company_profiles": true, "case_studies": true, "vendor_enrich": true,
+}
+
+var twoaiPeakNoted sync.Map
+
+// twoaiDeferForPeak reports whether a stage's model work is held for
+// off-peak hours right now, saying so once per stage per run.
+func twoaiDeferForPeak(stage string) bool {
+	if !twoaiBulkStages[stage] || !twoaiPeakAt(time.Now()) {
+		return false
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("TWOAI_PEAK_OK"))); v == "1" || v == "true" || v == "yes" || v == "on" {
+		return false
+	}
+	if _, seen := twoaiPeakNoted.LoadOrStore(stage, true); !seen {
+		fmt.Printf("%s: deferred, peak pricing hours (Mon-Fri 12:00-18:00 UTC), the next off-peak run does this work\n", stage)
+	}
+	return true
 }
 
 // twoaiOllamaTimeout is how long one non-streaming generation may take. 180
@@ -293,6 +338,9 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 		down := ollamaDown
 		ollamaMu.Unlock()
 		if !down {
+			if twoaiDeferForPeak(stage) {
+				return "", "", fmt.Errorf("%s: deferred to off-peak hours", stage)
+			}
 			model := twoaiOllamaModel(stage)
 			think := twoaiOllamaThink(stage)
 			out, err := twoaiOllamaCallThink(model, system, user, think)
