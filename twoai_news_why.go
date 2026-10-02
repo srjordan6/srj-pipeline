@@ -109,7 +109,7 @@ func twoaiNewsWhy(db *sql.DB) int {
 
 	rows, err := db.Query(`SELECT uid, headline, story::text, coalesce(story->'why_it_matters'->>'matched_hash',''), coalesce((story->'why_it_matters'->>'attempts')::int, 0)
 		FROM twoai_news_stories WHERE retired_at IS NULL AND published_on > current_date - 60
-		ORDER BY published_on DESC NULLS LAST, slug LIMIT 400`)
+		ORDER BY (story ? 'why_it_matters'), published_on DESC NULLS LAST, slug LIMIT 400`)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "twoai_news_why select:", err)
 		return 0
