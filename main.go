@@ -5230,6 +5230,15 @@ func twoaiBuild(db *sql.DB) error {
 	if err := twoaiTechGigNews(db); err != nil {
 		fmt.Println("twoai_techgig_news:", err)
 	}
+	// AI CVE tracker, 2026-10-02: NVD modified window each run, pages under
+	// news/cve-*.json and the list at news/cves.json.
+	if err := twoaiCVEWatch(db); err != nil {
+		fmt.Println("twoai_cve_watch:", err)
+	}
+	// A page for every programming language and AI framework, 2026-10-02.
+	if _, err := twoaiLangPages(db, today); err != nil {
+		fmt.Println("twoai_lang_pages:", err)
+	}
 	// FTC and SEC AI enforcement actions, once a day, 2026-09-27.
 	if stageDueToday("twoai_enforcement_watch") {
 		if err := twoaiEnforcementWatch(db, today); err != nil {

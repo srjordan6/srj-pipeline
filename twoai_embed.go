@@ -523,6 +523,13 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 		if strings.HasPrefix(name, "incident-") {
 			return base + "/ai-news/incident/" + strings.TrimPrefix(name, "incident-") + "/"
 		}
+		// AI CVE tracker, 2026-10-02: news/cve-CVE-2026-1234.json and news/cves.json.
+		if strings.HasPrefix(name, "cve-") {
+			return base + "/ai-news/cves/" + strings.TrimPrefix(name, "cve-") + "/"
+		}
+		if name == "cves" {
+			return base + "/ai-news/cves/"
+		}
 		return ""
 	case "tech", "models", "observatory", "grid":
 		// These render as uid children of an ecosystem section, and the
