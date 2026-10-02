@@ -106,7 +106,7 @@ func twoaiTechGigNews(db *sql.DB) error {
 		}
 		h := md5.Sum([]byte("story:" + it.url))
 		uid := hex.EncodeToString(h[:])[:8]
-		headline := strings.TrimSpace(tail.ReplaceAllString(it.title, ""))
+		headline := newsStripOutlet(strings.TrimSpace(tail.ReplaceAllString(it.title, "")), "techgig.com")
 		slug := strings.Trim(acctSlugRe.ReplaceAllString(strings.ToLower(headline), "-"), "-")
 		if len(slug) > 80 {
 			slug = strings.Trim(slug[:80], "-")

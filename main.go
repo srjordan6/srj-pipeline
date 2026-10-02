@@ -2376,6 +2376,16 @@ func publishNews(db *sql.DB) error {
 		// headline is decoded here, before the slug is cut from it, so neither
 		// carries an entity again. Slugs already published keep their URL.
 		h := html.UnescapeString(c.arts[0].Title)
+		{
+			// The outlet is not part of the headline (news_headline.go,
+			// 2026-10-02). Every domain in the cluster counts, because the
+			// title Google News hands over may name the syndicating outlet.
+			outlets := []string{}
+			for _, a := range c.arts {
+				outlets = append(outlets, a.Domain)
+			}
+			h = newsStripOutlet(h, outlets...)
+		}
 		sl := slugify(h)
 		if sl == "" || seen[sl] {
 			continue
@@ -3923,6 +3933,12 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"NTT DATA (coverage)", "https://news.google.com/rss/search?q=%22NTT+DATA%22+AI&hl=en-US&gl=US&ceid=US:en"},
 		// LTM (formerly LTIMindtree), 2026-10-01. Stephen: need this one.
 		{"LTM (coverage)", "https://news.google.com/rss/search?q=%22LTM+Limited%22+OR+LTIMindtree&hl=en-US&gl=US&ceid=US:en"},
+		// Complete Defense Solutions, 2026-10-02, theworldofai row 355 on
+		// Stephen's instruction: the wholly owned subsidiary of Complete
+		// Financial Solutions, Inc. (OTC: CFSU). Its items become one-outlet
+		// stories through twoai_solo_news, matched by title, since this
+		// company is rarely covered by several outlets on one event.
+		{"Complete Defense Solutions (coverage)", "https://news.google.com/rss/search?q=%22Complete+Defense+Solutions%22+OR+%22Complete+Financial+Solutions%22+OR+CFSU&hl=en-US&gl=US&ceid=US:en"},
 		// DEVELOPER AND ENTERPRISE IT PRESS, 2026-09-29. Stephen asked for the
 		// developer stories a newsletter carried and the site missed: agent
 		// standards, AI in software teams, infrastructure for AI workloads, AI
@@ -5229,6 +5245,11 @@ func twoaiBuild(db *sql.DB) error {
 	// TechGig as a news source on its own, one-outlet stories, 2026-10-02.
 	if err := twoaiTechGigNews(db); err != nil {
 		fmt.Println("twoai_techgig_news:", err)
+	}
+	// Named subjects followed on their own (Complete Defense Solutions first),
+	// one-outlet stories pinned to the company page, 2026-10-02.
+	if err := twoaiSoloNews(db); err != nil {
+		fmt.Println("twoai_solo_news:", err)
 	}
 	// AI CVE tracker, 2026-10-02: NVD modified window each run, pages under
 	// news/cve-*.json and the list at news/cves.json.

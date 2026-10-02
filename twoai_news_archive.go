@@ -133,6 +133,11 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 				if slug == "" || headline == "" {
 					continue
 				}
+				// The refresh below rewrites headline from news.json on every
+				// run while the story is current, so a cleaned headline would
+				// come back raw unless the same rule runs here too.
+				headline = newsStripOutlet(headline, newsArticleDomains(s)...)
+				s["Headline"] = headline
 				s["uid"] = twoaiUID("story:" + slug)
 				if arts, ok := s["Articles"].([]any); ok && len(arts) > twoaiNewsArchiveMaxArticles {
 					s["Articles"] = arts[:twoaiNewsArchiveMaxArticles]
@@ -301,6 +306,8 @@ func twoaiNewsArchiveBackfill(db *sql.DB) {
 			if slug == "" || headline == "" {
 				continue
 			}
+			headline = newsStripOutlet(headline, newsArticleDomains(s)...)
+			s["Headline"] = headline
 			if arts, ok := s["Articles"].([]any); ok && len(arts) > twoaiNewsArchiveMaxArticles {
 				s["Articles"] = arts[:twoaiNewsArchiveMaxArticles]
 			}
