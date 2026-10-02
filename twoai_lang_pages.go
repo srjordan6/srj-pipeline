@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
 	"sort"
 	"strings"
@@ -48,6 +49,26 @@ const twoaiLangWritePerRun = 6
 // site is the Semantic Kernel section of learn.microsoft.com.
 var langSiteOverrides = map[string]struct{ site, scope string }{
 	"microsoft/semantic-kernel": {"https://learn.microsoft.com/en-us/semantic-kernel/overview/", "learn.microsoft.com/en-us/semantic-kernel"},
+}
+
+// langScope turns a subject's site into its crawl key. For most sites that
+// is the host. On a code host the host is everyone's: the 06:05 run of
+// 2026-10-02 crawled sixty pages of github.com for exllamav2 (no homepage,
+// so its repository stood in) and would have handed that digest to every
+// other repository-only subject. There the key is host plus owner/repo, so
+// the crawl stays inside the one repository (crawlSplitScope).
+func langScope(site string) string {
+	host := crawlHost(site)
+	switch host {
+	case "github.com", "gitlab.com", "codeberg.org", "huggingface.co", "bitbucket.org":
+		if p, err := url.Parse(site); err == nil {
+			parts := strings.Split(strings.Trim(p.Path, "/"), "/")
+			if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+				return host + "/" + parts[0] + "/" + parts[1]
+			}
+		}
+	}
+	return host
 }
 
 // langShortLinkHost says whether a host only ever redirects somewhere else.
@@ -120,7 +141,7 @@ func twoaiLangSubjects(db *sql.DB) []langSubject {
 				}
 				out = append(out, langSubject{
 					key: "lang:" + slug, uid: twoaiUID("lang:" + slug), kind: "language", name: l.Name, slug: slug,
-					siteURL: l.SourceURL, domain: crawlHost(l.SourceURL),
+					siteURL: l.SourceURL, domain: langScope(l.SourceURL),
 					facts:      map[string]any{"ai_role": l.AIRole, "steward": l.Steward, "first_release": l.FirstRelease, "verified": l.Verified, "tracked_repos": l.Repos, "official_site": l.SourceURL},
 					parentPath: base + d.UID + "/", parentName: d.Name,
 				})
@@ -173,7 +194,7 @@ func twoaiLangSubjects(db *sql.DB) []langSubject {
 				if key == "" {
 					key = r.Name
 				}
-				scope := crawlHost(site)
+				scope := langScope(site)
 				if o, ok := langSiteOverrides[r.Repo]; ok {
 					site, scope = o.site, o.scope
 				}
@@ -243,10 +264,10 @@ func twoaiLangPages(db *sql.DB, today string) (int, error) {
 					continue
 				}
 				repo, _ := subjects[i].facts["repo_url"].(string)
-				if repo == "" || crawlHost(repo) == d {
+				if repo == "" || langScope(repo) == d {
 					continue
 				}
-				subjects[i].siteURL, subjects[i].domain = repo, crawlHost(repo)
+				subjects[i].siteURL, subjects[i].domain = repo, langScope(repo)
 				subjects[i].facts["official_site"] = repo
 				starts[subjects[i].domain] = append(starts[subjects[i].domain], repo)
 				if topicOf[subjects[i].domain] == "" {

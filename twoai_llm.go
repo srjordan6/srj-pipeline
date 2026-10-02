@@ -238,6 +238,15 @@ func twoaiOllamaCallThink(model, system, user string, think bool) (string, error
 	}
 	if think {
 		payload["think"] = true
+	} else if strings.Contains(strings.ToLower(model), "deepseek") {
+		// SAY NO, DO NOT JUST FAIL TO SAY YES. deepseek-v4.1-flash thinks
+		// unless told not to: the 06:05 run of 2026-10-02 spent the whole
+		// 64,000 token budget on 286,291 characters of thinking for a
+		// language page nobody asked it to reason about, three times in one
+		// run, each one paid for and each one retried. An explicit false
+		// turns it off. Only sent to models known to accept the flag, since
+		// a local model that does not would refuse the request outright.
+		payload["think"] = false
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest("POST", twoaiOllamaHost()+"/api/generate", bytes.NewReader(body))
