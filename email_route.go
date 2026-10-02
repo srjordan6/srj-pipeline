@@ -47,6 +47,8 @@ package main
 //   publishing, launch, promo     -> theworldofai
 //   spans several projects        -> all of them (the bridge row says so)
 //   nothing claims it             -> escalation only, no bridge spam
+//   PSIRT campaign mail           -> ciso_outreach (added 2026-10-02, see
+//                                    erOutreachRoute; decided before the model)
 // Deadline, financial, or legal language always escalates on top of routing.
 //
 // The website branch was one project until 2026-08-18. Stephen runs two sites
@@ -95,7 +97,21 @@ const erEscalateTo = "info@srjconsultingservices.com" // alias of the same box; 
 const erTokenURL = "https://oauth2.googleapis.com/token"
 const erGmailAPI = "https://gmail.googleapis.com/gmail/v1/users/me"
 
-var erBridgeProjects = []string{"books_kdp", "books_vol1", "books_vol2", "books_vol3", "books_vol4", "books_vol5", "books_vol6", "books_vol7", "books_vol8", "books_vol9", "career", "srj", "theworldofai"}
+var erBridgeProjects = []string{"books_kdp", "books_vol1", "books_vol2", "books_vol3", "books_vol4", "books_vol5", "books_vol6", "books_vol7", "books_vol8", "books_vol9", "career", "srj", "theworldofai", "ciso_outreach"}
+
+// CISO OUTREACH, added 2026-10-02 on bridge row 339 from ciso_outreach. That
+// project runs the Fractional PSIRT campaign from this same srj@ mailbox, so a
+// prospect's reply is indistinguishable from general mail to the model above
+// and would be routed by expertise, which is to say wrongly. The campaign's
+// mail is recognised by three things that need no judgement: the two subjects
+// it sends under, the sender's domain being one of the prospect companies in
+// srj_prospect_companies, and the word PSIRT. Delivery failure notices for
+// those subjects quote the subject in the body, so the subject test reads the
+// body too. A reply that looks like a yes or asks for a meeting is escalated
+// to Stephen as time sensitive, because a campaign reply that waits a day is
+// a lost meeting.
+var erOutreachSubjects = []string{"a psirt hire without the headcount", "coffee in plano"}
+var erOutreachHot = []string{"meeting", "let's talk", "lets talk", "happy to chat", "set up a call", "schedule a call", "jump on a call", "calendar", "calendly", "interested", "available", "coffee", "zoom", "teams link", "when works", "what times", "next week", "this week"}
 
 // ---- Google service-account token (JWT bearer grant, RS256 by hand so the
 // binary stays dependency-free) ------------------------------------------
@@ -367,6 +383,67 @@ func erPreRoute(m erMessage) []string {
 	return nil // an infra sender naming neither site: let the model decide
 }
 
+// erSenderDomain pulls the bare domain out of a From header, whatever its
+// shape: "Name <a@b.com>", "a@b.com", or "<a@b.com>". Empty when there is no
+// address. Lowercased, with a leading www. dropped so it matches the way the
+// prospect table stores domains.
+func erSenderDomain(from string) string {
+	addr := from
+	if i := strings.LastIndex(addr, "<"); i >= 0 {
+		addr = addr[i+1:]
+	}
+	addr = strings.TrimSpace(strings.TrimSuffix(addr, ">"))
+	at := strings.LastIndex(addr, "@")
+	if at < 0 {
+		return ""
+	}
+	return strings.TrimPrefix(strings.ToLower(addr[at+1:]), "www.")
+}
+
+// erOutreachRoute decides whether a message belongs to the CISO outreach
+// campaign, before the model or any other rule sees it. Returns the projects
+// to route to (nil when it is not campaign mail) and whether the message
+// reads as a positive reply or a meeting request, which escalates to Stephen.
+//
+// The domain test asks the database each time rather than caching the list,
+// because the campaign adds companies between runs and the stage processes at
+// most twenty-five messages an hour, so the cost is nothing. A subdomain of a
+// prospect domain counts: mail.example.com is still example.com's people.
+func erOutreachRoute(db *sql.DB, m erMessage) ([]string, bool) {
+	t := strings.ToLower(m.Subject + " " + m.Body)
+	matched := strings.Contains(t, "psirt")
+	for _, s := range erOutreachSubjects {
+		if strings.Contains(t, s) {
+			matched = true
+		}
+	}
+	if !matched {
+		if d := erSenderDomain(m.From); d != "" {
+			var hit bool
+			db.QueryRow(`SELECT true FROM srj_prospect_companies
+				WHERE lower(domain) = $1 OR $1 LIKE '%.' || lower(domain) LIMIT 1`, d).Scan(&hit)
+			matched = hit
+		}
+	}
+	if !matched {
+		return nil, false
+	}
+	// A bounce is campaign mail the project must log, but it is never a yes.
+	f := strings.ToLower(m.From)
+	bounce := strings.Contains(f, "mailer-daemon") || strings.Contains(f, "postmaster") ||
+		strings.Contains(t, "delivery status notification") || strings.Contains(t, "undeliverable")
+	hot := false
+	if !bounce {
+		for _, h := range erOutreachHot {
+			if strings.Contains(t, h) {
+				hot = true
+				break
+			}
+		}
+	}
+	return []string{"ciso_outreach"}, hot
+}
+
 func erRoute(v erVerdict) []string {
 	switch v.Expertise {
 	case "book":
@@ -466,7 +543,20 @@ func emailRoute(db *sql.DB) error {
 			failed++
 			continue
 		}
-		projects := erPreRoute(m)
+		// Campaign mail is decided first and overrides the model entirely: a
+		// prospect's two-line reply, or a bounce for a campaign subject, is
+		// exactly what the model calls noise, and it is the mail the campaign
+		// most needs to see.
+		projects, outreachHot := erOutreachRoute(db, m)
+		outreach := projects != nil
+		if outreach {
+			v.Noise = false
+			if outreachHot {
+				v.Deadline = true
+			}
+		} else {
+			projects = erPreRoute(m)
+		}
 		preRouted := projects != nil
 		if !preRouted {
 			projects = erRoute(v)
@@ -505,6 +595,9 @@ func emailRoute(db *sql.DB) error {
 			}
 			if v.FinancialLegal {
 				reason = "financial or legal"
+			}
+			if outreachHot {
+				reason = "campaign reply, possible meeting request"
 			}
 			db.Exec(`INSERT INTO escalations_to_user (email_log_id, reason, subject, projects)
 				VALUES ($1,$2,$3,$4)`, logID, reason, m.Subject, strings.Join(projects, ","))
