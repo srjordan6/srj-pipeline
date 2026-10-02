@@ -762,6 +762,37 @@ func main() {
 		return
 	}
 
+	// backlog works the model-written backlogs down in off-peak hours: CVE
+	// headlines and defence sections, then why-it-matters lines, pass after
+	// pass until a pass finds nothing or TWOAI_BACKLOG_MINUTES (default 40)
+	// is up. Stephen, 2026-10-02 evening: keep running to get rid of the
+	// backlog. A solo stage in run-pipeline.ps1, so it runs beside the
+	// scheduled run rather than holding its lock; the scheduled run's
+	// publish picks up whatever this has written. It stops itself the
+	// moment peak hours begin, like every bulk stage.
+	if src == "backlog" {
+		minutes := 40
+		if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("TWOAI_BACKLOG_MINUTES"))); err == nil && v > 0 {
+			minutes = v
+		}
+		deadline := time.Now().Add(time.Duration(minutes) * time.Minute)
+		passes := 0
+		for time.Now().Before(deadline) {
+			if twoaiPeakAt(time.Now()) {
+				fmt.Println("backlog: peak hours began, stopping")
+				break
+			}
+			passes++
+			did := twoaiCVEWrite(db) + twoaiNewsWhy(db)
+			fmt.Printf("backlog: pass %d considered %d, %s left before the deadline\n", passes, did, time.Until(deadline).Round(time.Minute))
+			if did == 0 {
+				fmt.Println("backlog: nothing left to write")
+				break
+			}
+		}
+		return
+	}
+
 	if src == "twoai_freshness" {
 		if err := twoaiFreshnessReport(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_freshness:", err)

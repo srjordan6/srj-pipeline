@@ -50,15 +50,20 @@ func whyNorm(s string) string {
 	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(s))), " ")
 }
 
-func twoaiNewsWhy(db *sql.DB) {
+func twoaiNewsWhy(db *sql.DB) int {
+	// Ten a run during the slowdown; thirty off-peak since 2026-10-02 evening,
+	// with 889 stories unjudged and Stephen asking for the backlog cleared.
 	perRun := 10
+	if !twoaiPeakAt(time.Now()) {
+		perRun = 30
+	}
 	if v := strings.TrimSpace(os.Getenv("TWOAI_WHY_PER_RUN")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			perRun = n
 		}
 	}
 	if perRun == 0 {
-		return
+		return 0
 	}
 	// Name indexes for the two kinds the clustering extracts by name.
 	companies := map[string]whyMatch{}
@@ -107,7 +112,7 @@ func twoaiNewsWhy(db *sql.DB) {
 		ORDER BY published_on DESC NULLS LAST, slug LIMIT 400`)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "twoai_news_why select:", err)
-		return
+		return 0
 	}
 	type cand struct {
 		uid, headline, summary, oldHash string
@@ -218,7 +223,7 @@ Return only JSON: {"text": "...", "cites": ["k1", "k2"]} where cites lists the k
 		out, model, gerr := twoaiGenerate("news_why", system, sb.String())
 		if gerr != nil {
 			if strings.Contains(gerr.Error(), "deferred") {
-				return
+				return len(todo)
 			}
 			continue
 		}
@@ -269,4 +274,5 @@ Return only JSON: {"text": "...", "cites": ["k1", "k2"]} where cites lists the k
 		fmt.Printf("twoai_news_why: %s: %s\n", c.uid, trunc(why, 110))
 	}
 	fmt.Printf("twoai_news_why: candidates=%d written=%d no_match=%d held=%d unchanged=%d ok=true\n", len(todo), written, none, held, skipped)
+	return len(todo)
 }

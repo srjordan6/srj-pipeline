@@ -59,15 +59,23 @@ var cveVersionRe = regexp.MustCompile(`\b\d+(?:\.\d+){1,3}\b`)
 // the update agree on it to the byte.
 const cveWriteHash = `md5(concat_ws('|', description, cvss_score::text, cvss_vector, cwe, kev::text, kev_added::text, references_json::text, last_modified::text))`
 
-func twoaiCVEWrite(db *sql.DB) {
+// twoaiCVEWrite returns how many rows it considered, so a backlog loop can
+// tell when nothing is left.
+func twoaiCVEWrite(db *sql.DB) int {
+	// Twelve a run was the pace for the Ollama slowdown. Stephen, 2026-10-02
+	// evening, with 603 unwritten: keep running to get rid of the backlog, so
+	// an off-peak run takes forty and the backlog stage loops until none.
 	perRun := 12
+	if !twoaiPeakAt(time.Now()) {
+		perRun = 40
+	}
 	if v := strings.TrimSpace(os.Getenv("TWOAI_CVE_WRITE_PER_RUN")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			perRun = n
 		}
 	}
 	if perRun == 0 {
-		return
+		return 0
 	}
 	rows, err := db.Query(`SELECT cve_id, coalesce(product,''), coalesce(vendor,''), coalesce(published::text,''), coalesce(description,''),
 			cvss_score, coalesce(cvss_severity,''), coalesce(cvss_vector,''), coalesce(cwe,''), kev, coalesce(kev_added::text,''),
@@ -77,7 +85,7 @@ func twoaiCVEWrite(db *sql.DB) {
 		ORDER BY published DESC NULLS LAST LIMIT $1`, perRun)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "twoai_cve_write select:", err)
-		return
+		return 0
 	}
 	type row struct {
 		id, product, vendor, published, desc, sev, vec, cwe, kevAdded, affRaw, taggedRaw, refsRaw, hash string
@@ -171,7 +179,7 @@ Never include exploit detail, proof of concept, payloads or steps an attacker co
 		out, model, gerr := twoaiGenerate("cve_writer", system, sb.String())
 		if gerr != nil {
 			if strings.Contains(gerr.Error(), "deferred") {
-				return
+				return len(todo)
 			}
 			continue // not counted as an attempt, retried next run
 		}
@@ -293,4 +301,5 @@ Never include exploit detail, proof of concept, payloads or steps an attacker co
 		fmt.Printf("twoai_cve_write: %s: %s\n", r.id, headline)
 	}
 	fmt.Printf("twoai_cve_write: candidates=%d written=%d held=%d nvd_refetched=%d ok=true\n", len(todo), written, held, fetched)
+	return len(todo)
 }
