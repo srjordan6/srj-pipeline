@@ -9770,10 +9770,30 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 	}
 	// A domain with no page of its own is a container, and the only honest
 	// number it has is its sections'. One with its own page keeps its own.
+	//
+	// A LANDING PAGE IS NOT A THING THE HUB HOLDS. Stephen, 2026-10-02:
+	// Programming Languages and Frameworks read 2 beside sections reading 7,
+	// 17 and 12, "I count 36". The 2 was its two landing documents (the hub
+	// page and the ecosystem copy), counted as pages because the rule above
+	// only sees zero as "no page of its own". A hub whose own documents
+	// declare no total is a container whatever its landing pages number, so
+	// it reports what its sections hold. A domain whose documents do declare
+	// a total keeps it, because there the sections are alternate views of
+	// the same entities and adding them would double-count.
 	for _, d := range doms {
 		d.WithSections += d.Pages
 		if d.Pages == 0 {
 			d.Pages = d.WithSections
+			continue
+		}
+		if len(d.Sections) == 0 {
+			continue
+		}
+		var ownTotal int
+		db.QueryRow(`SELECT COALESCE(max(COALESCE(NULLIF(p.data->>'total',''), NULLIF(p.data->>'total_points',''))::int),0)
+			FROM twoai_pages p WHERE p.taxonomy_slug=$1`, d.Slug).Scan(&ownTotal)
+		if ownTotal == 0 && d.WithSections-d.Pages > 0 {
+			d.Pages = d.WithSections - d.Pages
 		}
 	}
 	// AI Security and Risk presents its SIX SECURITY DOMAINS at this level,
