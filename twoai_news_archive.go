@@ -170,8 +170,17 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 		}
 	}
 
+	// RETIRED STORIES, 2026-10-01. Stephen, on /ai-news/37badd05/ ("Data
+	// Privacy and Targeting Archives", a Campaigns & Elections category
+	// archive clustered with three unrelated outlets): this makes no sense,
+	// why is it in the news. A story can be retired: the row and the
+	// permalink stay, the page says the story was withdrawn and why, is
+	// noindex, and leaves every list.
+	db.Exec(`ALTER TABLE twoai_news_stories ADD COLUMN IF NOT EXISTS retired_at timestamptz`)
+	db.Exec(`ALTER TABLE twoai_news_stories ADD COLUMN IF NOT EXISTS retired_reason text`)
 	rows, err := db.Query(`SELECT story::text, COALESCE(to_char(published_on,'YYYY-MM-DD'),''),
-			to_char(first_published at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"')
+			to_char(first_published at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+			retired_at IS NOT NULL, COALESCE(retired_reason,'')
 		FROM twoai_news_stories ORDER BY published_on DESC NULLS LAST, slug`)
 	if err != nil {
 		return 0, err
@@ -180,8 +189,9 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 
 	stories := []map[string]any{}
 	for rows.Next() {
-		var raw, pub, first string
-		if err := rows.Scan(&raw, &pub, &first); err != nil {
+		var raw, pub, first, why string
+		var retired bool
+		if err := rows.Scan(&raw, &pub, &first, &retired, &why); err != nil {
 			return 0, err
 		}
 		var s map[string]any
@@ -207,6 +217,10 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 		}
 		if slug != "" {
 			s["uid"] = twoaiUID("story:" + slug)
+		}
+		if retired {
+			s["retired"] = true
+			s["retired_reason"] = why
 		}
 		stories = append(stories, s)
 	}

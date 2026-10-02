@@ -1989,6 +1989,24 @@ func twoaiWireTitle(title string) string {
 // publishNews clusters the day's gdelt coverage into top stories and
 // publishes news/news.json to srj-content. Stories rank by breadth of
 // coverage (unique outlets). Same GitHub-commit flow as before.
+// twoaiIsIndexPage: a category archive, tag page, topic index or author page
+// is not a story. 2026-10-01: "Data Privacy and Targeting Archives", a
+// Campaigns & Elections category listing, was published as a story and
+// clustered with three unrelated outlets; the summary itself said no single
+// news event was reported.
+var twoaiIndexTitleRe = regexp.MustCompile(`(?i)\b(archives?|category|tag|topics?|author)\s*$|^(category|tag|topic|archive|author):\s`)
+var twoaiIndexPathRe = regexp.MustCompile(`(?i)/(category|categories|tag|tags|topic|topics|archive|archives|author|authors|section|sections)(/|$)|/page/\d+`)
+
+func twoaiIsIndexPage(title, u string) bool {
+	if twoaiIndexTitleRe.MatchString(strings.TrimSpace(title)) {
+		return true
+	}
+	if p, err := url.Parse(u); err == nil && twoaiIndexPathRe.MatchString(p.Path) {
+		return true
+	}
+	return false
+}
+
 func publishNews(db *sql.DB) error {
 	tok := os.Getenv("GITHUB_TOKEN")
 	if tok == "" {
@@ -2042,7 +2060,7 @@ func publishNews(db *sql.DB) error {
 		var a art
 		var d sql.NullString
 		if rows.Scan(&a.Title, &a.URL, &d, &a.Domain, &a.persons, &a.orgs) == nil {
-			if !twoaiTitleIsAI(a.Title) {
+			if !twoaiTitleIsAI(a.Title) || twoaiIsIndexPage(a.Title, a.URL) {
 				skipped++
 				continue
 			}
