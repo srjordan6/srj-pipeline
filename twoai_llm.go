@@ -140,6 +140,8 @@ var twoaiBulkStages = map[string]bool{
 	"ENACTED_LAWS": true,
 	// CVE headlines and defence sections, a 600 row backlog at a dozen a run.
 	"cve_writer": true,
+	// The why-it-matters line on news stories, ten a run over the live archive.
+	"news_why": true,
 }
 
 var twoaiPeakNoted sync.Map

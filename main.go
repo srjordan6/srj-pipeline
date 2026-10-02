@@ -4531,8 +4531,11 @@ func twoaiBuild(db *sql.DB) error {
 	stateNews := map[string][]map[string]any{}
 	{
 		policy := regexp.MustCompile(`(?i)\b(law|laws|bill|bills|legislat\w*|executive order|governor|gov\.|attorney general|regulat\w*|statute|ban|lawmakers|general assembly|senate|house)\b`)
+		// Retired stories, duplicates included, leave every list (row 368); a
+		// pin that still names a merged duplicate follows it to the survivor.
+		dupOf := newsDuplicateMap(db)
 		nrows, err := db.Query(`SELECT uid, headline, published_on::text, COALESCE(story->>'Summary','')
-			FROM twoai_news_stories WHERE published_on > current_date - 365 ORDER BY published_on DESC`)
+			FROM twoai_news_stories WHERE published_on > current_date - 365 AND retired_at IS NULL ORDER BY published_on DESC`)
 		if err == nil {
 			type nstory struct{ uid, head, date, sum string }
 			var all []nstory
@@ -4558,6 +4561,9 @@ func twoaiBuild(db *sql.DB) error {
 				for pr.Next() {
 					var sl, su string
 					if pr.Scan(&sl, &su) == nil {
+						if surv, ok := dupOf[su]; ok {
+							su = surv
+						}
 						if pins[sl] == nil {
 							pins[sl] = map[string]bool{}
 						}
@@ -5438,6 +5444,9 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	// One line of the site's own analysis per story, from the records the
+	// site has matched to it (row 371), written before the archive goes out.
+	twoaiNewsWhy(db)
 	newsArchive, err := twoaiNewsArchive(db, upsert)
 	if err != nil {
 		return err

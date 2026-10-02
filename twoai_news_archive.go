@@ -156,11 +156,18 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 				// news (clustering picks up outlets through the day), but
 				// first_published and published_on are written once. A
 				// permalink's date must not drift.
+				// The refresh replaces the story document, so anything the site
+				// wrote onto it after the fact (the why_it_matters line, row 371)
+				// is carried across rather than lost.
 				if _, err := db.Exec(`INSERT INTO twoai_news_stories
 					(slug, headline, story, published_on, uid)
 					VALUES ($1,$2,$3::jsonb,$4::date,$5)
 					ON CONFLICT (slug) DO UPDATE SET
-						headline=EXCLUDED.headline, story=EXCLUDED.story, last_seen=now(),
+						headline=EXCLUDED.headline,
+						story=CASE WHEN twoai_news_stories.story ? 'why_it_matters'
+							THEN EXCLUDED.story || jsonb_build_object('why_it_matters', twoai_news_stories.story->'why_it_matters')
+							ELSE EXCLUDED.story END,
+						last_seen=now(),
 						uid=COALESCE(twoai_news_stories.uid, EXCLUDED.uid)`,
 					slug, headline, string(raw), pub, twoaiUID("story:"+slug)); err != nil {
 					fmt.Fprintln(os.Stderr, "twoai_build: news story upsert:", err)
@@ -187,6 +194,23 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 	// table, so the row is marked here once the columns exist.
 	db.Exec(`UPDATE twoai_news_stories SET retired_at = now(), retired_reason = $2 WHERE uid = $1 AND retired_at IS NULL`,
 		"37badd05", "the page it was built from is a category archive listing on campaignsandelections.com, not a news story, and the three outlets clustered with it reported nothing related (editor, 2026-10-01)")
+	// One event is one story (row 368): same-event duplicates are merged
+	// before the archive is written, so the survivor carries every outlet
+	// and the duplicate's permalink points at it.
+	twoaiNewsDedupe(db)
+	dupOf := newsDuplicateMap(db)
+	survivorHead := map[string]string{}
+	if len(dupOf) > 0 {
+		if hr, err := db.Query(`SELECT uid, headline FROM twoai_news_stories WHERE retired_at IS NULL`); err == nil {
+			for hr.Next() {
+				var u, h string
+				if hr.Scan(&u, &h) == nil {
+					survivorHead[u] = h
+				}
+			}
+			hr.Close()
+		}
+	}
 	rows, err := db.Query(`SELECT story::text, COALESCE(to_char(published_on,'YYYY-MM-DD'),''),
 			to_char(first_published at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'),
 			retired_at IS NOT NULL, COALESCE(retired_reason,'')
@@ -230,6 +254,12 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 		if retired {
 			s["retired"] = true
 			s["retired_reason"] = why
+			if uid, _ := s["uid"].(string); uid != "" {
+				if surv, ok := dupOf[uid]; ok {
+					s["duplicate_of"] = surv
+					s["duplicate_of_headline"] = survivorHead[surv]
+				}
+			}
 		}
 		stories = append(stories, s)
 	}
