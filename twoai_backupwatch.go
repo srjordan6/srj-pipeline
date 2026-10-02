@@ -26,8 +26,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"github.com/lib/pq"
 )
 
 type bwCheck struct {
@@ -107,9 +105,24 @@ func twoaiBackupWatch(db *sql.DB) error {
 			subj = "Database backup recovered: " + c.key
 			body = "The " + c.key + " check is healthy again.\n\n" + detail
 		}
-		db.Exec(`INSERT INTO inkbox_outbox (from_handle, channel, to_addrs, subject, body) VALUES ($1,'email',$2,$3,$4)`,
-			bwFrom, pq.Array(bwAlertTo()), subj, body)
-		fmt.Println("backupwatch: queued:", subj)
+		bwAlert(db, "backupwatch", subj, body)
+		// A recovery closes the problem it answers. theworldofai, bridge row
+		// 352 (2026-10-02): the problem rows for wal-ship and nasdump sat open
+		// for two days after both jobs were healthy, until a person read the
+		// job logs and acked them by hand. Only this job's rows, only ones
+		// raised before this recovery, and only in the mailbox the alert went
+		// to. A job that has not recovered keeps its row open.
+		if state == "ok" {
+			res, err := db.Exec(`UPDATE project_bridge SET status='ack', acked_at=now()
+				WHERE to_project='theworldofai' AND status='open'
+				AND from_project IN ('inkbox','backupwatch')
+				AND topic=$1 AND created_at < now()`, "Database backup problem: "+c.key)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "backupwatch: ack problem rows for %s: %v\n", c.key, err)
+			} else if n, _ := res.RowsAffected(); n > 0 {
+				fmt.Printf("backupwatch: %s recovered, acked %d open problem row(s)\n", c.key, n)
+			}
+		}
 	}
 	return nil
 }

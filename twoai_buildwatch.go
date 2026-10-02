@@ -65,6 +65,30 @@ func bwAlertTo() []string {
 	return []string{"srj@srjconsultingservices.com"}
 }
 
+// bwAlert is how a watch raises its voice: the email goes into the outbox for
+// the same tick to send, and the same text goes straight into the theworldofai
+// bridge mailbox, written here and not by mirroring the mail back later.
+//
+// 2026-10-02: fourteen alerts in a row, every build and backup notice since
+// 2026-09-30 16:02 UTC, had failed to send. Inkbox refuses a conversation once
+// twenty messages have gone unanswered (403 conversation_unhealthy), and the
+// outbox parks a row after two tries. Nothing in the bridge said so, because
+// the bridge row only ever came from inkbox_pull mirroring the sent copy, and
+// an unsent mail has no copy. The project reads the bridge, Stephen reads the
+// mail, and the two must not share a single point of failure. from_project
+// names the watch so the project can tell a direct row from mirrored mail, and
+// inkbox_pull skips our own alert mail so a late delivery cannot add a second
+// row for the same event.
+func bwAlert(db *sql.DB, watch, subj, text string) {
+	db.Exec(`INSERT INTO inkbox_outbox (from_handle, channel, to_addrs, subject, body)
+		VALUES ($1,'email',$2,$3,$4)`, bwFrom, pq.Array(bwAlertTo()), subj, text)
+	if _, err := db.Exec(`INSERT INTO project_bridge (from_project, to_project, topic, body)
+		VALUES ($1,'theworldofai',$2,$3)`, watch, subj, text); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: bridge row for %q: %v\n", watch, subj, err)
+	}
+	fmt.Println(watch+": queued:", subj)
+}
+
 func twoaiBuildWatch(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_buildwatch (
 		key text PRIMARY KEY, value text NOT NULL, at timestamptz NOT NULL DEFAULT now())`); err != nil {
@@ -133,11 +157,7 @@ func twoaiBuildWatch(db *sql.DB) error {
 	}
 	now := time.Now().UTC()
 
-	queue := func(subj, text string) {
-		db.Exec(`INSERT INTO inkbox_outbox (from_handle, channel, to_addrs, subject, body)
-			VALUES ($1,'email',$2,$3,$4)`, bwFrom, pq.Array(bwAlertTo()), subj, text)
-		fmt.Println("buildwatch: queued:", subj)
-	}
+	queue := func(subj, text string) { bwAlert(db, "buildwatch", subj, text) }
 
 	// Rule 1: a commit on main that has not shipped.
 	// live.Commit must LOOK like a commit before it is treated as evidence.

@@ -181,7 +181,7 @@ func inkboxPull(db *sql.DB) error {
 		return err
 	}
 
-	totalMail, totalTasks, skipped, unreadable := 0, 0, 0, 0
+	totalMail, totalTasks, skipped, unreadable, ownAlerts := 0, 0, 0, 0, 0
 
 	for _, id := range ibIdentities {
 		key := ibKey(id.handle)
@@ -211,6 +211,26 @@ func inkboxPull(db *sql.DB) error {
 				}
 				subject := ibStr(m, "subject", "title")
 				from := ibStr(m, "from", "from_address", "fromAddress", "from.address", "sender")
+				// OUR OWN ALERT MAIL IS NOT INBOUND. The sent copy of every
+				// buildwatch and backupwatch email sits in this same mailbox
+				// with our own address as sender, and until 2026-10-02 this
+				// mirror was the only way such an alert reached the bridge: a
+				// mail that failed to send left no row at all. The watches now
+				// write the bridge row themselves (bwAlert), so the sent copy
+				// is logged as seen and marked read, and nothing else, or a
+				// late delivery would add a second row for the same event.
+				if strings.Contains(strings.ToLower(from), strings.ToLower(id.mailbox)) && ibQueuedByUs(db, id.handle, subject) {
+					db.Exec(`INSERT INTO inkbox_sync_log (kind, external_id, to_project, topic)
+						VALUES ('mail', $1, $2, $3) ON CONFLICT (kind, external_id) DO NOTHING`,
+						msgID, id.project, "(own alert, bridge row written by the watch) "+subject)
+					if _, err := ibDo(key, "PATCH",
+						"/mail/mailboxes/"+url.PathEscape(id.mailbox)+"/messages/"+url.PathEscape(msgID),
+						map[string]any{"is_read": true}); err != nil {
+						fmt.Fprintln(os.Stderr, "inkbox_pull mark own alert read:", err)
+					}
+					ownAlerts++
+					continue
+				}
 				text := ibStr(m, "text", "body_text", "bodyText", "body", "snippet", "preview")
 				body := fmt.Sprintf("Inkbox mail to %s\nFrom: %s\n\n%s", id.mailbox, from, text)
 				fresh, err := ibRecord(db, "mail", msgID, id.project, subject, body)
@@ -265,7 +285,17 @@ func inkboxPull(db *sql.DB) error {
 		}
 	}
 
-	fmt.Printf("inkbox_pull: mail=%d tasks=%d identities_skipped=%d unreadable=%d\n",
-		totalMail, totalTasks, skipped, unreadable)
+	fmt.Printf("inkbox_pull: mail=%d tasks=%d own_alerts=%d identities_skipped=%d unreadable=%d\n",
+		totalMail, totalTasks, ownAlerts, skipped, unreadable)
 	return nil
+}
+
+// ibQueuedByUs reports whether this handle queued an email with this subject
+// recently, which is what makes a message in our own mailbox, from our own
+// address, one of our alerts rather than something a person wrote to us.
+func ibQueuedByUs(db *sql.DB, handle, subject string) bool {
+	var hit bool
+	db.QueryRow(`SELECT true FROM inkbox_outbox WHERE from_handle=$1 AND subject=$2
+		AND created_at > now() - interval '30 days' LIMIT 1`, handle, subject).Scan(&hit)
+	return hit
 }
