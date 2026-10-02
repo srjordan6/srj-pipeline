@@ -135,6 +135,9 @@ var twoaiBulkStages = map[string]bool{
 	"page_readings": true, "sector_analysis": true, "twoai_source_pages": true, "art": true, "twoai_lang_pages": true,
 	"point_briefs": true, "paper_explain": true, "news_mine": true, "ma_readings": true, "learning_readings": true,
 	"benchmark_readings": true, "lawsuit_fill": true, "company_profiles": true, "case_studies": true, "vendor_enrich": true,
+	// The enacted laws writer is the one stage pipeline.env keeps on Pro with
+	// thinking, the dearest call in the run, and it works through a backlog.
+	"ENACTED_LAWS": true,
 }
 
 var twoaiPeakNoted sync.Map
