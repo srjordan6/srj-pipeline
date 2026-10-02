@@ -5226,6 +5226,10 @@ func twoaiBuild(db *sql.DB) error {
 	if err := twoaiAccountingNews(db); err != nil {
 		fmt.Println("twoai_accounting_news:", err)
 	}
+	// TechGig as a news source on its own, one-outlet stories, 2026-10-02.
+	if err := twoaiTechGigNews(db); err != nil {
+		fmt.Println("twoai_techgig_news:", err)
+	}
 	// FTC and SEC AI enforcement actions, once a day, 2026-09-27.
 	if stageDueToday("twoai_enforcement_watch") {
 		if err := twoaiEnforcementWatch(db, today); err != nil {
