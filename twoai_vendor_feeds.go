@@ -27,6 +27,9 @@ import (
 	"encoding/xml"
 	"fmt"
 	"html"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -183,9 +186,23 @@ func twoaiVendorFeeds(db *sql.DB) error {
 	}
 	rows.Close()
 
-	saved, failed := 0, 0
+	db.Exec(`ALTER TABLE twoai_vendor_feeds ADD COLUMN IF NOT EXISTS fetched_via text`)
+	saved, failed, viaCloudflare := 0, 0, 0
 	for _, f := range feeds {
 		body, err := twoaiJobsGet(f.url, nil)
+		via := "direct"
+		// ROUND THE GEO-BLOCK, NOT THROUGH IT. Stephen, 2026-10-02 (row 376):
+		// the office router drops Indian address space and stays that way, so
+		// a feed that fails on DNS or a connect timeout is fetched once more
+		// through the site Worker's allow-listed fetch-through route, which
+		// runs outside the office network. The row records which path worked.
+		if err != nil && feedLooksBlocked(err) {
+			if b2, err2 := feedFetchViaCloudflare(f.url); err2 == nil {
+				body, err, via = b2, nil, "cloudflare"
+			} else {
+				err = fmt.Errorf("%v (via cloudflare: %v)", err, err2)
+			}
+		}
 		if err != nil {
 			failed++
 			db.Exec(`UPDATE twoai_vendor_feeds SET last_error=$2,
@@ -193,6 +210,9 @@ func twoaiVendorFeeds(db *sql.DB) error {
 				f.vendor, err.Error())
 			fmt.Fprintf(os.Stderr, "twoai_vendor_feeds: %s: %v\n", f.vendor, err)
 			continue
+		}
+		if via == "cloudflare" {
+			viaCloudflare++
 		}
 		var doc twoaiFeedDoc
 		if err := xml.Unmarshal(body, &doc); err != nil {
@@ -265,8 +285,13 @@ func twoaiVendorFeeds(db *sql.DB) error {
 			saved++
 		}
 		db.Exec(`UPDATE twoai_vendor_feeds SET last_ok=now(), last_error=NULL,
-			consecutive_failures=0 WHERE vendor=$1`, f.vendor)
-		_ = n
+			consecutive_failures=0, fetched_via=$2 WHERE vendor=$1`, f.vendor, via)
+		if via == "cloudflare" {
+			fmt.Printf("twoai_vendor_feeds: %s fetched via cloudflare, %d item(s)\n", f.vendor, n)
+		}
+	}
+	if viaCloudflare > 0 {
+		fmt.Printf("twoai_vendor_feeds: %d feed(s) fetched via cloudflare\n", viaCloudflare)
 	}
 
 	// Feeds that have failed their way out of the rotation. Named, because a
@@ -295,6 +320,45 @@ func twoaiVendorFeeds(db *sql.DB) error {
 	fmt.Printf("twoai_vendor_feeds: feeds=%d ok=%d failed=%d posts_seen=%d archive=%d ok=true\n",
 		len(feeds), len(feeds)-failed, failed, saved, total)
 	return nil
+}
+
+// feedLooksBlocked says whether a fetch error is the shape a network block
+// produces (the name does not resolve, or the connection never opens),
+// rather than a server answering with an error.
+func feedLooksBlocked(err error) bool {
+	e := strings.ToLower(err.Error())
+	for _, sig := range []string{"no such host", "i/o timeout", "connectex", "deadline exceeded", "connection refused",
+		"tls handshake timeout", "network is unreachable", "connection reset"} {
+		if strings.Contains(e, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// feedFetchViaCloudflare asks the site Worker to fetch the feed from outside
+// the office network. FEED_FETCH_SECRET, when set in pipeline.env, must match
+// the Worker's secret; without it the Worker still answers for its
+// allow-listed hosts.
+func feedFetchViaCloudflare(feedURL string) ([]byte, error) {
+	req, err := http.NewRequest("GET", "https://theworldofai.org/api/feed-fetch?url="+url.QueryEscape(feedURL), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "srj-pipeline feed reader (srj@srjconsultingservices.com)")
+	if s := strings.TrimSpace(os.Getenv("FEED_FETCH_SECRET")); s != "" {
+		req.Header.Set("X-Feed-Secret", s)
+	}
+	resp, err := (&http.Client{Timeout: 40 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("worker answered %d: %s", resp.StatusCode, trunc(strings.TrimSpace(string(body)), 120))
+	}
+	return body, nil
 }
 
 func nullIfEmpty(s string) any {

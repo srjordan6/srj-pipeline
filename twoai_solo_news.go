@@ -39,6 +39,10 @@ type soloSubject struct {
 	match    string // Postgres regex over the candidate title, case-insensitive
 	pageUID  string // company page each story is pinned to, "" for none
 	pagePath string
+	// aiOnly keeps the AI-in-the-headline rule the subject's feeds use: a
+	// large company is in the news for many reasons, and only the AI ones
+	// are stories here. The model's NOT RELEVANT answer is the second gate.
+	aiOnly bool
 }
 
 var soloSubjects = []soloSubject{
@@ -48,6 +52,24 @@ var soloSubjects = []soloSubject{
 		match:    `complete (defense|defence|financial) solutions|\mCFSU\M`,
 		pageUID:  "2fc4d267", // twoaiUID("company:complete defense solutions")
 		pagePath: "companies/2fc4d267.json",
+	},
+	// theworldofai row 375, Stephen 2026-10-02: company news on company pages
+	// for the two followed with their own feeds since 2026-10-01 and 10-02.
+	{
+		key:      "kyndryl",
+		label:    "Kyndryl",
+		match:    `\mKyndryl\M`,
+		pageUID:  "b0d1ccaf",
+		pagePath: "companies/b0d1ccaf.json",
+		aiOnly:   true,
+	},
+	{
+		key:      "ntt-data",
+		label:    "NTT DATA",
+		match:    `\mNTT DATA\M`,
+		pageUID:  "e07c8073",
+		pagePath: "companies/e07c8073.json",
+		aiOnly:   true,
 	},
 }
 
@@ -97,6 +119,11 @@ func twoaiSoloNews(db *sql.DB) error {
 			outcome := func(o, uid string) {
 				db.Exec(`INSERT INTO twoai_solo_news (url, subject, story_uid, outcome) VALUES ($1, $2, NULLIF($3,''), $4) ON CONFLICT (url) DO NOTHING`,
 					it.url, sub.key, uid, o)
+			}
+			if sub.aiOnly && !aiTermRe.MatchString(it.title) {
+				outcome("not about AI by title", "")
+				skipped++
+				continue
 			}
 			// Already on the site as part of a briefing story, or as an
 			// earlier copy of the same announcement: ledgered, not repeated.
