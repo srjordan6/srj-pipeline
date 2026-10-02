@@ -1995,7 +1995,15 @@ func twoaiWireTitle(title string) string {
 // clustered with three unrelated outlets; the summary itself said no single
 // news event was reported.
 var twoaiIndexTitleRe = regexp.MustCompile(`(?i)\b(archives?|category|tag|topics?|author)\s*$|^(category|tag|topic|archive|author):\s`)
-var twoaiIndexPathRe = regexp.MustCompile(`(?i)/(category|categories|tag|tags|topic|topics|archive|archives|author|authors|section|sections)(/|$)|/page/\d+`)
+
+// Only a path that ENDS at the listing counts: /tag/data-privacy/ is a tag
+// page, while japantoday.com/category/tech/<slug>, freemalaysiatoday.com/
+// category/world/2026/09/17/<slug> and taipeitimes.com/News/biz/archives/
+// 2026/09/29/<id> are articles that merely live under such a folder.
+// A short label after the folder (/tag/privacy/, /topics/ai-policy/) is a
+// listing; a long hyphenated slug (culture.org/archive/newsom-s-new-ai-order-
+// puts-a-kill-switch/) is an article, so the title rule decides those.
+var twoaiIndexPathRe = regexp.MustCompile(`(?i)/(category|categories|tag|tags|topic|topics|archive|archives|author|authors|section|sections)(/[a-z0-9]+(-[a-z0-9]+){0,2})?/?$|/page/\d+/?$`)
 
 func twoaiIsIndexPage(title, u string) bool {
 	if twoaiIndexTitleRe.MatchString(strings.TrimSpace(title)) {
