@@ -271,15 +271,66 @@ type nvdCVE struct {
 		} `json:"description"`
 	} `json:"weaknesses"`
 	References []struct {
-		URL string `json:"url"`
+		URL  string   `json:"url"`
+		Tags []string `json:"tags"`
 	} `json:"references"`
 	Configurations []struct {
 		Nodes []struct {
 			CpeMatch []struct {
-				Criteria string `json:"criteria"`
+				Criteria              string `json:"criteria"`
+				Vulnerable            bool   `json:"vulnerable"`
+				VersionStartIncluding string `json:"versionStartIncluding"`
+				VersionStartExcluding string `json:"versionStartExcluding"`
+				VersionEndIncluding   string `json:"versionEndIncluding"`
+				VersionEndExcluding   string `json:"versionEndExcluding"`
 			} `json:"cpeMatch"`
 		} `json:"nodes"`
 	} `json:"configurations"`
+}
+
+// cveAffected is one affected-product range from NVD's configurations, kept
+// so the defence writer can name the fixed version (versionEndExcluding is
+// the first version that is not affected) without inventing one.
+type cveAffected struct {
+	Criteria       string `json:"criteria"`
+	StartIncluding string `json:"start_including,omitempty"`
+	StartExcluding string `json:"start_excluding,omitempty"`
+	EndIncluding   string `json:"end_including,omitempty"`
+	EndExcluding   string `json:"end_excluding,omitempty"`
+}
+
+type cveRef struct {
+	URL  string   `json:"url"`
+	Tags []string `json:"tags"`
+}
+
+// cveRecordExtras pulls the affected ranges and the tagged references out of
+// an NVD record, capped so a CVE with hundreds of CPE rows stays small.
+func cveRecordExtras(c nvdCVE) ([]cveAffected, []cveRef) {
+	aff := []cveAffected{}
+	for _, cfg := range c.Configurations {
+		for _, n := range cfg.Nodes {
+			for _, m := range n.CpeMatch {
+				if !m.Vulnerable || len(aff) >= 40 {
+					continue
+				}
+				aff = append(aff, cveAffected{Criteria: m.Criteria, StartIncluding: m.VersionStartIncluding, StartExcluding: m.VersionStartExcluding,
+					EndIncluding: m.VersionEndIncluding, EndExcluding: m.VersionEndExcluding})
+			}
+		}
+	}
+	refs := []cveRef{}
+	for i, r := range c.References {
+		if i >= 12 {
+			break
+		}
+		tags := r.Tags
+		if tags == nil {
+			tags = []string{}
+		}
+		refs = append(refs, cveRef{URL: r.URL, Tags: tags})
+	}
+	return aff, refs
 }
 
 type nvdPage struct {
@@ -463,13 +514,17 @@ func cveStore(db *sql.DB, c nvdCVE, hits []cveHit, status, reason, vendor, produ
 	}
 	refJSON, _ := json.Marshal(refs)
 	hitJSON, _ := json.Marshal(hits)
+	aff, tagged := cveRecordExtras(c)
+	affJSON, _ := json.Marshal(aff)
+	taggedJSON, _ := json.Marshal(tagged)
 	kevAdded := sql.NullString{String: kev[c.ID], Valid: kev[c.ID] != ""}
 	// Status is never downgraded by a refresh: a CVE Stephen approved stays
 	// approved, one he rejected stays rejected, and a published one stays
 	// published.
-	if _, err := db.Exec(`INSERT INTO twoai_cves (cve_id, uid, published, last_modified, description, vendor, product, cvss_score, cvss_severity, cvss_vector, cwe, kev, kev_added, status, match_reason, cve_org_url, nvd_url, references_json, entities_json, updated_at)
-		VALUES ($1,$2,$3::timestamptz,$4::timestamptz,$5,NULLIF($6,''),NULLIF($7,''),$8,NULLIF($9,''),NULLIF($10,''),NULLIF($11,''),$12,$13::date,$14,$15,$16,$17,$18::jsonb,$19::jsonb,now())
+	if _, err := db.Exec(`INSERT INTO twoai_cves (cve_id, uid, published, last_modified, description, vendor, product, cvss_score, cvss_severity, cvss_vector, cwe, kev, kev_added, status, match_reason, cve_org_url, nvd_url, references_json, entities_json, affected_json, references_tagged, updated_at)
+		VALUES ($1,$2,$3::timestamptz,$4::timestamptz,$5,NULLIF($6,''),NULLIF($7,''),$8,NULLIF($9,''),NULLIF($10,''),NULLIF($11,''),$12,$13::date,$14,$15,$16,$17,$18::jsonb,$19::jsonb,$20::jsonb,$21::jsonb,now())
 		ON CONFLICT (cve_id) DO UPDATE SET last_modified=EXCLUDED.last_modified, description=EXCLUDED.description,
+			affected_json=EXCLUDED.affected_json, references_tagged=EXCLUDED.references_tagged,
 			vendor=coalesce(EXCLUDED.vendor, twoai_cves.vendor), product=coalesce(EXCLUDED.product, twoai_cves.product),
 			cvss_score=coalesce(EXCLUDED.cvss_score, twoai_cves.cvss_score), cvss_severity=coalesce(EXCLUDED.cvss_severity, twoai_cves.cvss_severity),
 			cvss_vector=coalesce(EXCLUDED.cvss_vector, twoai_cves.cvss_vector), cwe=coalesce(EXCLUDED.cwe, twoai_cves.cwe),
@@ -479,7 +534,7 @@ func cveStore(db *sql.DB, c nvdCVE, hits []cveHit, status, reason, vendor, produ
 				ELSE EXCLUDED.status END,
 			match_reason=EXCLUDED.match_reason, references_json=EXCLUDED.references_json, entities_json=EXCLUDED.entities_json, updated_at=now()`,
 		c.ID, twoaiUID("cve:"+c.ID), c.Published, c.LastModified, desc, vendor, product, score, sev, vec, cwe, kevAdded.Valid, kevAdded,
-		status, reason, "https://www.cve.org/CVERecord?id="+c.ID, "https://nvd.nist.gov/vuln/detail/"+c.ID, string(refJSON), string(hitJSON)); err != nil {
+		status, reason, "https://www.cve.org/CVERecord?id="+c.ID, "https://nvd.nist.gov/vuln/detail/"+c.ID, string(refJSON), string(hitJSON), string(affJSON), string(taggedJSON)); err != nil {
 		fmt.Fprintln(os.Stderr, "twoai_cve_watch store", c.ID, ":", err)
 	}
 }
@@ -495,6 +550,15 @@ func twoaiCVEWatch(db *sql.DB) error {
 	}
 	if _, err := db.Exec(`ALTER TABLE twoai_cves ADD COLUMN IF NOT EXISTS entities_json jsonb`); err != nil {
 		return err
+	}
+	// Row 366 (2026-10-02): a written headline and defence section per CVE,
+	// and the record detail the writer needs (affected ranges, tagged
+	// references). twoai_cve_write.go owns the writing columns.
+	for _, col := range []string{"affected_json jsonb", "references_tagged jsonb", "headline text", "defense jsonb",
+		"written_on date", "written_hash text", "write_attempts int NOT NULL DEFAULT 0"} {
+		if _, err := db.Exec(`ALTER TABLE twoai_cves ADD COLUMN IF NOT EXISTS ` + col); err != nil {
+			return err
+		}
 	}
 	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_cve_state (key text PRIMARY KEY, value text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`)
 	idx := cveEntityIndex(db)
@@ -579,6 +643,9 @@ func twoaiCVEWatch(db *sql.DB) error {
 	for id, added := range kev {
 		db.Exec(`UPDATE twoai_cves SET kev=true, kev_added=coalesce(kev_added,$2::date), updated_at=now() WHERE cve_id=$1 AND NOT kev`, id, added)
 	}
+	// Headlines and defence sections for the newest published CVEs, a few
+	// a run, before the pages are written so this run's pages carry them.
+	twoaiCVEWrite(db)
 	built := twoaiCVEPages(db)
 	fmt.Printf("twoai_cve_watch: scanned=%d matched=%d pages=%d ok=true\n", scanned, matched, built)
 	return nil
@@ -590,7 +657,8 @@ func twoaiCVEPages(db *sql.DB) int {
 	today := time.Now().Format("2006-01-02")
 	rows, err := db.Query(`SELECT cve_id, uid, coalesce(published::text,''), coalesce(last_modified::text,''), coalesce(description,''), coalesce(vendor,''), coalesce(product,''),
 		cvss_score, coalesce(cvss_severity,''), coalesce(cvss_vector,''), coalesce(cwe,''), kev, coalesce(kev_added::text,''), status,
-		coalesce(match_reason,''), coalesce(cve_org_url,''), coalesce(nvd_url,''), coalesce(references_json,'[]'::jsonb)::text, coalesce(entities_json,'[]'::jsonb)::text
+		coalesce(match_reason,''), coalesce(cve_org_url,''), coalesce(nvd_url,''), coalesce(references_json,'[]'::jsonb)::text, coalesce(entities_json,'[]'::jsonb)::text,
+		coalesce(headline,''), coalesce(defense,'null'::jsonb)::text, coalesce(affected_json,'[]'::jsonb)::text, coalesce(references_tagged,'[]'::jsonb)::text
 		FROM twoai_cves WHERE status IN ('published','approved') ORDER BY published DESC NULLS LAST`)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "twoai_cve_watch pages:", err)
@@ -598,18 +666,27 @@ func twoaiCVEPages(db *sql.DB) int {
 	}
 	defer rows.Close()
 	var list []map[string]any
-	built, kevCount := 0, 0
+	built, kevCount, headlined := 0, 0, 0
 	for rows.Next() {
-		var id, uid, pub, mod, desc, vendor, product, sev, vec, cwe, kevAdded, status, reason, cveURL, nvdURL, refs, ents string
+		var id, uid, pub, mod, desc, vendor, product, sev, vec, cwe, kevAdded, status, reason, cveURL, nvdURL, refs, ents, headline, defRaw, affRaw, taggedRaw string
 		var score sql.NullFloat64
 		var kev bool
-		if rows.Scan(&id, &uid, &pub, &mod, &desc, &vendor, &product, &score, &sev, &vec, &cwe, &kev, &kevAdded, &status, &reason, &cveURL, &nvdURL, &refs, &ents) != nil {
+		if rows.Scan(&id, &uid, &pub, &mod, &desc, &vendor, &product, &score, &sev, &vec, &cwe, &kev, &kevAdded, &status, &reason, &cveURL, &nvdURL, &refs, &ents, &headline, &defRaw, &affRaw, &taggedRaw) != nil {
 			continue
 		}
 		refList := []string{}
 		entList := []cveHit{}
 		json.Unmarshal([]byte(refs), &refList)
 		json.Unmarshal([]byte(ents), &entList)
+		var defense any
+		json.Unmarshal([]byte(defRaw), &defense)
+		affected := []cveAffected{}
+		json.Unmarshal([]byte(affRaw), &affected)
+		tagged := []cveRef{}
+		json.Unmarshal([]byte(taggedRaw), &tagged)
+		if headline != "" {
+			headlined++
+		}
 		if len(pub) > 10 {
 			pub = pub[:10]
 		}
@@ -620,12 +697,17 @@ func twoaiCVEPages(db *sql.DB) int {
 		if score.Valid {
 			sc = score.Float64
 		}
+		title := id + ": " + product + " vulnerability"
+		if headline != "" {
+			title = headline + " (" + id + ")"
+		}
 		doc := map[string]any{
 			"shape": "cve", "cve_id": id, "uid": uid, "published": pub, "last_modified": mod,
-			"title":       id + ": " + product + " vulnerability",
+			"title":       title,
 			"description": desc, "vendor": vendor, "product": product, "cvss_score": sc, "cvss_severity": sev,
 			"cvss_vector": vec, "cwe": cwe, "kev": kev, "kev_added": kevAdded, "status": status, "match_reason": reason,
 			"cve_org_url": cveURL, "nvd_url": nvdURL, "references": refList, "entities": entList, "generated": today,
+			"headline": headline, "defense": defense, "affected": affected, "references_tagged": tagged,
 		}
 		j, _ := json.Marshal(doc)
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
@@ -647,9 +729,10 @@ func twoaiCVEPages(db *sql.DB) int {
 		}
 		list = append(list, map[string]any{
 			"cve_id": id, "uid": uid, "published": pub, "product": product, "vendor": vendor,
-			"cvss_score": sc, "cvss_severity": sev, "kev": kev, "summary": head, "entities": entList,
+			"cvss_score": sc, "cvss_severity": sev, "kev": kev, "summary": head, "entities": entList, "headline": headline,
 		})
 	}
+	fmt.Printf("twoai_cve_watch: pages with a written headline=%d of %d\n", headlined, len(list))
 	sort.SliceStable(list, func(i, j int) bool { return list[i]["published"].(string) > list[j]["published"].(string) })
 	lj, _ := json.Marshal(map[string]any{
 		"shape": "cve-list", "name": "AI CVE tracker", "generated": today, "total": len(list), "kev": kevCount, "cves": list,

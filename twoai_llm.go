@@ -138,6 +138,8 @@ var twoaiBulkStages = map[string]bool{
 	// The enacted laws writer is the one stage pipeline.env keeps on Pro with
 	// thinking, the dearest call in the run, and it works through a backlog.
 	"ENACTED_LAWS": true,
+	// CVE headlines and defence sections, a 600 row backlog at a dozen a run.
+	"cve_writer": true,
 }
 
 var twoaiPeakNoted sync.Map

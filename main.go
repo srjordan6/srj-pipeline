@@ -3931,6 +3931,12 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		// site-scoped news search, and outside coverage through a second.
 		{"NTT DATA press releases (coverage)", "https://news.google.com/rss/search?q=site:nttdata.com/global/en/news/press-release&hl=en-US&gl=US&ceid=US:en"},
 		{"NTT DATA (coverage)", "https://news.google.com/rss/search?q=%22NTT+DATA%22+AI&hl=en-US&gl=US&ceid=US:en"},
+		// Kyndryl, 2026-10-02, theworldofai row 362 on Stephen's instruction:
+		// the company (b0d1ccaf) was added 2026-10-01 with no feed. Same pair
+		// as NTT DATA, its own newsroom and outside coverage with AI in the
+		// query so infrastructure news without AI stays out.
+		{"Kyndryl press releases (coverage)", "https://news.google.com/rss/search?q=site:kyndryl.com+(news+OR+%22press+release%22)&hl=en-US&gl=US&ceid=US:en"},
+		{"Kyndryl (coverage)", "https://news.google.com/rss/search?q=%22Kyndryl%22+AI&hl=en-US&gl=US&ceid=US:en"},
 		// LTM (formerly LTIMindtree), 2026-10-01. Stephen: need this one.
 		{"LTM (coverage)", "https://news.google.com/rss/search?q=%22LTM+Limited%22+OR+LTIMindtree&hl=en-US&gl=US&ceid=US:en"},
 		// Complete Defense Solutions, 2026-10-02, theworldofai row 355 on
