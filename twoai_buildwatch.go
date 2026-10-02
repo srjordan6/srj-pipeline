@@ -44,11 +44,16 @@ import (
 )
 
 const (
-	bwSite      = "https://theworldofai.org"
-	bwRepo      = "srjordan6/twoai-site"
-	bwGrace     = 20 * time.Minute // a healthy build plus deploy takes 6 to 8 minutes
-	bwStaleLive = 30 * time.Hour   // the daily run should have shipped something by now
-	bwFrom      = "theworldofai"   // the Inkbox identity the alert is sent as
+	bwSite  = "https://theworldofai.org"
+	bwRepo  = "srjordan6/twoai-site"
+	bwGrace = 20 * time.Minute // a healthy build plus deploy takes 6 to 8 minutes
+	// 2026-10-01: four builds failed in a row from a URL guard block and the
+	// site went fifteen hours without shipping, inside the old thirty hour
+	// window, so nobody was told. A publish runs every three hours and a
+	// healthy build lands within the hour, so five hours without a build is a
+	// failure, reported at once and again every six hours until it clears.
+	bwStaleLive = 5 * time.Hour
+	bwFrom      = "theworldofai" // the Inkbox identity the alert is sent as
 )
 
 // bwAlertTo is where the alert lands. BUILD_ALERT_TO overrides it. The default
@@ -205,14 +210,30 @@ when it ships.`,
 				short, subject, builtAt.Format("2006-01-02 15:04")))
 	}
 
-	// Rule 2: nothing has shipped in over a day, whatever git says. Once a day.
-	if !builtAt.IsZero() && now.Sub(builtAt) > bwStaleLive && get("stale_alert_day") != now.Format("2006-01-02") {
-		set("stale_alert_day", now.Format("2006-01-02"))
-		queue("theworldofai.org has not rebuilt in over a day",
-			fmt.Sprintf(`The live site was built %s UTC, %.0f hours ago. The daily pipeline
-fires a build after every publish, so a site this old means the trigger, the
-build or the deploy has been failing since then. Bundle on the site: %s.`,
-				builtAt.Format("2006-01-02 15:04"), now.Sub(builtAt).Hours(), live.Bundle))
+	// Rule 2: nothing has shipped for five hours, whatever git says. Repeats
+	// every six hours while it lasts, and closes itself when a build lands.
+	if !builtAt.IsZero() && now.Sub(builtAt) > bwStaleLive {
+		lastAt, _ := time.Parse(time.RFC3339, get("stale_alert_at"))
+		if lastAt.IsZero() || now.Sub(lastAt) > 6*time.Hour {
+			set("stale_alert_at", now.Format(time.RFC3339))
+			set("stale_open", "1")
+			reason := bwLastBuildFailure()
+			queue(fmt.Sprintf("theworldofai.org has not rebuilt in %.0f hours", now.Sub(builtAt).Hours()),
+				fmt.Sprintf(`The live site was built %s UTC, %.0f hours ago. A publish runs every three
+hours and a healthy build lands within the hour, so the build or the deploy has
+been failing since then. Bundle on the site: %s.
+
+%s
+
+Read the log: https://dash.cloudflare.com/ -> Workers & Pages -> twoai-site -> Deployments.
+You will get one more email when a build lands.`,
+					builtAt.Format("2006-01-02 15:04"), now.Sub(builtAt).Hours(), live.Bundle, reason))
+		}
+	} else if get("stale_open") == "1" {
+		set("stale_open", "")
+		queue("theworldofai.org is building again",
+			fmt.Sprintf("A build landed at %s UTC, bundle %s. The earlier alert is closed.",
+				builtAt.Format("2006-01-02 15:04"), live.Bundle))
 	}
 
 	// Rule 3: the live build shipped without its URL guard. Found 2026-09-18:
@@ -304,4 +325,67 @@ func firstN(s string, n int) string {
 		return "(none)"
 	}
 	return s
+}
+
+// bwLastBuildFailure reads the newest Cloudflare build's log, when a token with
+// Workers Builds read is on hand (CLOUDFLARE_BUILDS_TOKEN, else
+// CLOUDFLARE_API_TOKEN), and returns the lines that explain a failure: the URL
+// guard's verdict and the dropped URLs, or any error line, so the email says
+// why rather than only that. Without a token it says so.
+func bwLastBuildFailure() string {
+	acct := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+	tok := os.Getenv("CLOUDFLARE_BUILDS_TOKEN")
+	if tok == "" {
+		tok = os.Getenv("CLOUDFLARE_API_TOKEN")
+	}
+	if acct == "" || tok == "" {
+		return "Why: unknown from here (no Cloudflare token with Workers Builds read in pipeline.env)."
+	}
+	hdr := map[string]string{"Authorization": "Bearer " + tok}
+	const worker = "469a1508424e4e748d5ed287ce7e5502"
+	b, err := twoaiJobsGet("https://api.cloudflare.com/client/v4/accounts/"+acct+"/builds/workers/"+worker+"/builds?per_page=1", hdr)
+	if err != nil {
+		return "Why: the Cloudflare builds list could not be read (" + trunc(err.Error(), 120) + ")."
+	}
+	var lst struct {
+		Result struct {
+			Builds []struct {
+				BuildUUID string `json:"build_uuid"`
+				Status    string `json:"status"`
+				Outcome   string `json:"build_outcome"`
+				CreatedOn string `json:"created_on"`
+			} `json:"builds"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(b, &lst) != nil || len(lst.Result.Builds) == 0 {
+		return "Why: the Cloudflare builds list came back empty or unreadable."
+	}
+	bl := lst.Result.Builds[0]
+	lb, err := twoaiJobsGet("https://api.cloudflare.com/client/v4/accounts/"+acct+"/builds/builds/"+bl.BuildUUID+"/logs", hdr)
+	if err != nil {
+		return fmt.Sprintf("Why: newest build %s is %s (%s) at %s; its log could not be read.", firstN(bl.BuildUUID, 8), bl.Outcome, bl.Status, bl.CreatedOn)
+	}
+	var lg struct {
+		Result struct {
+			Lines []struct {
+				Line string `json:"line"`
+			} `json:"lines"`
+		} `json:"result"`
+	}
+	json.Unmarshal(lb, &lg)
+	var keep []string
+	for _, l := range lg.Result.Lines {
+		t := strings.TrimSpace(l.Line)
+		if strings.Contains(t, "url-guard:") || strings.HasPrefix(t, "/") && len(keep) > 0 && strings.Contains(keep[len(keep)-1], "drops") ||
+			strings.Contains(t, "Failed:") || strings.Contains(t, "error occurred") || strings.Contains(t, "Error:") {
+			keep = append(keep, t)
+		}
+	}
+	if len(keep) > 12 {
+		keep = keep[len(keep)-12:]
+	}
+	if len(keep) == 0 {
+		return fmt.Sprintf("Why: newest build %s is %s (%s) at %s; no failure line found in its log.", firstN(bl.BuildUUID, 8), bl.Outcome, bl.Status, bl.CreatedOn)
+	}
+	return fmt.Sprintf("Why (newest build %s, %s, %s):\n  %s", firstN(bl.BuildUUID, 8), bl.Outcome, bl.CreatedOn, strings.Join(keep, "\n  "))
 }

@@ -10600,7 +10600,9 @@ func verifyTwoaiDeploy() {
 	}
 
 	if twoaiPublishedSHA != "" {
-		deadline := time.Now().Add(25 * time.Minute)
+		// 18 minutes: the wrapper kills a stage at 20, and a killed stage
+		// explains nothing (2026-10-01, four silent failures).
+		deadline := time.Now().Add(18 * time.Minute)
 		for {
 			sha, builtAt, ok := buildJSON()
 			if ok && sha == twoaiPublishedSHA {
@@ -10611,11 +10613,21 @@ func verifyTwoaiDeploy() {
 			if time.Now().After(deadline) {
 				// Not verified is not the same as broken, and saying which is
 				// the whole point of this rewrite.
+				reason := bwLastBuildFailure()
 				if ok {
-					fmt.Fprintf(os.Stderr, "deploy_site: NOT VERIFIED after 25 min. This run published bundle %s; the live site is still serving %s (built %s). The build either failed or has not finished. Check the Cloudflare build log.\n",
-						short(twoaiPublishedSHA), short(sha), builtAt)
+					fmt.Fprintf(os.Stderr, "deploy_site: NOT VERIFIED after 18 min. This run published bundle %s; the live site is still serving %s (built %s). The build either failed or has not finished.\n%s\n",
+						short(twoaiPublishedSHA), short(sha), builtAt, reason)
 				} else {
-					fmt.Fprintln(os.Stderr, "deploy_site: NOT VERIFIED after 25 min: /api/build.json did not answer. The site may be down, or the endpoint moved.")
+					fmt.Fprintln(os.Stderr, "deploy_site: NOT VERIFIED after 18 min: /api/build.json did not answer. The site may be down, or the endpoint moved.")
+				}
+				// Tell Stephen now, with the reason, rather than leaving it to
+				// the five hour stale rule.
+				if db, derr := sql.Open("postgres", os.Getenv("DATABASE_URL")); derr == nil {
+					db.Exec(`INSERT INTO inkbox_outbox (from_handle, channel, to_addrs, subject, body) VALUES ($1,'email',$2,$3,$4)`,
+						bwFrom, pq.Array(bwAlertTo()), "theworldofai.org build did not ship this run",
+						fmt.Sprintf("This run published bundle %s at %s UTC and the live site did not pick it up within 18 minutes.\n\n%s\n\nRead the log: https://dash.cloudflare.com/ -> Workers & Pages -> twoai-site -> Deployments.",
+							short(twoaiPublishedSHA), time.Now().UTC().Format("15:04"), reason))
+					db.Close()
 				}
 				os.Exit(1)
 			}
