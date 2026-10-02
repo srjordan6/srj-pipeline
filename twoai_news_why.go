@@ -202,11 +202,17 @@ func twoaiNewsWhy(db *sql.DB) {
 		}
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "Headline: %s\n\nSummary:\n%s\n\nRecords this site tracks that the story is matched to (use only these, cite by key):\n", c.headline, trunc(c.summary, 3000))
+		kindWord := map[string]string{"company": "a company this site profiles", "person": "a person this site profiles",
+			"member": "a member of Congress whose AI record this site keeps", "bill": "a bill this site tracks"}
 		for i, m := range c.matches {
-			fmt.Fprintf(&sb, "k%d: %s, %s (page %s)\n", i+1, m.Name, strings.ReplaceAll(m.Kind, "_", " "), m.Href)
+			fmt.Fprintf(&sb, "k%d: %s, %s\n", i+1, m.Name, fallback(kindWord[m.Kind], strings.ReplaceAll(m.Kind, "_", " ")))
 		}
-		system := `You write one line of analysis for The World of AI, a reference site that tracks AI laws, bills, lawsuits, companies, people and vulnerabilities. Under the heading "Why it matters here" the site says how a news story connects to records it already tracks, so a reader knows what to follow next on the site.
-Write one or two sentences, 25 to 70 words, naming the specific tracked records given to you and saying how the story bears on each: what the record is, what the story changes or adds, why a reader following that record should read on. Name each record exactly as given. Use only the records given and only facts in the summary. No opinion about the people in the story, no prediction, no legal advice, no advice of any kind. Commas rather than dashes, plain English, no markdown.
+		// The first run (2026-10-02 12:05) wrote "The story is matched to NTT
+		// DATA, the company tracked at /companies/e07c8073/", which is the
+		// prompt's own bookkeeping read back. The records are now given
+		// without paths, and the instruction says what the line is for.
+		system := `You write one short paragraph for The World of AI, a reference site that tracks AI laws, bills, lawsuits, companies and people. It appears under the heading "Why it matters here" on a news story page and tells the reader how this story bears on a law, company or person the site already follows, so they know what to read next on the site.
+Write one or two sentences, 25 to 70 words, in plain reader-facing prose. Name each tracked record exactly as given and say what the story adds to it or changes about it, using only facts in the summary. Write as a knowledgeable editor would: do not say that records are "matched" or "tracked", do not mention pages, paths, URLs, databases or this site's machinery, do not begin with "The story". No opinion about the people in the story, no prediction, no legal advice, no advice of any kind. Commas rather than dashes, no markdown.
 Return only JSON: {"text": "...", "cites": ["k1", "k2"]} where cites lists the keys of every record the text names.`
 		out, model, gerr := twoaiGenerate("news_why", system, sb.String())
 		if gerr != nil {

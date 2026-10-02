@@ -117,7 +117,7 @@ func twoaiNewsDedupe(db *sql.DB) int {
 		window = 30
 	}
 	rows, err := db.Query(`SELECT uid, slug, headline, published_on::text, story::text FROM twoai_news_stories
-		WHERE retired_at IS NULL AND published_on > current_date - $1 ORDER BY published_on, slug`, window)
+		WHERE retired_at IS NULL AND published_on > current_date - $1::int ORDER BY published_on, slug`, window)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "twoai_news_dedupe select:", err)
 		return 0
