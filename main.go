@@ -754,6 +754,14 @@ func main() {
 		return
 	}
 
+	// news_unmerge re-judges logged story merges against the current dedupe
+	// rules and reverses the ones below them. Run by hand after a rule
+	// change (first use 2026-10-02); safe to repeat.
+	if src == "news_unmerge" {
+		newsUnmerge(db)
+		return
+	}
+
 	if src == "twoai_freshness" {
 		if err := twoaiFreshnessReport(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_freshness:", err)

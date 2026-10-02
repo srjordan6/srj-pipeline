@@ -29,6 +29,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -254,8 +255,14 @@ func newsSameEvent(a, b *dedupeStory) string {
 		}
 	}
 	smallArts := min(len(a.urls), len(b.urls))
-	if sharedURL >= 2 || (sharedURL >= 1 && smallArts <= 2) {
-		return fmt.Sprintf("%d shared article URL(s)", sharedURL)
+	// MOST OF THE SMALLER SET, NOT TWO. The first pass (15:05 run,
+	// 2026-10-02) merged 401 of 932 stories: two shared articles was enough,
+	// and the daily clusters share articles freely, so an Anthropic doom story
+	// folded into a Connecticut rogue-agents story on eight shared links out
+	// of twenty-five. The shared links must now be at least half of the
+	// smaller story's articles, which is what the request said.
+	if sharedURL >= 1 && sharedURL*2 >= smallArts {
+		return fmt.Sprintf("%d shared article URL(s) of %d", sharedURL, smallArts)
 	}
 	shared := 0
 	for w := range a.words {
@@ -264,7 +271,10 @@ func newsSameEvent(a, b *dedupeStory) string {
 		}
 	}
 	small := min(len(a.words), len(b.words))
-	if small < 4 || shared*2 < small {
+	// Two thirds of at least five words, or five words outright. Three of
+	// five let "What The Tech: A new warning about AI" absorb a parenting
+	// column on the same pass.
+	if !((small >= 5 && shared*3 >= small*2) || shared >= 5) {
 		return ""
 	}
 	actors := 0
@@ -286,6 +296,96 @@ func newsSameEvent(a, b *dedupeStory) string {
 		return fmt.Sprintf("headlines share %d of %d words and %d outlets", shared, small, outlets)
 	}
 	return ""
+}
+
+var newsRuleURLRe = regexp.MustCompile(`^(\d+) shared article URL\(s\)`)
+var newsRuleWordsRe = regexp.MustCompile(`share (\d+) of (\d+) words`)
+
+// newsUnmerge re-judges every merge in the log against the current rules
+// and reverses the ones the rules no longer make. Written for the first
+// pass of 2026-10-02, which merged on two shared links and three of five
+// headline words; the stricter rules above keep 320 of its 401 merges. A
+// reversed loser is live again with its own articles intact; the survivor
+// keeps the extra coverage links it gained (the page shows two or three
+// anyway) and loses the loser from merged_from; pins the merge moved go
+// back; a record link the merge copied is dropped and the loser's own is
+// restored. The log row is marked reversed, so this is safe to rerun.
+func newsUnmerge(db *sql.DB) {
+	db.Exec(`ALTER TABLE twoai_news_dedupe_log ADD COLUMN IF NOT EXISTS reversed_at timestamptz`)
+	rows, err := db.Query(`SELECT d.loser_uid, d.survivor_uid, d.rule, l.story::text, sv.story::text, l.headline, sv.headline
+		FROM twoai_news_dedupe_log d JOIN twoai_news_stories l ON l.uid=d.loser_uid JOIN twoai_news_stories sv ON sv.uid=d.survivor_uid
+		WHERE d.reversed_at IS NULL`)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "twoai_news_unmerge:", err)
+		return
+	}
+	type pair struct{ loser, surv, rule, lraw, sraw, lhead, shead string }
+	var pairs []pair
+	for rows.Next() {
+		var p pair
+		if rows.Scan(&p.loser, &p.surv, &p.rule, &p.lraw, &p.sraw, &p.lhead, &p.shead) == nil {
+			pairs = append(pairs, p)
+		}
+	}
+	rows.Close()
+	kept, reversed := 0, 0
+	for _, p := range pairs {
+		var ls, ss map[string]any
+		json.Unmarshal([]byte(p.lraw), &ls)
+		json.Unmarshal([]byte(p.sraw), &ss)
+		count := func(m map[string]any) int {
+			if n, ok := m["ArticleCount"].(float64); ok {
+				return int(n)
+			}
+			if a, ok := m["Articles"].([]any); ok {
+				return len(a)
+			}
+			return 0
+		}
+		lc, sc := count(ls), count(ss)
+		keep := false
+		if m := newsRuleURLRe.FindStringSubmatch(p.rule); m != nil {
+			n, _ := strconv.Atoi(m[1])
+			// The survivor's count today includes what the loser brought, so
+			// its size before the merge is taken back out.
+			sOrig := sc - (lc - n)
+			if sOrig < 1 {
+				sOrig = 1
+			}
+			keep = n >= 1 && n*2 >= min(lc, sOrig)
+		} else if m := newsRuleWordsRe.FindStringSubmatch(p.rule); m != nil {
+			s, _ := strconv.Atoi(m[1])
+			w, _ := strconv.Atoi(m[2])
+			keep = (w >= 5 && s*3 >= w*2) || s >= 5
+		}
+		if keep {
+			kept++
+			continue
+		}
+		// Reverse. The loser comes back as it was; its row was only retired.
+		db.Exec(`UPDATE twoai_news_stories SET retired_at=NULL, retired_reason=NULL, last_seen=now() WHERE uid=$1 AND retired_reason LIKE 'duplicate of ' || $2 || '%'`, p.loser, p.surv)
+		mf := []string{}
+		for _, u := range newsStrings(ss["merged_from"]) {
+			if u != p.loser {
+				mf = append(mf, u)
+			}
+		}
+		ss["merged_from"] = mf
+		if raw, err := json.Marshal(ss); err == nil {
+			db.Exec(`UPDATE twoai_news_stories SET story=$2::jsonb WHERE uid=$1`, p.surv, string(raw))
+		}
+		db.Exec(`INSERT INTO twoai_state_news_pins (state_slug, story_uid, note, pinned_on)
+			SELECT state_slug, $1, replace(note, ' (moved from duplicate ' || $1 || ')', ''), pinned_on FROM twoai_state_news_pins
+			WHERE story_uid=$2 AND note LIKE '%(moved from duplicate ' || $1 || ')%' ON CONFLICT (state_slug, story_uid) DO NOTHING`, p.loser, p.surv)
+		db.Exec(`DELETE FROM twoai_state_news_pins WHERE story_uid=$2 AND note LIKE '%(moved from duplicate ' || $1 || ')%'`, p.loser, p.surv)
+		db.Exec(`UPDATE twoai_page_news SET active=true, retired_reason=NULL WHERE story_uid=$1 AND retired_reason = 'duplicate story merged into ' || $2`, p.loser, p.surv)
+		db.Exec(`DELETE FROM twoai_news_links WHERE story_uid=$2 AND matched_on LIKE '%(via duplicate ' || $1 || ')'`, p.loser, p.surv)
+		db.Exec(`UPDATE twoai_news_links SET retired_reason=NULL WHERE story_uid=$1 AND retired_reason = 'duplicate story merged into ' || $2`, p.loser, p.surv)
+		db.Exec(`UPDATE twoai_news_dedupe_log SET reversed_at=now(), rule = rule || ' (reversed: below the stricter rule)' WHERE loser_uid=$1`, p.loser)
+		reversed++
+		fmt.Printf("twoai_news_unmerge: restored %s (%s), was merged into %s on %q <- %q\n", p.loser, p.rule, p.surv, p.shead, p.lhead)
+	}
+	fmt.Printf("twoai_news_unmerge: judged=%d kept=%d reversed=%d ok=true\n", len(pairs), kept, reversed)
 }
 
 // newsMerge folds loser into surv: articles and outlets union, the loser
