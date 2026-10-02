@@ -231,6 +231,17 @@ func twoaiVendorFeeds(db *sql.DB) error {
 		for _, it := range items {
 			link := it.URL()
 			title := strings.TrimSpace(html.UnescapeString(twoaiTagStrip.ReplaceAllString(it.Title, "")))
+			// A FEED ONLY GOOGLE CAN REACH. pib.gov.in (2026-10-02) refuses the
+			// office network by geography and Cloudflare's addresses at its
+			// Akamai edge ("Access Denied, Reference #18..."), so its releases
+			// come in through a Google News RSS query on the site instead. The
+			// opaque Google link is resolved to the publisher's own address the
+			// way the intel stage does it, with no request to the publisher,
+			// and the " - PIB" Google appends to the title is dropped.
+			if isGoogleNewsURL(link) {
+				link = resolveGoogleNews(link)
+				title = newsStripOutlet(title, publisherFromURL(link), f.vendor)
+			}
 			if title == "" || link == "" || strings.Contains(link, "news.google.") {
 				continue
 			}
