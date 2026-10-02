@@ -205,8 +205,9 @@ func twoaiNewsWhy(db *sql.DB) {
 		kindWord := map[string]string{"company": "a company this site profiles", "person": "a person this site profiles",
 			"member": "a member of Congress whose AI record this site keeps", "bill": "a bill this site tracks"}
 		for i, m := range c.matches {
-			fmt.Fprintf(&sb, "k%d: %s, %s\n", i+1, m.Name, fallback(kindWord[m.Kind], strings.ReplaceAll(m.Kind, "_", " ")))
+			fmt.Fprintf(&sb, "k%d: %s [%s]\n", i+1, m.Name, fallback(kindWord[m.Kind], strings.ReplaceAll(m.Kind, "_", " ")))
 		}
+		sb.WriteString("\nThe part in square brackets says what kind of record it is, for your understanding only: never write it, and never write the words profile, profiles or record.\n")
 		// The first run (2026-10-02 12:05) wrote "The story is matched to NTT
 		// DATA, the company tracked at /companies/e07c8073/", which is the
 		// prompt's own bookkeeping read back. The records are now given
