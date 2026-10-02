@@ -178,6 +178,10 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 	// noindex, and leaves every list.
 	db.Exec(`ALTER TABLE twoai_news_stories ADD COLUMN IF NOT EXISTS retired_at timestamptz`)
 	db.Exec(`ALTER TABLE twoai_news_stories ADD COLUMN IF NOT EXISTS retired_reason text`)
+	// The first retirement, by the editor; the MCP role cannot alter this
+	// table, so the row is marked here once the columns exist.
+	db.Exec(`UPDATE twoai_news_stories SET retired_at = now(), retired_reason = $2 WHERE uid = $1 AND retired_at IS NULL`,
+		"37badd05", "the page it was built from is a category archive listing on campaignsandelections.com, not a news story, and the three outlets clustered with it reported nothing related (editor, 2026-10-01)")
 	rows, err := db.Query(`SELECT story::text, COALESCE(to_char(published_on,'YYYY-MM-DD'),''),
 			to_char(first_published at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'),
 			retired_at IS NOT NULL, COALESCE(retired_reason,'')
