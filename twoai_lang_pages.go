@@ -37,6 +37,19 @@ import (
 const twoaiLangCrawlPerRun = 4
 const twoaiLangWritePerRun = 6
 
+// langSiteOverrides names the official site for a repository whose GitHub
+// homepage field is wrong or too wide, keyed on owner/repo so it survives
+// the daily repo refresh. scope is the crawl key: the host, with a path
+// prefix when the host is a whole documentation estate and the subject is
+// one part of it (crawlSplitScope).
+//
+// Semantic Kernel: Stephen, 2026-10-02, via theworldofai row 360. The GitHub
+// homepage is https://aka.ms/semantic-kernel, a redirect, and the official
+// site is the Semantic Kernel section of learn.microsoft.com.
+var langSiteOverrides = map[string]struct{ site, scope string }{
+	"microsoft/semantic-kernel": {"https://learn.microsoft.com/en-us/semantic-kernel/overview/", "learn.microsoft.com/en-us/semantic-kernel"},
+}
+
 // langShortLinkHost says whether a host only ever redirects somewhere else.
 func langShortLinkHost(h string) bool {
 	switch h {
@@ -160,9 +173,13 @@ func twoaiLangSubjects(db *sql.DB) []langSubject {
 				if key == "" {
 					key = r.Name
 				}
+				scope := crawlHost(site)
+				if o, ok := langSiteOverrides[r.Repo]; ok {
+					site, scope = o.site, o.scope
+				}
 				out = append(out, langSubject{
 					key: src.prefix + key, uid: twoaiUID(src.prefix + key), kind: src.kind, name: r.Name, slug: strings.ToLower(strings.ReplaceAll(r.Name, "_", "-")),
-					siteURL: site, domain: crawlHost(site),
+					siteURL: site, domain: scope,
 					facts:      map[string]any{"description": r.Description, "repo": r.Repo, "repo_url": r.URL, "licence": r.Licence, "language": r.Language, "stars": r.Stars, "archived": r.Archived, "last_push": r.PushedAt, "official_site": site},
 					parentPath: base + d.UID + "/", parentName: d.Name,
 				})
@@ -295,7 +312,7 @@ func twoaiLangPages(db *sql.DB, today string) (int, error) {
 		}
 		if fb.Len() < 400 {
 			db.Exec(`INSERT INTO twoai_lang_pages (key, uid, kind, name, domain, error) VALUES ($1,$2,$3,$4,$5,$6)
-				ON CONFLICT (key) DO UPDATE SET error=$6`, s.key, s.uid, s.kind, s.name, s.domain, "site digest too thin to write from")
+				ON CONFLICT (key) DO UPDATE SET domain=$5, error=$6`, s.key, s.uid, s.kind, s.name, s.domain, "site digest too thin to write from")
 			skipped++
 			continue
 		}
@@ -323,7 +340,7 @@ func twoaiLangPages(db *sql.DB, today string) (int, error) {
 		out, model, gerr := twoaiGenerate("twoai_lang_pages", system, user)
 		if gerr != nil {
 			db.Exec(`INSERT INTO twoai_lang_pages (key, uid, kind, name, domain, error) VALUES ($1,$2,$3,$4,$5,$6)
-				ON CONFLICT (key) DO UPDATE SET error=$6`, s.key, s.uid, s.kind, s.name, s.domain, gerr.Error())
+				ON CONFLICT (key) DO UPDATE SET domain=$5, error=$6`, s.key, s.uid, s.kind, s.name, s.domain, gerr.Error())
 			continue
 		}
 		o := out
@@ -343,7 +360,7 @@ func twoaiLangPages(db *sql.DB, today string) (int, error) {
 		}
 		if err := json.Unmarshal([]byte(strings.TrimSpace(o)), &m); err != nil || strings.TrimSpace(m.Answer) == "" || len(m.Sections) < 5 {
 			db.Exec(`INSERT INTO twoai_lang_pages (key, uid, kind, name, domain, error) VALUES ($1,$2,$3,$4,$5,$6)
-				ON CONFLICT (key) DO UPDATE SET error=$6`, s.key, s.uid, s.kind, s.name, s.domain, "model output was not the expected JSON")
+				ON CONFLICT (key) DO UPDATE SET domain=$5, error=$6`, s.key, s.uid, s.kind, s.name, s.domain, "model output was not the expected JSON")
 			continue
 		}
 		title := strings.TrimSpace(m.Title)
@@ -369,7 +386,7 @@ func twoaiLangPages(db *sql.DB, today string) (int, error) {
 		raw, _ := json.Marshal(doc)
 		if _, err := db.Exec(`INSERT INTO twoai_lang_pages (key, uid, kind, name, domain, content_hash, doc, model, written_on, error)
 			VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,current_date,NULL)
-			ON CONFLICT (key) DO UPDATE SET content_hash=$6, doc=$7::jsonb, model=$8, written_on=current_date, error=NULL`,
+			ON CONFLICT (key) DO UPDATE SET domain=$5, content_hash=$6, doc=$7::jsonb, model=$8, written_on=current_date, error=NULL`,
 			s.key, s.uid, s.kind, s.name, s.domain, hash, string(raw), model); err != nil {
 			return written, err
 		}

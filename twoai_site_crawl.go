@@ -245,6 +245,16 @@ func crawlHost(u string) string {
 	return strings.TrimPrefix(strings.ToLower(p.Hostname()), "www.")
 }
 
+// crawlSplitScope reads a crawl key as a host and an optional path prefix:
+// "learn.microsoft.com/en-us/semantic-kernel" is the host learn.microsoft.com
+// bounded to paths under /en-us/semantic-kernel. A bare host has no prefix.
+func crawlSplitScope(key string) (host, prefix string) {
+	if i := strings.Index(key, "/"); i >= 0 {
+		return key[:i], key[i:]
+	}
+	return key, ""
+}
+
 // twoaiCrawlSite walks one website and stores its pages.
 func twoaiCrawlSite(db *sql.DB, domain string, starts []string, browser bool) (int, int) {
 	client := &http.Client{Timeout: 20 * time.Second}
@@ -255,7 +265,21 @@ func twoaiCrawlSite(db *sql.DB, domain string, starts []string, browser bool) (i
 	if p, err := url.Parse(starts[0]); err == nil && p.Scheme != "" {
 		scheme = p.Scheme + "://"
 	}
-	hostForm := domain
+	// A crawl key is a host, or a host with a path prefix when one site is
+	// many subjects (theworldofai row 360, 2026-10-02: learn.microsoft.com
+	// is all of Microsoft's documentation, and Semantic Kernel is the part
+	// under /en-us/semantic-kernel/). The prefix bounds every link followed
+	// and every page kept, and the key names the rows, so two subjects on
+	// one host never share a crawl or a digest.
+	host, prefix := crawlSplitScope(domain)
+	within := func(u string) bool {
+		p, err := url.Parse(u)
+		if err != nil {
+			return false
+		}
+		return crawlHost(u) == host && (prefix == "" || strings.HasPrefix(p.Path, prefix))
+	}
+	hostForm := host
 	if p, err := url.Parse(starts[0]); err == nil && p.Host != "" {
 		hostForm = p.Host
 	}
@@ -274,7 +298,7 @@ func twoaiCrawlSite(db *sql.DB, domain string, starts []string, browser bool) (i
 			return
 		}
 		p.Fragment = ""
-		if crawlHost(p.String()) != domain || crawlSkipExt.MatchString(p.Path) || crawlSkipPath.MatchString(p.Path+" ") {
+		if !within(p.String()) || crawlSkipExt.MatchString(p.Path) || crawlSkipPath.MatchString(p.Path+" ") {
 			return
 		}
 		if len(p.RawQuery) > 40 {
@@ -330,7 +354,7 @@ func twoaiCrawlSite(db *sql.DB, domain string, starts []string, browser bool) (i
 			continue
 		}
 		fetched++
-		if crawlHost(final) != domain {
+		if !within(final) {
 			continue
 		}
 		title, text := crawlText(body)
