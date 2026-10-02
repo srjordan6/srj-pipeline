@@ -197,6 +197,7 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 	// One event is one story (row 368): same-event duplicates are merged
 	// before the archive is written, so the survivor carries every outlet
 	// and the duplicate's permalink points at it.
+	newsStoryUIDRepair(db)
 	twoaiNewsDedupe(db)
 	dupOf := newsDuplicateMap(db)
 	survivorHead := map[string]string{}

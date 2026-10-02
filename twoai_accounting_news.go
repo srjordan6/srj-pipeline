@@ -13,9 +13,7 @@ package main
 // summarised from a headline. Eight a run.
 
 import (
-	"crypto/md5"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -91,13 +89,14 @@ func twoaiAccountingNews(db *sql.DB) error {
 			skipped++
 			continue
 		}
-		h := md5.Sum([]byte("story:" + it.url))
-		uid := hex.EncodeToString(h[:])[:8]
 		headline := newsStripOutlet(strings.TrimSpace(regexp.MustCompile(`\s+-\s+[^-]+$`).ReplaceAllString(it.title, "")), publisherFromURL(it.url), it.vendor)
 		slug := strings.Trim(acctSlugRe.ReplaceAllString(strings.ToLower(headline), "-"), "-")
 		if len(slug) > 80 {
 			slug = strings.Trim(slug[:80], "-")
 		}
+		// The uid the site addresses the story by: sha256 of story:<slug>,
+		// as the archive mints it (see twoai_techgig_news.go, 2026-10-02).
+		uid := twoaiUID("story:" + slug)
 		domain := it.url
 		if i := strings.Index(domain, "://"); i >= 0 {
 			domain = domain[i+3:]

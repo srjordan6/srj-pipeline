@@ -35,6 +35,46 @@ import (
 
 var newsDupReasonRe = regexp.MustCompile(`duplicate of ([0-9a-f]{8})`)
 
+// newsStoryUIDRepair gives every story the uid the site addresses it by.
+//
+// 2026-10-02: the one-outlet writers (accounting, TechGig, solo) minted an
+// md5 of the article URL as the story uid, while the archive export and the
+// site mint sha256 of story:<slug>. The archive quietly overrode the uid on
+// the way out, so the pages existed, but every pin in twoai_page_news and
+// every ledger row carried the md5 and linked to /ai-news/<md5>/, which no
+// page answers: 158 stories, 112 pins on the accountant and company pages.
+// This re-keys the row and everything that points at it, set-based, and is
+// a no-op once done. Postgres computes the same hash the Go code does.
+func newsStoryUIDRepair(db *sql.DB) {
+	const sha = `substr(encode(sha256(convert_to('story:' || slug, 'UTF8')), 'hex'), 1, 8)`
+	const mapping = `SELECT uid AS old, ` + sha + ` AS new FROM twoai_news_stories WHERE uid IS DISTINCT FROM ` + sha
+	var n int
+	db.QueryRow(`SELECT count(*) FROM (` + mapping + `) m`).Scan(&n)
+	if n == 0 {
+		return
+	}
+	for _, t := range []string{"twoai_page_news", "twoai_state_news_pins", "twoai_news_links", "twoai_solo_news", "twoai_techgig_news", "twoai_accounting_news", "twoai_news_dedupe_log"} {
+		col := "story_uid"
+		if t == "twoai_news_dedupe_log" {
+			col = "loser_uid"
+		}
+		if _, err := db.Exec(`UPDATE ` + t + ` x SET ` + col + ` = m.new FROM (` + mapping + `) m WHERE x.` + col + ` = m.old`); err != nil {
+			fmt.Fprintf(os.Stderr, "twoai_news_archive uid repair %s: %v\n", t, err)
+		}
+	}
+	db.Exec(`UPDATE twoai_news_dedupe_log x SET survivor_uid = m.new FROM (` + mapping + `) m WHERE x.survivor_uid = m.old`)
+	// The story entity: the archive refresh already inserts one under the
+	// sha uid, so an md5 twin is dropped where the sha one exists and
+	// re-keyed where it does not.
+	db.Exec(`DELETE FROM twoai_entities e USING (` + mapping + `) m WHERE e.kind='story' AND e.uid = m.old AND EXISTS (SELECT 1 FROM twoai_entities f WHERE f.uid = m.new)`)
+	db.Exec(`UPDATE twoai_entities e SET uid = m.new FROM (` + mapping + `) m WHERE e.kind='story' AND e.uid = m.old`)
+	if _, err := db.Exec(`UPDATE twoai_news_stories s SET uid = m.new, story = s.story || jsonb_build_object('uid', m.new) FROM (` + mapping + `) m WHERE s.uid = m.old`); err != nil {
+		fmt.Fprintf(os.Stderr, "twoai_news_archive uid repair stories: %v\n", err)
+		return
+	}
+	fmt.Printf("twoai_news_archive: re-keyed %d one-outlet stories to the site's uid, pins and ledgers moved with them\n", n)
+}
+
 // newsDuplicateMap says, for every retired duplicate, which story survived.
 func newsDuplicateMap(db *sql.DB) map[string]string {
 	out := map[string]string{}

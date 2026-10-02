@@ -16,9 +16,7 @@ package main
 // candidates and are not summarised from a headline. Eight a run.
 
 import (
-	"crypto/md5"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -104,13 +102,16 @@ func twoaiTechGigNews(db *sql.DB) error {
 			skipped++
 			continue
 		}
-		h := md5.Sum([]byte("story:" + it.url))
-		uid := hex.EncodeToString(h[:])[:8]
 		headline := newsStripOutlet(strings.TrimSpace(tail.ReplaceAllString(it.title, "")), "techgig.com")
 		slug := strings.Trim(acctSlugRe.ReplaceAllString(strings.ToLower(headline), "-"), "-")
 		if len(slug) > 80 {
 			slug = strings.Trim(slug[:80], "-")
 		}
+		// THE UID IS THE ONE THE SITE ADDRESSES THE STORY BY. Until 2026-10-02
+		// this minted an md5 of the URL, while the archive and the site mint
+		// sha256 of story:<slug>, so every pin and link to a one-outlet story
+		// pointed at a uid that no page answered (158 stories, 112 pins).
+		uid := twoaiUID("story:" + slug)
 		domain := "techgig.com"
 		pub := it.seen.Format("2006-01-02")
 		story := map[string]any{

@@ -21,9 +21,7 @@ package main
 // ledgered as duplicates of it, so one announcement is one story.
 
 import (
-	"crypto/md5"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -173,12 +171,13 @@ func twoaiSoloNews(db *sql.DB) error {
 				skipped++
 				continue
 			}
-			h := md5.Sum([]byte("story:" + it.url))
-			uid := hex.EncodeToString(h[:])[:8]
 			slug := strings.Trim(acctSlugRe.ReplaceAllString(strings.ToLower(headline), "-"), "-")
 			if len(slug) > 80 {
 				slug = strings.Trim(slug[:80], "-")
 			}
+			// The uid the site addresses the story by: sha256 of story:<slug>,
+			// as the archive mints it (see twoai_techgig_news.go, 2026-10-02).
+			uid := twoaiUID("story:" + slug)
 			domain := publisherFromURL(it.url)
 			pub := it.seen.Format("2006-01-02")
 			story := map[string]any{
