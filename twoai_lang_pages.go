@@ -78,7 +78,15 @@ func twoaiLangSubjects(db *sql.DB) []langSubject {
 			}
 		}
 	}
-	if db.QueryRow(`SELECT data::text FROM twoai_pages WHERE path='repos/ai-frameworks.json'`).Scan(&raw) == nil {
+	// Frameworks and inference engines: the two repository sections under the
+	// same hub. Stephen, 2026-10-02: treat all three sections the same.
+	for _, src := range []struct{ path, kind, prefix string }{
+		{"repos/ai-frameworks.json", "framework", "framework:"},
+		{"repos/inference-engines.json", "inference engine", "engine:"},
+	} {
+		if db.QueryRow(`SELECT data::text FROM twoai_pages WHERE path=$1`, src.path).Scan(&raw) != nil {
+			continue
+		}
 		var d struct {
 			UID   string `json:"uid"`
 			Name  string `json:"name"`
@@ -109,7 +117,7 @@ func twoaiLangSubjects(db *sql.DB) []langSubject {
 					key = r.Name
 				}
 				out = append(out, langSubject{
-					key: "framework:" + key, uid: twoaiUID("framework:" + key), kind: "framework", name: r.Name, slug: strings.ToLower(strings.ReplaceAll(r.Name, "_", "-")),
+					key: src.prefix + key, uid: twoaiUID(src.prefix + key), kind: src.kind, name: r.Name, slug: strings.ToLower(strings.ReplaceAll(r.Name, "_", "-")),
 					siteURL: site, domain: crawlHost(site),
 					facts: map[string]any{"description": r.Description, "repo": r.Repo, "repo_url": r.URL, "licence": r.Licence, "language": r.Language, "stars": r.Stars, "archived": r.Archived, "last_push": r.PushedAt, "official_site": site},
 					parentPath: base + d.UID + "/", parentName: d.Name,
@@ -226,6 +234,8 @@ func twoaiLangPages(db *sql.DB, today string) (int, error) {
 		what := "programming language"
 		if s.kind == "framework" {
 			what = "AI framework or library"
+		} else if s.kind == "inference engine" {
+			what = "AI inference engine or model serving runtime"
 		}
 		system := "You write one reference page for theworldofai.org about a " + what + " used in artificial intelligence work. " +
 			"You are given the facts this site holds about it and what a full reading of its official website found, page by page. Ground every claim in those; where they do not settle a question, say so in a sentence rather than invent. " +
