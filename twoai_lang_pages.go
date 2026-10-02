@@ -27,6 +27,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -34,6 +36,40 @@ import (
 
 const twoaiLangCrawlPerRun = 4
 const twoaiLangWritePerRun = 6
+
+// langShortLinkHost says whether a host only ever redirects somewhere else.
+func langShortLinkHost(h string) bool {
+	switch h {
+	case "aka.ms", "bit.ly", "t.co", "goo.gl", "tinyurl.com", "git.io", "lnkd.in", "":
+		return true
+	}
+	return false
+}
+
+var langResolved = map[string]string{}
+
+// langResolveSite follows redirects and returns the address a browser would
+// land on, so the crawl is keyed on the real host. On any failure the
+// address is returned as given.
+func langResolveSite(u string) string {
+	if v, ok := langResolved[u]; ok {
+		return v
+	}
+	final := u
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", u, nil)
+	if err == nil {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org site reader; srj@srjconsultingservices.com)")
+		if resp, err := client.Do(req); err == nil {
+			if resp.Request != nil && resp.Request.URL != nil && resp.StatusCode < 400 {
+				final = resp.Request.URL.String()
+			}
+			resp.Body.Close()
+		}
+	}
+	langResolved[u] = final
+	return final
+}
 
 type langSubject struct {
 	key, uid, kind, name, slug, siteURL, domain string
@@ -72,7 +108,7 @@ func twoaiLangSubjects(db *sql.DB) []langSubject {
 				out = append(out, langSubject{
 					key: "lang:" + slug, uid: twoaiUID("lang:" + slug), kind: "language", name: l.Name, slug: slug,
 					siteURL: l.SourceURL, domain: crawlHost(l.SourceURL),
-					facts: map[string]any{"ai_role": l.AIRole, "steward": l.Steward, "first_release": l.FirstRelease, "verified": l.Verified, "tracked_repos": l.Repos, "official_site": l.SourceURL},
+					facts:      map[string]any{"ai_role": l.AIRole, "steward": l.Steward, "first_release": l.FirstRelease, "verified": l.Verified, "tracked_repos": l.Repos, "official_site": l.SourceURL},
 					parentPath: base + d.UID + "/", parentName: d.Name,
 				})
 			}
@@ -112,6 +148,14 @@ func twoaiLangSubjects(db *sql.DB) []langSubject {
 				if r.Name == "" || site == "" {
 					continue
 				}
+				// Row 357: Semantic Kernel's homepage is https://aka.ms/semantic-kernel,
+				// a redirect, and the crawl keyed the domain aka.ms and fetched
+				// nothing. The redirect is followed first, and a homepage that
+				// still resolves nowhere useful gives way to the repository.
+				site = langResolveSite(site)
+				if langShortLinkHost(crawlHost(site)) && r.URL != "" {
+					site = r.URL
+				}
 				key := r.Repo
 				if key == "" {
 					key = r.Name
@@ -119,7 +163,7 @@ func twoaiLangSubjects(db *sql.DB) []langSubject {
 				out = append(out, langSubject{
 					key: src.prefix + key, uid: twoaiUID(src.prefix + key), kind: src.kind, name: r.Name, slug: strings.ToLower(strings.ReplaceAll(r.Name, "_", "-")),
 					siteURL: site, domain: crawlHost(site),
-					facts: map[string]any{"description": r.Description, "repo": r.Repo, "repo_url": r.URL, "licence": r.Licence, "language": r.Language, "stars": r.Stars, "archived": r.Archived, "last_push": r.PushedAt, "official_site": site},
+					facts:      map[string]any{"description": r.Description, "repo": r.Repo, "repo_url": r.URL, "licence": r.Licence, "language": r.Language, "stars": r.Stars, "archived": r.Archived, "last_push": r.PushedAt, "official_site": site},
 					parentPath: base + d.UID + "/", parentName: d.Name,
 				})
 			}
@@ -173,6 +217,30 @@ func twoaiLangPages(db *sql.DB, today string) (int, error) {
 		f, r := twoaiCrawlSite(db, d, starts[d], false)
 		fmt.Printf("twoai_lang_pages: crawled %s fetched=%d relevant=%d\n", d, f, r)
 		crawled++
+		// A site that yields nothing is not the subject's site for our
+		// purposes. Every subject keyed on it that has a repository falls
+		// back to the repository's host, so the profile can still be written.
+		if f == 0 {
+			for i := range subjects {
+				if subjects[i].domain != d {
+					continue
+				}
+				repo, _ := subjects[i].facts["repo_url"].(string)
+				if repo == "" || crawlHost(repo) == d {
+					continue
+				}
+				subjects[i].siteURL, subjects[i].domain = repo, crawlHost(repo)
+				subjects[i].facts["official_site"] = repo
+				starts[subjects[i].domain] = append(starts[subjects[i].domain], repo)
+				if topicOf[subjects[i].domain] == "" {
+					topicOf[subjects[i].domain] = "AI software development (the " + subjects[i].name + " " + subjects[i].kind + ")"
+				}
+				if !slices.Contains(domains, subjects[i].domain) {
+					domains = append(domains, subjects[i].domain)
+				}
+				fmt.Printf("twoai_lang_pages: %s fetched nothing for %s, falling back to %s\n", d, subjects[i].name, repo)
+			}
+		}
 	}
 	for _, d := range domains {
 		if digested >= twoaiLangCrawlPerRun {
@@ -346,8 +414,12 @@ func twoaiLangPages(db *sql.DB, today string) (int, error) {
 			}
 			doc["siblings"] = others
 			raw, _ := json.Marshal(doc)
+			// taxonomy_slug is NULL, as the incident pages use. 'lang-profile'
+			// is not a row in twoai_taxonomy, so the foreign key refused every
+			// insert on the first run and the log said published=0 (row 357).
+			// The shape lives in the document's own "shape" and "tax" fields.
 			if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, taxonomy_slug, data, url_count, updated_at)
-				VALUES ($1, 'tech-section', 'lang-profile', $2::jsonb, 1, now())
+				VALUES ($1, 'tech-section', NULL, $2::jsonb, 1, now())
 				ON CONFLICT (path) DO UPDATE SET data = EXCLUDED.data, updated_at = now()
 				WHERE twoai_pages.data::text IS DISTINCT FROM EXCLUDED.data::text`, "tech/profile-"+p.uid+".json", string(raw)); err == nil {
 				published++

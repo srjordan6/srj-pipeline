@@ -299,6 +299,17 @@ func twoaiGenerate(stage, system, user string) (string, string, error) {
 			if err == nil {
 				return twoaiStripMarkdown(out), "ollama:" + model, nil
 			}
+			// THINKING THAT SPENDS THE WHOLE BUDGET IS NOT AN ANSWER. Row 357,
+			// 2026-10-02: a twoai_lang_pages call on a thinking model hit
+			// eval_count=64000 with nothing in the response. The same request
+			// is made once more without thinking, which is a fast intuitive
+			// answer from the same model, before anything is given up on.
+			if think && strings.Contains(err.Error(), "budget exhausted") {
+				fmt.Fprintf(os.Stderr, "%s: thinking spent the output budget, retrying without it\n", stage)
+				if out2, err2 := twoaiOllamaCallThink(model, system, user, false); err2 == nil {
+					return twoaiStripMarkdown(out2), "ollama:" + model, nil
+				}
+			}
 			// A TIMEOUT IS NOT THE SERVER BEING DOWN, and neither is a reply
 			// with nothing in it. Both are one call going wrong. Marking the
 			// server down on a timeout sent every remaining insurance item to

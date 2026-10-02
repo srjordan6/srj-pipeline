@@ -68,7 +68,60 @@ var cveStopNames = map[string]bool{"cursor": true, "command": true, "flash": tru
 	"amazon": true, "microsoft": true, "nvidia": true, "intel": true, "oracle": true, "cisco": true, "ibm": true, "python": true, "rust": true, "java": true,
 	"javascript": true, "typescript": true, "go": true, "node": true, "docker": true, "linux": true, "windows": true, "chrome": true, "android": true,
 	"gpt": true, "llama": true, "mistral": true, "gemma": true, "qwen": true, "deepseek": true, "codex": true, "assistant": true, "agent": true, "agents": true,
-	"search": true, "fetch": true, "memory": true, "filesystem": true, "github": true, "gitlab": true, "slack": true, "notion": true, "stripe": true, "jira": true}
+	"search": true, "fetch": true, "memory": true, "filesystem": true, "github": true, "gitlab": true, "slack": true, "notion": true, "stripe": true, "jira": true,
+	// theworldofai, bridge row 357 (2026-10-02), from the first run: these
+	// MCP registry segments, display titles and repo names are ordinary words
+	// and matched almost every CVE. "remote attacker" alone published one.
+	"remote": true, "server": true, "servers": true, "check": true, "platform": true, "directory": true, "intelligence": true, "plugin": true,
+	"public": true, "knowledge": true, "valid": true, "schema": true, "knowledge base": true, "offers": true, "roster": true, "linear": true,
+	"mcp-server": true, "mcp-api": true, "mcp-proxy": true, "web-search": true, "ai-toolkit": true, "company-search": true, "control-plane": true,
+	"knowledge-base": true, "registry": true, "continue": true, "swarm": true, "inspector": true}
+
+// cveGenericWords are the words a product name can be made of without
+// saying which product it is. An MCP server title made only of these
+// ("Knowledge Base", "Web Search Server") is not a match key; one with a
+// word outside the list ("Acme Knowledge Base") is.
+var cveGenericWords = map[string]bool{
+	"mcp": true, "server": true, "servers": true, "remote": true, "check": true, "platform": true, "directory": true, "intelligence": true,
+	"plugin": true, "plugins": true, "public": true, "knowledge": true, "base": true, "valid": true, "schema": true, "offers": true, "roster": true,
+	"linear": true, "api": true, "apis": true, "proxy": true, "web": true, "search": true, "ai": true, "toolkit": true, "company": true, "control": true,
+	"plane": true, "tool": true, "tools": true, "service": true, "services": true, "data": true, "cloud": true, "app": true, "apps": true,
+	"agent": true, "agents": true, "assistant": true, "chat": true, "code": true, "file": true, "files": true, "system": true, "manager": true,
+	"client": true, "hub": true, "core": true, "framework": true, "engine": true, "model": true, "models": true, "open": true, "source": true,
+	"docs": true, "documentation": true, "integration": true, "connector": true, "gateway": true, "bridge": true, "local": true, "official": true,
+	"sdk": true, "cli": true, "dev": true, "test": true, "demo": true, "example": true, "sample": true, "template": true, "store": true,
+	"registry": true, "continue": true, "swarm": true, "inspector": true, "the": true, "a": true, "an": true, "for": true, "and": true, "of": true,
+	"with": true, "to": true, "in": true, "on": true, "by": true, "via": true, "my": true, "your": true, "simple": true, "basic": true, "fast": true,
+	"smart": true, "universal": true, "generic": true, "custom": true, "python": true, "node": true, "typescript": true, "javascript": true, "go": true,
+	"rust": true, "java": true, "io": true, "http": true, "rest": true, "graphql": true, "database": true, "db": true, "sql": true, "query": true,
+	"workflow": true, "automation": true, "monitor": true, "monitoring": true, "analytics": true, "report": true, "reports": true, "manage": true,
+	"management": true, "runner": true, "executor": true, "helper": true, "utils": true, "utility": true, "utilities": true, "kit": true, "lab": true, "labs": true}
+
+var cveWordRe = regexp.MustCompile(`[A-Za-z0-9]+`)
+
+// cveDistinctive reports whether a name says which product it is: at least
+// one word that is not a generic word, and at least two words in all unless
+// the one word is clearly a coined name (mixed case inside it or digits).
+func cveDistinctive(name string) bool {
+	words := cveWordRe.FindAllString(name, -1)
+	if len(words) == 0 {
+		return false
+	}
+	specific := 0
+	for _, w := range words {
+		if !cveGenericWords[strings.ToLower(w)] && !cveStopNames[strings.ToLower(w)] {
+			specific++
+		}
+	}
+	if specific == 0 {
+		return false
+	}
+	if len(words) >= 2 {
+		return true
+	}
+	w := words[0]
+	return len(w) >= 6 && (strings.ToLower(w) != w && strings.ToUpper(w) != w && strings.ToLower(w[1:]) != w[1:] || strings.ContainsAny(w, "0123456789"))
+}
 
 var cveLettersRe = regexp.MustCompile(`[A-Za-z]{3}`)
 
@@ -132,9 +185,24 @@ func cveEntityIndex(db *sql.DB) []cveEntity {
 			var t, n, s string
 			if rows.Scan(&t, &n, &s) == nil {
 				href := "/mcp/" + s + "/"
-				add("mcp_server", t, href, "", true)
+				// Row 357: a title is a key only when it names the product
+				// (cveDistinctive). The registry name's last segment is a key
+				// only when it carries the vendor token, the namespace owner
+				// in io.github.<owner>/<segment>, so "acme-search" under
+				// io.github.acme matches and "web-search" never does.
+				if cveDistinctive(t) {
+					add("mcp_server", t, href, "", true)
+				}
 				if i := strings.LastIndex(n, "/"); i >= 0 && n[i+1:] != t {
-					add("mcp_server", n[i+1:], href, "", true)
+					seg := n[i+1:]
+					ns := n[:i]
+					if j := strings.LastIndex(ns, "."); j >= 0 {
+						ns = ns[j+1:]
+					}
+					ns = strings.ToLower(ns)
+					if len(ns) >= 4 && !cveGenericWords[ns] && !cveStopNames[ns] && strings.Contains(strings.ToLower(seg), ns) && cveDistinctive(seg) {
+						add("mcp_server", seg, href, "", true)
+					}
 				}
 			}
 		}
@@ -294,7 +362,7 @@ func cveClassify(c nvdCVE, idx []cveEntity) ([]cveHit, string, string, string, s
 	var hits []cveHit
 	seen := map[string]bool{}
 	var reasons []string
-	auto, company := false, false
+	auto, company, held := false, false, false
 	vendor, product := "", ""
 	for _, e := range idx {
 		if !e.re.MatchString(hay) {
@@ -313,6 +381,13 @@ func cveClassify(c nvdCVE, idx []cveEntity) ([]cveHit, string, string, string, s
 		} else {
 			if e.auto {
 				auto = true
+			}
+			// A product Stephen marked not to auto-publish (n8n, Jupyter,
+			// Copilot, ChatGPT and the rest) holds the CVE at proposed unless
+			// the AI term test passes too. Row 357: a page-derived co-match
+			// was lifting these to published on its own.
+			if e.Kind == "product" && !e.auto {
+				held = true
 			}
 			if product == "" {
 				product = e.Name
@@ -334,7 +409,9 @@ func cveClassify(c nvdCVE, idx []cveEntity) ([]cveHit, string, string, string, s
 	}
 	status := ""
 	switch {
-	case auto:
+	case auto && !held:
+		status = "published"
+	case auto && held && terms > 0:
 		status = "published"
 	case company && terms > 0:
 		status = "published"
@@ -397,7 +474,9 @@ func cveStore(db *sql.DB, c nvdCVE, hits []cveHit, status, reason, vendor, produ
 			cvss_score=coalesce(EXCLUDED.cvss_score, twoai_cves.cvss_score), cvss_severity=coalesce(EXCLUDED.cvss_severity, twoai_cves.cvss_severity),
 			cvss_vector=coalesce(EXCLUDED.cvss_vector, twoai_cves.cvss_vector), cwe=coalesce(EXCLUDED.cwe, twoai_cves.cwe),
 			kev=EXCLUDED.kev OR twoai_cves.kev, kev_added=coalesce(EXCLUDED.kev_added, twoai_cves.kev_added),
-			status=CASE WHEN twoai_cves.status IN ('rejected','approved','published') THEN twoai_cves.status ELSE EXCLUDED.status END,
+			status=CASE WHEN twoai_cves.status IN ('rejected','approved','published') THEN twoai_cves.status
+				WHEN twoai_cves.status='proposed' AND EXCLUDED.status='published' AND twoai_cves.match_reason IS NOT DISTINCT FROM EXCLUDED.match_reason THEN 'proposed'
+				ELSE EXCLUDED.status END,
 			match_reason=EXCLUDED.match_reason, references_json=EXCLUDED.references_json, entities_json=EXCLUDED.entities_json, updated_at=now()`,
 		c.ID, twoaiUID("cve:"+c.ID), c.Published, c.LastModified, desc, vendor, product, score, sev, vec, cwe, kevAdded.Valid, kevAdded,
 		status, reason, "https://www.cve.org/CVERecord?id="+c.ID, "https://nvd.nist.gov/vuln/detail/"+c.ID, string(refJSON), string(hitJSON)); err != nil {
@@ -543,7 +622,7 @@ func twoaiCVEPages(db *sql.DB) int {
 		}
 		doc := map[string]any{
 			"shape": "cve", "cve_id": id, "uid": uid, "published": pub, "last_modified": mod,
-			"title": id + ": " + product + " vulnerability",
+			"title":       id + ": " + product + " vulnerability",
 			"description": desc, "vendor": vendor, "product": product, "cvss_score": sc, "cvss_severity": sev,
 			"cvss_vector": vec, "cwe": cwe, "kev": kev, "kev_added": kevAdded, "status": status, "match_reason": reason,
 			"cve_org_url": cveURL, "nvd_url": nvdURL, "references": refList, "entities": entList, "generated": today,
