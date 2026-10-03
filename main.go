@@ -5516,6 +5516,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 	fmt.Printf("twoai_build: model sections=%d\n", modelPages)
+	// One page per model family, Large Language Models first, three new
+	// pages a run at most (theworldofai bridge rows 386 to 389, 2026-10-03).
+	// After twoaiModels, which rewrites models/llms.json, so the family list
+	// attached to that page survives the run.
+	twoaiModelFamilies(db, today)
 
 	// These two are sub-steps of twoai_build, not entries in the sequence, so
 	// runSequence never sees their names and the once-a-day map alone would

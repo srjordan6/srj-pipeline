@@ -144,6 +144,8 @@ var twoaiBulkStages = map[string]bool{
 	"news_why": true,
 	// The AI paragraph on each CWE page, 107 classes, once a month at most.
 	"cwe_writer": true,
+	// The strengths and limits reading on each model family page, three a run.
+	"model_family_reading": true,
 }
 
 var twoaiPeakNoted sync.Map

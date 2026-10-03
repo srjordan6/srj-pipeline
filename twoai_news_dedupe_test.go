@@ -61,3 +61,22 @@ func TestNewsWordRuleKeepsRealDuplicates(t *testing.T) {
 		}
 	}
 }
+
+// Two releases from one newsroom are two events (21:05 run, 2026-10-02).
+func TestNewsOneNewsroom(t *testing.T) {
+	mk := func(head, url string) *dedupeStory {
+		return newsDedupeFrom("x", "", head, map[string]any{
+			"Orgs":     []any{"Kyndryl"},
+			"Articles": []any{map[string]any{"URL": url, "Domain": "kyndryl.com"}},
+		})
+	}
+	a := mk("Kyndryl Launches AI Innovation Lab in Dallas Area", "https://www.kyndryl.com/a")
+	b := mk("Kyndryl launches AI Innovation Lab in Singapore", "https://www.kyndryl.com/b")
+	if r := newsSameEvent(a, b); r != "" {
+		t.Errorf("two Kyndryl releases merged on %q", r)
+	}
+	c := mk("Kyndryl Launches AI Innovation Lab in Dallas Area", "https://www.kyndryl.com/a")
+	if r := newsSameEvent(a, c); r == "" {
+		t.Errorf("the same release ingested twice should still merge")
+	}
+}

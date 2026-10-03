@@ -255,8 +255,29 @@ func newsDedupeFrom(uid, slug, head string, st map[string]any) *dedupeStory {
 	return d
 }
 
+// newsOneNewsroom reports two stories that each come from one and the same
+// outlet under different headlines. A company newsroom does not publish one
+// announcement twice: the 21:05 run of 2026-10-02 folded Kyndryl's Dallas lab
+// release into its Singapore lab release, and NTT DATA releases into other
+// NTT DATA releases. Two stories from one outlet are the same event only when
+// the headline is the same, which is a feed ingesting one release twice.
+func newsOneNewsroom(a, b *dedupeStory) bool {
+	if len(a.domains) != 1 || len(b.domains) != 1 {
+		return false
+	}
+	for d := range a.domains {
+		if !b.domains[d] {
+			return false
+		}
+	}
+	return whyNorm(a.headline) != whyNorm(b.headline)
+}
+
 // newsSameEvent names the rule two stories match on, or returns "".
 func newsSameEvent(a, b *dedupeStory) string {
+	if newsOneNewsroom(a, b) {
+		return ""
+	}
 	sharedURL := 0
 	for u := range a.urls {
 		if b.urls[u] {
@@ -403,9 +424,36 @@ func newsUnmerge(db *sql.DB) {
 			// (names taken out since 2026-10-02 evening) still applies.
 			keep = newsWordRule(newsDedupeFrom(p.loser, "", p.lhead, ls), newsDedupeFrom(p.surv, "", p.shead, ss)) != ""
 		}
+		lv, sv := newsDedupeFrom(p.loser, "", p.lhead, ls), newsDedupeFrom(p.surv, "", p.shead, ss)
+		if keep && newsOneNewsroom(lv, sv) {
+			keep = false
+		}
 		if keep {
 			kept++
 			continue
+		}
+		// THE SURVIVOR GIVES BACK WHAT IT TOOK. The first version left the
+		// loser's articles on the survivor, so the next merge pass found the
+		// two sharing every link the loser had and merged them again: three
+		// NTT DATA stories restored at 19:20 were merged back at 21:05. The
+		// loser's article links now leave the survivor when the merge is
+		// reversed; the loser keeps its own copy.
+		if arts, ok := ss["Articles"].([]any); ok {
+			keepArts := []any{}
+			for _, a := range arts {
+				if m, ok := a.(map[string]any); ok {
+					if u, _ := m["URL"].(string); u != "" && lv.urls[u] {
+						continue
+					}
+				}
+				keepArts = append(keepArts, a)
+			}
+			if len(keepArts) > 0 {
+				ss["Articles"] = keepArts
+				if _, had := ss["ArticleCount"]; had {
+					ss["ArticleCount"] = len(keepArts)
+				}
+			}
 		}
 		// Reverse. The loser comes back as it was; its row was only retired.
 		db.Exec(`UPDATE twoai_news_stories SET retired_at=NULL, retired_reason=NULL, last_seen=now() WHERE uid=$1 AND retired_reason LIKE 'duplicate of ' || $2 || '%'`, p.loser, p.surv)
