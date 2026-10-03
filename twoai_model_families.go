@@ -682,16 +682,52 @@ func famAnswer(doc map[string]any) string {
 // famReading writes "Strengths and limits" from the page's facts only.
 func famReading(doc map[string]any) (string, string, bool) {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Family: %s, developer %s. %s\nLicence: %s. Input modalities: %v. Output: %v.\nVersions, newest first:\n",
+	fmt.Fprintf(&sb, "Family: %s, developer %s. %s\nLicence: %s. Input modalities: %v. Output: %v.\n",
 		doc["name"], doc["developer"], doc["answer"], doc["licence"], doc["input_modalities"], doc["output_modalities"])
+	// COUNTS FOR THE WHOLE FAMILY. The first GPT reading (2026-10-03) said
+	// all listed versions support reasoning, because it saw only the newest
+	// twenty of 56; GPT-3.5, GPT-4o and GPT-4.1 do not. Anything said about
+	// the family as a whole comes from these counts, not from the list.
+	live, reasoning, open := 0, 0, 0
+	var minCtx, maxCtx int64
 	if ms, ok := doc["members"].([]map[string]any); ok {
-		for i, m := range ms {
-			if i >= 20 {
-				break
-			}
+		for _, m := range ms {
 			if d, _ := m["delisted"].(bool); d {
 				continue
 			}
+			live++
+			if r, _ := m["reasoning"].(bool); r {
+				reasoning++
+			}
+			if o, _ := m["open_weights"].(bool); o {
+				open++
+			}
+			if c, _ := m["context"].(int64); c > 0 {
+				if minCtx == 0 || c < minCtx {
+					minCtx = c
+				}
+				if c > maxCtx {
+					maxCtx = c
+				}
+			}
+		}
+	}
+	fmt.Fprintf(&sb, "Whole family, %d versions: %d support reasoning, %d publish open weights, context windows from %d to %d tokens.\n", live, reasoning, open, minCtx, maxCtx)
+	shown := live
+	if shown > 20 {
+		shown = 20
+	}
+	fmt.Fprintf(&sb, "The newest %d of the %d versions, newest first:\n", shown, live)
+	if ms, ok := doc["members"].([]map[string]any); ok {
+		n := 0
+		for _, m := range ms {
+			if d, _ := m["delisted"].(bool); d {
+				continue
+			}
+			if n >= 20 {
+				break
+			}
+			n++
 			fmt.Fprintf(&sb, "- %s, released %s, context %v tokens, max output %v, $%v per million input, $%v output, reasoning %v, open weights %v\n",
 				m["name"], m["released"], m["context"], m["max_output"], m["prompt_pm"], m["completion_pm"], m["reasoning"], m["open_weights"])
 		}
@@ -702,7 +738,7 @@ func famReading(doc map[string]any) (string, string, bool) {
 			fmt.Fprintf(&sb, "- %s: %s scored %s (%s, as of %s)\n", b["benchmark"], b["system"], b["score"], b["source"], b["as_of"])
 		}
 	}
-	system := `You write for The World of AI, a reference site. You are given the facts about one AI model family from a public model catalog. Write a short "Strengths and limits" reading for someone choosing a model, 90 to 160 words, using only the facts given: context window, output length, price, modalities, reasoning support, open weights, the spread of versions and tiers, and any benchmark rows named with their source. Say what the facts suggest the family is good for and where it is limited or costly. No vendor marketing, no claims the facts do not support, no predictions, no comparison to families not named in the facts, no questions. Plain English, commas rather than dashes, no markdown, no lists.
+	system := `You write for The World of AI, a reference site. You are given the facts about one AI model family from a public model catalog. Write a short "Strengths and limits" reading for someone choosing a model, 90 to 160 words, using only the facts given: context window, output length, price, modalities, reasoning support, open weights, the spread of versions and tiers, and any benchmark rows named with their source. Anything said about the family as a whole, such as how many versions support reasoning or publish open weights, must come from the whole-family counts, never from the list, which may show only the newest versions. Say what the facts suggest the family is good for and where it is limited or costly. No vendor marketing, no claims the facts do not support, no predictions, no comparison to families not named in the facts, no questions. Plain English, commas rather than dashes, no markdown, no lists.
 Return only JSON: {"text": "..."}`
 	out, model, err := twoaiGenerate("model_family_reading", system, sb.String())
 	if err != nil {
