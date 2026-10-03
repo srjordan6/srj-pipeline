@@ -6125,18 +6125,23 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 		return 0, nil
 	}
 	type paper struct {
-		UID             string `json:"uid"`
-		Title           string `json:"title"`
-		Authors         string `json:"authors,omitempty"`
-		Year            int    `json:"year,omitempty"`
-		Journal         string `json:"journal,omitempty"`
-		Citations       int    `json:"citations"`
-		URL             string `json:"url"`
-		Topic           string `json:"topic"`
-		Note            string `json:"note,omitempty"`
-		Added           string `json:"added,omitempty"`
-		Abstract        string `json:"abstract,omitempty"`
-		AbstractSource  string `json:"abstract_source,omitempty"`
+		UID       string `json:"uid"`
+		Title     string `json:"title"`
+		Authors   string `json:"authors,omitempty"`
+		Year      int    `json:"year,omitempty"`
+		Journal   string `json:"journal,omitempty"`
+		Citations int    `json:"citations"`
+		URL       string `json:"url"`
+		Topic     string `json:"topic"`
+		Note      string `json:"note,omitempty"`
+		Added     string `json:"added,omitempty"`
+		// NEVER EXPORTED. theworldofai bridge row 402 (standing rule, Stephen,
+		// 2026-09-10): the site never republishes a paper or its abstract, only
+		// its own interpretation with a link to the original. The abstract is
+		// read for nothing here and json:"-" keeps it out of every row and the
+		// R2 bundle, the topic arrays as well as the paper pages.
+		Abstract        string `json:"-"`
+		AbstractSource  string `json:"-"`
 		DOI             string `json:"doi,omitempty"`
 		Volume          string `json:"volume,omitempty"`
 		Type            string `json:"paper_type,omitempty"`
@@ -6254,7 +6259,6 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 			"doi": p.DOI, "paper_type": p.Type,
 			"citations": p.Citations, "url": p.URL,
 			"topic": p.Topic, "topic_slug": p.Topic, "topic_name": p.TopicName,
-			"abstract": p.Abstract, "abstract_source": p.AbstractSource,
 			"note":                 p.Note,
 			"explain_beginner":     p.ExpBeginner,
 			"explain_practitioner": p.ExpPractitioner,

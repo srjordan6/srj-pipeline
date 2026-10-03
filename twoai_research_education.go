@@ -12,7 +12,8 @@ package main
 // papers and their effectiveness studies, the field reviews, the ethics and
 // policy frameworks, the generative AI and ChatGPT work, and learning
 // analytics. Each gets a one-sentence note written from its own title and
-// abstract only. Added once; a paper already on the shelf is left alone, and
+// abstract only; the abstract itself is read from twoai_works for the note
+// and never stored on the shelf (row 402). Added once; a paper already on the shelf is left alone, and
 // a note that fails is tried again on the next run.
 
 import (
@@ -103,11 +104,11 @@ func twoaiResearchEducation(db *sql.DB) int {
 		}
 		uid := "e" + twoaiUID("shelf:" + oid)[:7]
 		if _, err := db.Exec(`INSERT INTO twoai_research_papers
-				(uid, title, authors, year, journal, citations, url, topic, our_note, source, added_on, abstract, abstract_source, doi, paper_type, openalex_id)
-			VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,'openalex',current_date,$9,'openalex',$10,$11,$12)
+				(uid, title, authors, year, journal, citations, url, topic, our_note, source, added_on, doi, paper_type, openalex_id)
+			VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,'openalex',current_date,$9,$10,$11)
 			ON CONFLICT (uid) DO NOTHING`,
 			uid, title, strings.Join(names, ", "), nullInt(year), nullInt(cited), link, twoaiEducationTopic, note,
-			abstract, nullStr(strings.ToLower(doi)), nullStr(workType), oid); err != nil {
+			nullStr(strings.ToLower(doi)), nullStr(workType), oid); err != nil {
 			fmt.Println("twoai_research_education:", oid, err)
 			continue
 		}

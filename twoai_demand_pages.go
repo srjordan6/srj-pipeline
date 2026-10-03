@@ -46,7 +46,7 @@ func twoaiDemandPages(db *sql.DB) error {
 	}
 	type cand struct {
 		url, doi, title, q string
-		asks              int
+		asks               int
 	}
 	var cands []cand
 	for rows.Next() {
@@ -95,24 +95,24 @@ func twoaiDemandPages(db *sql.DB) error {
 		}
 		authors := strings.Join(names, ", ")
 
-		uid := "q" + twoaiUID("demand:"+c.url)[:7]
+		uid := "q" + twoaiUID("demand:" + c.url)[:7]
 		link := c.url
 		if doi != "" {
 			link = "https://doi.org/" + doi
 		}
-		absSrc := ""
-		if abstract != "" {
-			absSrc = "openalex"
-		}
+		// No abstract is stored on the shelf (theworldofai bridge row 402,
+		// standing rule of 2026-09-10): the explainers read it from twoai_works
+		// by DOI when they write, and nothing that is rendered carries it.
+		_ = abstract
 		note := fmt.Sprintf("Added because a reader's question on this site drew on it (%d time%s so far). The page exists so the next reader finds it in the answer.",
 			c.asks, map[bool]string{true: "", false: "s"}[c.asks == 1])
 		if _, err := db.Exec(`INSERT INTO twoai_research_papers
-				(uid, title, authors, year, journal, citations, url, topic, our_note, source, added_on, abstract, abstract_source, doi, paper_type, openalex_id)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,'asked-by-readers',$8,'ask-box demand',current_date,$9,$10,$11,$12,
-			        (SELECT openalex_id FROM twoai_works WHERE doi = $11 OR oa_url = $7 LIMIT 1))
+				(uid, title, authors, year, journal, citations, url, topic, our_note, source, added_on, doi, paper_type, openalex_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,'asked-by-readers',$8,'ask-box demand',current_date,$9,$10,
+			        (SELECT openalex_id FROM twoai_works WHERE doi = $9 OR oa_url = $7 LIMIT 1))
 			ON CONFLICT (uid) DO NOTHING`,
 			uid, title, authors, nullInt(year), journal, nullInt(cited), link, note,
-			nullStr(abstract), nullStr(absSrc), nullStr(strings.ToLower(doi)), nullStr(workType)); err != nil {
+			nullStr(strings.ToLower(doi)), nullStr(workType)); err != nil {
 			fmt.Println("twoai_demand_pages:", uid, err)
 			skipped++
 			continue
