@@ -772,6 +772,13 @@ func main() {
 	// moment peak hours begin, like every bulk stage.
 	// The CWE tracker on its own: MITRE's list, the AI paragraphs and the
 	// pages, without a full build. The next all run exports and deploys them.
+	// Model families on their own, for checking the pages a full build would
+	// write. The next all run exports and deploys them.
+	if src == "families" {
+		twoaiModelFamilies(db, time.Now().Format("2006-01-02"))
+		return
+	}
+
 	if src == "cwe" {
 		twoaiCWELoad(db)
 		twoaiCWEWrite(db)

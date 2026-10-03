@@ -42,8 +42,8 @@ import (
 
 const famBase = "/ai-ecosystem/technology-and-core-infrastructure/"
 
-// famEnabled turns the stage on once twoai-site renders shape model-family.
-const famEnabled = false
+// famEnabled: on since twoai-site bf7d821 renders shape model-family.
+const famEnabled = true
 
 type famMember struct {
 	ID, Name, Released, Cutoff, Expires, HFID, Tokenizer, Instruct string
