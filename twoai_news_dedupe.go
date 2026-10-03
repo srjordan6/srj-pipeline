@@ -180,31 +180,8 @@ func twoaiNewsDedupe(db *sql.DB) int {
 		if perr != nil {
 			continue
 		}
-		d := &dedupeStory{uid: uid, slug: slug, headline: head, date: date, published: t, story: st,
-			urls: map[string]bool{}, domains: map[string]bool{}, actors: map[string]bool{}, words: newsDedupeWords(head)}
-		if arts, ok := st["Articles"].([]any); ok {
-			for _, a := range arts {
-				if m, ok := a.(map[string]any); ok {
-					if u, _ := m["URL"].(string); u != "" {
-						d.urls[u] = true
-					}
-					if dom, _ := m["Domain"].(string); dom != "" {
-						d.domains[dom] = true
-					}
-				}
-			}
-		}
-		for _, dom := range newsStrings(st["Domains"]) {
-			d.domains[dom] = true
-		}
-		for _, a := range append(newsStrings(st["Persons"]), newsStrings(st["Orgs"])...) {
-			d.actors[strings.ToLower(strings.TrimSpace(a))] = true
-		}
-		if n, ok := st["DomainCount"].(float64); ok {
-			d.domainCount = int(n)
-		} else {
-			d.domainCount = len(d.domains)
-		}
+		d := newsDedupeFrom(uid, slug, head, st)
+		d.date, d.published = date, t
 		all = append(all, d)
 	}
 	rows.Close()
@@ -246,6 +223,38 @@ func twoaiNewsDedupe(db *sql.DB) int {
 	return merged
 }
 
+// newsDedupeFrom builds the comparison view of a story row: its article
+// URLs, outlets, named actors and headline words. Shared by the merge pass
+// and by the unmerge stage, which re-judges old merges from the same view.
+func newsDedupeFrom(uid, slug, head string, st map[string]any) *dedupeStory {
+	d := &dedupeStory{uid: uid, slug: slug, headline: head, story: st,
+		urls: map[string]bool{}, domains: map[string]bool{}, actors: map[string]bool{}, words: newsDedupeWords(head)}
+	if arts, ok := st["Articles"].([]any); ok {
+		for _, a := range arts {
+			if m, ok := a.(map[string]any); ok {
+				if u, _ := m["URL"].(string); u != "" {
+					d.urls[u] = true
+				}
+				if dom, _ := m["Domain"].(string); dom != "" {
+					d.domains[dom] = true
+				}
+			}
+		}
+	}
+	for _, dom := range newsStrings(st["Domains"]) {
+		d.domains[dom] = true
+	}
+	for _, a := range append(newsStrings(st["Persons"]), newsStrings(st["Orgs"])...) {
+		d.actors[strings.ToLower(strings.TrimSpace(a))] = true
+	}
+	if n, ok := st["DomainCount"].(float64); ok {
+		d.domainCount = int(n)
+	} else {
+		d.domainCount = len(d.domains)
+	}
+	return d
+}
+
 // newsSameEvent names the rule two stories match on, or returns "".
 func newsSameEvent(a, b *dedupeStory) string {
 	sharedURL := 0
@@ -264,17 +273,45 @@ func newsSameEvent(a, b *dedupeStory) string {
 	if sharedURL >= 1 && sharedURL*2 >= smallArts {
 		return fmt.Sprintf("%d shared article URL(s) of %d", sharedURL, smallArts)
 	}
-	shared := 0
+	return newsWordRule(a, b)
+}
+
+// newsWordRule is the headline test on its own: the rule name when two
+// headlines describe one event, or "".
+func newsWordRule(a, b *dedupeStory) string {
+	// A NAME IS NOT AN EVENT. The 18:05 run of 2026-10-02 merged four NTT
+	// DATA announcements into four other NTT DATA announcements (Google Cloud
+	// into a cloud-value study, Palo Alto Networks into IP networks, Databricks
+	// into ENGIE, a Gartner quadrant into an ISG leader award) on five shared
+	// words and one shared actor: the five words were ntt, data, ai and two
+	// more. The actor's own name and the word ai say which company and which
+	// subject, not which event, so they are taken out before the count is
+	// trusted: at least three of the shared words must be something else.
+	nameWords := map[string]bool{"ai": true}
+	for x := range a.actors {
+		for w := range newsDedupeWords(x) {
+			nameWords[w] = true
+		}
+	}
+	for x := range b.actors {
+		for w := range newsDedupeWords(x) {
+			nameWords[w] = true
+		}
+	}
+	shared, core := 0, 0
 	for w := range a.words {
 		if b.words[w] {
 			shared++
+			if !nameWords[w] {
+				core++
+			}
 		}
 	}
 	small := min(len(a.words), len(b.words))
 	// Two thirds of at least five words, or five words outright. Three of
 	// five let "What The Tech: A new warning about AI" absorb a parenting
 	// column on the same pass.
-	if !((small >= 5 && shared*3 >= small*2) || shared >= 5) {
+	if !((small >= 5 && shared*3 >= small*2) || shared >= 5) || core < 3 {
 		return ""
 	}
 	actors := 0
@@ -290,10 +327,10 @@ func newsSameEvent(a, b *dedupeStory) string {
 		}
 	}
 	if actors >= 1 {
-		return fmt.Sprintf("headlines share %d of %d words and %d actor(s)", shared, small, actors)
+		return fmt.Sprintf("headlines share %d of %d words (%d beyond names) and %d actor(s)", shared, small, core, actors)
 	}
 	if outlets >= 2 {
-		return fmt.Sprintf("headlines share %d of %d words and %d outlets", shared, small, outlets)
+		return fmt.Sprintf("headlines share %d of %d words (%d beyond names) and %d outlets", shared, small, core, outlets)
 	}
 	return ""
 }
@@ -353,10 +390,11 @@ func newsUnmerge(db *sql.DB) {
 				sOrig = 1
 			}
 			keep = n >= 1 && n*2 >= min(lc, sOrig)
-		} else if m := newsRuleWordsRe.FindStringSubmatch(p.rule); m != nil {
-			s, _ := strconv.Atoi(m[1])
-			w, _ := strconv.Atoi(m[2])
-			keep = (w >= 5 && s*3 >= w*2) || s >= 5
+		} else if newsRuleWordsRe.MatchString(p.rule) {
+			// Judged again from the stories themselves, so a rule that
+			// counts differently from the one that wrote the log line
+			// (names taken out since 2026-10-02 evening) still applies.
+			keep = newsWordRule(newsDedupeFrom(p.loser, "", p.lhead, ls), newsDedupeFrom(p.surv, "", p.shead, ss)) != ""
 		}
 		if keep {
 			kept++

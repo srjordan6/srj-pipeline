@@ -274,5 +274,8 @@ Return only JSON: {"text": "...", "cites": ["k1", "k2"]} where cites lists the k
 		fmt.Printf("twoai_news_why: %s: %s\n", c.uid, trunc(why, 110))
 	}
 	fmt.Printf("twoai_news_why: candidates=%d written=%d no_match=%d held=%d unchanged=%d ok=true\n", len(todo), written, none, held, skipped)
-	return len(todo)
+	// What was actually done, not what was looked at: the backlog loop of
+	// 2026-10-02 evening ran 4,000 empty passes because 400 candidates came
+	// back every time with nothing left to write.
+	return written + none + held
 }
