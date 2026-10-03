@@ -155,7 +155,12 @@ func twoaiDCTopics(db *sql.DB, today string) int {
 			if i := strings.Index(line, ":"); i > 0 {
 				kind, list = strings.ToLower(strings.TrimSpace(line[:i])), line[i+1:]
 			}
-			list = strings.ReplaceAll(list, " and ", ", ")
+			// "and" joins list items, except in a facility name: "Colossus 2
+			// Memphis and Southaven" is one site, and splitting it left
+			// "Southaven" as an unresolved name on the Megapack page.
+			if kind != "facilities" {
+				list = strings.ReplaceAll(list, " and ", ", ")
+			}
 			for _, item := range strings.Split(list, ",") {
 				item = strings.TrimSpace(item)
 				if item == "" {
