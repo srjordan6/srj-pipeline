@@ -402,6 +402,21 @@ func twoaiModelFamilies(db *sql.DB, today string) int {
 	newPages, refreshed, readings := 0, 0, 0
 	var listed []map[string]any
 	familyOf := map[string]map[string]string{}
+	// THE OPEN-WEIGHT ROWS TOO. Stephen, 2026-10-03: "nothing has been done"
+	// on 87868942, pointing at Qwen/Qwen3-0.6B. The page opens with about a
+	// thousand Hugging Face rows and the first version attached families only
+	// to the API models, so Qwen3-0.6B still linked out with no tie to the Qwen
+	// family. A Hugging Face repo joins a family when its owner is the family's
+	// own organisation (the owners its catalog members name, or the developer
+	// slug) and its name's line matches. Third-party repackagings (unsloth,
+	// bartowski) stay unlinked: a name cannot tell a copy from a fine-tune.
+	hfRows := []map[string]any{}
+	{
+		var raw string
+		if db.QueryRow(`SELECT coalesce(data->'models','[]'::jsonb)::text FROM twoai_pages WHERE path='models/llms.json'`).Scan(&raw) == nil {
+			json.Unmarshal([]byte(raw), &hfRows)
+		}
+	}
 	for _, f := range fams {
 		g := groups[f.key]
 		if g == nil || len(g.live()) < 2 {
@@ -413,6 +428,13 @@ func twoaiModelFamilies(db *sql.DB, today string) int {
 			}
 		}
 		doc := famDoc(db, g, f.uid, today, companies)
+		releases := famHFReleases(g, hfRows)
+		doc["hf_releases"] = releases
+		for _, r := range releases {
+			if id, _ := r["id"].(string); id != "" {
+				familyOf[id] = map[string]string{"uid": f.uid, "name": g.displayName()}
+			}
+		}
 		// THE READING, from the facts on the page only. Written when the page
 		// is first built and rewritten when the member list changes, at most
 		// three a run, held for off-peak hours like every bulk stage.
@@ -766,4 +788,31 @@ Return only JSON: {"text": "..."}`
 		return "", model, false
 	}
 	return para, model, true
+}
+
+// famHFReleases returns the family's own open-weight repos among the Hugging
+// Face rows of the category page, most downloaded first.
+func famHFReleases(g *famGroup, rows []map[string]any) []map[string]any {
+	orgs := map[string]bool{strings.ToLower(g.Dev): true, strings.ReplaceAll(strings.ToLower(g.Dev), "-", ""): true}
+	for _, m := range g.Members {
+		if i := strings.Index(m.HFID, "/"); i > 0 {
+			orgs[strings.ToLower(m.HFID[:i])] = true
+		}
+	}
+	out := []map[string]any{}
+	for _, r := range rows {
+		id, _ := r["id"].(string)
+		i := strings.Index(id, "/")
+		if i <= 0 || !orgs[strings.ToLower(id[:i])] {
+			continue
+		}
+		first := strings.SplitN(id[i+1:], "-", 2)[0]
+		if strings.ToLower(famVersionTail.ReplaceAllString(first, "")) != strings.ToLower(g.Line) {
+			continue
+		}
+		out = append(out, r)
+	}
+	dl := func(r map[string]any) float64 { v, _ := r["downloads"].(float64); return v }
+	sort.SliceStable(out, func(a, b int) bool { return dl(out[a]) > dl(out[b]) })
+	return out
 }

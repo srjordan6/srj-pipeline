@@ -69,3 +69,21 @@ func TestFamParams(t *testing.T) {
 		}
 	}
 }
+
+func TestFamHFReleases(t *testing.T) {
+	g := &famGroup{Dev: "qwen", Line: "qwen", Members: []famMember{{HFID: "Qwen/Qwen3.8-27B"}}}
+	rows := []map[string]any{
+		{"id": "Qwen/Qwen3-0.6B", "downloads": 9.0e6},
+		{"id": "Qwen/Qwen3-0.6B-GGUF", "downloads": 1.0e5},
+		{"id": "unsloth/Qwen3-0.6B-GGUF", "downloads": 2.0e6},
+		{"id": "Qwen/QwQ-32B", "downloads": 5.0e5},
+	}
+	got := famHFReleases(g, rows)
+	if len(got) != 2 || got[0]["id"] != "Qwen/Qwen3-0.6B" {
+		t.Errorf("want the two official Qwen3 repos, most downloaded first, got %v", got)
+	}
+	z := &famGroup{Dev: "z-ai", Line: "glm", Members: []famMember{{HFID: "zai-org/GLM-5.3"}}}
+	if r := famHFReleases(z, []map[string]any{{"id": "zai-org/GLM-4.5-Air"}}); len(r) != 1 {
+		t.Errorf("zai-org/GLM-4.5-Air should join Z.ai GLM")
+	}
+}
