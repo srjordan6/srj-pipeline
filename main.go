@@ -373,6 +373,32 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("publish_news: ok")
+		// The daily safety check rides behind the briefing (bridge row 409):
+		// once a UTC day it reports to theworldofai any subject three or more
+		// outlets carried in 72 hours with no story. Never fatal.
+		if err := twoaiNewsGapCheck(db); err != nil {
+			fmt.Fprintln(os.Stderr, "news_gap:", err)
+		}
+		return
+	}
+	if src == "news_gap" {
+		if err := twoaiNewsGapCheck(db); err != nil {
+			fmt.Fprintln(os.Stderr, "news_gap:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	// news_preview: the briefing and the safety check as they would run at
+	// TWOAI_NEWS_ASOF (RFC 3339, default now), printed, nothing published,
+	// no bridge row. For proving a clustering change against a past day.
+	if src == "news_preview" {
+		newsPreview = true
+		if err := publishNews(db); err != nil {
+			fmt.Fprintln(os.Stderr, "news_preview:", err)
+		}
+		if err := twoaiNewsGap(db, newsAsOf(), true); err != nil {
+			fmt.Fprintln(os.Stderr, "news_preview gap:", err)
+		}
 		return
 	}
 	if src == "publish_legislation" {
@@ -2156,15 +2182,31 @@ func publishNews(db *sql.DB) error {
 	if tok == "" {
 		return fmt.Errorf("GITHUB_TOKEN not set")
 	}
-	rows, err := db.Query(`SELECT d.title, d.url, to_char(d.published_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), d.raw->>'domain', coalesce(d.raw->>'persons',''), coalesce(d.raw->>'orgs','')
+	// SEVENTY-TWO HOURS, NOT THIRTY-SIX, AND NO 600-ROW CAP. theworldofai
+	// bridge row 409, 2026-10-03: AMD's $8.2 billion purchase of World Labs
+	// was covered by four GDELT outlets across 28 to 30 September and never
+	// became a story. The 36 hour window held up to 1,122 rows and the read
+	// took the newest 600 before any filter, so at most two AMD articles were
+	// ever in view together. A cluster may now span three days; ranking for
+	// the top ten still counts only the last 36 hours (fresh, below), so an
+	// old story does not hold the lead by age alone.
+	asOf := newsAsOf()
+	rows, err := db.Query(`SELECT d.title, d.url, to_char(d.published_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), d.raw->>'domain', coalesce(d.raw->>'persons',''), coalesce(d.raw->>'orgs',''),
+			d.fetched_at > $1::timestamptz - interval '36 hours'
 		FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
-		WHERE s.key='gdelt' AND d.title <> '' AND d.fetched_at > now() - interval '36 hours'
-		ORDER BY d.id DESC LIMIT 600`)
+		WHERE s.key='gdelt' AND d.title <> '' AND d.fetched_at > $1::timestamptz - interval '72 hours' AND d.fetched_at <= $1::timestamptz
+		ORDER BY d.id DESC LIMIT 5000`, asOf)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	type art struct{ Title, URL, Date, Domain, persons, orgs string }
+	// cand marks a vendor-news candidate read as coverage (no text, so it
+	// never heads a story or supplies the summary); fresh marks an article
+	// from the last 36 hours, the only ones the top-ten score counts.
+	type art struct {
+		Title, URL, Date, Domain, persons, orgs string
+		cand, fresh                             bool
+	}
 	var arts []art
 	// Per-URL summary and lead text, for the story summary at the top of each
 	// news page. Own-words summaries only; the site never republishes bodies.
@@ -2173,8 +2215,8 @@ func publishNews(db *sql.DB) error {
 	{
 		drows, derr := db.Query(`SELECT d.url, COALESCE(d.summary,''), COALESCE(substr(d.fulltext,1,12000),'')
 			FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
-			WHERE s.key='gdelt' AND d.fetched_at > now() - interval '36 hours'
-			AND (d.summary IS NOT NULL OR d.fulltext IS NOT NULL)`)
+			WHERE s.key='gdelt' AND d.fetched_at > $1::timestamptz - interval '72 hours' AND d.fetched_at <= $1::timestamptz
+			AND (d.summary IS NOT NULL OR d.fulltext IS NOT NULL)`, asOf)
 		if derr == nil {
 			for drows.Next() {
 				var u, sm, tx string
@@ -2200,14 +2242,20 @@ func publishNews(db *sql.DB) error {
 	// answering, and means the briefing corrects itself on the next run rather
 	// than waiting a day and a half for bad records to age out.
 	skipped := 0
+	seenURL := map[string]bool{}
 	for rows.Next() {
 		var a art
 		var d sql.NullString
-		if rows.Scan(&a.Title, &a.URL, &d, &a.Domain, &a.persons, &a.orgs) == nil {
+		if rows.Scan(&a.Title, &a.URL, &d, &a.Domain, &a.persons, &a.orgs, &a.fresh) == nil {
 			if !twoaiTitleIsAI(a.Title) || twoaiIsIndexPage(a.Title, a.URL) {
 				skipped++
 				continue
 			}
+			cu := newsCanonURL(a.URL)
+			if seenURL[cu] {
+				continue
+			}
+			seenURL[cu] = true
 			a.Date = d.String
 			arts = append(arts, a)
 		}
@@ -2215,6 +2263,23 @@ func publishNews(db *sql.DB) error {
 	if skipped > 0 {
 		fmt.Printf("publishNews: %d non-AI headlines skipped, %d kept\n", skipped, len(arts))
 	}
+	// THE VENDOR-NEWS INTAKE COUNTS AS COVERAGE. RTHK and The Business Times
+	// carried the World Labs deal through the Google News coverage feeds,
+	// which file into ai_intel_candidates, and nothing read those rows into
+	// the briefing. They join the clusters here as outlets. They carry no
+	// article text, so a story still needs a GDELT article to head it and to
+	// summarise; a subject covered only by candidates is reported by the daily
+	// safety check (news_gap) instead.
+	nCand := 0
+	for _, c := range newsCandidateArticles(db, asOf, 72) {
+		if !twoaiTitleIsAI(c.Title) || twoaiIsIndexPage(c.Title, c.URL) || seenURL[c.URL] {
+			continue
+		}
+		seenURL[c.URL] = true
+		arts = append(arts, art{Title: c.Title, URL: c.URL, Date: c.Date, Domain: c.Domain, cand: true, fresh: c.Fresh})
+		nCand++
+	}
+	fmt.Printf("publishNews: %d articles in 72 hours, %d of them from the vendor-news intake\n", len(arts), nCand)
 
 	stop := map[string]bool{"the": true, "a": true, "an": true, "of": true, "to": true, "in": true, "on": true, "for": true, "and": true, "with": true, "as": true, "at": true, "by": true, "is": true, "its": true, "ai": true, "artificial": true, "intelligence": true, "new": true, "how": true, "what": true, "why": true}
 	toks := func(s string) map[string]bool {
@@ -2234,6 +2299,11 @@ func publishNews(db *sql.DB) error {
 						x = strings.TrimSuffix(x, suf)
 						break
 					}
+				}
+				// One word for a deal: "acquire", "buys", "acquisition"
+				// and "takeover" headlines about one purchase now share it.
+				if newsDealWord[x] {
+					x = "acquire"
 				}
 				m[x] = true
 			}
@@ -2357,6 +2427,52 @@ func publishNews(db *sql.DB) error {
 		}
 		seedTk[i] = m
 	}
+	// NAMED SUBJECTS, bridge row 409. Each cluster's entities as it formed:
+	// the companies, people, models and operators the site knows, plus any
+	// GDELT-extracted name that appears in a headline of the window. Two
+	// clusters naming the same two subjects, neither of them ubiquitous this
+	// window, with some headline overlap, are one story: "AMD to Acquire World
+	// Labs" and "AMD Stock: World Labs Acquisition Bolsters AI Expertise".
+	// Seeded once and never widened, for the reason seedTk is.
+	var entTitles, entNames []string
+	for _, a := range arts {
+		entTitles = append(entTitles, a.Title)
+		for _, n := range strings.Split(a.persons+";"+a.orgs, ";") {
+			if n = strings.TrimSpace(n); n != "" {
+				entNames = append(entNames, n)
+			}
+		}
+	}
+	entVocab := newsEntityVocab(newsEntityDict(db), entTitles, entNames)
+	entDF := map[string]int{}
+	artEnts := map[string][]string{}
+	for _, a := range arts {
+		es := newsTitleEntities(a.Title, entVocab)
+		artEnts[a.URL] = es
+		for _, e := range es {
+			entDF[e]++
+		}
+	}
+	ubiq := map[string]bool{}
+	ubiqAt := len(arts) / 40
+	if ubiqAt < 25 {
+		ubiqAt = 25
+	}
+	for e, n := range entDF {
+		if n > ubiqAt {
+			ubiq[e] = true
+		}
+	}
+	seedEnt := make([]map[string]bool, len(cls))
+	for i, c := range cls {
+		m := map[string]bool{}
+		for _, a := range c.arts {
+			for _, e := range artEnts[a.URL] {
+				m[e] = true
+			}
+		}
+		seedEnt[i] = m
+	}
 	for merged := true; merged; {
 		merged = false
 		for i := 0; i < len(cls) && !merged; i++ {
@@ -2367,7 +2483,8 @@ func publishNews(db *sql.DB) error {
 				// its own: two stories naming Trump and Altman still have to
 				// look somewhat alike.
 				same := overlap >= 0.5 ||
-					(sharedPersons(pi, personSet(cls[j])) >= 2 && overlap >= 0.25)
+					(sharedPersons(pi, personSet(cls[j])) >= 2 && overlap >= 0.25) ||
+					(newsSharedEntities(seedEnt[i], seedEnt[j], ubiq) >= 2 && overlap >= 0.25)
 				if !same {
 					continue
 				}
@@ -2377,6 +2494,7 @@ func publishNews(db *sql.DB) error {
 				}
 				cls = append(cls[:j], cls[j+1:]...)
 				seedTk = append(seedTk[:j], seedTk[j+1:]...)
+				seedEnt = append(seedEnt[:j], seedEnt[j+1:]...)
 				merged = true
 				break
 			}
@@ -2431,7 +2549,35 @@ func publishNews(db *sql.DB) error {
 		}
 		return w
 	}
-	score := func(c *cluster) int { return newsrooms(c)*2 + authority(c) }
+	// The top ten are ranked on the last 36 hours, as before the window grew:
+	// fresh() is the cluster cut down to its fresh articles. A cluster with no
+	// fresh article is old news and drops out entirely. One with no GDELT
+	// article has no text to head or summarise it and drops out too.
+	fresh := func(c *cluster) *cluster {
+		f := &cluster{tk: c.tk}
+		for _, a := range c.arts {
+			if a.fresh {
+				f.arts = append(f.arts, a)
+			}
+		}
+		return f
+	}
+	hasText := func(c *cluster) bool {
+		for _, a := range c.arts {
+			if !a.cand {
+				return true
+			}
+		}
+		return false
+	}
+	live := cls[:0]
+	for _, c := range cls {
+		if len(fresh(c).arts) > 0 && hasText(c) {
+			live = append(live, c)
+		}
+	}
+	cls = live
+	score := func(c *cluster) int { f := fresh(c); return newsrooms(f)*2 + authority(f) }
 	sort.Slice(cls, func(i, j int) bool {
 		if score(cls[i]) != score(cls[j]) {
 			return score(cls[i]) > score(cls[j])
@@ -2441,8 +2587,59 @@ func publishNews(db *sql.DB) error {
 		}
 		return len(cls[i].arts) > len(cls[j].arts)
 	})
+	if newsPreview {
+		if m := strings.ToLower(os.Getenv("TWOAI_NEWS_PREVIEW_MATCH")); m != "" {
+			for i, c := range cls {
+				for _, a := range c.arts {
+					if strings.Contains(strings.ToLower(a.Title), m) {
+						doms := []string{}
+						for _, b := range c.arts {
+							doms = append(doms, b.Domain)
+						}
+						fmt.Printf("news_preview: match at rank %d, newsrooms=%d fresh_score=%d articles=%d: %s\n", i+1, newsrooms(c), score(c), len(c.arts), strings.Join(doms, ", "))
+						break
+					}
+				}
+			}
+		}
+	}
+	// WIDE COVERAGE IS NEVER CUT. Below the ten, any cluster that three or
+	// more newsrooms wrote up in the 72 hours is published after them, up to
+	// twenty stories in all, widest first. The World Labs deal had five
+	// outlets and lost its place to the ten every time; this is the rule that
+	// would have carried it.
 	if len(cls) > 10 {
-		cls = cls[:10]
+		rest := []*cluster{}
+		for _, c := range cls[10:] {
+			if newsrooms(c) >= 3 {
+				rest = append(rest, c)
+			}
+		}
+		sort.SliceStable(rest, func(i, j int) bool { return newsrooms(rest[i]) > newsrooms(rest[j]) })
+		if len(rest) > 10 {
+			rest = rest[:10]
+		}
+		cls = append(cls[:10:10], rest...)
+		if len(rest) > 0 {
+			fmt.Printf("publishNews: %d wide-coverage stories added below the top ten\n", len(rest))
+		}
+	}
+	// Preview: print what would publish, as of TWOAI_NEWS_ASOF, and stop
+	// before any summary is written or anything is committed.
+	if newsPreview {
+		for i, c := range cls {
+			fmt.Printf("news_preview: %2d. newsrooms=%d fresh_score=%d articles=%d | %s\n", i+1, newsrooms(c), score(c), len(c.arts), trunc(html.UnescapeString(c.arts[0].Title), 110))
+			shown := map[string]bool{}
+			for _, a := range c.arts {
+				w := twoaiWireTitle(a.Title)
+				if shown[w] || len(shown) >= 5 {
+					continue
+				}
+				shown[w] = true
+				fmt.Printf("news_preview:       - %s (%s)\n", trunc(html.UnescapeString(a.Title), 100), a.Domain)
+			}
+		}
+		return nil
 	}
 
 	slugify := func(s string) string {
@@ -2511,7 +2708,16 @@ func publishNews(db *sql.DB) error {
 		// AND the slug ("...stocks-to-watch-today-x2013-september-2nd"). The
 		// headline is decoded here, before the slug is cut from it, so neither
 		// carries an entity again. Slugs already published keep their URL.
-		h := html.UnescapeString(c.arts[0].Title)
+		// The headline comes from the newest GDELT article, never from a
+		// vendor-news candidate, so a story's title is one we have text for.
+		lead := c.arts[0]
+		for _, a := range c.arts {
+			if !a.cand {
+				lead = a
+				break
+			}
+		}
+		h := html.UnescapeString(lead.Title)
 		{
 			// The outlet is not part of the headline (news_headline.go,
 			// 2026-10-02). Every domain in the cluster counts, because the
@@ -4234,6 +4440,18 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 					}
 				}
 				time.Sleep(700 * time.Millisecond)
+			}
+			// ONE ARTICLE, ONE ROW. Google News hands out a different
+			// redirect token for the same article on different days, so the
+			// source_id check above cannot see a repeat: RTHK's World Labs
+			// story was filed on 29 September and again on 3 October (bridge
+			// row 409). The resolved URL, canonicalised, is the identity.
+			if !isGoogleNewsURL(link) {
+				link = newsCanonURL(link)
+				var dup bool
+				if db.QueryRow(`SELECT EXISTS(SELECT 1 FROM ai_intel_candidates WHERE kind='vendor-news' AND url = $1)`, link).Scan(&dup); dup {
+					continue
+				}
 			}
 			// THE FEED'S OWN DATE, 2026-09-30. Stephen found the vendor
 			// section leading with the UK AI Security Institute's o1

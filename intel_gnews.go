@@ -109,12 +109,15 @@ func resolveGoogleNews(gurl string) string {
 		return gurl
 	}
 	// The response is JSON-escaped twice; unquote turns \u003d and friends
-	// back into real characters.
+	// back into real characters. One unquote removes only one layer, so until
+	// 2026-10-03 an RTHK URL was stored ending ?spTabChangeable\u003d0 and the
+	// same article was filed twice (bridge row 409). newsCanonURL decodes the
+	// second layer and drops tracking parameters.
 	out, err := strconv.Unquote(`"` + m[1] + `"`)
 	if err != nil || !strings.HasPrefix(out, "http") || isGoogleNewsURL(out) {
 		return gurl
 	}
-	return out
+	return newsCanonURL(out)
 }
 
 func gnFetch(method, u string, body io.Reader, ctype string) (string, error) {
