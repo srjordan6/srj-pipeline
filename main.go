@@ -792,16 +792,56 @@ func main() {
 			minutes = v
 		}
 		deadline := time.Now().Add(time.Duration(minutes) * time.Minute)
-		passes := 0
+		// WIDER SINCE 2026-10-03. Stephen: keep pushing the pipeline during
+		// off-peak hours to catch up on the backlog. Each pass now also runs
+		// the bulk writers with a queue: research paper explainers, M&A filing
+		// readings, point briefs, AI Lawyer topics and the language profiles.
+		// Each caps itself per call. A pass waits while a scheduled heavy run
+		// holds pipeline.lock, so the two never write the same items twice,
+		// and it stops when peak hours begin or two passes find nothing to do.
+		today := time.Now().Format("2006-01-02")
+		passes, idle := 0, 0
 		for time.Now().Before(deadline) {
 			if twoaiPeakAt(time.Now()) {
 				fmt.Println("backlog: peak hours began, stopping")
 				break
 			}
+			if _, err := os.Stat(`C:\srj-data\pipeline.lock`); err == nil {
+				fmt.Println("backlog: a scheduled run holds pipeline.lock, waiting five minutes")
+				time.Sleep(5 * time.Minute)
+				continue
+			}
 			passes++
+			started := time.Now()
 			did := twoaiCVEWrite(db) + twoaiNewsWhy(db) + twoaiCWEWrite(db)
-			fmt.Printf("backlog: pass %d considered %d, %s left before the deadline\n", passes, did, time.Until(deadline).Round(time.Minute))
-			if did == 0 {
+			if err := twoaiPaperExplain(db); err != nil {
+				fmt.Fprintln(os.Stderr, "backlog paper_explain:", err)
+			}
+			if err := twoaiMAReadings(db); err != nil {
+				fmt.Fprintln(os.Stderr, "backlog ma_readings:", err)
+			}
+			if err := twoaiPointBriefs(db); err != nil {
+				fmt.Fprintln(os.Stderr, "backlog point_briefs:", err)
+			}
+			twoaiArtCap = 60
+			if err := twoaiArt(db, today); err != nil {
+				fmt.Fprintln(os.Stderr, "backlog art:", err)
+			}
+			if _, err := twoaiLangPages(db, today); err != nil {
+				fmt.Fprintln(os.Stderr, "backlog lang_pages:", err)
+			}
+			took := time.Since(started)
+			fmt.Printf("backlog: pass %d took %s, counted writers considered %d, %s left before the deadline\n",
+				passes, took.Round(time.Second), did, time.Until(deadline).Round(time.Minute))
+			// The other writers report errors, not counts. A pass that wrote
+			// anything with a model takes minutes; two quick empty passes in
+			// a row mean the queues are dry.
+			if did == 0 && took < 2*time.Minute {
+				idle++
+			} else {
+				idle = 0
+			}
+			if idle >= 2 {
 				fmt.Println("backlog: nothing left to write")
 				break
 			}
