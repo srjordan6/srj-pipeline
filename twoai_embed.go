@@ -530,6 +530,13 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 		if name == "cves" {
 			return base + "/ai-news/cves/"
 		}
+		// AI CWE tracker, 2026-10-03: news/cwe-CWE-918.json and news/cwes.json.
+		if strings.HasPrefix(name, "cwe-") {
+			return base + "/ai-news/cwes/" + strings.TrimPrefix(name, "cwe-") + "/"
+		}
+		if name == "cwes" {
+			return base + "/ai-news/cwes/"
+		}
 		return ""
 	case "tech", "models", "observatory", "grid":
 		// These render as uid children of an ecosystem section, and the

@@ -667,6 +667,9 @@ func twoaiCVEPages(db *sql.DB) int {
 	defer rows.Close()
 	var list []map[string]any
 	built, kevCount, headlined := 0, 0, 0
+	// The weakness class by name, its page, and MITRE's first mitigations,
+	// so the CVE page links its CWE and the defence section can quote it.
+	cwes := cweIndex(db)
 	for rows.Next() {
 		var id, uid, pub, mod, desc, vendor, product, sev, vec, cwe, kevAdded, status, reason, cveURL, nvdURL, refs, ents, headline, defRaw, affRaw, taggedRaw string
 		var score sql.NullFloat64
@@ -708,6 +711,15 @@ func twoaiCVEPages(db *sql.DB) int {
 			"cvss_vector": vec, "cwe": cwe, "kev": kev, "kev_added": kevAdded, "status": status, "match_reason": reason,
 			"cve_org_url": cveURL, "nvd_url": nvdURL, "references": refList, "entities": entList, "generated": today,
 			"headline": headline, "defense": defense, "affected": affected, "references_tagged": tagged,
+		}
+		if ci, ok := cwes[cwe]; ok {
+			doc["cwe_name"] = ci.Name
+			doc["cwe_page"] = ci.HasPage
+			m := ci.Mitigations
+			if len(m) > 3 {
+				m = m[:3]
+			}
+			doc["cwe_mitigations"] = m
 		}
 		j, _ := json.Marshal(doc)
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)

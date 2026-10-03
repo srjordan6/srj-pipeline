@@ -770,6 +770,15 @@ func main() {
 	// scheduled run rather than holding its lock; the scheduled run's
 	// publish picks up whatever this has written. It stops itself the
 	// moment peak hours begin, like every bulk stage.
+	// The CWE tracker on its own: MITRE's list, the AI paragraphs and the
+	// pages, without a full build. The next all run exports and deploys them.
+	if src == "cwe" {
+		twoaiCWELoad(db)
+		twoaiCWEWrite(db)
+		twoaiCWEPages(db)
+		return
+	}
+
 	if src == "backlog" {
 		minutes := 40
 		if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("TWOAI_BACKLOG_MINUTES"))); err == nil && v > 0 {
@@ -783,7 +792,7 @@ func main() {
 				break
 			}
 			passes++
-			did := twoaiCVEWrite(db) + twoaiNewsWhy(db)
+			did := twoaiCVEWrite(db) + twoaiNewsWhy(db) + twoaiCWEWrite(db)
 			fmt.Printf("backlog: pass %d considered %d, %s left before the deadline\n", passes, did, time.Until(deadline).Round(time.Minute))
 			if did == 0 {
 				fmt.Println("backlog: nothing left to write")
@@ -5304,9 +5313,15 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	// AI CVE tracker, 2026-10-02: NVD modified window each run, pages under
 	// news/cve-*.json and the list at news/cves.json.
+	// MITRE's CWE list first, monthly, so the CVE pages can name and link
+	// their weakness class; then the CWE pages after the CVEs are current.
+	// theworldofai bridge row 385, 2026-10-03.
+	twoaiCWELoad(db)
 	if err := twoaiCVEWatch(db); err != nil {
 		fmt.Println("twoai_cve_watch:", err)
 	}
+	twoaiCWEWrite(db)
+	twoaiCWEPages(db)
 	// A page for every programming language and AI framework, 2026-10-02.
 	if _, err := twoaiLangPages(db, today); err != nil {
 		fmt.Println("twoai_lang_pages:", err)

@@ -142,6 +142,8 @@ var twoaiBulkStages = map[string]bool{
 	"cve_writer": true,
 	// The why-it-matters line on news stories, ten a run over the live archive.
 	"news_why": true,
+	// The AI paragraph on each CWE page, 107 classes, once a month at most.
+	"cwe_writer": true,
 }
 
 var twoaiPeakNoted sync.Map
