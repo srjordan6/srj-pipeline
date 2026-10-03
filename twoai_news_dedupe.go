@@ -188,6 +188,18 @@ func twoaiNewsDedupe(db *sql.DB) int {
 
 	retired := map[string]string{} // loser -> survivor, this run
 	merged := 0
+	// A merge an editor reversed stays reversed: the pair is never merged
+	// again automatically, whichever way round.
+	edited := map[string]bool{}
+	if er, err := db.Query(`SELECT loser_uid, survivor_uid FROM twoai_news_dedupe_log WHERE reversed_at IS NOT NULL AND rule LIKE '%(reversed by an editor)%'`); err == nil {
+		for er.Next() {
+			var l, s string
+			if er.Scan(&l, &s) == nil {
+				edited[l+"|"+s], edited[s+"|"+l] = true, true
+			}
+		}
+		er.Close()
+	}
 	for i := 0; i < len(all); i++ {
 		a := all[i]
 		if retired[a.uid] != "" {
@@ -200,6 +212,9 @@ func twoaiNewsDedupe(db *sql.DB) int {
 			}
 			if b.published.Sub(a.published) > 4*24*time.Hour {
 				break // sorted by date, nothing later is close enough
+			}
+			if edited[a.uid+"|"+b.uid] {
+				continue
 			}
 			rule := newsSameEvent(a, b)
 			if rule == "" {
@@ -486,7 +501,11 @@ func newsUnmerge(db *sql.DB) {
 		db.Exec(`UPDATE twoai_page_news SET active=true, retired_reason=NULL WHERE story_uid=$1 AND retired_reason = 'duplicate story merged into ' || $2`, p.loser, p.surv)
 		db.Exec(`DELETE FROM twoai_news_links WHERE story_uid=$2 AND matched_on LIKE '%(via duplicate ' || $1 || ')'`, p.loser, p.surv)
 		db.Exec(`UPDATE twoai_news_links SET retired_reason=NULL WHERE story_uid=$1 AND retired_reason = 'duplicate story merged into ' || $2`, p.loser, p.surv)
-		db.Exec(`UPDATE twoai_news_dedupe_log SET reversed_at=now(), rule = rule || ' (reversed: below the stricter rule)' WHERE loser_uid=$1`, p.loser)
+		note := " (reversed: below the stricter rule)"
+		if forced[p.loser] {
+			note = " (reversed by an editor)"
+		}
+		db.Exec(`UPDATE twoai_news_dedupe_log SET reversed_at=now(), rule = rule || $2 WHERE loser_uid=$1`, p.loser, note)
 		reversed++
 		fmt.Printf("twoai_news_unmerge: restored %s (%s), was merged into %s on %q <- %q\n", p.loser, p.rule, p.surv, p.shead, p.lhead)
 	}
