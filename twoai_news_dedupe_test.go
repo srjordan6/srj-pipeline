@@ -33,11 +33,31 @@ func TestNewsWordRuleNameIsNotAnEvent(t *testing.T) {
 	}
 }
 
-// A genuine duplicate still matches once the person's name is taken out.
-func TestNewsWordRuleKeepsRealDuplicate(t *testing.T) {
-	a := dedupeStoryFor("a", "Bill Gates warns artificial intelligence 'powerful enough' to cause 'a billion deaths' if unchecked", "Bill Gates")
-	b := dedupeStoryFor("b", "Bill Gates Warns AI Could Cause 'A Billion Deaths,' Again Calls for Regulation", "Bill Gates")
-	if r := newsWordRule(a, b); r == "" {
-		t.Errorf("the Bill Gates pair should still match")
+// Genuine duplicates still match, including the five the first cut of the
+// name rule wrongly reversed on 2026-10-02 (short headlines that are mostly
+// the actors' names because the actors are the event).
+func TestNewsWordRuleKeepsRealDuplicates(t *testing.T) {
+	type pair struct {
+		a, b   string
+		actors []string
+	}
+	pairs := []pair{
+		{"Bill Gates warns artificial intelligence 'powerful enough' to cause 'a billion deaths' if unchecked",
+			"Bill Gates Warns AI Could Cause 'A Billion Deaths,' Again Calls for Regulation", []string{"Bill Gates"}},
+		{"Canada unveils national AI literacy initiative",
+			"Government of Canada launches National AI Literacy Initiative", []string{"Government of Canada", "National AI Literacy Initiative", "Canada"}},
+		{"AI 'superintelligence' ban proposed by Casar, Sanders",
+			"Bernie Sanders and Greg Casar propose AI 'superintelligence' ban with a 20-year jail penalty", []string{"Bernie Sanders", "Greg Casar", "Sanders", "Casar", "Congress", "AI"}},
+		{"Gov. Spanberger unveils accountability framework for data centers, launches AI task force",
+			"Spanberger issues executive order to hold data centers 'accountable,' form AI task force", []string{"Spanberger", "Virginia", "AI Task Force", "Abigail Spanberger"}},
+		{"Trump says US will henceforth call AI 'super intelligence'",
+			"Trump Attempts to Rebrand Artificial Intelligence as \"Super Intelligence\"", []string{"Trump", "Donald Trump", "US", "White House"}},
+	}
+	for _, p := range pairs {
+		a := dedupeStoryFor("a", p.a, p.actors...)
+		b := dedupeStoryFor("b", p.b, p.actors...)
+		if r := newsWordRule(a, b); r == "" {
+			t.Errorf("should match: %q <- %q", p.b, p.a)
+		}
 	}
 }

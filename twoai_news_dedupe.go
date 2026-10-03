@@ -308,17 +308,24 @@ func newsWordRule(a, b *dedupeStory) string {
 		}
 	}
 	small := min(len(a.words), len(b.words))
-	// Two thirds of at least five words, or five words outright. Three of
-	// five let "What The Tech: A new warning about AI" absorb a parenting
-	// column on the same pass.
-	if !((small >= 5 && shared*3 >= small*2) || shared >= 5) || core < 3 {
-		return ""
-	}
 	actors := 0
 	for x := range a.actors {
 		if b.actors[x] {
 			actors++
 		}
+	}
+	// Two thirds of at least five words, or five words outright. Three of
+	// five let "What The Tech: A new warning about AI" absorb a parenting
+	// column on the same pass. The two-thirds path stands on its own: a
+	// short headline is mostly names when the names are the event ("AI
+	// superintelligence ban proposed by Casar, Sanders"), and the first
+	// cut of this rule reversed five true duplicates by asking it for
+	// words beyond them. The outright path is where the NTT DATA merges
+	// came from, and it alone asks for the words beyond the names.
+	twoThirds := small >= 5 && shared*3 >= small*2
+	outright := shared >= 5 && (core >= 3 || (core >= 2 && actors >= 2))
+	if !(twoThirds || outright) {
+		return ""
 	}
 	outlets := 0
 	for d := range a.domains {
@@ -499,6 +506,9 @@ func newsMerge(db *sql.DB, surv, loser *dedupeStory, rule string) bool {
 		SELECT $2, target_kind, target_uid, matched_on || ' (via duplicate ' || $1 || ')', $3, published_on FROM twoai_news_links WHERE story_uid=$1
 		ON CONFLICT (story_uid, target_kind, target_uid) DO NOTHING`, loser.uid, surv.uid, surv.headline)
 	db.Exec(`UPDATE twoai_news_links SET retired_reason='duplicate story merged into ' || $2 WHERE story_uid=$1 AND retired_reason IS NULL`, loser.uid, surv.uid)
-	db.Exec(`INSERT INTO twoai_news_dedupe_log (loser_uid, survivor_uid, rule) VALUES ($1,$2,$3) ON CONFLICT (loser_uid) DO NOTHING`, loser.uid, surv.uid, rule)
+	// A pair reversed by the unmerge stage and merged again under a later
+	// rule gets its log row back as a live merge, so the log stays the record.
+	db.Exec(`INSERT INTO twoai_news_dedupe_log (loser_uid, survivor_uid, rule) VALUES ($1,$2,$3)
+		ON CONFLICT (loser_uid) DO UPDATE SET survivor_uid=EXCLUDED.survivor_uid, rule=EXCLUDED.rule, merged_at=now(), reversed_at=NULL`, loser.uid, surv.uid, rule)
 	return true
 }
