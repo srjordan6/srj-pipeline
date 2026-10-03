@@ -18,9 +18,11 @@ package main
 // they get no page; a CVE classed under one keeps its plain CWE label.
 //
 // Paths: news/cwe-CWE-918.json per weakness, news/cwes.json for the list.
-// Pages render at /ai-news/cwes/CWE-918/; the ranked list renders on the
-// Application and Product Security page, /ai-ecosystem/enterprise-applications-governance-and-tools/72cf7bba/#cwe-list
-// (Stephen, 2026-10-03), and /ai-news/cwes/ redirects there.
+// Pages render at /ai-news/cwes/CWE-918/; the ranked list renders on its own
+// page under Application and Product Security,
+// /ai-ecosystem/enterprise-applications-governance-and-tools/aa6058ad/
+// (Stephen, 2026-10-03; uid sha256("cwe-list")[:8]), and /ai-news/cwes/
+// redirects there.
 
 import (
 	"archive/zip"
@@ -462,7 +464,7 @@ func twoaiCWEPages(db *sql.DB) int {
 	var noCWE int
 	db.QueryRow(`SELECT count(*) FROM twoai_cves WHERE status IN ('published','approved') AND coalesce(cwe,'') NOT LIKE 'CWE-%'`).Scan(&noCWE)
 	lj, _ := json.Marshal(map[string]any{
-		"shape": "cwe-list", "name": "AI CWE tracker", "generated": today,
+		"shape": "cwe-list", "name": "The weaknesses behind AI vulnerabilities", "uid": twoaiUID("cwe-list"), "generated": today,
 		"total": len(list), "cves_classed": totalCVEs, "cves_unclassed": noCWE, "mitre_total": len(known),
 		"cwes": list, "unlisted": unlisted,
 		"sources": map[string]string{"cwe": "https://cwe.mitre.org/", "list": cweCSVURL},
@@ -475,7 +477,7 @@ func twoaiCWEPages(db *sql.DB) int {
 		db.Exec(`INSERT INTO twoai_taxonomy (slug, name, parent_slug, level, sort, blurb, status, live_path)
 			VALUES ('ai-cwes', 'Latest AI CWEs', 'ai-news', 2, 7,
 				'The weakness classes behind the AI CVEs on record, ranked by how many AI vulnerabilities each accounts for, with MITRE''s definition and mitigations.',
-				'live', '/ai-ecosystem/enterprise-applications-governance-and-tools/72cf7bba/#cwe-list')
+				'live', '/ai-ecosystem/enterprise-applications-governance-and-tools/aa6058ad/')
 			ON CONFLICT (slug) DO NOTHING`)
 	}
 	fmt.Printf("twoai_cwe: pages=%d classes_without_mitre_entry=%d cves_classed=%d unclassed=%d ok=true\n", built, len(unlisted), totalCVEs, noCWE)
