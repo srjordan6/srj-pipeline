@@ -18,7 +18,9 @@ package main
 // they get no page; a CVE classed under one keeps its plain CWE label.
 //
 // Paths: news/cwe-CWE-918.json per weakness, news/cwes.json for the list.
-// Pages render at /ai-news/cwes/CWE-918/ and /ai-news/cwes/.
+// Pages render at /ai-news/cwes/CWE-918/; the ranked list renders on the
+// Application and Product Security page, /ai-ecosystem/enterprise-applications-governance-and-tools/72cf7bba/#cwe-list
+// (Stephen, 2026-10-03), and /ai-news/cwes/ redirects there.
 
 import (
 	"archive/zip"
@@ -473,7 +475,7 @@ func twoaiCWEPages(db *sql.DB) int {
 		db.Exec(`INSERT INTO twoai_taxonomy (slug, name, parent_slug, level, sort, blurb, status, live_path)
 			VALUES ('ai-cwes', 'Latest AI CWEs', 'ai-news', 2, 7,
 				'The weakness classes behind the AI CVEs on record, ranked by how many AI vulnerabilities each accounts for, with MITRE''s definition and mitigations.',
-				'live', '/ai-news/cwes/')
+				'live', '/ai-ecosystem/enterprise-applications-governance-and-tools/72cf7bba/#cwe-list')
 			ON CONFLICT (slug) DO NOTHING`)
 	}
 	fmt.Printf("twoai_cwe: pages=%d classes_without_mitre_entry=%d cves_classed=%d unclassed=%d ok=true\n", built, len(unlisted), totalCVEs, noCWE)

@@ -534,8 +534,10 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 		if strings.HasPrefix(name, "cwe-") {
 			return base + "/ai-news/cwes/" + strings.TrimPrefix(name, "cwe-") + "/"
 		}
+		// The ranked list renders on Application and Product Security
+		// (Stephen, 2026-10-03), not at /ai-news/cwes/, which redirects there.
 		if name == "cwes" {
-			return base + "/ai-news/cwes/"
+			return base + "/ai-ecosystem/enterprise-applications-governance-and-tools/72cf7bba/#cwe-list"
 		}
 		return ""
 	case "tech", "models", "observatory", "grid":
