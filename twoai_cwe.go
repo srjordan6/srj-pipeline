@@ -471,15 +471,8 @@ func twoaiCWEPages(db *sql.DB) int {
 	})
 	db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count) VALUES ('news/cwes.json','cwe-list',$1::jsonb,NULL,1)
 		ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data, url_count=1, updated_at=now()`, string(lj))
-	// The AI News menu entry, after Latest AI CVEs, once there is a page to
-	// point at. Inserted once; the menu row is theirs to edit after that.
-	if built > 0 {
-		db.Exec(`INSERT INTO twoai_taxonomy (slug, name, parent_slug, level, sort, blurb, status, live_path)
-			VALUES ('ai-cwes', 'Latest AI CWEs', 'ai-news', 2, 7,
-				'The weakness classes behind the AI CVEs on record, ranked by how many AI vulnerabilities each accounts for, with MITRE''s definition and mitigations.',
-				'live', '/ai-ecosystem/enterprise-applications-governance-and-tools/aa6058ad/')
-			ON CONFLICT (slug) DO NOTHING`)
-	}
+	// No AI News menu entry: Stephen took Latest AI CWEs out of the menu on
+	// 2026-10-03, and the row the first version inserted is retired.
 	fmt.Printf("twoai_cwe: pages=%d classes_without_mitre_entry=%d cves_classed=%d unclassed=%d ok=true\n", built, len(unlisted), totalCVEs, noCWE)
 	return built
 }
