@@ -7465,6 +7465,23 @@ func twoaiPeople(db *sql.DB, today string, upsert func(path, kind string, v any)
 		}
 	}
 
+	// ONE ENTRY PER PERSON. theworldofai bridge row 405: the homepage said 285
+	// people in the field against 284 person pages, because Anastasis
+	// Germanidis was listed twice under the same uid (two site_people rows).
+	// The directory and its total keep the first entry for each uid.
+	{
+		seenUID := map[string]bool{}
+		uniq := list[:0]
+		for _, e := range list {
+			if e.UID != "" && seenUID[e.UID] {
+				continue
+			}
+			seenUID[e.UID] = true
+			uniq = append(uniq, e)
+		}
+		list = uniq
+	}
+
 	// A to Z. Stephen asked for it on the hub: 160 people is past the point
 	// where a reader scans a list, and an alphabet is how a directory is
 	// entered. Grouped on the surname where there is one, because that is how
