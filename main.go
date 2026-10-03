@@ -774,6 +774,37 @@ func main() {
 	// pages, without a full build. The next all run exports and deploys them.
 	// Model families on their own, for checking the pages a full build would
 	// write. The next all run exports and deploys them.
+	// The source summary pages on their own, repeated until the crawl queue is
+	// clear (theworldofai bridge row 407, Stephen: "fix it"). Each pass reads
+	// and digests up to ten sites and writes the pages their digests allow. It
+	// waits while a scheduled run holds pipeline.lock, so it never makes one
+	// skip, and stops when a pass reads and digests nothing or at the deadline.
+	if src == "source_pages" {
+		minutes := 360
+		if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("TWOAI_SOURCE_PAGES_MINUTES"))); err == nil && v > 0 {
+			minutes = v
+		}
+		deadline := time.Now().Add(time.Duration(minutes) * time.Minute)
+		for pass := 1; time.Now().Before(deadline); pass++ {
+			if _, err := os.Stat(`C:\srj-data\pipeline.lock`); err == nil {
+				fmt.Println("source_pages: a scheduled run holds pipeline.lock, waiting five minutes")
+				time.Sleep(5 * time.Minute)
+				pass--
+				continue
+			}
+			n, err := twoaiSourcePages(db, time.Now().Format("2006-01-02"))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "source_pages:", err)
+			}
+			fmt.Printf("source_pages: pass %d pages=%d crawled=%d digested=%d\n", pass, n, twoaiCrawlLast.crawled, twoaiCrawlLast.digested)
+			if twoaiCrawlLast.crawled == 0 && twoaiCrawlLast.digested == 0 {
+				fmt.Println("source_pages: the crawl queue is clear")
+				break
+			}
+		}
+		return
+	}
+
 	if src == "dc_topics" {
 		twoaiDCTopics(db, time.Now().Format("2006-01-02"))
 		return

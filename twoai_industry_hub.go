@@ -679,10 +679,10 @@ func twoaiAnalyzeValidated(gen func(extra string) (string, string, error), paylo
 // BUT THE PAYLOAD DOES NOT ONLY SPEAK IN DIGITS. Source pages write percentages
 // three ways, and a validator that recognises only "57%" rejects correct work:
 //
-//   57%                      the digit form
-//   57 percent               digits with the word
-//   Fifty-seven percent      spelled out, which is house style at many
-//                            publishers and is what CEP writes
+//	57%                      the digit form
+//	57 percent               digits with the word
+//	Fifty-seven percent      spelled out, which is house style at many
+//	                         publishers and is what CEP writes
 //
 // The nonprofits sector failed on exactly this on 2026-08-19: the CEP excerpt
 // in the payload reads "Fifty-seven percent of leaders say foundation grants

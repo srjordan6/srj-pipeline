@@ -496,7 +496,13 @@ func twoaiDigestSite(db *sql.DB, domain, industry string) (int, error) {
 
 // twoaiSiteCrawlStep runs the crawl and digest work for this run and returns
 // the digests ready to be written, keyed by domain.
+// twoaiCrawlLast records what the last crawl step did, so the source_pages
+// stage can repeat until a pass reads and digests nothing.
+var twoaiCrawlLast struct{ crawled, digested int }
+
 func twoaiSiteCrawlStep(db *sql.DB, cited map[string][]string, industryOf map[string]string) {
+	crawledN, digestedN := 0, 0
+	defer func() { twoaiCrawlLast.crawled, twoaiCrawlLast.digested = crawledN, digestedN }()
 	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_site_crawl (domain text PRIMARY KEY, start_url text,
 		pages_fetched int, pages_relevant int, crawled_on date, digest jsonb, digested_on date, useful_pages int, model text)`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_site_crawl_pages (url text PRIMARY KEY, domain text NOT NULL, title text,
@@ -523,6 +529,7 @@ func twoaiSiteCrawlStep(db *sql.DB, cited map[string][]string, industryOf map[st
 		f, r := twoaiCrawlSite(db, d, cited[d], false)
 		fmt.Printf("twoai_site_crawl: %s fetched=%d relevant=%d\n", d, f, r)
 		crawled++
+		crawledN++
 	}
 	// One site the plain reader could not read gets the browser, if the
 	// month's page budget allows.
@@ -551,5 +558,6 @@ func twoaiSiteCrawlStep(db *sql.DB, cited map[string][]string, industryOf map[st
 			fmt.Printf("twoai_site_crawl: digested %s useful_pages=%d\n", d, u)
 		}
 		digested++
+		digestedN++
 	}
 }
