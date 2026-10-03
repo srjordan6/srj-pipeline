@@ -774,6 +774,11 @@ func main() {
 	// pages, without a full build. The next all run exports and deploys them.
 	// Model families on their own, for checking the pages a full build would
 	// write. The next all run exports and deploys them.
+	if src == "dc_topics" {
+		twoaiDCTopics(db, time.Now().Format("2006-01-02"))
+		return
+	}
+
 	if src == "research_education" {
 		twoaiResearchEducation(db)
 		return
@@ -5576,6 +5581,9 @@ func twoaiBuild(db *sql.DB) error {
 	// After twoaiModels, which rewrites models/llms.json, so the family list
 	// attached to that page survives the run.
 	twoaiModelFamilies(db, today)
+	// Topic pages under Data Centers from twoai_dc_power_topics, theworldofai
+	// bridge row 399, 2026-10-03.
+	twoaiDCTopics(db, today)
 
 	// These two are sub-steps of twoai_build, not entries in the sequence, so
 	// runSequence never sees their names and the once-a-day map alone would
