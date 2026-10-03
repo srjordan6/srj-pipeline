@@ -1039,8 +1039,25 @@ func twoaiIndustryHub(db *sql.DB, today string) (int, error) {
 			if bt != nil {
 				patchDoc["btos"] = bt
 			}
-			patchDoc["sources_read"] = len(harvested)
-			patchDoc["sources_total"] = len(pts)
+			// THE SAME SET ON BOTH SIDES. theworldofai bridge row 406: Accounting
+			// read "7 of 6 source pages read". The numerator counted every
+			// harvest row filed under the sector, including sources the page no
+			// longer cites (the old AICPA topic URL); the denominator counted the
+			// current points. Both now count the current points' sources.
+			cur := map[string]bool{}
+			for _, p := range pts {
+				if strings.HasPrefix(p.Source, "http") {
+					cur[p.Source] = true
+				}
+			}
+			readNow := 0
+			for _, h := range harvested {
+				if cur[h.URL] {
+					readNow++
+				}
+			}
+			patchDoc["sources_read"] = readNow
+			patchDoc["sources_total"] = len(cur)
 			// Per-source briefs, keyed by URL so the template can put one under
 			// the point that cites it. Written by twoai_point_briefs from the
 			// same harvest read above; a source without one is simply absent

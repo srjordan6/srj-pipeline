@@ -45,8 +45,8 @@ import (
 
 const (
 	twoaiCrawlMaxPages    = 60
-	twoaiCrawlSitesPerRun = 2
-	twoaiDigestPerRun     = 2
+	twoaiCrawlSitesPerRun = 10
+	twoaiDigestPerRun     = 10
 	twoaiCrawlRefreshDays = 90
 )
 
