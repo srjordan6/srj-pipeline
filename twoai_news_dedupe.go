@@ -394,6 +394,12 @@ func newsUnmerge(db *sql.DB) {
 	}
 	rows.Close()
 	kept, reversed := 0, 0
+	forced := map[string]bool{}
+	for _, u := range strings.Split(os.Getenv("TWOAI_UNMERGE_UIDS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			forced[u] = true
+		}
+	}
 	for _, p := range pairs {
 		var ls, ss map[string]any
 		json.Unmarshal([]byte(p.lraw), &ls)
@@ -426,6 +432,12 @@ func newsUnmerge(db *sql.DB) {
 		}
 		lv, sv := newsDedupeFrom(p.loser, "", p.lhead, ls), newsDedupeFrom(p.surv, "", p.shead, ss)
 		if keep && newsOneNewsroom(lv, sv) {
+			keep = false
+		}
+		// AN EDITOR'S REVERSAL. A merge the rules cannot see is wrong once the
+		// survivor has absorbed the loser's links and outlets, so a named loser
+		// is reversed on request: TWOAI_UNMERGE_UIDS=uid,uid (one run only).
+		if forced[p.loser] {
 			keep = false
 		}
 		if keep {
