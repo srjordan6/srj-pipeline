@@ -11,8 +11,11 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/lib/pq"
 )
 
 // THE WORKS SPINE, PHASE 1: EVERY AI PAPER OPENALEX KNOWS, AS METADATA.
@@ -118,23 +121,61 @@ var twoaiOASubfields = []struct{ id, name string }{
 // under Sociology and Political Science, subfields this stage never walked.
 // T13048, Patient Dignity and Privacy, is bedside dignity in clinical care,
 // not data, and is left out on purpose.
-var twoaiOATopics = []struct{ id, name string }{
-	// Data centres. Verified 2026-09-13 across four topic searches with
-	// Stephen's key. OpenAlex has no "data center" topic: it splits the
-	// physical layer across computing, storage and power engineering, so
-	// coverage means several topics, each wider than the beat, with dcTerm
-	// doing the narrowing at render. Thermal management returned nothing under
-	// that name and cooling is therefore still a gap.
-	{"T10101", "Cloud Computing and Resource Management"},     // 131,387: scheduling, utilisation, efficiency
-	{"T12055", "Distributed and Parallel Computing Systems"},   // 32,924: cluster architecture at scale
-	{"T11227", "Advanced Data Storage Technologies"},          // 30,713: the storage half of a facility
-	{"T10627", "Smart Grid Energy Management"},                // 40,745: demand response, large-load integration
-	{"T12147", "Power System Optimization and Stability"},    // 36,555: grid stability under new load
-	// Privacy law and policy, verified the same day. See the note above for
-	// what was already covered and what was left out.
-	{"T14234", "Data Privacy and Cybersecurity"},              // Law: 31,975
-	{"T11045", "Privacy, Security, and Data Protection"},      // policy: 70,840
+// TOPIC IDS ARE NOT STABLE. theworldofai bridge row 394 (Stephen,
+// 2026-10-03): three of the ids above had come to name Diabetic Foot Ulcer
+// Assessment, Boron Compounds in Chemistry and Urban and Rural Development,
+// and a fourth (T10627, entered as Smart Grid Energy Management) now names
+// Advanced Image and Video Retrieval. OpenAlex renumbered its topics after
+// 2026-09-13, and the harvest kept walking the old numbers into about 181,000
+// works that belong nowhere on this site. Every id below was looked up again
+// against api.openalex.org/topics on 2026-10-03, and each scope logs its name
+// every run, so a future renumbering shows up as a name that does not match.
+//
+// aiOnly scopes add an AI filter on title and abstract: the topic is a
+// domain the site covers (insurance, accounting, health policy, data-centre
+// infrastructure) and most of its works are not about AI. Unfiltered, the
+// insurance topic is 116,557 works; filtered, 2,478.
+//
+// Left out on purpose: T13851 Law, AI and Intellectual Property, T12026
+// Explainable AI and T10764 Privacy-Preserving Technologies sit inside
+// subfield 1702, which is harvested whole, so naming them again would spend
+// the same budget twice.
+var twoaiOATopics = []struct {
+	id, name string
+	aiOnly   bool
+}{
+	// Data centres, ids current on 2026-10-03, AI-filtered because each is
+	// far wider than the beat (Distributed and Parallel Computing is 190,978).
+	{"T10101", "Cloud Computing and Resource Management", false},
+	{"T10715", "Distributed and Parallel Computing Systems", true},
+	{"T11181", "Advanced Data Storage Technologies", true},
+	{"T10603", "Smart Grid Energy Management", true},
+	{"T10305", "Power System Optimization and Stability", true},
+	// Privacy law and policy, verified 2026-09-13 and again 2026-10-03.
+	{"T14234", "Data Privacy and Cybersecurity", false},
+	{"T11045", "Privacy, Security, and Data Protection", false},
+	// AI topics outside subfield 1702, taken whole (row 394).
+	{"T10883", "Ethics and Social Impacts of AI", false},
+	{"T13643", "Artificial Intelligence in Law", false},
+	{"T11147", "Misinformation and Its Impacts", false},
+	{"T14414", "Artificial Intelligence in Education", false},
+	{"T11099", "Autonomous Vehicle Technology and Safety", false},
+	{"T10203", "Recommender Systems and Techniques", false},
+	// Domains the site covers, AI works only (row 394).
+	{"T12394", "Insurance and Financial Risk Management", true},
+	{"T13509", "Accounting and Financial Management", true},
+	{"T10797", "Accounting and Organizational Management", true},
+	{"T11653", "Financial Distress and Bankruptcy Prediction", true},
+	{"T10260", "Software Engineering Research", true},
+	{"T10391", "Healthcare Policy and Management", true},
 }
+
+// twoaiOAAIFilter narrows an aiOnly topic to works about AI.
+const twoaiOAAIFilter = `title_and_abstract.search:"artificial intelligence" OR "machine learning" OR "large language model"`
+
+// twoaiOAOffTopic names the topics the renumbered ids brought in. Their
+// works are kept, marked excluded, and served by nothing.
+var twoaiOAOffTopic = []string{"Diabetic Foot Ulcer Assessment and Management", "Boron Compounds in Chemistry", "Urban and Rural Development Challenges"}
 
 // twoaiOADoc is one work as OpenAlex returns it. Named rather than inline
 // because the DOI queue resolves single works through the same shape, and
@@ -256,12 +297,21 @@ func twoaiArxivID(doi, oaURL string) string {
 // indistinguishable from one the backfill found - same columns, same
 // provenance, same licence class.
 func twoaiOAUpsert(db *sql.DB, d twoaiOADoc) (string, error) {
+	oid, _, err := twoaiOAUpsertNew(db, d)
+	return oid, err
+}
+
+// twoaiOANew counts works inserted this run, by harvest source.
+var twoaiOANew = map[string]int{}
+
+// twoaiOAUpsertNew upserts one work and reports whether it was new.
+func twoaiOAUpsertNew(db *sql.DB, d twoaiOADoc) (string, bool, error) {
 	title := strings.TrimSpace(d.Title)
 	if title == "" {
 		title = strings.TrimSpace(d.Display)
 	}
 	if title == "" || d.ID == "" {
-		return "", fmt.Errorf("work has no title or id")
+		return "", false, fmt.Errorf("work has no title or id")
 	}
 	oid := strings.TrimPrefix(d.ID, "https://openalex.org/")
 	doi := strings.TrimPrefix(d.DOI, "https://doi.org/")
@@ -322,7 +372,8 @@ func twoaiOAUpsert(db *sql.DB, d twoaiOADoc) (string, error) {
 			WHERE doi = $1 AND duplicate_of IS NULL AND openalex_id <> $2 LIMIT 1`,
 			doi, oid).Scan(&dupOf)
 	}
-	if _, err := db.Exec(`INSERT INTO twoai_works
+	var inserted bool
+	if err := db.QueryRow(`INSERT INTO twoai_works
 		(openalex_id, doi, arxiv_id, pmid, title, abstract, pub_date, pub_year,
 		 work_type, language, oa_status, oa_url, license, cited_by, referenced,
 		 topic, topic_score, authors, institutions, source_updated, duplicate_of)
@@ -339,13 +390,14 @@ func twoaiOAUpsert(db *sql.DB, d twoaiOADoc) (string, error) {
 			referenced=EXCLUDED.referenced, topic=EXCLUDED.topic,
 			topic_score=EXCLUDED.topic_score, authors=EXCLUDED.authors,
 			institutions=EXCLUDED.institutions,
-			source_updated=EXCLUDED.source_updated, last_seen=now()`,
+			source_updated=EXCLUDED.source_updated, last_seen=now()
+		RETURNING (xmax = 0)`,
 		oid, doi, arxiv, pmid, title, twoaiOAAbstract(d.AbstractII), pubDate, d.PubYear,
 		d.Type, d.Language, d.OpenAccess.Status, d.OpenAccess.URL, license,
-		d.CitedBy, d.Referenced, topic, score, string(aj), string(ij), d.Updated, dupOf); err != nil {
-		return "", err
+		d.CitedBy, d.Referenced, topic, score, string(aj), string(ij), d.Updated, dupOf).Scan(&inserted); err != nil {
+		return "", false, err
 	}
-	return oid, nil
+	return oid, inserted, nil
 }
 
 // errOpenAlexBudget marks the one 429 that waiting cannot cure: the daily
@@ -384,9 +436,15 @@ func twoaiOpenAlex(db *sql.DB) error {
 		scopes = append(scopes, scope{"primary_topic.subfield.id:subfields/" + sf.id, "openalex:" + sf.id, sf.name})
 	}
 	for _, tp := range twoaiOATopics {
+		if tp.aiOnly {
+			// Its own cursor key: a filter change invalidates a cursor.
+			scopes = append(scopes, scope{"primary_topic.id:" + tp.id + "," + twoaiOAAIFilter, "openalex:topic:" + tp.id + ":ai", tp.name + " (AI only)"})
+			continue
+		}
 		scopes = append(scopes, scope{"primary_topic.id:" + tp.id, "openalex:topic:" + tp.id, tp.name})
 	}
 	offset := time.Now().UTC().YearDay() % len(scopes)
+	twoaiOANew = map[string]int{}
 
 	for i := 0; i < len(scopes); i++ {
 		s := scopes[(offset+i)%len(scopes)]
@@ -403,6 +461,18 @@ func twoaiOpenAlex(db *sql.DB) error {
 		}
 		total += n
 	}
+	// NEW WORKS BY SOURCE, row 394: "saved" counts refreshes of works already
+	// held, which is why the 2026-09-28 drop in new works (about 57,000 a day
+	// to 16,000, with about 40,000 pulled throughout) could not be read from it.
+	parts := []string{}
+	newTotal := 0
+	for _, sc := range scopes {
+		if n := twoaiOANew[sc.source]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", sc.source, n))
+			newTotal += n
+		}
+	}
+	fmt.Printf("openalex: new works by source: %s (total new %d)\n", strings.Join(parts, ", "), newTotal)
 	var works int
 	db.QueryRow(`SELECT count(*) FROM twoai_works`).Scan(&works)
 	fmt.Printf("openalex: scopes=%d (started at %s) saved=%d works_total=%d\n",
@@ -441,6 +511,19 @@ func twoaiOAEnsureTables(db *sql.DB) error {
 	db.Exec(`CREATE INDEX IF NOT EXISTS twoai_works_doi ON twoai_works (doi) WHERE doi IS NOT NULL`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS twoai_works_arxiv ON twoai_works (arxiv_id) WHERE arxiv_id IS NOT NULL`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS twoai_works_year ON twoai_works (pub_year)`)
+	// EXCLUDED, NOT DELETED (row 394). Works brought in by the renumbered
+	// topic ids are kept and marked; the Ask box, research pages, claims and
+	// counts read only rows with no excluded_reason. Marked once.
+	db.Exec(`ALTER TABLE twoai_works ADD COLUMN IF NOT EXISTS excluded_reason text`)
+	var marked int
+	db.QueryRow(`SELECT count(*) FROM twoai_works WHERE excluded_reason LIKE 'off-topic%'`).Scan(&marked)
+	if marked == 0 {
+		if res, err := db.Exec(`UPDATE twoai_works SET excluded_reason = 'off-topic: harvested under a renumbered OpenAlex topic id, removed 2026-10-03'
+			WHERE excluded_reason IS NULL AND topic = ANY($1)`, pq.Array(twoaiOAOffTopic)); err == nil {
+			n, _ := res.RowsAffected()
+			fmt.Printf("openalex: marked %d off-topic works excluded\n", n)
+		}
+	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_harvest_cursors (
 		source text PRIMARY KEY,
 		mode text NOT NULL,
@@ -647,11 +730,15 @@ func twoaiOAHarvestScope(db *sql.DB, base, source, subfieldName string, pageBudg
 				skippedYear++
 				continue
 			}
-			if _, err := twoaiOAUpsert(db, w); err != nil {
+			_, isNew, err := twoaiOAUpsertNew(db, w)
+			if err != nil {
 				fmt.Fprintln(os.Stderr, "openalex upsert:", err)
 				continue
 			}
 			saved++
+			if isNew {
+				twoaiOANew[source]++
+			}
 			if w.Updated > newestUpdate {
 				newestUpdate = w.Updated
 			}
@@ -688,7 +775,17 @@ func twoaiOAHarvestScope(db *sql.DB, base, source, subfieldName string, pageBudg
 			WHERE source=$2`, newestUpdate, source)
 	}
 
-	fmt.Printf("openalex %s: mode=%s pages=%d saved=%d skipped_year=%d\n",
-		subfieldName, mode, pages, saved, skippedYear)
+	fmt.Printf("openalex %s: mode=%s pages=%d saved=%d new=%d skipped_year=%d\n",
+		subfieldName, mode, pages, saved, twoaiOANew[source], skippedYear)
 	return saved, nil
+}
+
+var twoaiWorksExcludedOnce sync.Once
+
+// twoaiWorksExcludedCol makes sure twoai_works.excluded_reason exists before a
+// reader filters on it, whichever stage runs first after it was added.
+func twoaiWorksExcludedCol(db *sql.DB) {
+	twoaiWorksExcludedOnce.Do(func() {
+		db.Exec(`ALTER TABLE twoai_works ADD COLUMN IF NOT EXISTS excluded_reason text`)
+	})
 }

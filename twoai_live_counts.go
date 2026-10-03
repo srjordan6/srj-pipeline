@@ -25,6 +25,7 @@ var liveCountRe = regexp.MustCompile(`\{\{([a-z_]+)\}\}`)
 // twoaiLiveCounts computes every value a blurb may ask for. Once per run;
 // the queries are cheap and the values are stable for the run's duration.
 func twoaiLiveCounts(db *sql.DB) map[string]string {
+	twoaiWorksExcludedCol(db)
 	v := map[string]string{}
 	one := func(key, q string) {
 		var n sql.NullInt64
@@ -32,8 +33,8 @@ func twoaiLiveCounts(db *sql.DB) map[string]string {
 			v[key] = withCommas(n.Int64)
 		}
 	}
-	one("works_total", `SELECT count(*) FROM twoai_works WHERE duplicate_of IS NULL`)
-	one("works_with_abstract", `SELECT count(*) FROM twoai_works WHERE duplicate_of IS NULL AND COALESCE(abstract,'') <> ''`)
+	one("works_total", `SELECT count(*) FROM twoai_works WHERE duplicate_of IS NULL AND excluded_reason IS NULL`)
+	one("works_with_abstract", `SELECT count(*) FROM twoai_works WHERE duplicate_of IS NULL AND excluded_reason IS NULL AND COALESCE(abstract,'') <> ''`)
 	one("works_earliest_year", `SELECT min(pub_year) FROM twoai_works WHERE pub_year > 1000`)
 	one("shelf_papers", `SELECT COALESCE(NULLIF(data->>'total','')::int, 0) FROM twoai_pages WHERE path = 'research/index.json'`)
 	one("shelf_topics", `SELECT count(*) FROM twoai_pages WHERE kind = 'research-topic'`)

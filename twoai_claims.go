@@ -175,6 +175,7 @@ func twoaiClaimSane(c twoaiClaim) bool {
 }
 
 func twoaiClaims(db *sql.DB) error {
+	twoaiWorksExcludedCol(db)
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_claims (
 		id bigserial PRIMARY KEY,
 		openalex_id text NOT NULL REFERENCES twoai_works(openalex_id) ON DELETE CASCADE,
@@ -216,6 +217,7 @@ func twoaiClaims(db *sql.DB) error {
 		LEFT JOIN twoai_claim_attempts a
 		  ON a.openalex_id = w.openalex_id AND a.extractor IN ($1, $3)
 		WHERE w.abstract IS NOT NULL
+		  AND w.excluded_reason IS NULL
 		  AND a.openalex_id IS NULL
 		  AND w.abstract ~* '\m(accuracy|f1|bleu|auc|precision|recall|error rate|perplexity|iou|rouge|speedup|win rate)\M'
 		  AND w.abstract ~ '[0-9]'
@@ -283,7 +285,7 @@ func twoaiClaims(db *sql.DB) error {
 	db.QueryRow(`SELECT count(DISTINCT openalex_id) FROM twoai_claims`).Scan(&totalWorks)
 	db.QueryRow(`SELECT count(*) FROM twoai_works w
 		LEFT JOIN twoai_claim_attempts a ON a.openalex_id=w.openalex_id
-		WHERE w.abstract IS NOT NULL AND a.openalex_id IS NULL
+		WHERE w.abstract IS NOT NULL AND w.excluded_reason IS NULL AND a.openalex_id IS NULL
 		  AND w.abstract ~* '\m(accuracy|f1|bleu|auc|precision|recall|error rate|perplexity|iou|rouge|speedup|win rate)\M'
 		  AND w.abstract ~ '[0-9]'`).Scan(&remaining)
 	fmt.Printf("twoai_claims: read=%d new_claims=%d no_claim=%d failed=%d | claims_total=%d works_with_claims=%d queue=%d\n",
