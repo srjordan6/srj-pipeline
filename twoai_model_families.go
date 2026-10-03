@@ -38,12 +38,53 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 const famBase = "/ai-ecosystem/technology-and-core-infrastructure/"
 
 // famEnabled: on since twoai-site bf7d821 renders shape model-family.
 const famEnabled = true
+
+// famCat is one model category with family pages, in the order rows 386 to
+// 389 set: Large Language Models first, then Reasoning Models, then on down
+// the Foundation Models hub. member says whether a catalog model belongs to
+// the category; a family is in it when one of its live members does.
+type famCat struct {
+	slug, name, uid, path string
+	member                func(m famMember) bool
+}
+
+var famCats = []famCat{
+	{"llms", "Large Language Models", "87868942", "models/llms.json", func(m famMember) bool { return true }},
+	{"reasoning-models", "Reasoning Models", "80f6d64d", "models/reasoning-models.json", func(m famMember) bool { return m.Reasoning }},
+}
+
+// famOpen is how many of famCats are open. One category at a time, and the
+// next only when Stephen says so: he reviewed the Large Language Models ten
+// on 2026-10-03 ("look fine"), which opened Reasoning Models.
+const famOpen = 2
+
+func famCatBySlug(slug string) famCat {
+	for _, c := range famCats {
+		if c.slug == slug {
+			return c
+		}
+	}
+	return famCats[0]
+}
+
+// famInCat reports whether a family has a live member in the category, and
+// when its newest such member was created.
+func famInCat(g *famGroup, c famCat) (bool, int64) {
+	for _, m := range g.live() {
+		if c.member(m) {
+			return true, m.Created
+		}
+	}
+	return false, 0
+}
 
 type famMember struct {
 	ID, Name, Released, Cutoff, Expires, HFID, Tokenizer, Instruct string
@@ -233,7 +274,8 @@ func famEnsure(db *sql.DB) {
 
 // famSelect chooses the category's first ten once and freezes them, then
 // adds a family only when its second member arrived after the freeze.
-func famSelect(db *sql.DB, cat string, groups map[string]*famGroup) {
+func famSelect(db *sql.DB, c famCat, groups map[string]*famGroup) {
+	cat := c.slug
 	var n int
 	var freeze sql.NullTime
 	db.QueryRow(`SELECT count(*), min(selected_on) FROM twoai_model_families WHERE category=$1`, cat).Scan(&n, &freeze)
@@ -243,9 +285,12 @@ func famSelect(db *sql.DB, cat string, groups map[string]*famGroup) {
 	}
 	var all []ranked
 	for _, g := range groups {
-		l := g.live()
-		if len(l) >= 2 {
-			all = append(all, ranked{g, l[0].Created})
+		if len(g.live()) < 2 {
+			continue
+		}
+		// Ranked by the newest member that is in this category.
+		if in, newest := famInCat(g, c); in {
+			all = append(all, ranked{g, newest})
 		}
 	}
 	sort.SliceStable(all, func(i, j int) bool {
@@ -364,31 +409,41 @@ func twoaiModelFamilies(db *sql.DB, today string) int {
 	if len(groups) == 0 {
 		return 0
 	}
-	const cat = "llms"
-	famSelect(db, cat, groups)
+	open := famCats[:famOpen]
+	openSlugs := []string{}
+	catOrder := map[string]int{}
+	for i, c := range open {
+		famSelect(db, c, groups)
+		openSlugs = append(openSlugs, c.slug)
+		catOrder[c.slug] = i
+	}
 	companies := famCompanies(db)
 
 	type famRow struct {
-		key, uid, name, how, built, reading, readingModel, readingOn, readingHash string
-		attempts                                                                  int
+		key, uid, name, how, built, reading, readingModel, readingOn, readingHash, category string
+		attempts                                                                            int
 	}
 	var fams []famRow
 	rows, err := db.Query(`SELECT family_key, uid, name, how, coalesce(page_built_on::text,''), coalesce(reading,''), coalesce(reading_model,''),
-			coalesce(reading_on::text,''), coalesce(reading_hash,''), reading_attempts
-		FROM twoai_model_families WHERE category=$1 ORDER BY selected_on, family_key`, cat)
+			coalesce(reading_on::text,''), coalesce(reading_hash,''), reading_attempts, category
+		FROM twoai_model_families WHERE category = ANY($1) ORDER BY selected_on, family_key`, pq.Array(openSlugs))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "twoai_model_families:", err)
 		return 0
 	}
 	for rows.Next() {
 		var f famRow
-		if rows.Scan(&f.key, &f.uid, &f.name, &f.how, &f.built, &f.reading, &f.readingModel, &f.readingOn, &f.readingHash, &f.attempts) == nil {
+		if rows.Scan(&f.key, &f.uid, &f.name, &f.how, &f.built, &f.reading, &f.readingModel, &f.readingOn, &f.readingHash, &f.attempts, &f.category) == nil {
 			fams = append(fams, f)
 		}
 	}
 	rows.Close()
-	// Unbuilt families newest first, so the pages arrive in LIFO order.
+	// Category order first, then unbuilt families newest first, so the
+	// pages arrive one category at a time in LIFO order.
 	sort.SliceStable(fams, func(i, j int) bool {
+		if catOrder[fams[i].category] != catOrder[fams[j].category] {
+			return catOrder[fams[i].category] < catOrder[fams[j].category]
+		}
 		gi, gj := groups[fams[i].key], groups[fams[j].key]
 		if gi == nil || gj == nil || len(gi.live()) == 0 || len(gj.live()) == 0 {
 			return false
@@ -400,7 +455,8 @@ func twoaiModelFamilies(db *sql.DB, today string) int {
 		perRun = v
 	}
 	newPages, refreshed, readings := 0, 0, 0
-	var listed []map[string]any
+	listedBy := map[string][]map[string]any{}
+	built := map[string]bool{}
 	familyOf := map[string]map[string]string{}
 	// THE OPEN-WEIGHT ROWS TOO. Stephen, 2026-10-03: "nothing has been done"
 	// on 87868942, pointing at Qwen/Qwen3-0.6B. The page opens with about a
@@ -427,7 +483,18 @@ func twoaiModelFamilies(db *sql.DB, today string) int {
 				continue
 			}
 		}
-		doc := famDoc(db, g, f.uid, today, companies)
+		doc := famDoc(db, g, f.uid, today, companies, famCatBySlug(f.category))
+		// The other open categories this family also belongs to.
+		also := []map[string]string{}
+		for _, c := range open {
+			if c.slug == f.category {
+				continue
+			}
+			if in, _ := famInCat(g, c); in {
+				also = append(also, map[string]string{"name": c.name, "href": famBase + c.uid + "/"})
+			}
+		}
+		doc["also_in"] = also
 		releases := famHFReleases(g, hfRows)
 		doc["hf_releases"] = releases
 		for _, r := range releases {
@@ -471,40 +538,70 @@ func twoaiModelFamilies(db *sql.DB, today string) int {
 			refreshed++
 		}
 		l := g.live()
-		listed = append(listed, map[string]any{"uid": f.uid, "name": g.displayName(), "developer": g.DevName,
+		built[f.key] = true
+		listedBy[f.category] = append(listedBy[f.category], map[string]any{"uid": f.uid, "key": f.key, "name": g.displayName(), "developer": g.DevName,
 			"members": len(l), "newest": l[0].Released, "newest_model": l[0].Name, "first": l[len(l)-1].Released,
 			"href": famBase + f.uid + "/", "how": f.how})
 		for _, m := range l {
 			familyOf[m.ID] = map[string]string{"uid": f.uid, "name": g.displayName()}
 		}
 	}
-	sort.SliceStable(listed, func(i, j int) bool { return listed[i]["newest"].(string) > listed[j]["newest"].(string) })
-	lj, _ := json.Marshal(listed)
 	fj, _ := json.Marshal(familyOf)
-	db.Exec(`UPDATE twoai_pages SET data = jsonb_set(jsonb_set(data, '{families}', $1::jsonb), '{family_of}', $2::jsonb), updated_at=now()
-		WHERE path='models/llms.json'`, string(lj), string(fj))
+	for ci, c := range open {
+		// This category's own families, and the families paged under another
+		// category that also belong here (row 388: listed apart, not counted).
+		listed := listedBy[c.slug]
+		sort.SliceStable(listed, func(i, j int) bool { return listed[i]["newest"].(string) > listed[j]["newest"].(string) })
+		alsoHere := []map[string]any{}
+		for _, other := range open {
+			if other.slug == c.slug {
+				continue
+			}
+			for _, x := range listedBy[other.slug] {
+				if g := groups[x["key"].(string)]; g != nil {
+					if in, _ := famInCat(g, c); in {
+						alsoHere = append(alsoHere, x)
+					}
+				}
+			}
+		}
+		sort.SliceStable(alsoHere, func(i, j int) bool { return alsoHere[i]["newest"].(string) > alsoHere[j]["newest"].(string) })
+		lj, _ := json.Marshal(listed)
+		aj, _ := json.Marshal(alsoHere)
+		db.Exec(`UPDATE twoai_pages SET data = jsonb_set(jsonb_set(jsonb_set(data, '{families}', $1::jsonb), '{also_families}', $2::jsonb), '{family_of}', $3::jsonb), updated_at=now()
+			WHERE path=$4`, string(lj), string(aj), string(fj), c.path)
 
-	// The ten live: ask Stephen, through theworldofai, before the next category.
-	var total, built, notified int
-	db.QueryRow(`SELECT count(*), count(page_built_on), count(notified_on) FROM twoai_model_families WHERE category=$1 AND how='first ten'`, cat).Scan(&total, &built, &notified)
-	if total == 10 && built == 10 && notified == 0 {
-		names := []string{}
-		for _, l := range listed {
-			names = append(names, fmt.Sprintf("%s %s%s/", l["name"], "theworldofai.org", l["href"]))
+		// The ten live: ask Stephen, through theworldofai, before the next
+		// category opens.
+		var total, builtN, notified int
+		db.QueryRow(`SELECT count(*), count(page_built_on), count(notified_on) FROM twoai_model_families WHERE category=$1 AND how='first ten'`, c.slug).Scan(&total, &builtN, &notified)
+		if total == 10 && builtN == 10 && notified == 0 {
+			names := []string{}
+			for _, l := range listed {
+				names = append(names, fmt.Sprintf("%s theworldofai.org%s", l["name"], l["href"]))
+			}
+			next := "no further category is listed yet"
+			if ci+1 < len(famCats) {
+				next = famCats[ci+1].name + " (" + famCats[ci+1].uid + ") does not start until he says so through this bridge"
+			} else if famOpen < len(famCats) {
+				next = famCats[famOpen].name + " does not start until he says so through this bridge"
+			}
+			body := "Rows 386 to 389: the ten " + c.name + " family pages are built and go live with this run's deploy. Listed on /ai-ecosystem/technology-and-core-infrastructure/" + c.uid + "/ under Model families. " +
+				strings.Join(names, ", ") + ". Please ask Stephen to look at them. " + next + "."
+			body = strings.ReplaceAll(body, ";", ",")
+			if _, err := db.Exec(`INSERT INTO project_bridge (from_project, to_project, topic, body) VALUES ('srj','theworldofai',$1,$2)`,
+				c.name+": ten family pages live, Stephen to review", body); err == nil {
+				db.Exec(`UPDATE twoai_model_families SET notified_on=current_date WHERE category=$1 AND how='first ten'`, c.slug)
+			}
 		}
-		body := "Rows 386 to 389: the ten Large Language Models family pages are built and go live with this run's deploy. Listed on /ai-ecosystem/technology-and-core-infrastructure/87868942/ under Model families. " +
-			strings.Join(names, ", ") + ". Please ask Stephen to look at them. Reasoning Models (80f6d64d) does not start until he says so through this bridge."
-		body = strings.ReplaceAll(body, ";", ",")
-		if _, err := db.Exec(`INSERT INTO project_bridge (from_project, to_project, topic, body) VALUES ('srj','theworldofai','Large Language Models: ten family pages live, Stephen to review',$1)`, body); err == nil {
-			db.Exec(`UPDATE twoai_model_families SET notified_on=current_date WHERE category=$1 AND how='first ten'`, cat)
-		}
+		fmt.Printf("twoai_model_families: %s families=%d also=%d ok=true\n", c.slug, len(listed), len(alsoHere))
 	}
-	fmt.Printf("twoai_model_families: %s families=%d new_pages=%d refreshed=%d ok=true\n", cat, len(fams), newPages, refreshed)
+	fmt.Printf("twoai_model_families: rows=%d new_pages=%d refreshed=%d ok=true\n", len(fams), newPages, refreshed)
 	return newPages
 }
 
 // famDoc builds the page document for one family from the catalog.
-func famDoc(db *sql.DB, g *famGroup, uid, today string, companies map[string]famCompany) map[string]any {
+func famDoc(db *sql.DB, g *famGroup, uid, today string, companies map[string]famCompany, parent famCat) map[string]any {
 	l := g.live()
 	name := g.displayName()
 	ins, outs := map[string]bool{}, map[string]bool{}
@@ -595,7 +692,7 @@ func famDoc(db *sql.DB, g *famGroup, uid, today string, companies map[string]fam
 	doc := map[string]any{
 		"shape": "model-family", "uid": uid, "name": name, "title": name + " model family",
 		"family_key": g.Key, "developer": g.DevName, "line": g.LineName,
-		"parent_path": famBase + "87868942/", "parent_name": "Large Language Models",
+		"parent_path": famBase + parent.uid + "/", "parent_name": parent.name,
 		"hub_path": famBase + "70d363c9/", "hub_name": "Foundation Models",
 		"first_release": l[len(l)-1].Released, "latest_release": l[0].Released, "latest_model": l[0].Name,
 		"member_count": len(l), "licence": licence, "input_modalities": keys(ins), "output_modalities": keys(outs),
