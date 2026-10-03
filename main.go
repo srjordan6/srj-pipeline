@@ -774,6 +774,11 @@ func main() {
 	// pages, without a full build. The next all run exports and deploys them.
 	// Model families on their own, for checking the pages a full build would
 	// write. The next all run exports and deploys them.
+	if src == "research_education" {
+		twoaiResearchEducation(db)
+		return
+	}
+
 	if src == "families" {
 		twoaiModelFamilies(db, time.Now().Format("2006-01-02"))
 		return
@@ -5414,6 +5419,9 @@ func twoaiBuild(db *sql.DB) error {
 		fmt.Println("twoai_paper_explain:", err)
 	}
 
+	// The Education shelf, added once from the OpenAlex index (Stephen,
+	// 2026-10-03). Ahead of the library build so its papers are on the shelf.
+	twoaiResearchEducation(db)
 	research, err := twoaiResearch(db, today, upsert)
 	if err != nil {
 		return err
@@ -6175,6 +6183,7 @@ func twoaiResearch(db *sql.DB, today string, upsert func(path, kind string, v an
 		"applications":            "Applications by Sector",
 		"methodology":             "Research Methodology",
 		"healthcare-regulation":   "Healthcare Regulation",
+		"education":               "AI in Education",
 	}
 
 	// Backfill topic label on each paper so the paper-detail page can render
