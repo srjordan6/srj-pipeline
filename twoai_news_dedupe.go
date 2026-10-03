@@ -315,6 +315,10 @@ func newsSameEvent(a, b *dedupeStory) string {
 // newsWordRule is the headline test on its own: the rule name when two
 // headlines describe one event, or "".
 func newsWordRule(a, b *dedupeStory) string {
+	// Two different places named, two events (news_places.go).
+	if newsDifferentPlaces(a.headline, b.headline) {
+		return ""
+	}
 	// A NAME IS NOT AN EVENT. The 18:05 run of 2026-10-02 merged four NTT
 	// DATA announcements into four other NTT DATA announcements (Google Cloud
 	// into a cloud-value study, Palo Alto Networks into IP networks, Databricks

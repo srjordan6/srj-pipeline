@@ -80,3 +80,24 @@ func TestNewsOneNewsroom(t *testing.T) {
 		t.Errorf("the same release ingested twice should still merge")
 	}
 }
+
+// Different places, different events (23:38 run, 2026-10-02).
+func TestNewsDifferentPlaces(t *testing.T) {
+	sg := dedupeStoryFor("a", "Kyndryl launches AI Innovation Lab in Singapore", "Kyndryl")
+	lu := dedupeStoryFor("b", "BIL welcomes the launch of Kyndryl's AI Innovation Lab in Luxembourg", "Kyndryl")
+	if r := newsWordRule(sg, lu); r != "" {
+		t.Errorf("Singapore and Luxembourg labs merged on %q", r)
+	}
+	d1 := dedupeStoryFor("c", "Kyndryl Launches AI Innovation Lab in Dallas Area", "Kyndryl")
+	d2 := dedupeStoryFor("d", "Kyndryl opens AI Innovation Lab in Dallas, creating jobs", "Kyndryl")
+	if r := newsWordRule(d1, d2); r == "" {
+		t.Errorf("two Dallas lab stories should still match")
+	}
+	l2 := dedupeStoryFor("e", "Kyndryl launches AI Innovation Lab in Luxembourg", "Kyndryl")
+	if r := newsWordRule(lu, l2); r == "" {
+		t.Errorf("two Luxembourg lab stories should still match")
+	}
+	if !newsDifferentPlaces("Lab opens in New York City", "Lab opens in Boston") || newsDifferentPlaces("Lab opens in New York City", "New York lab opens") {
+		t.Errorf("place matching wrong for New York")
+	}
+}
