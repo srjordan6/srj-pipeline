@@ -165,7 +165,7 @@ func twoaiDartRefreshCorps(db *sql.DB, key string, client *http.Client) error {
 	}
 	resp, err := client.Get(dartBase + "corpCode.xml?crtfc_key=" + url.QueryEscape(key))
 	if err != nil {
-		return fmt.Errorf("corpCode: %w", err)
+		return fmt.Errorf("corpCode: %s", dartRedact(err, key))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
@@ -346,7 +346,7 @@ func twoaiDart(db *sql.DB) error {
 		q.Set("page_count", "100")
 		resp, err := client.Get(dartBase + "list.json?" + q.Encode())
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "twoai_dart: %s: %v\n", c.name, err)
+			fmt.Fprintf(os.Stderr, "twoai_dart: %s: %s\n", c.name, dartRedact(err, key))
 			continue
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
@@ -401,4 +401,20 @@ func twoaiDart(db *sql.DB) error {
 	db.QueryRow(`SELECT count(*) FROM twoai_dart_filings`).Scan(&total)
 	fmt.Printf("twoai_dart: watched=%d seen=%d new=%d total=%d\n", len(watch), seen, newRows, total)
 	return nil
+}
+
+// dartRedact keeps the API key out of logs. A failed request's error is a
+// url.Error that prints the whole request URL, crtfc_key included, so on
+// 2026-10-04 the key was written in clear into the run log by a TLS
+// handshake failure. The key is replaced wherever it appears.
+func dartRedact(err error, key string) string {
+	if err == nil {
+		return ""
+	}
+	m := err.Error()
+	if key != "" {
+		m = strings.ReplaceAll(m, key, "REDACTED")
+		m = strings.ReplaceAll(m, url.QueryEscape(key), "REDACTED")
+	}
+	return m
 }
