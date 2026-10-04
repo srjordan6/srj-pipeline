@@ -144,6 +144,10 @@ func crawlFetch(client *http.Client, u string) (int, []byte, string, error) {
 // bots stays unreadable; this is for pages drawn by script.
 const crawlBrowserMonthlyPages = 6000
 
+// crawlBrowserPerRun is how many unreadable cited sites get the browser in
+// one run (row 435, 2026-10-04: raised from one).
+const crawlBrowserPerRun = 5
+
 func crawlFetchBrowser(client *http.Client, u string) (int, []byte, string, error) {
 	acct := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
 	tok := os.Getenv("CLOUDFLARE_BROWSER_TOKEN")
@@ -534,16 +538,33 @@ func twoaiSiteCrawlStep(db *sql.DB, cited map[string][]string, industryOf map[st
 		crawled++
 		crawledN++
 	}
-	// One site the plain reader could not read gets the browser, if the
-	// month's page budget allows.
+	// Up to five sites the plain reader could not read get the browser each
+	// run, within the month's page budget (theworldofai row 435, 2026-10-04:
+	// one a run left twenty waiting ten days under two runs a day). Only
+	// sites an industry page cites are taken here; the language and framework
+	// sites get theirs in twoaiLangPages. Redirect hosts such as aka.ms are
+	// never crawled: their subject has its own override (row 360).
 	var monthPages int
 	db.QueryRow(`SELECT count(*) FROM twoai_site_crawl_pages WHERE fetched_via='browser' AND fetched_on >= date_trunc('month', current_date)`).Scan(&monthPages)
-	if monthPages < crawlBrowserMonthlyPages && os.Getenv("CLOUDFLARE_ACCOUNT_ID") != "" {
-		var d string
-		db.QueryRow(`SELECT domain FROM twoai_site_crawl WHERE crawl_status = 'unreadable' AND browser_tried_on IS NULL ORDER BY crawled_on, domain LIMIT 1`).Scan(&d)
-		if d != "" && len(cited[d]) > 0 {
+	if os.Getenv("CLOUDFLARE_ACCOUNT_ID") != "" {
+		var cands []string
+		if br, err := db.Query(`SELECT domain FROM twoai_site_crawl WHERE crawl_status = 'unreadable' AND browser_tried_on IS NULL
+			AND domain NOT IN ('aka.ms','bit.ly','t.co','goo.gl','tinyurl.com','git.io','lnkd.in') ORDER BY crawled_on, domain LIMIT 40`); err == nil {
+			for br.Next() {
+				var d string
+				if br.Scan(&d) == nil && len(cited[d]) > 0 {
+					cands = append(cands, d)
+				}
+			}
+			br.Close()
+		}
+		for i, d := range cands {
+			if i >= crawlBrowserPerRun || monthPages >= crawlBrowserMonthlyPages {
+				break
+			}
 			f, r := twoaiCrawlSite(db, d, cited[d], true)
-			fmt.Printf("twoai_site_crawl: %s read through the browser fetched=%d relevant=%d (browser pages this month: %d)\n", d, f, r, monthPages+f)
+			monthPages += f
+			fmt.Printf("twoai_site_crawl: %s read through the browser fetched=%d relevant=%d (browser pages this month: %d)\n", d, f, r, monthPages)
 		}
 	}
 	digested := 0

@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -57,6 +58,23 @@ var langSiteOverrides = map[string]struct{ site, scope string }{
 // so its repository stood in) and would have handed that digest to every
 // other repository-only subject. There the key is host plus owner/repo, so
 // the crawl stays inside the one repository (crawlSplitScope).
+// langDeepStarts adds the pages a documentation site's subject is explained
+// on, so a crawl does not stop at the landing page (row 435): for a
+// huggingface.co/docs path its index, quick tour, installation and concept
+// pages; for a code repository its README and docs folder.
+func langDeepStarts(scope string) []string {
+	base := "https://" + strings.TrimSuffix(scope, "/")
+	switch {
+	case strings.HasPrefix(scope, "huggingface.co/docs/"):
+		return []string{base + "/index", base + "/quicktour", base + "/installation", base + "/install",
+			base + "/conceptual_guides/adapter", base + "/conceptual/streaming", base + "/philosophy"}
+	case strings.HasPrefix(scope, "github.com/"), strings.HasPrefix(scope, "gitlab.com/"):
+		return []string{base + "/blob/master/README.md", base + "/blob/main/README.md",
+			base + "/tree/master/doc", base + "/tree/master/docs", base + "/tree/main/docs"}
+	}
+	return nil
+}
+
 func langScope(site string) string {
 	host := crawlHost(site)
 	switch host {
@@ -248,12 +266,19 @@ func twoaiLangPages(db *sql.DB, today string) (int, error) {
 			break
 		}
 		var last sql.NullTime
-		db.QueryRow(`SELECT crawled_on FROM twoai_site_crawl WHERE domain=$1`, d).Scan(&last)
-		if last.Valid && time.Since(last.Time) < twoaiCrawlRefreshDays*24*time.Hour {
+		var status string
+		var browserTried bool
+		db.QueryRow(`SELECT crawled_on, COALESCE(crawl_status,''), browser_tried_on IS NOT NULL FROM twoai_site_crawl WHERE domain=$1`, d).Scan(&last, &status, &browserTried)
+		// A documentation site the plain reader could not read gets one
+		// browser read, deeper than its landing page (row 435): the six
+		// profiles that failed "site digest too thin" were all read as a
+		// single landing page.
+		useBrowser := status == "unreadable" && !browserTried && os.Getenv("CLOUDFLARE_ACCOUNT_ID") != ""
+		if !useBrowser && last.Valid && time.Since(last.Time) < twoaiCrawlRefreshDays*24*time.Hour {
 			continue
 		}
-		f, r := twoaiCrawlSite(db, d, starts[d], false)
-		fmt.Printf("twoai_lang_pages: crawled %s fetched=%d relevant=%d\n", d, f, r)
+		f, r := twoaiCrawlSite(db, d, append(starts[d], langDeepStarts(d)...), useBrowser)
+		fmt.Printf("twoai_lang_pages: crawled %s fetched=%d relevant=%d browser=%v\n", d, f, r, useBrowser)
 		crawled++
 		// A site that yields nothing is not the subject's site for our
 		// purposes. Every subject keyed on it that has a repository falls
