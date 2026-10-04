@@ -131,6 +131,7 @@ type dedupeStory struct {
 	urls, domains, actors     map[string]bool
 	words                     map[string]bool
 	domainCount               int
+	titles                    []string // article titles, lead first (row 414 bundle test)
 }
 
 func newsStrings(v any) []string {
@@ -253,6 +254,9 @@ func newsDedupeFrom(uid, slug, head string, st map[string]any) *dedupeStory {
 				if dom, _ := m["Domain"].(string); dom != "" {
 					d.domains[dom] = true
 				}
+				if t, _ := m["Title"].(string); t != "" {
+					d.titles = append(d.titles, t)
+				}
 			}
 		}
 	}
@@ -291,6 +295,11 @@ func newsOneNewsroom(a, b *dedupeStory) bool {
 // newsSameEvent names the rule two stories match on, or returns "".
 func newsSameEvent(a, b *dedupeStory) string {
 	if newsOneNewsroom(a, b) {
+		return ""
+	}
+	// A one-outlet bundle (row 414) shares links with whatever absorbed it,
+	// which says nothing about the event: never merged.
+	if newsBundle(a.titles, a.domains) || newsBundle(b.titles, b.domains) {
 		return ""
 	}
 	sharedURL := 0
@@ -394,7 +403,12 @@ var newsRuleWordsRe = regexp.MustCompile(`share (\d+) of (\d+) words`)
 // anyway) and loses the loser from merged_from; pins the merge moved go
 // back; a record link the merge copied is dropped and the loser's own is
 // restored. The log row is marked reversed, so this is safe to rerun.
-func newsUnmerge(db *sql.DB) {
+func newsUnmerge(db *sql.DB) { newsUnmergeWhere(db, "", nil) }
+
+// newsUnmergeWhere is newsUnmerge limited, when only is set, to the logged
+// merges whose loser it picks; those are reversed and every other merge is
+// left alone. label names the reason in the log.
+func newsUnmergeWhere(db *sql.DB, label string, only func(loser *dedupeStory) bool) {
 	db.Exec(`ALTER TABLE twoai_news_dedupe_log ADD COLUMN IF NOT EXISTS reversed_at timestamptz`)
 	rows, err := db.Query(`SELECT d.loser_uid, d.survivor_uid, d.rule, l.story::text, sv.story::text, l.headline, sv.headline
 		FROM twoai_news_dedupe_log d JOIN twoai_news_stories l ON l.uid=d.loser_uid JOIN twoai_news_stories sv ON sv.uid=d.survivor_uid
@@ -453,6 +467,12 @@ func newsUnmerge(db *sql.DB) {
 		if keep && newsOneNewsroom(lv, sv) {
 			keep = false
 		}
+		if only != nil {
+			if !only(lv) {
+				continue
+			}
+			keep = false
+		}
 		// AN EDITOR'S REVERSAL. A merge the rules cannot see is wrong once the
 		// survivor has absorbed the loser's links and outlets, so a named loser
 		// is reversed on request: TWOAI_UNMERGE_UIDS=uid,uid (one run only).
@@ -508,6 +528,9 @@ func newsUnmerge(db *sql.DB) {
 		note := " (reversed: below the stricter rule)"
 		if forced[p.loser] {
 			note = " (reversed by an editor)"
+		}
+		if label != "" {
+			note = " (reversed: " + label + ")"
 		}
 		db.Exec(`UPDATE twoai_news_dedupe_log SET reversed_at=now(), rule = rule || $2 WHERE loser_uid=$1`, p.loser, note)
 		reversed++

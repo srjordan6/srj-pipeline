@@ -316,20 +316,22 @@ func twoaiNewsGap(db *sql.DB, asOf time.Time, preview bool) error {
 		last_flagged timestamptz NOT NULL DEFAULT now())`); err != nil {
 		return err
 	}
+	db.Exec(`ALTER TABLE twoai_news_gap_flags ADD COLUMN IF NOT EXISTS acted_on timestamptz`)
+	db.Exec(`ALTER TABLE twoai_news_gap_flags ADD COLUMN IF NOT EXISTS outcome text`)
 	today := asOf.Format("2006-01-02")
+	// New subjects are flagged once a day; subjects flagged but not yet acted
+	// on (row 415) are worked on every run until they are.
 	var done bool
 	db.QueryRow(`SELECT EXISTS(SELECT 1 FROM twoai_news_gap_runs WHERE run_date=$1::date)`, today).Scan(&done)
-	if done && !preview {
-		fmt.Println("news_gap: already checked today")
-		return nil
-	}
 
 	type item struct{ title, url, domain, names string }
 	var items []item
 	seen := map[string]bool{}
 	add := func(it item) {
 		c := newsCanonURL(it.url)
-		if c == "" || seen[c] || !twoaiTitleIsAI(it.title) || twoaiIsIndexPage(it.title, c) {
+		// No AI-in-the-headline filter (row 416): the judge reads the
+		// articles. Category and tag listings are still not articles.
+		if c == "" || seen[c] || twoaiIsIndexPage(it.title, c) {
 			return
 		}
 		seen[c] = true
@@ -400,6 +402,7 @@ func twoaiNewsGap(db *sql.DB, asOf time.Time, preview bool) error {
 	type acc struct {
 		outlets  map[string]bool
 		examples []string
+		arts     []newsGapArticle
 	}
 	groups := map[string]*acc{}
 	display := map[string]string{}
@@ -413,6 +416,7 @@ func twoaiNewsGap(db *sql.DB, asOf time.Time, preview bool) error {
 		if dom == "" {
 			dom = publisherFromURL(it.url)
 		}
+		g.arts = append(g.arts, newsGapArticle{Title: it.title, URL: it.url, Domain: dom})
 		if !g.outlets[dom] {
 			g.outlets[dom] = true
 			if len(g.examples) < 3 {
@@ -479,49 +483,127 @@ func twoaiNewsGap(db *sql.DB, asOf time.Time, preview bool) error {
 				continue
 			}
 		}
-		var recent bool
-		db.QueryRow(`SELECT EXISTS(SELECT 1 FROM twoai_news_gap_flags WHERE gap_key=$1 AND last_flagged > now() - interval '3 days')`, g.Key).Scan(&recent)
-		if recent && !preview {
-			continue
-		}
 		keep = append(keep, g)
 	}
 	gaps = keep
-	if len(gaps) > 12 {
-		gaps = gaps[:12]
+
+	// New today: not flagged in the last three days. Pending: flagged and
+	// not acted on yet, which is how the four of row 412 are picked up.
+	var fresh []newsGapItem
+	if !done || preview {
+		for _, g := range gaps {
+			var recent bool
+			db.QueryRow(`SELECT EXISTS(SELECT 1 FROM twoai_news_gap_flags WHERE gap_key=$1 AND last_flagged > now() - interval '3 days')`, g.Key).Scan(&recent)
+			if !recent {
+				fresh = append(fresh, g)
+			}
+		}
+		if len(fresh) > 12 {
+			fresh = fresh[:12]
+		}
+	}
+	work := append([]newsGapItem{}, fresh...)
+	if prows, err := db.Query(`SELECT gap_key FROM twoai_news_gap_flags WHERE acted_on IS NULL AND last_flagged > now() - interval '3 days' ORDER BY outlets DESC`); err == nil {
+		inWork := map[string]bool{}
+		for _, g := range work {
+			inWork[g.Key] = true
+		}
+		for prows.Next() {
+			var k string
+			if prows.Scan(&k) != nil || inWork[k] {
+				continue
+			}
+			g := groups[k]
+			if g == nil || len(g.outlets) < 2 {
+				continue
+			}
+			names := strings.Split(k, " + ")
+			disp := make([]string, len(names))
+			for i, n := range names {
+				disp[i] = display[n]
+				if disp[i] == "" {
+					disp[i] = n
+				}
+			}
+			work = append(work, newsGapItem{Key: k, Names: names, Display: disp, Outlets: len(g.outlets), Examples: g.examples})
+		}
+		prows.Close()
 	}
 
 	if preview {
-		fmt.Printf("news_gap preview as of %s: articles=%d vocabulary=%d subjects=%d would flag=%d\n", asOf.Format(time.RFC3339), len(items), len(vocab), len(groups), len(gaps))
-		for _, g := range gaps {
+		fmt.Printf("news_gap preview as of %s: articles=%d vocabulary=%d subjects=%d would flag=%d would act on=%d\n", asOf.Format(time.RFC3339), len(items), len(vocab), len(groups), len(fresh), len(work))
+		for _, g := range work {
 			fmt.Printf("news_gap preview: %s, %d outlets\n", strings.Join(g.Display, " and "), g.Outlets)
 		}
 		return nil
 	}
-	if len(gaps) > 0 {
+	for _, g := range fresh {
+		db.Exec(`INSERT INTO twoai_news_gap_flags (gap_key, outlets) VALUES ($1,$2)
+			ON CONFLICT (gap_key) DO UPDATE SET outlets=EXCLUDED.outlets, last_flagged=now(), acted_on=NULL, outcome=NULL`, g.Key, g.Outlets)
+	}
+
+	// ACT, rows 415 and 416: at most eight subjects a run, widest first.
+	companies := newsCompanyPages(db)
+	var built, reported []string
+	acted := 0
+	for _, g := range work {
+		if acted >= 8 {
+			reported = append(reported, fmt.Sprintf("%s, %d outlets: waiting for the next run", strings.Join(g.Display, " and "), g.Outlets))
+			continue
+		}
+		if isCovered(g.Names...) {
+			db.Exec(`UPDATE twoai_news_gap_flags SET acted_on=now(), outcome='covered by a story since flagged' WHERE gap_key=$1`, g.Key)
+			continue
+		}
+		acted++
+		arts := groups[g.Key].arts
+		res := newsGapAct(db, g.Key, strings.Join(g.Display, " and "), g.Names, arts, g.Outlets, asOf, companies)
+		label := fmt.Sprintf("%s, %d outlets", res.Display, res.Outlets)
+		outcome := res.Report
+		if len(res.Stories) > 0 {
+			for _, st := range res.Stories {
+				built = append(built, label+": "+st)
+			}
+			outcome = strings.Join(res.Stories, "; ")
+		} else {
+			reported = append(reported, label+": "+res.Report)
+		}
+		if strings.Contains(outcome, "next run") {
+			continue // not settled, tried again
+		}
+		db.Exec(`UPDATE twoai_news_gap_flags SET acted_on=now(), outcome=$2 WHERE gap_key=$1`, g.Key, trunc(outcome, 500))
+	}
+
+	if len(built) > 0 || len(reported) > 0 {
 		var b strings.Builder
-		fmt.Fprintf(&b, "Daily news safety check, %s (srj-pipeline news_gap, bridge row 409). These subjects were in the headlines of three or more outlets in the last 72 hours and no live story from the last five days names them. Each is either a story the briefing missed or one you can ignore.\n", today)
-		for i, g := range gaps {
-			fmt.Fprintf(&b, "\n%d. %s, %d outlets\n", i+1, strings.Join(g.Display, " and "), g.Outlets)
-			for _, ex := range g.Examples {
-				fmt.Fprintf(&b, "   - %s\n", ex)
+		fmt.Fprintf(&b, "News safety check, %s (srj-pipeline news_gap, rows 409, 415, 416). Subjects carried by three or more outlets in 72 hours with no live story. The model judged from the articles whether AI is the substance; yes became a story through the normal story shape and was pinned to the company page where one exists, no is listed with the judge's reason. Verdicts are kept in twoai_ai_verdicts.\n", today)
+		if len(built) > 0 {
+			b.WriteString("\n" + "STORIES BUILT\n")
+			for _, x := range built {
+				b.WriteString("- " + x + "\n")
 			}
 		}
-		b.WriteString("\nA subject reported here is not reported again for three days.")
-		if _, err := db.Exec(`INSERT INTO project_bridge (from_project, to_project, topic, body) VALUES ('srj','theworldofai',$1,$2)`,
-			fmt.Sprintf("News safety check: %d subject%s with wide coverage and no story", len(gaps), map[bool]string{true: "", false: "s"}[len(gaps) == 1]),
-			b.String()); err != nil {
+		if len(reported) > 0 {
+			b.WriteString("\n" + "REPORTED ONLY\n")
+			for _, x := range reported {
+				b.WriteString("- " + x + "\n")
+			}
+		}
+		b.WriteString("\n" + "A subject is not flagged again for three days. The why-it-matters line is written for each new story on the next run.")
+		topic := fmt.Sprintf("News safety check: %d stor%s built, %d reported", len(built), map[bool]string{true: "y", false: "ies"}[len(built) == 1], len(reported))
+		if _, err := db.Exec(`INSERT INTO project_bridge (from_project, to_project, topic, body) VALUES ('srj','theworldofai',$1,$2)`, topic, b.String()); err != nil {
 			return err
 		}
-		for _, g := range gaps {
-			db.Exec(`INSERT INTO twoai_news_gap_flags (gap_key, outlets) VALUES ($1,$2)
-				ON CONFLICT (gap_key) DO UPDATE SET outlets=EXCLUDED.outlets, last_flagged=now()`, g.Key, g.Outlets)
-		}
 	}
-	db.Exec(`INSERT INTO twoai_news_gap_runs (run_date, flagged) VALUES ($1::date,$2) ON CONFLICT (run_date) DO NOTHING`, today, len(gaps))
-	fmt.Printf("news_gap: articles=%d vocabulary=%d subjects=%d flagged=%d ok=true\n", len(items), len(vocab), len(groups), len(gaps))
-	for _, g := range gaps {
-		fmt.Printf("news_gap: %s, %d outlets\n", strings.Join(g.Display, " and "), g.Outlets)
+	if !done {
+		db.Exec(`INSERT INTO twoai_news_gap_runs (run_date, flagged) VALUES ($1::date,$2) ON CONFLICT (run_date) DO NOTHING`, today, len(fresh))
+	}
+	fmt.Printf("news_gap: articles=%d vocabulary=%d subjects=%d flagged=%d acted=%d built=%d reported=%d ok=true\n", len(items), len(vocab), len(groups), len(fresh), acted, len(built), len(reported))
+	for _, x := range built {
+		fmt.Printf("news_gap: built %s\n", x)
+	}
+	for _, x := range reported {
+		fmt.Printf("news_gap: reported %s\n", x)
 	}
 	return nil
 }

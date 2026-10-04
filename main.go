@@ -2281,35 +2281,9 @@ func publishNews(db *sql.DB) error {
 	}
 	fmt.Printf("publishNews: %d articles in 72 hours, %d of them from the vendor-news intake\n", len(arts), nCand)
 
-	stop := map[string]bool{"the": true, "a": true, "an": true, "of": true, "to": true, "in": true, "on": true, "for": true, "and": true, "with": true, "as": true, "at": true, "by": true, "is": true, "its": true, "ai": true, "artificial": true, "intelligence": true, "new": true, "how": true, "what": true, "why": true}
-	toks := func(s string) map[string]bool {
-		m := map[string]bool{}
-		w := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !('a' <= r && r <= 'z' || '0' <= r && r <= '9') })
-		for _, x := range w {
-			if len(x) > 2 && !stop[x] {
-				// LIGHT STEMMING. "enacts", "enacted" and "enacting" are one
-				// token. Without this, California's auditing laws ran as two
-				// stories on 2026-09-10 - "California Enacts..." and
-				// "California enacted the first..." - because the two headlines
-				// shared only "california" and "laws" as written. A suffix
-				// strip is crude and is enough: this compares headlines about
-				// the same event, not prose.
-				for _, suf := range []string{"ing", "ed", "es", "s"} {
-					if len(x) > len(suf)+3 && strings.HasSuffix(x, suf) {
-						x = strings.TrimSuffix(x, suf)
-						break
-					}
-				}
-				// One word for a deal: "acquire", "buys", "acquisition"
-				// and "takeover" headlines about one purchase now share it.
-				if newsDealWord[x] {
-					x = "acquire"
-				}
-				m[x] = true
-			}
-		}
-		return m
-	}
+	// Headline words, outlet name removed first (bridge row 414): see
+	// newsTitleTokens. Stop list, stemming and deal words live there now.
+	toks := newsTitleTokens
 	sim := func(a, b map[string]bool) float64 {
 		n := 0
 		for k := range a {
@@ -2327,29 +2301,102 @@ func publishNews(db *sql.DB) error {
 		return float64(n) / float64(d)
 	}
 
+	// NAMED SUBJECTS, bridge row 409. Each cluster's entities as it formed:
+	// the companies, people, models and operators the site knows, plus any
+	// GDELT-extracted name that appears in a headline of the window. Two
+	// clusters naming the same two subjects, neither of them ubiquitous this
+	// window, with some headline overlap, are one story: "AMD to Acquire World
+	// Labs" and "AMD Stock: World Labs Acquisition Bolsters AI Expertise".
+	// Seeded once and never widened, for the reason seedTk is.
+	var entTitles, entNames []string
+	for _, a := range arts {
+		entTitles = append(entTitles, a.Title)
+		for _, n := range strings.Split(a.persons+";"+a.orgs, ";") {
+			if n = strings.TrimSpace(n); n != "" {
+				entNames = append(entNames, n)
+			}
+		}
+	}
+	entVocab := newsEntityVocab(newsEntityDict(db), entTitles, entNames)
+	entDF := map[string]int{}
+	artEnts := map[string][]string{}
+	for _, a := range arts {
+		es := newsTitleEntities(a.Title, entVocab)
+		artEnts[a.URL] = es
+		for _, e := range es {
+			entDF[e]++
+		}
+	}
+	ubiq := map[string]bool{}
+	ubiqAt := len(arts) / 40
+	if ubiqAt < 25 {
+		ubiqAt = 25
+	}
+	for e, n := range entDF {
+		if n > ubiqAt {
+			ubiq[e] = true
+		}
+	}
 	type cluster struct {
 		arts []art
 		tk   map[string]bool
+		seed map[string]bool // the first headline's words, for the same-outlet test
 	}
 	var cls []*cluster
+	entSet := func(as []art) map[string]bool {
+		m := map[string]bool{}
+		for _, a := range as {
+			for _, e := range artEnts[a.URL] {
+				m[e] = true
+			}
+		}
+		return m
+	}
+	// oneOutlet names the single outlet every article in the clusters came
+	// from, or "" when there is more than one.
+	oneOutlet := func(cs ...*cluster) string {
+		d := ""
+		for _, c := range cs {
+			for _, a := range c.arts {
+				if d == "" {
+					d = a.Domain
+				} else if a.Domain != d {
+					return ""
+				}
+			}
+		}
+		return d
+	}
 	for _, a := range arts {
-		tk := toks(a.Title)
+		tk := toks(newsStripOutlet(a.Title, a.Domain))
 		if len(tk) < 3 {
 			continue
 		}
 		placed := false
 		for _, c := range cls {
-			if sim(tk, c.tk) >= 0.6 {
-				c.arts = append(c.arts, a)
-				for k := range tk {
-					c.tk[k] = true
-				}
-				placed = true
-				break
+			if sim(tk, c.tk) < 0.6 {
+				continue
 			}
+			// SAME OUTLET, ROW 414. One outlet's articles join only when
+			// they name a subject other than the outlet and agree with the
+			// first headline on the topic, never on the publisher.
+			if d := oneOutlet(c); d != "" && d == a.Domain &&
+				!newsSameOutletStory(tk, c.seed, entSet([]art{a}), entSet(c.arts[:1]), d) {
+				continue
+			}
+			c.arts = append(c.arts, a)
+			for k := range tk {
+				c.tk[k] = true
+			}
+			placed = true
+			break
 		}
 		if !placed {
-			cls = append(cls, &cluster{arts: []art{a}, tk: tk})
+			seed := map[string]bool{}
+			for k := range tk {
+				seed[k] = true
+			}
+			cls = append(cls, &cluster{arts: []art{a}, tk: tk, seed: seed})
 		}
 	}
 
@@ -2427,42 +2474,6 @@ func publishNews(db *sql.DB) error {
 		}
 		seedTk[i] = m
 	}
-	// NAMED SUBJECTS, bridge row 409. Each cluster's entities as it formed:
-	// the companies, people, models and operators the site knows, plus any
-	// GDELT-extracted name that appears in a headline of the window. Two
-	// clusters naming the same two subjects, neither of them ubiquitous this
-	// window, with some headline overlap, are one story: "AMD to Acquire World
-	// Labs" and "AMD Stock: World Labs Acquisition Bolsters AI Expertise".
-	// Seeded once and never widened, for the reason seedTk is.
-	var entTitles, entNames []string
-	for _, a := range arts {
-		entTitles = append(entTitles, a.Title)
-		for _, n := range strings.Split(a.persons+";"+a.orgs, ";") {
-			if n = strings.TrimSpace(n); n != "" {
-				entNames = append(entNames, n)
-			}
-		}
-	}
-	entVocab := newsEntityVocab(newsEntityDict(db), entTitles, entNames)
-	entDF := map[string]int{}
-	artEnts := map[string][]string{}
-	for _, a := range arts {
-		es := newsTitleEntities(a.Title, entVocab)
-		artEnts[a.URL] = es
-		for _, e := range es {
-			entDF[e]++
-		}
-	}
-	ubiq := map[string]bool{}
-	ubiqAt := len(arts) / 40
-	if ubiqAt < 25 {
-		ubiqAt = 25
-	}
-	for e, n := range entDF {
-		if n > ubiqAt {
-			ubiq[e] = true
-		}
-	}
 	seedEnt := make([]map[string]bool, len(cls))
 	for i, c := range cls {
 		m := map[string]bool{}
@@ -2485,6 +2496,10 @@ func publishNews(db *sql.DB) error {
 				same := overlap >= 0.5 ||
 					(sharedPersons(pi, personSet(cls[j])) >= 2 && overlap >= 0.25) ||
 					(newsSharedEntities(seedEnt[i], seedEnt[j], ubiq) >= 2 && overlap >= 0.25)
+				// Two clusters from one outlet: the row 414 test, not these.
+				if d := oneOutlet(cls[i], cls[j]); d != "" {
+					same = newsSameOutletStory(cls[i].seed, cls[j].seed, seedEnt[i], seedEnt[j], d)
+				}
 				if !same {
 					continue
 				}
@@ -4411,6 +4426,15 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 			// (compute) also pass on the hardware terms; every other feed keeps
 			// the AI-only rule.
 			keep := mentionsAI(title) || (strings.Contains(f.vendor, "(compute)") && computeTerm.MatchString(title))
+			// FOLLOWED COMPANIES ARE JUDGED BY THE ARTICLE (bridge row 417,
+			// Stephen 2026-10-03). Their feeds keep every item; twoai_solo_news
+			// has the model judge from the text whether AI is the substance.
+			// An item without AI in its headline is filed as 'ignored' so it
+			// stays off the intel lists until the judge has spoken.
+			status := "new"
+			if !keep && soloFeedVendor(f.vendor) {
+				keep, status = true, "ignored"
+			}
 			if title == "" || link == "" || !keep {
 				continue
 			}
@@ -4465,10 +4489,10 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 					break
 				}
 			}
-			r, ierr := db.Exec(`INSERT INTO ai_intel_candidates (kind, name, vendor, url, source, source_id, published_on)
-				VALUES ('vendor-news', $1, $2, $3, 'rss', $4, NULLIF($5,'')::date)
+			r, ierr := db.Exec(`INSERT INTO ai_intel_candidates (kind, name, vendor, url, source, source_id, published_on, status)
+				VALUES ('vendor-news', $1, $2, $3, 'rss', $4, NULLIF($5,'')::date, $6)
 				ON CONFLICT (source_id) DO NOTHING`,
-				trunc(title, 300), vendorLabel, link, sourceID, pubOn)
+				trunc(title, 300), vendorLabel, link, sourceID, pubOn, status)
 			if ierr != nil {
 				continue
 			}

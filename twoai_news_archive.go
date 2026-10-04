@@ -198,6 +198,10 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 	// before the archive is written, so the survivor carries every outlet
 	// and the duplicate's permalink points at it.
 	newsStoryUIDRepair(db)
+	// One outlet's unrelated articles are not a story (bridge row 414):
+	// merges of such bundles are reversed and bundles trimmed to the
+	// articles that match their headline, before the dedupe pass.
+	newsBundleRepair(db)
 	twoaiNewsDedupe(db)
 	dupOf := newsDuplicateMap(db)
 	survivorHead := map[string]string{}

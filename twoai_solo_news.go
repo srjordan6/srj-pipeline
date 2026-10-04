@@ -37,9 +37,9 @@ type soloSubject struct {
 	match    string // Postgres regex over the candidate title, case-insensitive
 	pageUID  string // company page each story is pinned to, "" for none
 	pagePath string
-	// aiOnly keeps the AI-in-the-headline rule the subject's feeds use: a
-	// large company is in the news for many reasons, and only the AI ones
-	// are stories here. The model's NOT RELEVANT answer is the second gate.
+	// aiOnly marked the subjects that kept the AI-in-the-headline rule. Since
+	// 2026-10-03 (bridge row 417, Stephen) every subject is judged from the
+	// article itself by twoaiAIJudge instead; the field is kept as a record.
 	aiOnly bool
 }
 
@@ -71,6 +71,18 @@ var soloSubjects = []soloSubject{
 	},
 }
 
+// soloFeedVendor reports an intel feed that follows one of the solo
+// subjects ("Kyndryl press releases (coverage)", "NTT DATA (coverage)").
+func soloFeedVendor(vendor string) bool {
+	v := strings.ToLower(vendor)
+	for _, s := range soloSubjects {
+		if strings.Contains(v, strings.ToLower(s.label)) {
+			return true
+		}
+	}
+	return false
+}
+
 func twoaiSoloNews(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_solo_news (
 		url text PRIMARY KEY, subject text NOT NULL, story_uid text, outcome text NOT NULL,
@@ -85,7 +97,7 @@ func twoaiSoloNews(db *sql.DB) error {
 		rows, err := db.Query(`SELECT DISTINCT ON (c.url) c.name, c.url, c.discovered_at FROM ai_intel_candidates c
 			WHERE c.name ~* $1
 			  AND c.discovered_at > now() - interval '21 days'
-			  AND NOT EXISTS (SELECT 1 FROM twoai_solo_news t WHERE t.url = c.url)
+			  AND NOT EXISTS (SELECT 1 FROM twoai_solo_news t WHERE t.url = c.url AND t.outcome <> 'not about AI by title')
 			ORDER BY c.url, c.discovered_at DESC`, sub.match)
 		if err != nil {
 			return err
@@ -115,13 +127,9 @@ func twoaiSoloNews(db *sql.DB) error {
 		total += len(items)
 		for _, it := range items {
 			outcome := func(o, uid string) {
-				db.Exec(`INSERT INTO twoai_solo_news (url, subject, story_uid, outcome) VALUES ($1, $2, NULLIF($3,''), $4) ON CONFLICT (url) DO NOTHING`,
+				db.Exec(`INSERT INTO twoai_solo_news (url, subject, story_uid, outcome) VALUES ($1, $2, NULLIF($3,''), $4)
+					ON CONFLICT (url) DO UPDATE SET story_uid=EXCLUDED.story_uid, outcome=EXCLUDED.outcome, tried_at=now()`,
 					it.url, sub.key, uid, o)
-			}
-			if sub.aiOnly && !aiTermRe.MatchString(it.title) {
-				outcome("not about AI by title", "")
-				skipped++
-				continue
 			}
 			// Already on the site as part of a briefing story, or as an
 			// earlier copy of the same announcement: ledgered, not repeated.
@@ -159,6 +167,22 @@ func twoaiSoloNews(db *sql.DB) error {
 			}
 			if len(text) > 14000 {
 				text = text[:14000]
+			}
+			// AI IS JUDGED FROM THE ARTICLE (bridge row 417, Stephen
+			// 2026-10-03), not from words in the headline: a Kyndryl
+			// infrastructure release can be an AI story without saying AI.
+			// The verdict and its reason are kept in twoai_ai_verdicts with
+			// the safety check's.
+			yes, why, jmodel, jerr := twoaiAIJudge("solo_news_judge", sub.label, []string{it.title}, text)
+			if jerr != nil {
+				skipped++ // not recorded: retried next run
+				continue
+			}
+			twoaiAIVerdictLog(db, "solo_news", sub.key, it.url, yes, why, jmodel)
+			if !yes {
+				outcome("judged not about AI: "+trunc(why, 200), "")
+				skipped++
+				continue
 			}
 			out, model, gerr := twoaiGenerate("news_summary", system, "Headline: "+it.title+"\n\nArticle text:\n"+text)
 			out = strings.TrimSpace(out)
