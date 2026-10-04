@@ -51,7 +51,14 @@ type famHistLink struct {
 	URL   string `json:"url"`
 }
 
+// famHistVersion marks histories written under the current rules. The site
+// shows only these (2026-10-04: version 1 let catalog dates vouch for
+// Wikipedia events, so Gemini CLI was dated to the family's first catalog
+// release, and the closing note could pass judgement).
+const famHistVersion = 2
+
 type famHistory struct {
+	V         int            `json:"v"`
 	Basis     string         `json:"basis"` // "wikipedia" or "catalog"
 	Entries   []famHistEntry `json:"entries"`
 	Now       string         `json:"now"`
@@ -260,7 +267,7 @@ func famGrams(src string) map[string]bool {
 	return g
 }
 
-const famHistSystem = `You write the History section of an AI model family page for The World of AI, a reference site read by business leaders, developers and policy readers. You are given an encyclopedia article about the family, perhaps one or two of the developer's announcements, and facts from our model catalog. Write in your own words: never copy a sentence or a distinctive phrase from the sources. Give four to eight dated entries in time order on how the family came to be, its first release, each major generation, and any notable incidents or controversies the sources record. Use only dates the sources state. If a source gives only a month or a year, give only that. Leave out any event without a stated date. Then two or three sentences on where the family stands now. Plain English, commas rather than dashes, no markdown. Reply in exactly this form, one entry per line, nothing else:
+const famHistSystem = `You write the History section of an AI model family page for The World of AI, a reference site read by business leaders, developers and policy readers. You are given an encyclopedia article about the family, perhaps one or two of the developer's announcements, and facts from our model catalog. Write in your own words: never copy a sentence or a distinctive phrase from the sources. Give four to eight dated entries in time order on how the family came to be, its first release, each major generation, and any notable incidents or controversies the sources record. Use only dates the sources state. If a source gives only a month or a year, give only that. Leave out any event without a stated date. The catalog facts are for the closing note only, never for a dated entry. Then two or three factual sentences on where the family stands now, with no judgement, opinion or prediction. Plain English, commas rather than dashes, no markdown. Reply in exactly this form, one entry per line, nothing else:
 ENTRY: YYYY-MM-DD | one sentence
 NOW: two or three sentences`
 
@@ -285,7 +292,7 @@ func famHistCatalog(f famHistFamily) famHistory {
 		rs = append(rs, rel{d, n})
 	}
 	sort.Slice(rs, func(i, j int) bool { return rs[i].date < rs[j].date })
-	h := famHistory{Basis: "catalog", Primary: []famHistLink{}, Written: time.Now().UTC().Format("2006-01-02")}
+	h := famHistory{V: famHistVersion, Basis: "catalog", Primary: []famHistLink{}, Written: time.Now().UTC().Format("2006-01-02")}
 	if len(rs) == 0 {
 		return h
 	}
@@ -361,8 +368,11 @@ func twoaiFamilyHistory(db *sql.DB) {
 		var basis, oldTitle, oldLatest string
 		var oldRev, oldSize sql.NullInt64
 		var oldAt time.Time
-		have := db.QueryRow(`SELECT basis, COALESCE(wiki_title,''), wiki_revid, wiki_size, COALESCE(latest_release,''), written_at
-			FROM twoai_family_history WHERE uid=$1`, f.uid).Scan(&basis, &oldTitle, &oldRev, &oldSize, &oldLatest, &oldAt) == nil
+		var oldV int
+		have := db.QueryRow(`SELECT basis, COALESCE(wiki_title,''), wiki_revid, wiki_size, COALESCE(latest_release,''), written_at,
+				COALESCE((history->>'v')::int, 1)
+			FROM twoai_family_history WHERE uid=$1`, f.uid).Scan(&basis, &oldTitle, &oldRev, &oldSize, &oldLatest, &oldAt, &oldV) == nil
+		stale := have && oldV < famHistVersion
 		newGen := func() bool {
 			a, e1 := time.Parse("2006-01-02", oldLatest)
 			b, e2 := time.Parse("2006-01-02", f.latest)
@@ -371,7 +381,7 @@ func twoaiFamilyHistory(db *sql.DB) {
 
 		if title == "" {
 			// Catalog basis: free, so kept current every run.
-			if !have || basis != "catalog" || oldLatest != f.latest {
+			if !have || stale || basis != "catalog" || oldLatest != f.latest {
 				h := famHistCatalog(f)
 				if len(h.Entries) > 0 {
 					raw, _ := json.Marshal(h)
@@ -382,7 +392,7 @@ func twoaiFamilyHistory(db *sql.DB) {
 				}
 			}
 		} else if written < perRun {
-			due := !have || basis != "wikipedia" || oldTitle != title || newGen() || time.Since(oldAt) > 90*24*time.Hour
+			due := !have || stale || basis != "wikipedia" || oldTitle != title || newGen() || time.Since(oldAt) > 90*24*time.Hour
 			var w *famWiki
 			if !due && oldRev.Valid {
 				// Only an article that changed materially is worth a rewrite.
@@ -446,15 +456,21 @@ func famHistWrite(db *sql.DB, f famHistFamily, w *famWiki) (famHistory, string, 
 			latestName, _ = m["name"].(string)
 		}
 	}
+	if i := strings.Index(latestName, ": "); i > 0 {
+		latestName = latestName[i+2:]
+	}
 	user := fmt.Sprintf("Family: %s, developer %s.\nCatalog facts: %d versions in our catalog, first released %s, newest released %s (%s).\n\nEncyclopedia article: %s\n%s%s",
 		f.name, f.dev, len(f.members), f.first, f.latest, latestName, w.Title, src, ptext)
 	out, model, err := twoaiGenerate("family_history", famHistSystem, user)
 	if err != nil || isRefusal(out) {
 		return famHistory{}, model, false
 	}
-	all := src + ptext + " " + f.first + " " + f.latest
+	// Only the sources vouch for a date. Version 1 also accepted the
+	// catalog's first and newest release dates here, which let a Wikipedia
+	// event borrow a catalog date.
+	all := src + ptext
 	grams := famGrams(src + ptext)
-	h := famHistory{Basis: "wikipedia", WikiTitle: w.Title, Retrieved: time.Now().UTC().Format("2006-01-02"),
+	h := famHistory{V: famHistVersion, Basis: "wikipedia", WikiTitle: w.Title, Retrieved: time.Now().UTC().Format("2006-01-02"),
 		WikiURL: "https://en.wikipedia.org/wiki/" + url.PathEscape(strings.ReplaceAll(w.Title, " ", "_")),
 		Primary: primary, Written: time.Now().UTC().Format("2006-01-02")}
 	if h.Primary == nil {
@@ -472,7 +488,7 @@ func famHistWrite(db *sql.DB, f famHistFamily, w *famWiki) (famHistory, string, 
 		}
 		date, ok := famHistVerify(m[1], m[2], m[3], all)
 		text := strings.TrimSpace(m[4])
-		if !ok || text == "" || famCopied(text, grams) {
+		if !ok || text == "" || famCopied(text, grams) || strings.Contains(strings.ToLower(text), "catalog") {
 			continue
 		}
 		h.Entries = append(h.Entries, famHistEntry{date, text})
@@ -484,5 +500,16 @@ func famHistWrite(db *sql.DB, f famHistFamily, w *famWiki) (famHistory, string, 
 	if famCopied(h.Now, grams) {
 		h.Now = ""
 	}
-	return h, model, len(h.Entries) >= 3
+	if len(h.Entries) < 2 {
+		return h, model, false
+	}
+	// The catalog's own first and newest releases follow the sourced
+	// entries, in the catalog history's wording, when they come later.
+	last := h.Entries[len(h.Entries)-1].Date
+	for _, e := range famHistCatalog(f).Entries {
+		if e.Date > last && len(h.Entries) < 9 {
+			h.Entries = append(h.Entries, e)
+		}
+	}
+	return h, model, true
 }

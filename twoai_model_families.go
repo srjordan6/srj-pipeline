@@ -156,6 +156,12 @@ func (g *famGroup) displayName() string {
 	if strings.EqualFold(g.DevName, g.LineName) || g.DevName == "" {
 		return g.LineName
 	}
+	// "ByteDance Seed" already ends with its line "Seed" (2026-10-04, the
+	// first Multimodal page read "ByteDance Seed Seed"). Display only: the
+	// uid comes from the family key, so no URL moves.
+	if strings.HasSuffix(strings.ToLower(g.DevName), " "+strings.ToLower(g.LineName)) {
+		return g.DevName
+	}
 	return g.DevName + " " + g.LineName
 }
 
