@@ -135,6 +135,7 @@ func newsBundle(titles []string, domains map[string]bool) bool {
 // links leave. Runs each build, before the dedupe pass, and is idempotent.
 func newsBundleRepair(db *sql.DB) {
 	newsUnmergeWhere(db, "bundle", func(loser *dedupeStory) bool { return newsBundle(loser.titles, loser.domains) })
+	newsBundleChainStrip(db)
 	rows, err := db.Query(`SELECT uid, headline, story::text FROM twoai_news_stories
 		WHERE retired_at IS NULL AND published_on > current_date - 14`)
 	if err != nil {
@@ -522,4 +523,93 @@ func newsCompanyPages(db *sql.DB) map[string]string {
 		}
 	}
 	return out
+}
+
+var newsDupOfRe = regexp.MustCompile(`^duplicate of ([0-9a-f]{8})`)
+
+// newsBundleChainStrip follows each one-outlet bundle along the stories it
+// was merged into (the "duplicate of" chain on retired rows, which survives
+// even when the merge log was overwritten) and takes the bundle's stray
+// links, the articles that do not match its own headline, out of each of
+// them. 2026-10-04: the Manila Times bundle 9a54c265 went into b8678de1,
+// which was then merged into 2928478e, carrying six unrelated Manila Times
+// pieces into a story about the "super intelligence" rebrand. Links are only
+// taken from stories on the bundle's own chain, never from a story that
+// carries the same article on its own merits.
+func newsBundleChainStrip(db *sql.DB) {
+	rows, err := db.Query(`SELECT uid, headline, story::text, COALESCE(retired_reason,'') FROM twoai_news_stories
+		WHERE published_on > current_date - 21`)
+	if err != nil {
+		return
+	}
+	type st struct {
+		head, reason string
+		doc          map[string]any
+	}
+	all := map[string]*st{}
+	for rows.Next() {
+		var uid, head, raw, reason string
+		if rows.Scan(&uid, &head, &raw, &reason) != nil {
+			continue
+		}
+		var d map[string]any
+		if json.Unmarshal([]byte(raw), &d) == nil {
+			all[uid] = &st{head, reason, d}
+		}
+	}
+	rows.Close()
+	changed := map[string]bool{}
+	for uid, b := range all {
+		d := newsDedupeFrom(uid, "", b.head, b.doc)
+		if !newsBundle(d.titles, d.domains) {
+			continue
+		}
+		var dom string
+		for x := range d.domains {
+			dom = x
+		}
+		lead := newsTitleTokens(newsStripOutlet(b.head, dom))
+		stray := map[string]bool{}
+		arts, _ := b.doc["Articles"].([]any)
+		for _, a := range arts {
+			m, _ := a.(map[string]any)
+			t, _ := m["Title"].(string)
+			u, _ := m["URL"].(string)
+			if u != "" && newsTokSim(lead, newsTitleTokens(newsStripOutlet(t, dom))) < 0.6 {
+				stray[u] = true
+			}
+		}
+		if len(stray) == 0 {
+			continue
+		}
+		cur := uid
+		for hop := 0; hop < 6; hop++ {
+			m := newsDupOfRe.FindStringSubmatch(all[cur].reason)
+			if m == nil || all[m[1]] == nil {
+				break
+			}
+			next := all[m[1]]
+			sarts, _ := next.doc["Articles"].([]any)
+			keep := []any{}
+			for _, a := range sarts {
+				mm, _ := a.(map[string]any)
+				if u, _ := mm["URL"].(string); stray[u] {
+					continue
+				}
+				keep = append(keep, a)
+			}
+			if len(keep) < len(sarts) && len(keep) > 0 {
+				next.doc["Articles"] = keep
+				next.doc["ArticleCount"] = len(keep)
+				changed[m[1]] = true
+				fmt.Printf("news_bundle: %s loses %d stray links from bundle %s\n", m[1], len(sarts)-len(keep), uid)
+			}
+			cur = m[1]
+		}
+	}
+	for uid := range changed {
+		if b, err := json.Marshal(all[uid].doc); err == nil {
+			db.Exec(`UPDATE twoai_news_stories SET story=$2::jsonb WHERE uid=$1`, uid, string(b))
+		}
+	}
 }
