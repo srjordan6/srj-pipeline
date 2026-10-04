@@ -5820,6 +5820,11 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	// Dated correction notes and the public log (theworldofai row 437).
+	if _, err := twoaiCorrections(db, upsert); err != nil {
+		fmt.Println("twoai_corrections:", err)
+	}
+
 	timeline, err := twoaiTimeline(db, today, upsert)
 	if err != nil {
 		return err
