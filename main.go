@@ -9280,17 +9280,9 @@ func benchResults(db *sql.DB) error {
 	// The official boards of row 438 and the MLPerf round watch.
 	updated += benchRefreshAll(db)
 
-	// Mirror changed results into the page rows the site renders. Guarded on
-	// IS DISTINCT FROM so untouched pages keep their updated_at.
-	if _, err := db.Exec(`UPDATE twoai_pages p
-		SET data = p.data || jsonb_build_object('results', b.results), updated_at = now()
-		FROM twoai_benchmarks b
-		WHERE p.path = 'benchmarks/' || b.slug || '.json'
-		  AND b.results IS NOT NULL
-		  AND p.data->'results' IS DISTINCT FROM b.results`); err != nil {
-		return err
-	}
-
+	// Pages, results and family links are written by benchSyncPages. The
+	// mirror that copied bare results onto the pages before it stripped the
+	// family links every run, so it is gone.
 	if err := benchSyncPages(db); err != nil {
 		fmt.Println("bench_pages:", err)
 	}
