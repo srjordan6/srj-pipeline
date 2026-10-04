@@ -381,6 +381,15 @@ func main() {
 		}
 		return
 	}
+	// twoai_freshness on its own: the audit of row 439. TWOAI_FRESHNESS_PREVIEW=1
+	// prints each dataset and writes nothing.
+	if src == "twoai_freshness" {
+		if err := twoaiFreshnessAudit(db, os.Getenv("TWOAI_FRESHNESS_PREVIEW") != ""); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_freshness:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if src == "news_gap" {
 		if err := twoaiNewsGapCheck(db); err != nil {
 			fmt.Fprintln(os.Stderr, "news_gap:", err)
@@ -5648,6 +5657,11 @@ func twoaiBuild(db *sql.DB) error {
 	// federal rows.
 	if err := twoaiPolicyLedger(db, today); err != nil {
 		fmt.Println("twoai_policy_ledger:", err)
+	}
+	// The freshness audit of row 439 measures the age of the data itself,
+	// before the Data Quality page that reports it.
+	if err := twoaiFreshnessAudit(db, false); err != nil {
+		fmt.Println("twoai_freshness:", err)
 	}
 	// The public Data Quality page, /data-quality/, 2026-09-28.
 	if err := twoaiQualityPage(db, today); err != nil {

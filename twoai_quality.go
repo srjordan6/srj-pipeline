@@ -94,6 +94,7 @@ func twoaiQualityPage(db *sql.DB, today string) error {
 	}
 	sb.WriteString(`</tbody></table>`)
 	fmt.Fprintf(&sb, `<p>%d pages across these sections; %d overdue today.</p>`, totalPages, totalOver)
+	sb.WriteString(twoaiFreshnessLine(db))
 	add("Sections, sources and schedules", sb.String())
 
 	// Not verified and incomplete.
