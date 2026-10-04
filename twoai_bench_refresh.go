@@ -397,7 +397,7 @@ func benchFetchOSWorld() (map[string]any, error) {
 	}
 	return benchResult(newest, "OSWorld-Verified results published by the OSWorld team", "https://os-world.github.io/",
 		"Success rate on the 361 OSWorld-Verified tasks, best entry per system",
-		"Entries differ in step budget and in whether the result was verified by the OSWorld team or reported by the submitter; the step budget is shown with each entry.",
+		"These are the results the OSWorld team verified; self-reported results are listed separately on the OSWorld site. Entries differ in step budget, which is shown with each entry.",
 		benchTop(rs, 10)), nil
 }
 
