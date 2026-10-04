@@ -4428,7 +4428,8 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 			// AI compute but rarely says "AI" in the headline. Feeds tagged
 			// (compute) also pass on the hardware terms; every other feed keeps
 			// the AI-only rule.
-			keep := mentionsAI(title) || (strings.Contains(f.vendor, "(compute)") && computeTerm.MatchString(title))
+			keep := mentionsAI(title) || (strings.Contains(f.vendor, "(compute)") && computeTerm.MatchString(title)) ||
+				twoaiVendorLab(f.vendor)
 			// FOLLOWED COMPANIES ARE JUDGED BY THE ARTICLE (bridge row 417,
 			// Stephen 2026-10-03). Their feeds keep every item; twoai_solo_news
 			// has the model judge from the text whether AI is the substance.
@@ -8412,6 +8413,30 @@ func twoaiPostSlug(name, url string) string {
 // published description (summary, when the row has one) and a permanent
 // slug, because every post gets its own on-site page telling the reader why
 // the outbound link is worth clicking before they leave the site.
+// twoaiVendorLabs are the first-party feeds the AI Vendor News section shows.
+// The intel intake keeps every item from these feeds, not only those with an
+// AI word in the headline: a lab's own post is about AI by definition, and
+// its headlines rarely say so. Stephen, 2026-10-04, on the section showing
+// nothing newer than 30 September: "Gemini 4 Argon: our next era of frontier
+// intelligence", "Introducing SynthID Bio" and OpenAI's "A model guide for
+// the GPT-6 family" had all been dropped at intake for want of the word AI.
+var twoaiVendorLabs = []string{
+	"OpenAI", "Google DeepMind", "Hugging Face", "Mistral AI",
+	"European Commission AI", "CIFAR", "AI Singapore",
+	"stability.ai",
+}
+
+// twoaiVendorLab reports a lab whose whole feed is about AI. The European
+// Commission digital strategy feed, CIFAR and AI Singapore also publish news
+// that is not, so they keep the headline rule.
+func twoaiVendorLab(vendor string) bool {
+	switch vendor {
+	case "OpenAI", "Google DeepMind", "Hugging Face", "Mistral AI", "stability.ai":
+		return true
+	}
+	return false
+}
+
 func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (int, error) {
 	// Display names for feeds whose vendor column holds a hostname. Anything
 	// not listed renders as stored.
@@ -8422,11 +8447,7 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 	// aisi.gov.uk left the list on 2026-09-30: the UK AI Security Institute
 	// is a government evaluator, not a company building AI, and Stephen said
 	// its posts are not vendor news. Its feed stays in the intel watch.
-	allowed := []string{
-		"OpenAI", "Google DeepMind", "Hugging Face", "Mistral AI",
-		"European Commission AI", "CIFAR", "AI Singapore",
-		"stability.ai",
-	}
+	allowed := twoaiVendorLabs
 	const windowDays = 30
 	const perVendor = 25
 
