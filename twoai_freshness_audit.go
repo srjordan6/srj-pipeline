@@ -83,13 +83,17 @@ var freshDatasets = []freshDataset{
 		Items: `SELECT 'wikidata', max(fetched_on), NULL::int FROM twoai_wikidata_models`},
 	{Key: "model_families", Label: "Model family pages", Cadence: 7, Auto: true, How: "rebuilt from the model catalog each run",
 		Items: `SELECT name, page_built_on, NULL::int FROM twoai_model_families WHERE page_built_on IS NOT NULL`},
-	// Fourteen days, not seven: intel checks twelve dockets a day, oldest
-	// first, because CourtListener rate limits anything more, so a full
-	// sweep of 150 cases takes about thirteen days. A shorter cadence here
-	// would only report that limit every day.
-	{Key: "lawsuits", Label: "Lawsuit dockets", Cadence: 14, Auto: true,
-		How:   "CourtListener dockets, twelve a day oldest first; state cases from established outlets",
-		Items: `SELECT slug, docket_checked_at::date, NULL::int FROM ai_lawsuits WHERE is_active`},
+	// Fourteen days, not seven: intel checks up to twelve dockets a run,
+	// oldest first, because CourtListener rate limits anything more, so a
+	// full sweep of 150 cases takes one to two weeks.
+	// A federal case is current when CourtListener last answered for it
+	// (docket_ok_at), not when a fetch was attempted; a state case is
+	// followed from reporting and stamped by the state case watch. An
+	// overdue docket reopens intel for the second run of the day.
+	{Key: "lawsuits", Label: "Lawsuit dockets", Cadence: 14, Auto: true, Stage: "intel",
+		How: "CourtListener dockets, twelve a run oldest first; state cases from established outlets",
+		Items: `SELECT slug, CASE WHEN courtlistener_url IS NOT NULL THEN docket_ok_at::date ELSE docket_checked_at::date END, NULL::int
+			FROM ai_lawsuits WHERE is_active`},
 	{Key: "federal_register", Label: "Federal Register", Cadence: 7, Auto: true, How: "Federal Register API",
 		Items: `SELECT 'federal register', max(fetched_at)::date, NULL::int FROM pipeline.documents WHERE source_id = 1`},
 	{Key: "state_bills", Label: "State bills", Cadence: 7, Auto: true, Stage: "legiscan", How: "LegiScan API",

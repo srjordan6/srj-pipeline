@@ -3520,6 +3520,7 @@ func putToRepoTok(tok, repo, path, message string, payload []byte) error {
 var (
 	clThrottleMu     sync.Mutex
 	clThrottledUntil time.Time
+	clWait           time.Duration
 )
 
 func clThrottled() bool {
@@ -3528,12 +3529,28 @@ func clThrottled() bool {
 	return time.Now().Before(clThrottledUntil)
 }
 
+// clLastWait is the Retry-After of the last throttled call, and
+// clClearThrottle lifts the latch once a caller has waited it out.
+func clLastWait() time.Duration {
+	clThrottleMu.Lock()
+	defer clThrottleMu.Unlock()
+	return clWait
+}
+
+func clClearThrottle() {
+	clThrottleMu.Lock()
+	defer clThrottleMu.Unlock()
+	clThrottledUntil = time.Time{}
+	clWait = 0
+}
+
 func clSetThrottled(d time.Duration) {
 	clThrottleMu.Lock()
 	defer clThrottleMu.Unlock()
 	if until := time.Now().Add(d); until.After(clThrottledUntil) {
 		clThrottledUntil = until
 	}
+	clWait = time.Until(clThrottledUntil)
 }
 
 func clGet(path string, params map[string]string, out any) error {
@@ -3669,7 +3686,18 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 	}
 	rows.Close()
 	rateLimited := 0
-	for _, c := range cases {
+	// docket_ok_at is set only when CourtListener answered, so the
+	// freshness audit measures real checks, not attempts (row 439).
+	db.Exec(`ALTER TABLE ai_lawsuits ADD COLUMN IF NOT EXISTS docket_ok_at timestamptz`)
+	// WAIT OUT SHORT THROTTLES, 2026-10-04. CourtListener answered the
+	// second docket of a run with a 51 second Retry-After, and the sweep
+	// ended there: two to four cases a day, a full pass of 146 cases in
+	// seven weeks. A short window is now waited out, up to four minutes of
+	// waiting a sweep, inside the stage's ten minute deadline.
+	slept := time.Duration(0)
+	const sleepBudget = 4 * time.Minute
+	for i := 0; i < len(cases); i++ {
+		c := cases[i]
 		m := docketIDRe.FindStringSubmatch(c.clURL)
 		if m == nil {
 			continue
@@ -3691,6 +3719,14 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 			// starves every stage downstream. The remaining cases keep their
 			// place in the queue and are checked on the next run.
 			if strings.Contains(err.Error(), "rate limited") {
+				if w := clLastWait(); w > 0 && w <= 90*time.Second && slept+w <= sleepBudget {
+					time.Sleep(w + 2*time.Second)
+					slept += w + 2*time.Second
+					clClearThrottle()
+					checked--
+					i-- // the same case again
+					continue
+				}
 				rateLimited++
 				if rateLimited >= 2 {
 					fmt.Fprintln(os.Stderr, "intel refresh: rate limited, ending sweep early")
@@ -3700,6 +3736,7 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 			time.Sleep(2 * time.Second)
 			continue
 		}
+		db.Exec(`UPDATE ai_lawsuits SET docket_ok_at = now() WHERE id = $1`, c.id)
 		// THE LINK A READER CAN OPEN. CourtListener refuses /docket/<id>/ and
 		// answers only /docket/<id>/<slug>/. Stephen, 2026-09-21: none of the
 		// docket links work. 13 cases held the bare form and every timeline row
