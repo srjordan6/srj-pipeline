@@ -9277,6 +9277,9 @@ func benchResults(db *sql.DB) error {
 
 	benchCheckLMArenaMirror()
 
+	// The official boards of row 438 and the MLPerf round watch.
+	updated += benchRefreshAll(db)
+
 	// Mirror changed results into the page rows the site renders. Guarded on
 	// IS DISTINCT FROM so untouched pages keep their updated_at.
 	if _, err := db.Exec(`UPDATE twoai_pages p
@@ -9288,6 +9291,9 @@ func benchResults(db *sql.DB) error {
 		return err
 	}
 
+	if err := benchSyncPages(db); err != nil {
+		fmt.Println("bench_pages:", err)
+	}
 	fmt.Printf("bench_results: updated=%d ok=true\n", updated)
 	return nil
 }

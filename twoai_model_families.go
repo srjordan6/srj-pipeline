@@ -720,7 +720,6 @@ func famDoc(db *sql.DB, g *famGroup, uid, today string, companies map[string]fam
 	// BENCHMARKS: only rows from the site's benchmark records, each a named
 	// public source with its date and link, whose system names this family.
 	bench := []map[string]string{}
-	lineRe := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(g.LineName) + `\b`)
 	if rows, err := db.Query(`SELECT name, coalesce(results->>'source',''), coalesce(results->>'source_url', url, ''), coalesce(results->>'as_of',''),
 			coalesce(results->>'metric',''), coalesce(results->'rows','[]'::jsonb)::text FROM twoai_benchmarks WHERE results IS NOT NULL`); err == nil {
 		for rows.Next() {
@@ -732,10 +731,8 @@ func famDoc(db *sql.DB, g *famGroup, uid, today string, companies map[string]fam
 			json.Unmarshal([]byte(rraw), &rs)
 			for _, r := range rs {
 				sys, _ := r["system"].(string)
-				if sys == "" || !lineRe.MatchString(sys) {
-					continue
-				}
-				if g.DevName != "" && !strings.Contains(strings.ToLower(sys), strings.ToLower(g.DevName)) && !strings.EqualFold(g.DevName, g.LineName) {
+				det, _ := r["detail"].(string)
+				if !famBenchMatch(g.LineName, g.DevName, sys, det) {
 					continue
 				}
 				bench = append(bench, map[string]string{"benchmark": bname, "system": sys, "score": fmt.Sprint(r["score"]),

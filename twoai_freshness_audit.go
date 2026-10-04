@@ -50,16 +50,24 @@ type freshDataset struct {
 	// Auto is false when nothing in the pipeline refreshes this dataset by
 	// itself yet, so an overdue item needs a decision, not another run.
 	Auto bool
-	How  string
+	// NeverDecides sends an item with no date at all straight to the
+	// decision list: nothing has ever filled it, so another run will not.
+	NeverDecides bool
+	How          string
 }
 
 // The live leaderboards of row 438 move weekly.
 const freshBenchWeekly = `'lmarena','livebench','swe-bench','hle','gpqa','osworld','gaia','webarena','tau-bench','metr-time-horizon'`
 
 var freshDatasets = []freshDataset{
-	{Key: "benchmarks", Label: "Benchmark results", Auto: false,
-		How: "official leaderboards; automatic only for SWE-bench, HLE and GPQA so far, the rest are being built under row 438",
-		Items: `SELECT slug, CASE WHEN results->>'as_of' ~ '^\d{4}-\d{2}-\d{2}' THEN left(results->>'as_of',10)::date
+	// The date measured is retrieved, the day the board was last read, so a
+	// board between releases is current once re-read. An MLPerf snapshot
+	// with a newer round published counts as never refreshed.
+	{Key: "benchmarks", Label: "Benchmark results", Auto: true, NeverDecides: true,
+		How: "each maintainer's official leaderboard, read by bench_results",
+		Items: `SELECT slug, CASE WHEN results ? 'newer_round' THEN NULL
+				WHEN results->>'retrieved' ~ '^\d{4}-\d{2}-\d{2}' THEN left(results->>'retrieved',10)::date
+				WHEN results->>'as_of' ~ '^\d{4}-\d{2}-\d{2}' THEN left(results->>'as_of',10)::date
 				WHEN results->>'as_of' ~ '^\d{4}-\d{2}$' THEN (results->>'as_of' || '-01')::date END,
 			CASE WHEN slug IN (` + freshBenchWeekly + `) THEN 7 WHEN slug LIKE 'mlperf%' THEN 90 ELSE review_interval_days END
 			FROM twoai_benchmarks`},
@@ -323,9 +331,13 @@ func twoaiFreshnessAudit(db *sql.DB, preview bool) error {
 			ex = append(ex, fmt.Sprintf("%s (%s, every %dd)", it.item, d, it.cadence))
 		}
 		line := fmt.Sprintf("%s: %d of %d overdue, oldest %s", r.d.Label, r.overdue, r.items, strings.Join(ex, ", "))
-		if !r.d.Auto || r.runs >= 3 {
+		never := r.d.NeverDecides && len(r.late) > 0 && !r.late[0].asOf.Valid
+		if !r.d.Auto || r.runs >= 3 || never {
 			why := "no automatic refresher"
-			if r.d.Auto {
+			switch {
+			case never:
+				why = "never filled"
+			case r.d.Auto:
 				why = fmt.Sprintf("overdue %d runs running", r.runs)
 			}
 			decide = append(decide, line+". "+why+", source: "+r.d.How)
