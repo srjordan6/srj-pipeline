@@ -2330,6 +2330,16 @@ func publishNews(db *sql.DB) error {
 			entDF[e]++
 		}
 	}
+	// Product names (newsProductKeys) and how many headlines carry each.
+	artProd := map[string][]string{}
+	prodDF := map[string]int{}
+	for _, a := range arts {
+		ks := newsProductKeys(a.Title, entVocab)
+		artProd[a.URL] = ks
+		for _, k := range ks {
+			prodDF[k]++
+		}
+	}
 	ubiq := map[string]bool{}
 	ubiqAt := len(arts) / 40
 	if ubiqAt < 25 {
@@ -2477,6 +2487,18 @@ func publishNews(db *sql.DB) error {
 		}
 		seedTk[i] = m
 	}
+	seedProd := make([]map[string]bool, len(cls))
+	for i, c := range cls {
+		m := map[string]bool{}
+		for _, a := range c.arts {
+			for _, k := range artProd[a.URL] {
+				if prodDF[k] >= 2 && prodDF[k] <= 12 {
+					m[k] = true
+				}
+			}
+		}
+		seedProd[i] = m
+	}
 	seedEnt := make([]map[string]bool, len(cls))
 	for i, c := range cls {
 		m := map[string]bool{}
@@ -2498,7 +2520,10 @@ func publishNews(db *sql.DB) error {
 				// look somewhat alike.
 				same := overlap >= 0.5 ||
 					(sharedPersons(pi, personSet(cls[j])) >= 2 && overlap >= 0.25) ||
-					(newsSharedEntities(seedEnt[i], seedEnt[j], ubiq) >= 2 && overlap >= 0.25)
+					(newsSharedEntities(seedEnt[i], seedEnt[j], ubiq) >= 2 && overlap >= 0.25) ||
+					// One product name both name, carried by few headlines:
+					// "Gemini 4 Argon" in five differently worded headlines.
+					(newsSharedEntities(seedProd[i], seedProd[j], nil) >= 1 && overlap >= 0.15)
 				// Two clusters from one outlet: the row 414 test, not these.
 				if d := oneOutlet(cls[i], cls[j]); d != "" {
 					same = newsSameOutletStory(cls[i].seed, cls[j].seed, seedEnt[i], seedEnt[j], d)
@@ -2513,6 +2538,7 @@ func publishNews(db *sql.DB) error {
 				cls = append(cls[:j], cls[j+1:]...)
 				seedTk = append(seedTk[:j], seedTk[j+1:]...)
 				seedEnt = append(seedEnt[:j], seedEnt[j+1:]...)
+				seedProd = append(seedProd[:j], seedProd[j+1:]...)
 				merged = true
 				break
 			}

@@ -64,3 +64,28 @@ func TestNewsEntNormPlural(t *testing.T) {
 		t.Errorf("double s kept: got %q", got)
 	}
 }
+
+func TestNewsProductKeysArgon(t *testing.T) {
+	vocab := map[string]string{"google": "company", "gemini": "model"}
+	titles := []string{
+		"Gemini 4 Argon: Check How It Works, Features and Difference From Other AI Chatbots",
+		"Google's Gemini 4 Argon is the latest super-smart AI that most cannot get",
+		"Google Enters Cyber AI Race With Gemini 4 Argon",
+		"Google Unveils Gemini 4 Argon, Its Most Advanced AI Model Yet",
+	}
+	for _, ti := range titles {
+		ks := newsProductKeys(ti, vocab)
+		found := false
+		for _, k := range ks {
+			if k == "gemini argon" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%q: keys %v, want gemini argon", ti, ks)
+		}
+	}
+	if ks := newsProductKeys("OpenAI says Gemini is popular", vocab); len(ks) != 0 {
+		t.Errorf("no product name expected, got %v", ks)
+	}
+}

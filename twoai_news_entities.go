@@ -649,3 +649,64 @@ func newsCandidateArticles(db *sql.DB, asOf time.Time, hours int) []newsCandidat
 	}
 	return out
 }
+
+// newsProductKeys finds product names in a headline: a known name followed,
+// within two words, by a capitalised word that is not itself a known name,
+// skipping version numbers. "Google's Gemini 4 Argon is the latest" gives
+// "gemini argon". 2026-10-04: five outlets covered Gemini 4 Argon on 1 and
+// 2 October and no story formed, because the headlines shared only
+// "Gemini", too common to count, and "Argon", which no list knew.
+func newsProductKeys(title string, vocab map[string]string) []string {
+	orig := strings.FieldsFunc(title, func(r rune) bool {
+		return !('a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9' || r == '.')
+	})
+	fold := make([]string, len(orig))
+	for i, w := range orig {
+		fold[i] = newsEntWord(strings.ToLower(strings.Trim(w, ".")))
+	}
+	isNum := func(w string) bool {
+		w = strings.Trim(w, ".")
+		if w == "" {
+			return true
+		}
+		for _, r := range w {
+			if !('0' <= r && r <= '9' || r == '.') {
+				return false
+			}
+		}
+		return true
+	}
+	seen := map[string]bool{}
+	var out []string
+	for i := 0; i < len(orig); i++ {
+		for n := 2; n >= 1; n-- {
+			if i+n > len(orig) {
+				continue
+			}
+			ent := strings.Join(fold[i:i+n], " ")
+			if _, ok := vocab[ent]; !ok || newsEntGeneric[ent] {
+				continue
+			}
+			for j, step := i+n, 0; j < len(orig) && step < 3; j, step = j+1, step+1 {
+				w := strings.Trim(orig[j], ".")
+				if isNum(w) {
+					continue
+				}
+				f := fold[j]
+				c := w[0]
+				if 'A' <= c && c <= 'Z' && len(w) >= 3 && !newsStop[f] && !newsEntGeneric[f] {
+					if _, known := vocab[f]; !known {
+						k := ent + " " + f
+						if !seen[k] {
+							seen[k] = true
+							out = append(out, k)
+						}
+					}
+				}
+				break
+			}
+			break
+		}
+	}
+	return out
+}
