@@ -843,6 +843,9 @@ func main() {
 
 	if src == "families" {
 		twoaiModelFamilies(db, time.Now().Format("2006-01-02"))
+		// History section on each family page (theworldofai row 423), attached
+		// after the family docs are rewritten.
+		twoaiFamilyHistory(db)
 		return
 	}
 
@@ -5854,6 +5857,9 @@ func twoaiBuild(db *sql.DB) error {
 	// After twoaiModels, which rewrites models/llms.json, so the family list
 	// attached to that page survives the run.
 	twoaiModelFamilies(db, today)
+	// History section on each family page (theworldofai row 423), attached
+	// after the family docs are rewritten.
+	twoaiFamilyHistory(db)
 	// Topic pages under Data Centers from twoai_dc_power_topics, theworldofai
 	// bridge row 399, 2026-10-03.
 	twoaiDCTopics(db, today)

@@ -59,12 +59,17 @@ type famCat struct {
 var famCats = []famCat{
 	{"llms", "Large Language Models", "87868942", "models/llms.json", func(m famMember) bool { return true }},
 	{"reasoning-models", "Reasoning Models", "80f6d64d", "models/reasoning-models.json", func(m famMember) bool { return m.Reasoning }},
+	// Multimodal: more than one input modality, the rule twoai_models uses
+	// for the section's own API table (len(InputMods) > 1).
+	{"multimodal-models", "Multimodal Models", "62d0f0ce", "models/multimodal-models.json", func(m famMember) bool { return len(m.In) > 1 }},
 }
 
 // famOpen is how many of famCats are open. One category at a time, and the
 // next only when Stephen says so: he reviewed the Large Language Models ten
-// on 2026-10-03 ("look fine"), which opened Reasoning Models.
-const famOpen = 2
+// on 2026-10-03 ("look fine"), which opened Reasoning Models, and approved
+// the Reasoning Models ten the same evening (theworldofai row 422), which
+// opened Multimodal Models. Nothing beyond Multimodal until he has seen its ten.
+const famOpen = 3
 
 func famCatBySlug(slug string) famCat {
 	for _, c := range famCats {
