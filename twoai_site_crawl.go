@@ -511,6 +511,9 @@ func twoaiSiteCrawlStep(db *sql.DB, cited map[string][]string, industryOf map[st
 	db.Exec(`ALTER TABLE twoai_site_crawl ADD COLUMN IF NOT EXISTS browser_tried_on date`)
 	db.Exec(`ALTER TABLE twoai_site_crawl_pages ADD COLUMN IF NOT EXISTS fetched_via text`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS twoai_site_crawl_pages_domain ON twoai_site_crawl_pages (domain)`)
+	// Pages Stephen saved by hand for sites that refuse the crawler
+	// (twoai_crawl_drop.go), imported before anything is digested.
+	twoaiCrawlDropImport(db)
 	var domains []string
 	for d := range cited {
 		domains = append(domains, d)
