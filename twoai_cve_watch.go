@@ -744,6 +744,15 @@ func twoaiCVEPages(db *sql.DB) int {
 			"cvss_score": sc, "cvss_severity": sev, "kev": kev, "summary": head, "entities": entList, "headline": headline,
 		})
 	}
+	// A CVE moved back to proposed or rejected keeps no page. On 2026-10-02 a
+	// reclassification demoted 405 of them, their pages stayed in twoai_pages,
+	// 404 on the site but counted as overdue by the freshness report (row 477).
+	if res, err := db.Exec(`DELETE FROM twoai_pages p WHERE p.path LIKE 'news/cve-%'
+		AND NOT EXISTS (SELECT 1 FROM twoai_cves c WHERE 'news/cve-' || c.cve_id || '.json' = p.path AND c.status IN ('published','approved'))`); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			fmt.Printf("twoai_cve_watch: removed %d pages of CVEs no longer published\n", n)
+		}
+	}
 	fmt.Printf("twoai_cve_watch: pages with a written headline=%d of %d\n", headlined, len(list))
 	sort.SliceStable(list, func(i, j int) bool { return list[i]["published"].(string) > list[j]["published"].(string) })
 	lj, _ := json.Marshal(map[string]any{

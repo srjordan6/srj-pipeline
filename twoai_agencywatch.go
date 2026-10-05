@@ -266,8 +266,10 @@ func twoaiAgencyWatch(db *sql.DB) error {
 	// Say which feed broke rather than reporting a quiet zero: EEOC and HHS
 	// OCR are already known-missing, and a fifth silent failure would be
 	// indistinguishable from a quiet week.
+	// Stdout, not stderr: an unavailable feed is a notice, and PowerShell logs
+	// anything on stderr as a NativeCommandError (row 477).
 	if len(failed) > 0 {
-		fmt.Fprintf(os.Stderr, "agency_watch: %d feed(s) unavailable: %s\n",
+		fmt.Printf("agency_watch: %d feed(s) unavailable: %s\n",
 			len(failed), strings.Join(failed, "; "))
 	}
 	return nil

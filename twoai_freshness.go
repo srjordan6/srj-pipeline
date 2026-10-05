@@ -203,8 +203,10 @@ func twoaiFreshnessReport(db *sql.DB) error {
 		fmt.Println("twoai_freshness: every page is within its refresh cadence")
 	} else {
 		var total int
-		db.QueryRow(`SELECT count(*) FROM twoai_pages WHERE data ? 'refresh_every_days' AND NULLIF(data->>'generated','') IS NOT NULL
-			AND (current_date - NULLIF(data->>'generated','')::date) > (data->>'refresh_every_days')::int`).Scan(&total)
+		// The same measure as the list above and the daily bridge row: last
+		// checked, not last built (row 477: 510 here against 1 in the summary).
+		db.QueryRow(`SELECT count(*) FROM twoai_pages p WHERE p.data ? 'refresh_every_days' AND NULLIF(p.data->>'generated','') IS NOT NULL
+			AND (current_date - ` + twoaiLastCheckedSQL + `) > (p.data->>'refresh_every_days')::int`).Scan(&total)
 		fmt.Printf("twoai_freshness: %d pages overdue in total\n", total)
 	}
 	return nil
