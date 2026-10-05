@@ -296,6 +296,19 @@ const extSumBase = "/ai-ecosystem/enterprise-applications-governance-and-tools/"
 
 // extPagePath finds the twoai_pages row behind a live path ending in a uid.
 func extPagePath(db *sql.DB, livePath string) string {
+	// Sections whose pages have no uid in their URL, theworldofai row 464:
+	// /ai-prompts/ and /benchmarks/, and their child pages by slug.
+	for prefix, dir := range map[string]string{"/ai-prompts/": "prompts", "/benchmarks/": "benchmarks"} {
+		if strings.HasPrefix(livePath, prefix) {
+			slug := strings.Trim(strings.TrimPrefix(livePath, prefix), "/")
+			if slug == "" {
+				slug = "index"
+			}
+			var path string
+			db.QueryRow(`SELECT path FROM twoai_pages WHERE path = $1`, dir+"/"+slug+".json").Scan(&path)
+			return path
+		}
+	}
 	p := strings.TrimSuffix(livePath, "/")
 	uid := p[strings.LastIndex(p, "/")+1:]
 	var path string
