@@ -28,6 +28,7 @@ import (
 var sectionDomainWords = map[string]string{
 	"lsc":  "pharmaceutical | pharma | drug | drugs | biotech | biotechnology | clinical | fda | ema | medical | medicine | patient | health | biology | therapeutic | protein | antibody | gmp | pharmacovigilance | medtech",
 	"dmed": "diabetes | diabetic | glucose | insulin | obesity | glp | metformin | a1c | hba1c | glycemic | incretin",
+	"lpa":  "lipoprotein | cardiovascular | cholesterol | heart | aortic | atherosclerosis | lipid | pelacarsen | olpasiran | lepodisiran | zerlasiran | muvalaplin",
 	"hcd":  "hospital | hospitals | clinical | clinician | patient | patients | health | healthcare | physician | nurse | nursing | medical | medicine",
 }
 

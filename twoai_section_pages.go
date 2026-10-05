@@ -41,9 +41,18 @@ type sectionPage struct {
 }
 
 // Where each section's root hangs: its parent page on the site.
-// The Latest in Diabetic Medicine, section dmed, joined Healthcare on
-// 2026-10-05 (row 483).
-var sectionRootParent = map[string]string{"lsc": "industry-use-cases", "hcd": "industry-healthcare", "dmed": "industry-healthcare"}
+// The Latest in Diabetic Medicine (dmed, row 483) and the Lp(a) Research
+// Center (lpa, row 484) joined Healthcare on 2026-10-05.
+var sectionRootParent = map[string]string{"lsc": "industry-use-cases", "hcd": "industry-healthcare",
+	"dmed": "industry-healthcare", "lpa": "industry-healthcare"}
+
+// Sections about a person's own treatment, whose every page says it is not
+// medical advice.
+var sectionMedical = map[string]bool{"dmed": true, "lpa": true}
+
+// Cross links between trees, both ways (row 484: heart protection in
+// diabetes and the future of Lp(a) treatment).
+var sectionSeeAlso = map[string][]string{"dmed-heart": {"lpa-future"}, "lpa-future": {"dmed-heart"}}
 
 const sectionBase = "/ai-ecosystem/enterprise-applications-governance-and-tools/"
 
@@ -116,6 +125,10 @@ func twoaiSectionPages(db *sql.DB, today string) error {
 	if _, ok := bySlug["dmed-pipeline"]; ok {
 		drugs = dmedLoadDrugs(db)
 	}
+	var lpaDrugs []map[string]string
+	if _, ok := bySlug["lpa-trials"]; ok {
+		lpaDrugs = lpaLoadDrugs(db)
+	}
 	written := 0
 	for _, p := range pages {
 		var kids, sibs []ref
@@ -169,11 +182,23 @@ func twoaiSectionPages(db *sql.DB, today string) error {
 		}
 		// Row 483: every diabetes page says plainly that it is not medical
 		// advice, and the pipeline page carries the drug table.
-		if p.Section == "dmed" {
+		if sectionMedical[p.Section] {
 			doc["medical_note"] = true
 		}
 		if p.Slug == "dmed-pipeline" && len(drugs) > 0 {
 			doc["drug_table"] = dmedDrugTable(drugs)
+		}
+		if p.Slug == "lpa-trials" && len(lpaDrugs) > 0 {
+			doc["lpa_table"] = lpaDrugs
+		}
+		var see []ref
+		for _, o := range sectionSeeAlso[p.Slug] {
+			if op, ok := bySlug[o]; ok {
+				see = append(see, ref{Name: op.Name, Path: path(o), Blurb: line(op)})
+			}
+		}
+		if len(see) > 0 {
+			doc["see_also"] = see
 		}
 		var kp []string
 		if json.Unmarshal(p.KeyPoints, &kp) == nil && len(kp) > 0 {
@@ -239,7 +264,7 @@ func twoaiSectionPages(db *sql.DB, today string) error {
 		written += dmedDrugPages(db, drugs, trail, dp.Name, path(dp.Slug), bySlug["dmed"].Name, path("dmed"), today)
 	}
 	var subpages []ref
-	for _, root := range []string{"hcd", "dmed"} {
+	for _, root := range []string{"hcd", "dmed", "lpa"} {
 		if h, ok := bySlug[root]; ok {
 			subpages = append(subpages, ref{Name: h.Name, Path: path(root), Blurb: line(h)})
 		}
