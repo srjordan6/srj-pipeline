@@ -73,6 +73,10 @@ var twoaiStageDeadline = map[string]time.Duration{
 	"twoai_publish": 10 * time.Minute,
 	// 40 IntuitionLabs summaries a run, each fact checked at its source (row 456).
 	"twoai_ext_library": 45 * time.Minute,
+	// PubMed, ClinicalTrials.gov, openFDA, EMA, journal, newsroom and
+	// coverage feeds for the diabetes and Lp(a) hubs. It stops fetching 90
+	// seconds before this and still sends its bridge rows.
+	"twoai_health_watch": 10 * time.Minute,
 }
 
 const twoaiStageDeadlineDefault = 20 * time.Minute
@@ -243,7 +247,9 @@ func main() {
 		// twoai_gaps leads, so a hand build refreshes the published backlog
 		// rather than leaving yesterday's figures on the site. It reads only
 		// this database and makes no external call, so it costs nothing here.
-		for _, s := range []string{"twoai_gaps", "twoai_build", "twoai_build_tail", "twoai_publish_r2", "twoai_publish", "deploy_site"} {
+		// twoai_health_watch does fetch (PubMed, trials, FDA, feeds), within
+		// its own ten minutes, so a hand run carries the newest health items.
+		for _, s := range []string{"twoai_gaps", "twoai_health_watch", "twoai_build", "twoai_build_tail", "twoai_publish_r2", "twoai_publish", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run()
@@ -300,7 +306,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -676,6 +682,16 @@ func main() {
 		// growing; a bad API day costs a batch, not a build.
 		if err := twoaiClaims(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_claims:", err)
+		}
+		return
+	}
+
+	if src == "twoai_health_watch" {
+		// Diabetes and Lp(a) watch. A source being down is a notice inside
+		// the stage; only a table that cannot be created fails it.
+		if err := twoaiHealthWatch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_health_watch:", err)
+			os.Exit(1)
 		}
 		return
 	}
