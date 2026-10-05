@@ -34,6 +34,10 @@ type sectionPage struct {
 	Developments                                                                         json.RawMessage
 	Sort, Refresh                                                                        int
 	Reviewed                                                                             string
+	// Row 481: the explainer under "How it works", its questions and, on hubs,
+	// the key points listed under the answer.
+	Explainer      string
+	KeyPoints, Faq json.RawMessage
 }
 
 // Where each section's root hangs: its parent page on the site.
@@ -44,7 +48,8 @@ const sectionBase = "/ai-ecosystem/enterprise-applications-governance-and-tools/
 func twoaiSectionPages(db *sql.DB, today string) error {
 	rows, err := db.Query(`SELECT slug, section, COALESCE(parent_slug,''), kind, name, COALESCE(blurb,''), COALESCE(answer,''),
 			COALESCE(meaning_heading,''), COALESCE(meaning,''), COALESCE(written_by,''), COALESCE(developments,'[]'::jsonb)::text,
-			sort, refresh_days, COALESCE(reviewed_on::text,'')
+			sort, refresh_days, COALESCE(reviewed_on::text,''),
+			COALESCE(explainer,''), COALESCE(key_points,'[]'::jsonb)::text, COALESCE(faq,'[]'::jsonb)::text
 		FROM twoai_section_pages WHERE status = 'live' ORDER BY section, sort, name`)
 	if err != nil {
 		return err
@@ -52,10 +57,11 @@ func twoaiSectionPages(db *sql.DB, today string) error {
 	var pages []sectionPage
 	for rows.Next() {
 		var p sectionPage
-		var dev string
+		var dev, kp, faq string
 		if rows.Scan(&p.Slug, &p.Section, &p.Parent, &p.Kind, &p.Name, &p.Blurb, &p.Answer, &p.MeaningHeading,
-			&p.Meaning, &p.WrittenBy, &dev, &p.Sort, &p.Refresh, &p.Reviewed) == nil {
+			&p.Meaning, &p.WrittenBy, &dev, &p.Sort, &p.Refresh, &p.Reviewed, &p.Explainer, &kp, &faq) == nil {
 			p.Developments = json.RawMessage(dev)
+			p.KeyPoints, p.Faq = json.RawMessage(kp), json.RawMessage(faq)
 			pages = append(pages, p)
 		}
 	}
@@ -103,6 +109,7 @@ func twoaiSectionPages(db *sql.DB, today string) error {
 		}
 		return chain
 	}
+	ix := sectionLoadIndex(db)
 	written := 0
 	for _, p := range pages {
 		var kids, sibs []ref
@@ -150,6 +157,41 @@ func twoaiSectionPages(db *sql.DB, today string) error {
 		var dev []map[string]any
 		if json.Unmarshal(p.Developments, &dev) == nil && len(dev) > 0 {
 			doc["developments"] = dev
+		}
+		if strings.TrimSpace(p.Explainer) != "" {
+			doc["explainer"] = p.Explainer
+		}
+		var kp []string
+		if json.Unmarshal(p.KeyPoints, &kp) == nil && len(kp) > 0 {
+			doc["key_points"] = kp
+		}
+		var faq []struct {
+			Q string `json:"q"`
+			A string `json:"a"`
+		}
+		var faqOut []map[string]string
+		if json.Unmarshal(p.Faq, &faq) == nil {
+			for _, f := range faq {
+				if strings.TrimSpace(f.Q) != "" && strings.TrimSpace(f.A) != "" {
+					faqOut = append(faqOut, map[string]string{"q": f.Q, "a": f.A})
+				}
+			}
+		}
+		if len(faqOut) > 0 {
+			doc["faq"] = faqOut
+		}
+		// Everything the page says, for finding the terms and companies it names.
+		text := strings.Join([]string{p.Answer, p.Explainer, p.Meaning, strings.Join(kp, " ")}, " ")
+		for _, f := range faqOut {
+			text += " " + f["q"] + " " + f["a"]
+		}
+		for _, d := range dev {
+			if t, ok := d["text"].(string); ok {
+				text += " " + t
+			}
+		}
+		if rel := sectionRelated(db, ix, p, path(p.Slug), text); len(rel) > 0 {
+			doc["related"] = rel
 		}
 		if p.Parent != "" {
 			if par, ok := bySlug[p.Parent]; ok {
