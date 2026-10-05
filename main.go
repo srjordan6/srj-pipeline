@@ -51,6 +51,7 @@ import (
 // most the batch in progress.
 var twoaiStageDeadline = map[string]time.Duration{
 	"twoai_build":        45 * time.Minute, // renders every page document
+	"twoai_build_tail":   30 * time.Minute, // the build's second half, row 477
 	"twoai_embed":        45 * time.Minute, // embeds every changed chunk
 	"twoai_vectorize":    30 * time.Minute,
 	"openalex_pull":      25 * time.Minute, // 150 pages plus backoff on 504s
@@ -243,7 +244,7 @@ func main() {
 		// twoai_gaps leads, so a hand build refreshes the published backlog
 		// rather than leaving yesterday's figures on the site. It reads only
 		// this database and makes no external call, so it costs nothing here.
-		for _, s := range []string{"twoai_gaps", "twoai_build", "twoai_publish_r2", "twoai_publish", "deploy_site"} {
+		for _, s := range []string{"twoai_gaps", "twoai_build", "twoai_build_tail", "twoai_publish_r2", "twoai_publish", "deploy_site"} {
 			cmd := exec.Command(os.Args[0], s)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			cmd.Run()
@@ -300,7 +301,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -595,6 +596,13 @@ func main() {
 	if src == "twoai_build" {
 		if err := twoaiBuild(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_build:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if src == "twoai_build_tail" {
+		if err := twoaiBuildTail(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_build_tail:", err)
 			os.Exit(1)
 		}
 		return
@@ -6043,6 +6051,23 @@ func twoaiBuild(db *sql.DB) error {
 	}
 	fmt.Printf("twoai_build: industry hub sections=%d\n", ihPages)
 
+	// The steps from the source pages to the freshness stamp run as their own
+	// stage, twoai_build_tail, right after this one (theworldofai row 477,
+	// 2026-10-05: the build was killed at its 45 minute deadline after the
+	// industry hub, so nothing after it ran and the site shipped their old
+	// output). Each stage now has its own deadline.
+
+	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d skills=%d downloads=%d ok=true\n",
+		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive, skillPages, downloads)
+	return nil
+}
+
+// twoaiBuildTail is the second half of the build: source pages, the
+// Observatory, the graph, capex, data centers, security, the reference
+// sections and the editor-written section trees, then the freshness stamp,
+// which must come after every write. Split out 2026-10-05 (row 477).
+func twoaiBuildTail(db *sql.DB) error {
+	today := time.Now().UTC().Format("2006-01-02")
 	// A page of our own for every source the industry pages cite, 2026-09-25.
 	// Runs after the hub so the industry documents it patches are this
 	// run's; a failure here is logged and does not stop the build.
@@ -6168,9 +6193,7 @@ func twoaiBuild(db *sql.DB) error {
 	if err := twoaiStampFreshness(db); err != nil {
 		fmt.Println("twoai_freshness: stamp:", err)
 	}
-
-	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d skills=%d downloads=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive, skillPages, downloads)
+	fmt.Println("twoai_build_tail: ok=true")
 	return nil
 }
 
