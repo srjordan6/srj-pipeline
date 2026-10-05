@@ -232,7 +232,7 @@ when it ships.`,
 
 	// Rule 2: nothing has shipped for five hours, whatever git says. Repeats
 	// every six hours while it lasts, and closes itself when a build lands.
-	if !builtAt.IsZero() && now.Sub(builtAt) > bwStaleLive {
+	if !builtAt.IsZero() && now.Sub(builtAt) > bwStaleAfter(now) {
 		lastAt, _ := time.Parse(time.RFC3339, get("stale_alert_at"))
 		if lastAt.IsZero() || now.Sub(lastAt) > 6*time.Hour {
 			set("stale_alert_at", now.Format(time.RFC3339))
@@ -408,4 +408,16 @@ func bwLastBuildFailure() string {
 		return fmt.Sprintf("Why: newest build %s is %s (%s) at %s; no failure line found in its log.", firstN(bl.BuildUUID, 8), bl.Outcome, bl.Status, bl.CreatedOn)
 	}
 	return fmt.Sprintf("Why (newest build %s, %s, %s):\n  %s", firstN(bl.BuildUUID, 8), bl.Outcome, bl.CreatedOn, strings.Join(keep, "\n  "))
+}
+
+// bwStaleAfter is how long the live site may go without a build. Until
+// 2026-10-12 run-pipeline.ps1 lets full runs start only at 10:00 and 18:00
+// UTC, a gap of up to sixteen hours, so five hours raised a false alert every
+// afternoon (row 475, built 11:43 UTC, alerted 16:47 UTC). The gate lapses
+// on its own date and so does this.
+func bwStaleAfter(now time.Time) time.Duration {
+	if now.Before(time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)) {
+		return 18 * time.Hour
+	}
+	return bwStaleLive
 }
