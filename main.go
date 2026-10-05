@@ -27,7 +27,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -59,7 +58,7 @@ var twoaiStageDeadline = map[string]time.Duration{
 	"twoai_lawsuit_fill": 30 * time.Minute, // up to 40 cases a run through Ollama
 	"twoai_jobs":         25 * time.Minute,
 	"intel":              10 * time.Minute, // the stage that proved the need
-	"twoai_recap":        8 * time.Minute,  // RECAP filing harvest, 12 dockets a run
+	"twoai_recap":        8 * time.Minute,  // RECAP filing harvest, dockets until the budget is spent
 	"export_corpus":      20 * time.Minute,
 	// twoai_publish pushes the whole changed set as ONE commit through the git
 	// data API: read the ref, build trees from it, commit, move the ref. About
@@ -3536,111 +3535,8 @@ func putToRepoTok(tok, repo, path, message string, payload []byte) error {
 // srj_intel_log. COURTLISTENER_TOKEN is required for docket-detail reads
 // (search works anonymously); without it the refresh job logs and moves on.
 
-// THE STAGE-DEADLINE BURN, caught 2026-08-30. Each clGet retried a 429 three
-// times, honouring Retry-After up to ninety seconds, so one call could sleep
-// four and a half minutes and two calls could exceed the stage's whole
-// deadline. That is what happened: twoai_recap was KILLED after 8m and intel
-// after 10m, eighteen minutes of cron spent sleeping, with nothing harvested.
-//
-// Retrying is right for a brief throttle and wrong for a spent quota, and the
-// difference is knowable: once CourtListener has told us to wait, every other
-// call in this run will be told the same. The first long wait therefore sets
-// a latch, and every later call fails immediately instead of sleeping. The
-// stages already stop cleanly on a rate-limited error, so they now stop in
-// seconds and leave their unscanned work at the front of tomorrow's rotation.
-var (
-	clThrottleMu     sync.Mutex
-	clThrottledUntil time.Time
-	clWait           time.Duration
-)
-
-func clThrottled() bool {
-	clThrottleMu.Lock()
-	defer clThrottleMu.Unlock()
-	return time.Now().Before(clThrottledUntil)
-}
-
-// clLastWait is the Retry-After of the last throttled call, and
-// clClearThrottle lifts the latch once a caller has waited it out.
-func clLastWait() time.Duration {
-	clThrottleMu.Lock()
-	defer clThrottleMu.Unlock()
-	return clWait
-}
-
-func clClearThrottle() {
-	clThrottleMu.Lock()
-	defer clThrottleMu.Unlock()
-	clThrottledUntil = time.Time{}
-	clWait = 0
-}
-
-func clSetThrottled(d time.Duration) {
-	clThrottleMu.Lock()
-	defer clThrottleMu.Unlock()
-	if until := time.Now().Add(d); until.After(clThrottledUntil) {
-		clThrottledUntil = until
-	}
-	clWait = time.Until(clThrottledUntil)
-}
-
-func clGet(path string, params map[string]string, out any) error {
-	if clThrottled() {
-		return fmt.Errorf("courtlistener rate limited: %s (quota window still open, not waiting)", path)
-	}
-	req, err := http.NewRequest("GET", "https://www.courtlistener.com/api/rest/v4"+path, nil)
-	if err != nil {
-		return err
-	}
-	q := req.URL.Query()
-	for k, v := range params {
-		q.Set(k, v)
-	}
-	req.URL.RawQuery = q.Encode()
-	req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
-	if tok := os.Getenv("COURTLISTENER_TOKEN"); tok != "" {
-		req.Header.Set("Authorization", "Token "+tok)
-	}
-	for attempt := 1; attempt <= 3; attempt++ {
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return err
-		}
-		if resp.StatusCode == 429 {
-			// CourtListener sends Retry-After telling us exactly how long
-			// its quota window has left. The old fixed 15/30/45s ladder
-			// ignored it and burned all three attempts inside a window
-			// that had longer to run, which is why the Aug 8 run lost four
-			// docket refreshes while two succeeded. Honor the header when
-			// present, capped so a long window cannot stall the whole run.
-			wait := time.Duration(15*attempt) * time.Second
-			if ra := resp.Header.Get("Retry-After"); ra != "" {
-				if secs, perr := strconv.Atoi(strings.TrimSpace(ra)); perr == nil && secs > 0 {
-					wait = time.Duration(secs) * time.Second
-					if wait > 90*time.Second {
-						wait = 90 * time.Second
-					}
-				}
-			}
-			resp.Body.Close()
-			// A wait this long means the quota window, not a burst. Latch it
-			// so the rest of the run fails fast rather than sleeping.
-			if wait >= 30*time.Second {
-				clSetThrottled(wait)
-				return fmt.Errorf("courtlistener rate limited: %s (waiting %s would exceed the stage budget)", path, wait)
-			}
-			time.Sleep(wait)
-			continue
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			return fmt.Errorf("courtlistener %s: %s", path, resp.Status)
-		}
-		return json.NewDecoder(resp.Body).Decode(out)
-	}
-	clSetThrottled(2 * time.Minute)
-	return fmt.Errorf("courtlistener rate limited: %s", path)
-}
+// The CourtListener client, clGet and clFetch, lives in courtlistener.go with
+// its rate-limit history: the 2026-08-30 latch and the 2026-10-05 budget.
 
 // twoaiCourtListenerURL returns the docket URL a reader can actually open.
 // On 2026-09-04 Stephen found three lawsuit pages linking to
@@ -3691,12 +3587,30 @@ var docketIDRe = regexp.MustCompile(`/docket/(\d+)/`)
 // checked today; one dormant since 2025 waits its turn. Over a few days every
 // case still gets checked, which is what daily docket monitoring actually
 // requires, without any single run trying to do all of it.
+//
+// TIME, NOT A COUNT, BOUNDS THE SWEEP, 2026-10-05. The sweep used to take
+// twelve cases ordered by docket_checked_at, stamped before the fetch, so a
+// case that was throttled counted as checked and went to the back of the
+// line without CourtListener ever answering for it. 129 of 147 federal
+// dockets had never been answered and the freshness report, which reads
+// docket_ok_at, showed them all overdue. Now the order is docket_ok_at, the
+// last real answer, oldest and never first, so each run picks up where the
+// last one stopped. Cases are taken until the refresh share of the stage
+// budget is spent (see clSetStageDeadline), waiting out short throttles on
+// the way, and each case is stamped the moment it is done.
 func intelRefresh(db *sql.DB) (checked, updated int, err error) {
-	// Budget per run. Raise it only if CourtListener stops rate limiting.
-	const sweepLimit = 12
+	// The most cases one run will look at. The time budget stops the sweep
+	// well before this on a throttled day; it is a ceiling, not a target.
+	const sweepLimit = 60
+	// The refresh may run until five minutes before the intel deadline, which
+	// leaves resolve, discover and the AI feed watch their own time.
+	clSetStageDeadline("intel", 5*time.Minute)
+	// docket_ok_at is set only when CourtListener answered, so the
+	// freshness audit measures real checks, not attempts (row 439).
+	db.Exec(`ALTER TABLE ai_lawsuits ADD COLUMN IF NOT EXISTS docket_ok_at timestamptz`)
 	rows, err := db.Query(`SELECT id, slug, courtlistener_url, COALESCE(latest_development_date::text,''), COALESCE(timeline::text,'[]')
 		FROM ai_lawsuits WHERE is_active AND courtlistener_url IS NOT NULL
-		ORDER BY docket_checked_at ASC NULLS FIRST, latest_development_date DESC NULLS LAST
+		ORDER BY docket_ok_at ASC NULLS FIRST, docket_checked_at ASC NULLS FIRST, latest_development_date DESC NULLS LAST
 		LIMIT $1`, sweepLimit)
 	if err != nil {
 		return 0, 0, err
@@ -3716,58 +3630,43 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 		cases = append(cases, c)
 	}
 	rows.Close()
-	rateLimited := 0
-	// docket_ok_at is set only when CourtListener answered, so the
-	// freshness audit measures real checks, not attempts (row 439).
-	db.Exec(`ALTER TABLE ai_lawsuits ADD COLUMN IF NOT EXISTS docket_ok_at timestamptz`)
-	// WAIT OUT SHORT THROTTLES, 2026-10-04. CourtListener answered the
-	// second docket of a run with a 51 second Retry-After, and the sweep
-	// ended there: two to four cases a day, a full pass of 146 cases in
-	// seven weeks. A short window is now waited out, up to four minutes of
-	// waiting a sweep, inside the stage's ten minute deadline.
-	slept := time.Duration(0)
-	const sleepBudget = 4 * time.Minute
-	for i := 0; i < len(cases); i++ {
-		c := cases[i]
+	// A case is stamped the moment it is done, so a run that stops on the
+	// budget keeps everything it finished. docket_ok_at only when
+	// CourtListener answered for the docket; docket_checked_at for any
+	// answer, a refusal such as a 404 included, so a dead docket rotates
+	// behind the others that have not been answered either. A case that was
+	// only throttled is stamped with neither and keeps its place in front.
+	done := func(id int64, answered bool) {
+		if answered {
+			db.Exec(`UPDATE ai_lawsuits SET docket_ok_at = now(), docket_checked_at = now() WHERE id = $1`, id)
+			checked++
+		} else {
+			db.Exec(`UPDATE ai_lawsuits SET docket_checked_at = now() WHERE id = $1`, id)
+		}
+	}
+	stopped := false
+	for _, c := range cases {
 		m := docketIDRe.FindStringSubmatch(c.clURL)
 		if m == nil {
 			continue
 		}
 		did := m[1]
-		checked++
-		// Stamp the attempt before the fetch, so a case that rate limits does
-		// not monopolise the front of the queue on the next run.
-		db.Exec(`UPDATE ai_lawsuits SET docket_checked_at = now() WHERE id = $1`, c.id)
 		var docket struct {
 			DateLastFiling string `json:"date_last_filing"`
 			AbsoluteURL    string `json:"absolute_url"`
 		}
 		if err := clGet("/dockets/"+did+"/", nil, &docket); err != nil {
-			fmt.Fprintln(os.Stderr, "intel refresh", c.slug, "docket fetch:", err)
-			// Give up the sweep once CourtListener is clearly throttling us.
-			// Each blocked fetch costs about ninety seconds of backoff, so
-			// pushing on turns one throttled API into an hour-long run and
-			// starves every stage downstream. The remaining cases keep their
-			// place in the queue and are checked on the next run.
-			if strings.Contains(err.Error(), "rate limited") {
-				if w := clLastWait(); w > 0 && w <= 90*time.Second && slept+w <= sleepBudget {
-					time.Sleep(w + 2*time.Second)
-					slept += w + 2*time.Second
-					clClearThrottle()
-					checked--
-					i-- // the same case again
-					continue
-				}
-				rateLimited++
-				if rateLimited >= 2 {
-					fmt.Fprintln(os.Stderr, "intel refresh: rate limited, ending sweep early")
-					break
-				}
+			if clIsBudget(err) {
+				// The refresh share of the budget is spent. The rest of the
+				// cases keep their place and are first in line next run.
+				stopped = true
+				break
 			}
+			fmt.Fprintln(os.Stderr, "intel refresh", c.slug, "docket fetch:", err)
+			done(c.id, false)
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		db.Exec(`UPDATE ai_lawsuits SET docket_ok_at = now() WHERE id = $1`, c.id)
 		// THE LINK A READER CAN OPEN. CourtListener refuses /docket/<id>/ and
 		// answers only /docket/<id>/<slug>/. Stephen, 2026-09-21: none of the
 		// docket links work. 13 cases held the bare form and every timeline row
@@ -3784,6 +3683,7 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 			}
 		}
 		if docket.DateLastFiling == "" || (c.since != "" && docket.DateLastFiling <= c.since) {
+			done(c.id, true)
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -3797,7 +3697,16 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 		if err := clGet("/docket-entries/", map[string]string{
 			"docket": did, "order_by": "-date_filed", "page_size": "5",
 		}, &entries); err != nil {
+			if clIsBudget(err) {
+				// Not stamped: the new filings are still unread, so the case
+				// stays in front and both reads happen again next run.
+				stopped = true
+				break
+			}
+			// The docket itself answered, so it counts as checked; the new
+			// entries are read when the case next comes round.
 			fmt.Fprintln(os.Stderr, "intel refresh", c.slug, "entries fetch:", err)
+			done(c.id, true)
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -3841,7 +3750,13 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 			updated++
 			fmt.Printf("intel refresh %s: %d new docket entries through %v\n", c.slug, len(fresh), newest["date"])
 		}
+		done(c.id, true)
 		time.Sleep(2 * time.Second)
+	}
+	if stopped {
+		// Out of budget is not a failure: say how far the sweep got, once,
+		// on stdout, and let the next run carry on from here.
+		fmt.Printf("intel refresh: rate limited, %d of %d dockets done, rest next run ok=true\n", checked, len(cases))
 	}
 	return checked, updated, nil
 }
@@ -3849,6 +3764,9 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 // intelResolve fills docket numbers still marked pending verification straight
 // from CourtListener search.
 func intelResolve(db *sql.DB) (resolved int, err error) {
+	// Resolve and discover share CourtListener time until three minutes
+	// before the intel deadline; the AI feed watch has the rest.
+	clSetStageDeadline("intel", 3*time.Minute)
 	rows, err := db.Query(`SELECT id, slug, case_name, COALESCE(defendants,'')
 		FROM ai_lawsuits WHERE docket ILIKE '%pending%' AND is_active`)
 	if err != nil {
@@ -3875,6 +3793,10 @@ func intelResolve(db *sql.DB) (resolved int, err error) {
 		if err := clGet("/search/", map[string]string{
 			"type": "r", "q": `"` + q + `"`, "order_by": "score desc",
 		}, &res); err != nil {
+			if clIsBudget(err) {
+				fmt.Printf("intel resolve: rate limited, %d of %d pending dockets resolved, rest next run ok=true\n", resolved, len(pending))
+				break
+			}
 			fmt.Fprintln(os.Stderr, "intel resolve", p.slug, "search:", err)
 			continue
 		}
@@ -3923,6 +3845,7 @@ func intelResolve(db *sql.DB) (resolved int, err error) {
 // A tracker that only watched copyright would have shown a shrinking field while
 // the actual field expanded.
 func intelDiscover(db *sql.DB) (added int, err error) {
+	clSetStageDeadline("intel", 3*time.Minute)
 	since := time.Now().AddDate(0, 0, -45).Format("2006-01-02")
 
 	// Defendants worth watching by name. Precision comes from the party, so
@@ -4014,7 +3937,9 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 	// throttles, each one costs about ninety seconds of backoff, which is over
 	// half an hour of a run spent achieving nothing. Stop at the first sign of
 	// it: discovery is a daily sweep, and missing one day costs a candidate
-	// being queued tomorrow instead of today.
+	// being queued tomorrow instead of today. Since 2026-10-05 clGet waits
+	// out short throttles itself, so a rate-limited error here means the
+	// stage budget is spent, not that one window was open.
 	throttled := false
 	for _, q := range subjects {
 		if throttled {
@@ -4314,10 +4239,13 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"AI21 Labs (coverage)", "https://news.google.com/rss/search?q=%22AI21+Labs%22&hl=en-US&gl=US&ceid=US:en"},
 		// Mercor and its founders, tracked from 2026-10-04 (theworldofai rows 446, 447).
 		{"Mercor (coverage)", "https://news.google.com/rss/search?q=%22Mercor%22+AI+OR+%22Brendan+Foody%22+OR+%22Adarsh+Hiremath%22+OR+%22Surya+Midha%22&hl=en-US&gl=US&ceid=US:en"},
-		{"The Alan Turing Institute", "https://www.turing.ac.uk/rss.xml"},
+		// turing.ac.uk and mbzuai.ac.ae answer every feed path with a Cloudflare
+		// "Just a moment" challenge page (HTTP 403, HTML), probed 2026-10-05, so
+		// both are watched through Google News coverage queries instead.
+		{"The Alan Turing Institute (coverage)", "https://news.google.com/rss/search?q=%22Alan+Turing+Institute%22&hl=en-GB&gl=GB&ceid=GB:en"},
 		{"INRIA", "https://inria.fr/en/rss.xml"},
 		{"RIKEN AIP", "https://www.riken.jp/en/feed/"},
-		{"MBZUAI", "https://mbzuai.ac.ae/news/feed/"},
+		{"MBZUAI (coverage)", "https://news.google.com/rss/search?q=MBZUAI+OR+%22Mohamed+bin+Zayed+University+of+Artificial+Intelligence%22&hl=en-US&gl=US&ceid=US:en"},
 		{"AI Singapore", "https://aisingapore.org/feed/"},
 		// Policy, regulation, standards
 		{"European Commission AI", "https://digital-strategy.ec.europa.eu/en/rss.xml"},
@@ -4339,7 +4267,11 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"Tech in Asia", "https://www.techinasia.com/rss"},
 		{"KrASIA", "https://kr-asia.com/feed"},
 		{"The Yuan (coverage)", "https://news.google.com/rss/search?q=%22The+Yuan%22+AI+site:the-yuan.com+OR+%22the-yuan.com%22&hl=en-US&gl=US&ceid=US:en"},
-		{"Computing UK", "https://www.computing.co.uk/feeds/rss"},
+		// computing.co.uk/feeds/rss returns a Cloudflare challenge page and the
+		// site publishes no other feed path (/rss, /feed, /rss/news all 404,
+		// probed 2026-10-05), so the outlet is watched by domain like the Asia
+		// outlets below.
+		{"Computing UK (coverage)", "https://news.google.com/rss/search?q=site:computing.co.uk+%22artificial+intelligence%22+OR+AI&hl=en-GB&gl=GB&ceid=GB:en"},
 		{"Heise", "https://www.heise.de/rss/heise-atom.xml"},
 		{"L'Usine Digitale", "https://www.usine-digitale.fr/rss"},
 		// Phase 2 of the watch-everything directive: sources with no working

@@ -90,7 +90,7 @@ var freshDatasets = []freshDataset{
 	// followed from reporting and stamped by the state case watch. An
 	// overdue docket reopens intel for the second run of the day.
 	{Key: "lawsuits", Label: "Lawsuit dockets", Cadence: 14, Auto: true, Stage: "intel",
-		How: "CourtListener dockets, twelve a run oldest first; state cases from established outlets",
+		How: "CourtListener dockets, as many a run as the rate limit allows, never answered first; state cases from established outlets",
 		Items: `SELECT slug, CASE WHEN courtlistener_url IS NOT NULL THEN docket_ok_at::date ELSE docket_checked_at::date END, NULL::int
 			FROM ai_lawsuits WHERE is_active`},
 	{Key: "federal_register", Label: "Federal Register", Cadence: 7, Auto: true, How: "Federal Register API",

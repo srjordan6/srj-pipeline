@@ -16,12 +16,18 @@ package main
 //
 // Rides at the start of twoai_lawsuit_fill, which runs directly behind intel,
 // so a case promoted today is classified in the same run.
+//
+// SHARED CLIENT AND A TURN ORDER, 2026-10-05. This stage had its own client
+// with a fixed 5, 10, 15 second ladder that ignored Retry-After, so behind
+// intel, which had just been throttled, two of 13 reads came back HTTP 429
+// and nothing was learned. It now reads through clFetch with a three minute
+// budget, and cases are taken oldest nos_checked_at first, stamped as soon
+// as CourtListener answers, so a run that stops on the budget leaves the
+// unread ones first in line and the ones left for review go to the back.
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -47,8 +53,13 @@ var lawsuitNOSTag = map[string]string{"820": "copyright", "830": "patent", "835"
 var lawsuitDocketIDRe = regexp.MustCompile(`courtlistener\.com/docket/(\d+)`)
 
 func twoaiLawsuitClassify(db *sql.DB) error {
+	// The page writer behind this step needs most of the stage's thirty
+	// minutes, so CourtListener gets three of them.
+	clSetBudget(3 * time.Minute)
+	db.Exec(`ALTER TABLE ai_lawsuits ADD COLUMN IF NOT EXISTS nos_checked_at timestamptz`)
 	rows, err := db.Query(`SELECT slug, courtlistener_url FROM ai_lawsuits
-		WHERE category = 'unclassified' AND courtlistener_url LIKE '%courtlistener.com/docket/%'`)
+		WHERE category = 'unclassified' AND courtlistener_url LIKE '%courtlistener.com/docket/%'
+		ORDER BY nos_checked_at ASC NULLS FIRST, slug`)
 	if err != nil {
 		return err
 	}
@@ -63,24 +74,33 @@ func twoaiLawsuitClassify(db *sql.DB) error {
 		}
 	}
 	rows.Close()
-	client := &http.Client{Timeout: 30 * time.Second}
 	tok := os.Getenv("COURTLISTENER_TOKEN")
 	read, classified, left := 0, 0, 0
+	stopped := false
 	for _, x := range cs {
 		// The docket endpoint is the direct read and needs the token the
 		// pipeline already holds; the search endpoint is the fallback. The
 		// first run used search only and 12 of 22 came back empty, most likely
 		// throttled, which the old code could not tell from no data.
-		nos, status := lawsuitNOSFromDocket(client, tok, x.id)
-		if nos == "" {
+		nos, status, err := lawsuitNOSFromDocket(tok, x.id)
+		if nos == "" && !clIsBudget(err) {
 			var s2 int
-			nos, s2 = lawsuitNOSFromSearch(client, tok, x.id)
+			nos, s2, err = lawsuitNOSFromSearch(x.id)
 			if status == 0 {
 				status = s2
 			}
 		}
+		if clIsBudget(err) {
+			// Out of CourtListener time for this run. Not stamped, so this
+			// case and the ones after it are first in line next run.
+			stopped = true
+			break
+		}
 		time.Sleep(700 * time.Millisecond)
 		read++
+		// CourtListener answered one way or another, so the case goes to the
+		// back of the line, a code left for review included.
+		db.Exec(`UPDATE ai_lawsuits SET nos_checked_at = now() WHERE slug = $1`, x.slug)
 		if nos == "" {
 			fmt.Printf("twoai_lawsuit_classify: %s: no nature of suit returned (http %d)\n", x.slug, status)
 			continue
@@ -101,56 +121,41 @@ func twoaiLawsuitClassify(db *sql.DB) error {
 			fmt.Printf("twoai_lawsuit_classify: %s: %v\n", x.slug, err)
 		}
 	}
+	if stopped {
+		fmt.Printf("twoai_lawsuit_classify: rate limited, %d of %d dockets done, rest next run ok=true\n", read, len(cs))
+	}
 	fmt.Printf("twoai_lawsuit_classify: unclassified=%d read=%d classified=%d left_for_review=%d ok=true\n", len(cs), read, classified, left)
 	return nil
 }
 
-func lawsuitCLGet(client *http.Client, tok, u string, into any) int {
-	req, _ := http.NewRequest("GET", u, nil)
-	req.Header.Set("User-Agent", "theworldofai.org lawsuit tracker (srj@srjconsultingservices.com)")
-	if tok != "" {
-		req.Header.Set("Authorization", "Token "+tok)
-	}
-	for attempt := 0; attempt < 3; attempt++ {
-		resp, err := client.Do(req)
-		if err != nil {
-			return 0
-		}
-		if resp.StatusCode == 429 {
-			resp.Body.Close()
-			time.Sleep(time.Duration(5*(attempt+1)) * time.Second)
-			continue
-		}
-		if resp.StatusCode == 200 {
-			json.NewDecoder(resp.Body).Decode(into)
-		}
-		resp.Body.Close()
-		return resp.StatusCode
-	}
-	return 429
+// lawsuitCLGet reads one CourtListener URL through the shared client and
+// returns the HTTP status alongside the error, so a run can still tell an
+// empty answer from a refusal.
+func lawsuitCLGet(u string, into any) (int, error) {
+	return clFetch(u, into)
 }
 
-func lawsuitNOSFromDocket(client *http.Client, tok, id string) (string, int) {
+func lawsuitNOSFromDocket(tok, id string) (string, int, error) {
 	if tok == "" {
-		return "", 0
+		return "", 0, nil
 	}
 	var d struct {
 		NatureOfSuit string `json:"nature_of_suit"`
 	}
-	s := lawsuitCLGet(client, tok, "https://www.courtlistener.com/api/rest/v4/dockets/"+id+"/?fields=nature_of_suit", &d)
-	return strings.TrimSpace(d.NatureOfSuit), s
+	s, err := lawsuitCLGet(clAPIBase+"/dockets/"+id+"/?fields=nature_of_suit", &d)
+	return strings.TrimSpace(d.NatureOfSuit), s, err
 }
 
-func lawsuitNOSFromSearch(client *http.Client, tok, id string) (string, int) {
+func lawsuitNOSFromSearch(id string) (string, int, error) {
 	var d struct {
 		Results []struct {
 			SuitNature string `json:"suitNature"`
 		} `json:"results"`
 	}
 	q := url.Values{"type": {"r"}, "q": {"docket_id:" + id}}
-	s := lawsuitCLGet(client, tok, "https://www.courtlistener.com/api/rest/v4/search/?"+q.Encode(), &d)
+	s, err := lawsuitCLGet(clAPIBase+"/search/?"+q.Encode(), &d)
 	if len(d.Results) == 0 {
-		return "", s
+		return "", s, err
 	}
-	return strings.TrimSpace(d.Results[0].SuitNature), s
+	return strings.TrimSpace(d.Results[0].SuitNature), s, err
 }

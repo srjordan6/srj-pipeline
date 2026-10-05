@@ -19,13 +19,23 @@ import (
 // the document it came from, so a claim on the site is a claim with a docket
 // citation behind it.
 //
-// Twelve dockets per run, least recently scanned first, three pages of
-// documents per docket, so a full sweep of the tracker takes about nine days
-// and then stays current as new filings land. A docket whose documents carry
-// no extracted text produces nothing, and that is the correct output; text
-// that was never read is never cited. Uses the same clGet client, token and
-// Retry-After discipline as the docket refresh.
+// Least recently scanned first, three pages of documents per docket, as many
+// dockets as the stage budget allows (up to recapMaxDockets), each recorded in
+// twoai_recap_scan the moment it is done. A docket whose documents carry no
+// extracted text produces nothing, and that is the correct output; text that
+// was never read is never cited. Uses the shared clGet client, which waits
+// out CourtListener's short throttles while the budget allows.
+//
+// It used to take twelve dockets and stop at the second throttled page. On
+// 2026-10-05 that was the second docket: CourtListener asked for 47 seconds,
+// the old client called that a spent quota, and the stage ended after 14
+// seconds of its eight minutes with 10 of 12 dockets unread.
+const recapMaxDockets = 40
+
 func twoaiRecapCitations(db *sql.DB) error {
+	// Stop CourtListener work 45 seconds before the stage deadline, so the
+	// last scan row and the summary line are always written.
+	clSetStageDeadline("twoai_recap", 45*time.Second)
 	type prec struct {
 		slug string
 		re   *regexp.Regexp
@@ -60,7 +70,7 @@ func twoaiRecapCitations(db *sql.DB) error {
 		LEFT JOIN twoai_recap_scan s ON s.lawsuit_slug = l.slug
 		WHERE l.is_active AND COALESCE(l.courtlistener_url,'') ~ '/docket/\d+'
 		ORDER BY s.scanned_at ASC NULLS FIRST, l.filed_date DESC NULLS LAST
-		LIMIT 12`)
+		LIMIT $1`, recapMaxDockets)
 	if err != nil {
 		return err
 	}
@@ -80,16 +90,13 @@ func twoaiRecapCitations(db *sql.DB) error {
 	rows.Close()
 
 	totalHits, totalDocs, totalText := 0, 0, 0
-	rateLimited := 0 // consecutive rate-limited page fetches across dockets
 	done := 0
+	outOfBudget := false
 	for _, j := range jobs {
-		if rateLimited >= 2 {
-			// CourtListener is throttling this token right now. Sleeping into
-			// the stage deadline harvests nothing and burns eight minutes of
-			// cron, which is exactly what the first production run did. Stop
-			// cleanly; unscanned dockets keep their place at the front of the
-			// rotation and tomorrow's budget is fresh.
-			fmt.Printf("twoai_recap: rate limited, stopping after %d of %d dockets\n", done, len(jobs))
+		if outOfBudget {
+			// The budget ran out on the last docket. Sleeping into the stage
+			// deadline harvests nothing and gets the stage killed; unscanned
+			// dockets keep their place at the front of the rotation.
 			break
 		}
 		seen, withText, hits := 0, 0, 0
@@ -112,14 +119,16 @@ func twoaiRecapCitations(db *sql.DB) error {
 				} `json:"results"`
 			}
 			if err := clGet(next, params, &out); err != nil {
-				fmt.Println("twoai_recap:", j.slug, "page", page, err)
-				if strings.Contains(err.Error(), "rate limited") {
-					rateLimited++
+				if clIsBudget(err) {
+					// Pages already read are kept: they are the newest
+					// documents, and the scan row below records them.
+					outOfBudget = true
+				} else {
+					fmt.Println("twoai_recap:", j.slug, "page", page, err)
 				}
 				break
 			}
 			pagesOK++
-			rateLimited = 0
 			// clGet takes path-relative requests; a "next" URL from the API is
 			// absolute, so after page one we pass its path and drop our params.
 			for _, d := range out.Results {
@@ -212,7 +221,10 @@ func twoaiRecapCitations(db *sql.DB) error {
 	}
 	var lawsuits, links int
 	db.QueryRow(`SELECT count(DISTINCT lawsuit_slug), count(*) FROM twoai_precedent_citations`).Scan(&lawsuits, &links)
-	fmt.Printf("twoai_recap: dockets=%d docs=%d with_text=%d new_hits=%d total: lawsuits=%d links=%d\n",
-		len(jobs), totalDocs, totalText, totalHits, lawsuits, links)
+	if outOfBudget {
+		fmt.Printf("twoai_recap: rate limited, %d of %d dockets done, rest next run ok=true\n", done, len(jobs))
+	}
+	fmt.Printf("twoai_recap: dockets=%d of %d docs=%d with_text=%d new_hits=%d total: lawsuits=%d links=%d\n",
+		done, len(jobs), totalDocs, totalText, totalHits, lawsuits, links)
 	return nil
 }
