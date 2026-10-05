@@ -10224,7 +10224,10 @@ func twoaiEcosystem(db *sql.DB, today string, upsert func(path, kind string, v a
 		fmt.Fprintln(os.Stderr, "twoai_understand_ai:", err)
 	}
 
-	rows, err := db.Query(`SELECT t.slug, t.name, COALESCE(t.blurb,''), t.status,
+	// Domains and sections list their one line, not a long blurb (row 450).
+	rows, err := db.Query(`SELECT t.slug, t.name,
+			CASE WHEN t.level >= 2 AND length(COALESCE(t.blurb,'')) > 240 AND COALESCE(t.line,'') <> '' THEN t.line ELSE COALESCE(t.blurb,'') END,
+			t.status,
 			COALESCE(t.live_path,''), COALESCE(t.parent_slug,''), t.level,
 			-- THE DATA COUNT WINS OVER THE PAGE COUNT. Stephen, 2026-09-29: the
 			-- Research Library read 149 beside a blurb saying 135 papers. The 149

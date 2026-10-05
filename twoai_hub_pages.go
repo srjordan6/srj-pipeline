@@ -44,10 +44,13 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 )
 
 func twoaiEnsureHubPages(db *sql.DB) error {
+	// One line per child (row 450): fill twoai_taxonomy.line first.
+	twoaiTaxonomyLines(db)
 	// A hub already given a live_path by an earlier run still needs its page
 	// written, because the first version wrote it to a folder no route reads.
 	// The guard is the ecosystem page's absence, not the live_path's.
@@ -119,18 +122,21 @@ func twoaiEnsureHubPages(db *sql.DB) error {
 				-- sections inside this hub appear as its contents. 'children'
 				-- carries the same rows with their hrefs for anything that wants
 				-- the links themselves.
-				'built', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
-					'name', c.name, 'detail', COALESCE(NULLIF(c.blurb,''), c.name)) ORDER BY c.sort), '[]'::jsonb)
-					FROM twoai_taxonomy c WHERE c.parent_slug = $2 AND c.live_path IS NOT NULL AND COALESCE(c.status,'') <> 'retired'),
-				'children', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
-					'name', c.name, 'href', c.live_path, 'desc', COALESCE(c.blurb,''), 'sort', c.sort) ORDER BY c.sort), '[]'::jsonb)
-					FROM twoai_taxonomy c WHERE c.parent_slug = $2 AND c.live_path IS NOT NULL AND COALESCE(c.status,'') <> 'retired'),
+				'built', `+twoaiHubBuiltSQL+`,
+				'children', `+twoaiHubChildrenSQL+`,
 				'points', '[]'::jsonb, 'total', 0), now())
 			ON CONFLICT (path) DO UPDATE SET kind = EXCLUDED.kind, data = EXCLUDED.data,
 				taxonomy_slug = EXCLUDED.taxonomy_slug, updated_at = now()`,
 			"ecosystem/"+h.slug+".json", h.slug, uid, h.name, today, summary, h.parent); err != nil {
 			return fmt.Errorf("%s: %w", h.slug, err)
 		}
+		// The first version of this stage wrote hubs to industries/, and those
+		// copies still render on the enterprise route. Their child lists are
+		// kept in step, so no copy of a hub prints the long readings.
+		db.Exec(`UPDATE twoai_pages SET data = data || jsonb_build_object('children', `+twoaiHubChildrenSQL+`, 'built', `+twoaiHubBuiltSQL+`),
+				updated_at = now()
+			WHERE path = 'industries/' || $1 || '.json' AND data->>'is_hub' = 'true'
+			  AND (data->'children' IS DISTINCT FROM `+twoaiHubChildrenSQL+`)`, h.slug, h.slug)
 		if _, err := db.Exec(`UPDATE twoai_taxonomy SET live_path = $2, updated_at = now() WHERE slug = $1 AND live_path IS NULL`,
 			h.slug, path); err != nil {
 			return fmt.Errorf("%s path: %w", h.slug, err)
@@ -141,3 +147,16 @@ func twoaiEnsureHubPages(db *sql.DB) error {
 	fmt.Printf("twoai_ecosystem: hub pages generated=%d\n", made)
 	return nil
 }
+
+// The child list of a hub, one line each (row 450): the section's name, its
+// count when its page declares one, and its one-line description. $2 is the
+// hub's slug wherever it is used.
+var twoaiHubChildrenSQL = strings.ReplaceAll(`(SELECT COALESCE(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+		'name', c.name, 'href', c.live_path, 'desc', `+twoaiTaxLineSQL+`, 'sort', c.sort,
+		'count', (SELECT NULLIF(max(CASE WHEN p.data->>'total' ~ '^[0-9]+$' THEN (p.data->>'total')::int END), 0)
+			FROM twoai_pages p WHERE p.taxonomy_slug = c.slug))) ORDER BY c.sort), '[]'::jsonb)
+	FROM twoai_taxonomy c WHERE c.parent_slug = $HUB AND c.live_path IS NOT NULL AND COALESCE(c.status,'') <> 'retired')`, "$HUB", "$2")
+
+var twoaiHubBuiltSQL = strings.ReplaceAll(`(SELECT COALESCE(jsonb_agg(jsonb_build_object(
+		'name', c.name, 'detail', COALESCE(NULLIF(`+twoaiTaxLineSQL+`,''), c.name)) ORDER BY c.sort), '[]'::jsonb)
+	FROM twoai_taxonomy c WHERE c.parent_slug = $HUB AND c.live_path IS NOT NULL AND COALESCE(c.status,'') <> 'retired')`, "$HUB", "$2")
