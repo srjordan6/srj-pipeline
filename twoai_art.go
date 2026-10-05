@@ -131,6 +131,15 @@ func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 // numericLine, the form readings were written under before, which
 // twoaiArtTokenMigrate recognises.
 func (f twoaiArtFacts) line(section string) string {
+	// NO COUNTS AT ALL, theworldofai row 476 (2026-10-05): sentences quoting
+	// the site's own counts added nothing to a reading, so 161 were removed
+	// and the model is now told not to state them. tokenLine below is the
+	// form readings were written under on 2026-10-05, kept so they are
+	// recognised and not rewritten.
+	return "Do not state how many of anything this site holds, tracks or lists: no counts of tools, terms, pages, papers, models, lawsuits, servers or anything else of this site's own. Write about the subject."
+}
+
+func (f twoaiArtFacts) tokenLine(section string) string {
 	const copyRule = " Every figure above is a placeholder in double braces: where you use one, copy the placeholder exactly, braces included, and never write a number in its place."
 	switch section {
 	case "sql":

@@ -92,7 +92,10 @@ func twoaiTypedCounts(db *sql.DB) []typedCount {
 	}
 	scan(`SELECT path, concat_ws(' ', data->>'answer', data->>'blurb', data->>'summary', data->>'intro',
 			(SELECT string_agg(x->>'body', ' ') FROM jsonb_array_elements(CASE WHEN jsonb_typeof(data->'sections') = 'array' THEN data->'sections' ELSE '[]'::jsonb END) x))
-		FROM twoai_pages`, "page ")
+		FROM twoai_pages
+		-- Source summary pages quote the outside source's own figures (row 476:
+		-- "700 PropTech companies" is the source's count, not ours).
+		WHERE path NOT LIKE 'industries/source-%'`, "page ")
 	scan(`SELECT slug, COALESCE(blurb,'') || ' ' || COALESCE(line,'') FROM twoai_taxonomy WHERE status <> 'retired'`, "taxonomy ")
 	scan(`SELECT slug, concat_ws(' ', answer, blurb, meaning) FROM twoai_section_pages WHERE status = 'live'`, "section page ")
 	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_typed_counts (found_on date NOT NULL DEFAULT current_date, where_found text, token text,

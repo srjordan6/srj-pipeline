@@ -42,6 +42,7 @@ func twoaiLiveCounts(db *sql.DB) map[string]string {
 	one("people_total", `SELECT count(*) FROM site_people`)
 	one("lawsuits_total", `SELECT count(*) FROM twoai_lawsuits`)
 	one("facilities_total", `SELECT count(*) FROM twoai_dc_facilities`)
+	one("facilities_us", `SELECT count(*) FROM twoai_dc_facilities WHERE country = 'US'`)
 	one("bills_total", `SELECT count(DISTINCT (raw->'bill'->>'state', raw->'bill'->>'bill_number')) FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id AND s.key='legiscan'`)
 	one("enacted_laws_total", `SELECT count(*) FROM twoai_bill_events WHERE relevant AND status = 4`)
 	one("tools_total", `SELECT COALESCE(NULLIF(data->>'total','')::int, 0) FROM twoai_pages WHERE path = 'tools/index.json'`)

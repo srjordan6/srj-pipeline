@@ -106,7 +106,8 @@ func twoaiArtTokenMigrate(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts,
 		}
 		tok := twoaiArtTokenize(body)
 		oldLine := facts.numericLine(n.Section) + extra
-		if have == twoaiArtHash(n, oldLine) || have == twoaiArtLegacyHash(n, oldLine) {
+		tokLine := facts.tokenLine(n.Section) + extra
+		if have == twoaiArtHash(n, oldLine) || have == twoaiArtLegacyHash(n, oldLine) || have == twoaiArtHash(n, tokLine) {
 			have = twoaiArtHash(n, facts.line(n.Section)+extra)
 		} else if tok == body {
 			continue
