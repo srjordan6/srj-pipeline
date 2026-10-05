@@ -27,7 +27,6 @@ import (
 	"io"
 	"net/http"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 )
@@ -217,39 +216,12 @@ func twoaiExtLibrary(db *sql.DB) error {
 		}
 	}
 
-	// 3. Publish the grouped list to the Healthcare page.
-	rows, err := db.Query(`SELECT topic, title, url, COALESCE(lastmod::text, first_seen::text)
-		FROM twoai_ext_library WHERE source = $1 AND topic IS NOT NULL AND topic <> 'none'
-		ORDER BY COALESCE(lastmod, first_seen) DESC, title`, extLibSource)
-	if err != nil {
-		return err
-	}
-	byTopic := map[string][]map[string]string{}
-	total := 0
-	for rows.Next() {
-		var topic, title, url, date string
-		if rows.Scan(&topic, &title, &url, &date) == nil {
-			byTopic[topic] = append(byTopic[topic], map[string]string{"title": title, "url": url, "date": date})
-			total++
-		}
-	}
-	rows.Close()
-	var groups []map[string]any
-	for _, t := range extLibTopics {
-		if items := byTopic[t]; len(items) > 0 {
-			groups = append(groups, map[string]any{"topic": t, "count": len(items), "items": items})
-		}
-	}
-	sort.SliceStable(groups, func(i, j int) bool { return groups[i]["count"].(int) > groups[j]["count"].(int) })
-	if total > 0 {
-		v, _ := json.Marshal(map[string]any{
-			"source": "IntuitionLabs", "source_url": "https://intuitionlabs.ai/articles",
-			"count": total, "as_of": time.Now().UTC().Format("2006-01-02"), "groups": groups,
-		})
-		db.Exec(`INSERT INTO twoai_page_extras (page_path, key, value, updated_at) VALUES ($1, 'library', $2::jsonb, now())
-			ON CONFLICT (page_path, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
-			WHERE twoai_page_extras.value IS DISTINCT FROM EXCLUDED.value`, extLibPage, string(v))
-	}
-	fmt.Printf("twoai_ext_library: %d new articles, %d classified, %d listed on Healthcare ok=true\n", added, classified, total)
+	// SUPERSEDED, theworldofai row 457 (Stephen, 2026-10-05): the site carries
+	// no reference to IntuitionLabs, no per-article pages and no list of their
+	// titles. This stage now only registers and classifies the articles; the
+	// material reaches the site through the Life Sciences synthesis pages and
+	// the routing of rows 457 and 458, each fact cited to its primary source.
+	// The Healthcare library row in twoai_page_extras is kept, not rendered.
+	fmt.Printf("twoai_ext_library: %d new articles, %d classified ok=true\n", added, classified)
 	return nil
 }

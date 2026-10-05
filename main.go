@@ -71,6 +71,8 @@ var twoaiStageDeadline = map[string]time.Duration{
 	// generous for the new shape and short enough that a hang is visible the
 	// same day rather than eating the run.
 	"twoai_publish": 10 * time.Minute,
+	// 40 IntuitionLabs summaries a run, each fact checked at its source (row 456).
+	"twoai_ext_library": 45 * time.Minute,
 }
 
 const twoaiStageDeadlineDefault = 20 * time.Minute

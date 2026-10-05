@@ -147,7 +147,7 @@ var twoaiBulkStages = map[string]bool{
 	// The strengths and limits reading on each model family page, three a run.
 	"model_family_reading": true,
 	// Topic sorting for the IntuitionLabs library on Healthcare, a 530 title backlog.
-	"library_topics": true,
+	"library_topics": true, "ext_summaries": true, "ext_fact_check": true,
 }
 
 var twoaiPeakNoted sync.Map

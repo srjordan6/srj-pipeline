@@ -362,6 +362,13 @@ func twoaiFreshnessAudit(db *sql.DB, preview bool) error {
 			b.WriteString("- " + s + "\n")
 		}
 	}
+	// IntuitionLabs progress, theworldofai row 456.
+	var exWritten, exTotal, exVerified, exDropped int
+	if db.QueryRow(`SELECT count(*) FILTER (WHERE s.doc IS NOT NULL), (SELECT count(*) FROM twoai_ext_library WHERE is_ai AND topic IS NOT NULL),
+			COALESCE(sum(s.facts_verified),0), COALESCE(sum(s.facts_dropped),0) FROM twoai_ext_summaries s`).Scan(&exWritten, &exTotal, &exVerified, &exDropped) == nil && exTotal > 0 {
+		fmt.Fprintf(&b, "\nIntuitionLabs: %d of %d article summaries written, %d facts checked at their primary source, %d dropped for want of one.\n",
+			exWritten, exTotal, exVerified, exDropped)
+	}
 	b.WriteString("\nItems in twoai_freshness_items, datasets in twoai_freshness. srj owns the refreshers; send code needs by bridge.")
 	topic := fmt.Sprintf("Freshness: %d overdue, %d fixed, %d need a decision", overdueItems, fixedToday, len(decide))
 	if _, err := db.Exec(`INSERT INTO project_bridge (from_project, to_project, topic, body) VALUES ('srj','theworldofai',$1,$2)`, topic, b.String()); err == nil {
