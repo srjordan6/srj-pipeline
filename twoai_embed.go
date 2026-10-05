@@ -426,16 +426,17 @@ var twoaiDocTitlesByPath = map[string]string{
 // the list adds nothing a reader could be cited to; the meta and talent files
 // are the site's working data and member records, not reading matter.
 var twoaiEmbedByDesign = map[string]string{
-	"companies/index.json":         "directory list, each company is indexed by its own page",
-	"mcp/index.json":               "directory list, each server is indexed by its own page",
-	"people/index.json":            "directory list, each person is indexed by their own page",
-	"ecosystem/index.json":         "the home page map, every section in it is indexed by its own page",
-	"meta/dead-links.json":         "maintenance data, not a page for readers",
-	"meta/popular-pages.json":      "maintenance data, not a page for readers",
-	"talent/matches.json":          "member records, never indexed",
-	"talent/options.json":          "form options, not a page",
-	"talent/profiles.json":         "member records, never indexed",
-	"compliance/page-reviews.json": "review queue, not a page for readers",
+	"companies/index.json":           "directory list, each company is indexed by its own page",
+	"mcp/index.json":                 "directory list, each server is indexed by its own page",
+	"people/index.json":              "directory list, each person is indexed by their own page",
+	"ecosystem/index.json":           "the home page map, every section in it is indexed by its own page",
+	"meta/dead-links.json":           "maintenance data, not a page for readers",
+	"meta/popular-pages.json":        "maintenance data, not a page for readers",
+	"talent/matches.json":            "member records, never indexed",
+	"talent/options.json":            "form options, not a page",
+	"talent/profiles.json":           "member records, never indexed",
+	"compliance/page-reviews.json":   "review queue, not a page for readers",
+	"tech/hw-power-and-cooling.json": "merged into Data Centers 2026-10-04, its URL redirects there (row 449)",
 }
 
 // twoaiDocURL resolves ONE document to its page URL. Empty means the document

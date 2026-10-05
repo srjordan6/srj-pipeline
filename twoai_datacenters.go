@@ -182,6 +182,32 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		orows.Close()
 	}
 
+	// POWER AND COOLING, MERGED IN 2026-10-04 (theworldofai row 449). The
+	// hardware section of that name covered the same ground as this page's
+	// Power block, so its three curated entries come here the same way the
+	// GPU-cloud operators did, and the paragraph that keeps the four power
+	// numbers apart comes with them. The old URL d98d9c37 redirects here.
+	var powerCooling []operator
+	if prows, err := db.Query(`SELECT name, maker, note, source_url, COALESCE(verified_on::text,'')
+		FROM twoai_hardware WHERE section_slug='power-and-cooling' ORDER BY slug`); err == nil {
+		for prows.Next() {
+			var o operator
+			if prows.Scan(&o.Name, &o.Maker, &o.Note, &o.SourceURL, &o.Verified) == nil {
+				powerCooling = append(powerCooling, o)
+			}
+		}
+		prows.Close()
+	}
+	var pcBlurb, powerTerms string
+	db.QueryRow(`SELECT COALESCE(blurb,'') FROM twoai_taxonomy WHERE slug='power-and-cooling'`).Scan(&pcBlurb)
+	for _, para := range strings.Split(pcBlurb, "\n\n") {
+		const lead = "The section exists partly to keep four numbers apart that directories routinely print as one another."
+		if strings.HasPrefix(strings.TrimSpace(para), lead) {
+			powerTerms = "Four power numbers are kept apart on this site, because directories routinely print them as one another." +
+				strings.TrimPrefix(strings.TrimSpace(para), lead)
+		}
+	}
+
 	// The national facility registry: refresh from OpenStreetMap, geocode a
 	// batch, then render one directory page per state.
 	twoaiDcHarvest(db)
@@ -738,7 +764,8 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		"shape": "datacenters", "uid": twoaiUID("section:data-centers"),
 		"tax": "data-centers", "generated": today, "name": name, "blurb": blurb,
 		"metrics": metrics, "sources": srcs, "capex": capex, "filings": filings,
-		"operators":    operators,
+		"operators":     operators,
+		"power_cooling": powerCooling, "power_terms": powerTerms,
 		"metric_pages": metricPages, "builder_pages": builderPages,
 		"operator_pages":      operatorPages,
 		"operators_index_uid": twoaiUID("dc-operators-index"),

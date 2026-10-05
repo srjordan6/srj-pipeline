@@ -27,7 +27,10 @@ var twoaiHardwareSections = []string{
 	// twoai_hardware directly. The old URL 910155f0 redirects in
 	// public/_redirects. Rows stay in the table so apistatus keeps
 	// verifying their links.
-	"networking-fabric", "power-and-cooling",
+	// "power-and-cooling" retired 2026-10-04 the same way (theworldofai row
+	// 449): Data Centers absorbs its three rows and its four-numbers
+	// paragraph, and d98d9c37 redirects to b441a27b.
+	"networking-fabric",
 }
 
 const twoaiAmazonTag = "theworldofa0b-20"
