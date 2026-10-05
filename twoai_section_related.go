@@ -24,6 +24,9 @@ import (
 	"unicode"
 )
 
+// Sections whose papers come from twoai_health_papers, not twoai_works.
+var sectionHealthLibrary = map[string]bool{"dmed": true, "lpa": true}
+
 // Words of each section's domain, one of which a matched record must carry.
 var sectionDomainWords = map[string]string{
 	"lsc":  "pharmaceutical | pharma | drug | drugs | biotech | biotechnology | clinical | fda | ema | medical | medicine | patient | health | biology | therapeutic | protein | antibody | gmp | pharmacovigilance | medtech",
@@ -37,8 +40,15 @@ var sectionStopWords = map[string]bool{
 	"ai": true, "and": true, "the": true, "of": true, "for": true, "in": true, "with": true, "its": true,
 	"a": true, "an": true, "how": true, "why": true, "using": true, "inside": true, "when": true, "needs": true,
 	"itself": true, "what": true, "to": true, "on": true, "by": true, "at": true, "as": true, "from": true,
-	"life": true, "sciences": true, "built": true, "latest": true, "list": true, "end": true, "s": true,
+	"life": true, "sciences": true, "built": true, "latest": true,
+	// Words that name a kind of page rather than its subject (row 484: "The
+	// Lp(a) Research Center" found papers about research centres).
+	"research": true, "center": true, "centre": true, "understanding": true, "current": true, "future": true,
+	"treatment": true, "treatments": true, "list": true, "end": true, "s": true,
 }
+
+// Two-letter words that are a subject: Lp(a).
+var sectionShortWords = map[string]bool{"lp": true}
 
 // sectionNameWords returns the subject words of a page name, longest first.
 func sectionNameWords(name string) []string {
@@ -47,7 +57,7 @@ func sectionNameWords(name string) []string {
 	for _, w := range strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}) {
-		if sectionStopWords[w] || seen[w] || (len(w) < 3 && !unicode.IsDigit(rune(w[0]))) {
+		if sectionStopWords[w] || seen[w] || (len(w) < 3 && !unicode.IsDigit(rune(w[0])) && !sectionShortWords[w]) {
 			continue
 		}
 		seen[w] = true
@@ -248,12 +258,39 @@ func sectionRelated(db *sql.DB, ix sectionRelatedIndex, p sectionPage, selfPath,
 	}, true); len(facts) > 0 {
 		rel["facts"] = facts
 	}
-	if len(words) > 0 {
-		// Title must carry the subject; the domain may sit in the abstract.
+	if sectionHealthLibrary[p.Section] {
+		// The medical trees draw on the research library theworldofai keeps for
+		// them (row 485), by sub-hub, most cited first: titles and DOIs only,
+		// the abstracts stay internal. twoai_works is about AI and gave the
+		// Lp(a) pages papers on AI in cardiology.
+		sub := strings.TrimPrefix(p.Slug, p.Section+"-")
+		if p.Kind != "subhub" && p.Kind != "topic" {
+			sub = ""
+		}
+		if rows, err := db.Query(`SELECT title, COALESCE(year,0), COALESCE(citations,0), doi FROM twoai_health_papers
+			WHERE topic = $1 AND ($2 = '' OR subtopic = $2) AND COALESCE(title,'') <> '' AND COALESCE(status,'') <> 'rejected'
+			ORDER BY citations DESC NULLS LAST, year DESC NULLS LAST LIMIT 5`, p.Section, sub); err == nil {
+			var papers []map[string]any
+			for rows.Next() {
+				var title, doi string
+				var year, cited int
+				if rows.Scan(&title, &year, &cited, &doi) == nil {
+					papers = append(papers, map[string]any{"title": title, "year": year, "cited_by": cited, "url": "https://doi.org/" + doi})
+				}
+			}
+			rows.Close()
+			if len(papers) > 0 {
+				rel["papers"] = papers
+				rel["papers_from_library"] = true
+			}
+		}
+	} else if len(words) > 0 {
+		// Title must carry the subject and a word of the domain; the abstract
+		// alone found aerospace maintenance for "Predictive Maintenance".
 		if papers := first(`SELECT title, COALESCE(pub_year,0), COALESCE(cited_by,0), COALESCE(doi,''), COALESCE(oa_url,''), openalex_id
 			FROM twoai_works
 			WHERE to_tsvector('english', COALESCE(title,'') || ' ' || COALESCE(abstract,'')) @@ (to_tsquery('english', $1) && to_tsquery('english', $2))
-			  AND to_tsvector('english', COALESCE(title,'')) @@ to_tsquery('english', $1)
+			  AND to_tsvector('english', COALESCE(title,'')) @@ (to_tsquery('english', $1) && to_tsquery('english', $2))
 			  AND duplicate_of IS NULL AND excluded_reason IS NULL AND $3 <> ''
 			ORDER BY cited_by DESC NULLS LAST LIMIT 5`, func(r *sql.Rows) map[string]any {
 			var title, doi, oa, oid string
