@@ -400,6 +400,14 @@ func main() {
 		}
 		return
 	}
+	// section_pages: the editor-written section trees and sourced facts alone.
+	if src == "section_pages" {
+		if err := twoaiSectionPages(db, time.Now().UTC().Format("2006-01-02")); err != nil {
+			fmt.Fprintln(os.Stderr, "section_pages:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if src == "news_gap" {
 		if err := twoaiNewsGapCheck(db); err != nil {
 			fmt.Fprintln(os.Stderr, "news_gap:", err)
@@ -6082,6 +6090,10 @@ func twoaiBuild(db *sql.DB) error {
 	// written by the model against this site's own counts. Never fatal.
 	if err := twoaiArt(db, today); err != nil {
 		fmt.Println("twoai_art:", err)
+	}
+	// Section trees and sourced facts written by theworldofai (rows 457, 458).
+	if err := twoaiSectionPages(db, today); err != nil {
+		fmt.Println("twoai_section_pages:", err)
 	}
 
 	// Staleness tripwire for benchmark results. The result snapshots in
