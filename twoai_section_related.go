@@ -26,8 +26,9 @@ import (
 
 // Words of each section's domain, one of which a matched record must carry.
 var sectionDomainWords = map[string]string{
-	"lsc": "pharmaceutical | pharma | drug | drugs | biotech | biotechnology | clinical | fda | ema | medical | medicine | patient | health | biology | therapeutic | protein | antibody | gmp | pharmacovigilance | medtech",
-	"hcd": "hospital | hospitals | clinical | clinician | patient | patients | health | healthcare | physician | nurse | nursing | medical | medicine",
+	"lsc":  "pharmaceutical | pharma | drug | drugs | biotech | biotechnology | clinical | fda | ema | medical | medicine | patient | health | biology | therapeutic | protein | antibody | gmp | pharmacovigilance | medtech",
+	"dmed": "diabetes | diabetic | glucose | insulin | obesity | glp | metformin | a1c | hba1c | glycemic | incretin",
+	"hcd":  "hospital | hospitals | clinical | clinician | patient | patients | health | healthcare | physician | nurse | nursing | medical | medicine",
 }
 
 // Words every page name in these trees shares, or that carry no subject.
@@ -35,7 +36,7 @@ var sectionStopWords = map[string]bool{
 	"ai": true, "and": true, "the": true, "of": true, "for": true, "in": true, "with": true, "its": true,
 	"a": true, "an": true, "how": true, "why": true, "using": true, "inside": true, "when": true, "needs": true,
 	"itself": true, "what": true, "to": true, "on": true, "by": true, "at": true, "as": true, "from": true,
-	"life": true, "sciences": true, "built": true, "list": true, "end": true, "s": true,
+	"life": true, "sciences": true, "built": true, "latest": true, "list": true, "end": true, "s": true,
 }
 
 // sectionNameWords returns the subject words of a page name, longest first.

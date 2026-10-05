@@ -41,7 +41,9 @@ type sectionPage struct {
 }
 
 // Where each section's root hangs: its parent page on the site.
-var sectionRootParent = map[string]string{"lsc": "industry-use-cases", "hcd": "industry-healthcare"}
+// The Latest in Diabetic Medicine, section dmed, joined Healthcare on
+// 2026-10-05 (row 483).
+var sectionRootParent = map[string]string{"lsc": "industry-use-cases", "hcd": "industry-healthcare", "dmed": "industry-healthcare"}
 
 const sectionBase = "/ai-ecosystem/enterprise-applications-governance-and-tools/"
 
@@ -110,6 +112,10 @@ func twoaiSectionPages(db *sql.DB, today string) error {
 		return chain
 	}
 	ix := sectionLoadIndex(db)
+	var drugs []dmedDrug
+	if _, ok := bySlug["dmed-pipeline"]; ok {
+		drugs = dmedLoadDrugs(db)
+	}
 	written := 0
 	for _, p := range pages {
 		var kids, sibs []ref
@@ -160,6 +166,14 @@ func twoaiSectionPages(db *sql.DB, today string) error {
 		}
 		if strings.TrimSpace(p.Explainer) != "" {
 			doc["explainer"] = p.Explainer
+		}
+		// Row 483: every diabetes page says plainly that it is not medical
+		// advice, and the pipeline page carries the drug table.
+		if p.Section == "dmed" {
+			doc["medical_note"] = true
+		}
+		if p.Slug == "dmed-pipeline" && len(drugs) > 0 {
+			doc["drug_table"] = dmedDrugTable(drugs)
 		}
 		var kp []string
 		if json.Unmarshal(p.KeyPoints, &kp) == nil && len(kp) > 0 {
@@ -220,8 +234,18 @@ func twoaiSectionPages(db *sql.DB, today string) error {
 			db.Exec(`UPDATE twoai_taxonomy SET blurb = $1 WHERE slug = 'life-sciences' AND COALESCE(blurb,'') = ''`, b)
 		}
 	}
-	if h, ok := bySlug["hcd"]; ok {
-		v, _ := json.Marshal([]ref{{Name: h.Name, Path: path("hcd"), Blurb: line(h)}})
+	if dp, ok := bySlug["dmed-pipeline"]; ok {
+		trail := append(crumbs(dp), ref{Name: dp.Name, Path: path(dp.Slug)})
+		written += dmedDrugPages(db, drugs, trail, dp.Name, path(dp.Slug), bySlug["dmed"].Name, path("dmed"), today)
+	}
+	var subpages []ref
+	for _, root := range []string{"hcd", "dmed"} {
+		if h, ok := bySlug[root]; ok {
+			subpages = append(subpages, ref{Name: h.Name, Path: path(root), Blurb: line(h)})
+		}
+	}
+	if len(subpages) > 0 {
+		v, _ := json.Marshal(subpages)
 		db.Exec(`INSERT INTO twoai_page_extras (page_path, key, value) VALUES ('industries/industry-healthcare.json', 'subpages', $1::jsonb)
 			ON CONFLICT (page_path, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
 			WHERE twoai_page_extras.value IS DISTINCT FROM EXCLUDED.value`, string(v))
