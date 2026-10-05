@@ -46,6 +46,17 @@ func twoaiLiveCounts(db *sql.DB) map[string]string {
 	one("enacted_laws_total", `SELECT count(*) FROM twoai_bill_events WHERE relevant AND status = 4`)
 	one("tools_total", `SELECT COALESCE(NULLIF(data->>'total','')::int, 0) FROM twoai_pages WHERE path = 'tools/index.json'`)
 	one("mcp_servers_total", `SELECT count(*) FROM twoai_mcp_servers`)
+	// Row 467, 2026-10-05: no count of the site's own data is typed anywhere.
+	one("glossary_terms", `SELECT jsonb_array_length(data->'terms') FROM site_content WHERE path = 'resources/glossary.json'`)
+	one("glossary_with_origin", `SELECT count(*) FROM site_content, jsonb_array_elements(data->'terms') t WHERE path = 'resources/glossary.json' AND COALESCE(t->>'origin','') <> ''`)
+	one("cves_total", `SELECT count(*) FROM twoai_pages WHERE kind = 'cve'`)
+	one("cwes_total", `SELECT count(*) FROM twoai_pages WHERE kind = 'cwe'`)
+	one("model_families_total", `SELECT count(*) FROM twoai_pages WHERE path LIKE 'tech/family-%'`)
+	one("benchmarks_total", `SELECT count(*) FROM twoai_benchmarks`)
+	one("industry_pages_total", `SELECT count(*) FROM twoai_pages WHERE path LIKE 'industries/industry-%' AND path <> 'industries/industry-use-cases.json'`)
+	one("lifesci_pages_total", `SELECT count(*) FROM twoai_section_pages WHERE section = 'lsc' AND status = 'live'`)
+	one("care_pages_total", `SELECT count(*) FROM twoai_section_pages WHERE section = 'hcd' AND status = 'live'`)
+	one("sourced_facts_total", `SELECT count(*) FROM twoai_sourced_facts WHERE status = 'live'`)
 	if y, ok := v["works_earliest_year"]; ok {
 		v["works_earliest_year"] = strings.ReplaceAll(y, ",", "")
 	}

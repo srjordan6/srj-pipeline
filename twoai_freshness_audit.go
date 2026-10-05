@@ -369,6 +369,17 @@ func twoaiFreshnessAudit(db *sql.DB, preview bool) error {
 		fmt.Fprintf(&b, "\nIntuitionLabs: %d of %d article summaries written, %d facts checked at their primary source, %d dropped for want of one.\n",
 			exWritten, exTotal, exVerified, exDropped)
 	}
+	// Typed counts of the site's own data, row 467.
+	if tc := twoaiTypedCounts(db); len(tc) > 0 {
+		fmt.Fprintf(&b, "\nTYPED COUNTS (row 467): %d numbers describing this site's own data are typed, not read from a token. First ones:\n", len(tc))
+		for i, t := range tc {
+			if i == 8 {
+				break
+			}
+			fmt.Fprintf(&b, "- %s: %s, live %s ({{%s}})\n", t.Where, t.Found, t.Live, t.Token)
+		}
+		b.WriteString("All of them are in twoai_typed_counts.\n")
+	}
 	b.WriteString("\nItems in twoai_freshness_items, datasets in twoai_freshness. srj owns the refreshers; send code needs by bridge.")
 	topic := fmt.Sprintf("Freshness: %d overdue, %d fixed, %d need a decision", overdueItems, fixedToday, len(decide))
 	if _, err := db.Exec(`INSERT INTO project_bridge (from_project, to_project, topic, body) VALUES ('srj','theworldofai',$1,$2)`, topic, b.String()); err == nil {

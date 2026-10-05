@@ -401,6 +401,11 @@ func main() {
 		return
 	}
 	// section_pages: the editor-written section trees and sourced facts alone.
+	// typed_counts: the row 467 sweep for typed counts of the site's own data.
+	if src == "typed_counts" {
+		twoaiTypedCounts(db)
+		return
+	}
 	if src == "section_pages" {
 		if err := twoaiSectionPages(db, time.Now().UTC().Format("2006-01-02")); err != nil {
 			fmt.Fprintln(os.Stderr, "section_pages:", err)
@@ -6352,11 +6357,15 @@ func twoaiPublishR2(db *sql.DB) error {
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
 	files := 0
+	// NO TYPED COUNTS (theworldofai row 467, Stephen 2026-10-05): any field of
+	// any page may carry a {{token}}, filled here from the live data.
+	liveCounts := twoaiLiveCounts(db)
 	for rows.Next() {
 		var p, d string
 		if rows.Scan(&p, &d) != nil {
 			continue
 		}
+		d = twoaiFillLiveCounts(d, liveCounts)
 		if err := tw.WriteHeader(&tar.Header{
 			Name: p, Mode: 0o644, Size: int64(len(d)), ModTime: time.Now(),
 		}); err != nil {
@@ -10654,11 +10663,13 @@ func twoaiPublish(db *sql.DB) error {
 		payload []byte
 	}
 	var changed []change
+	liveCounts := twoaiLiveCounts(db)
 	for rows.Next() {
 		var path, pretty string
 		if err := rows.Scan(&path, &pretty); err != nil {
 			return err
 		}
+		pretty = twoaiFillLiveCounts(pretty, liveCounts)
 		payload := []byte(pretty + "\n")
 		if repoSha[path] == blobSha(payload) {
 			unchanged++
