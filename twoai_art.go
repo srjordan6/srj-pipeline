@@ -123,10 +123,39 @@ func twoaiArtReadFacts(db *sql.DB) twoaiArtFacts {
 	return f
 }
 
-// line is what the model is told this site holds. Each section gets the
+// line is what the model is told this site holds, as {{token}} placeholders
+// rather than figures (theworldofai row 467, Stephen 2026-10-05: no count of
+// the site's own data is typed). The model copies a placeholder where it uses
+// a figure, and the publisher fills it from the live data on every run, so a
+// reading written once never freezes a count. The phrasing matches
+// numericLine, the form readings were written under before, which
+// twoaiArtTokenMigrate recognises.
+func (f twoaiArtFacts) line(section string) string {
+	const copyRule = " Every figure above is a placeholder in double braces: where you use one, copy the placeholder exactly, braces included, and never write a number in its place."
+	switch section {
+	case "sql":
+		return "This site currently tracks {{art_mcp_total}} active Model Context Protocol servers, {{art_db_mcp}} of them for SQL databases and warehouses, {{art_papers}} research papers in its library, {{art_tools}} AI tools and {{glossary_terms}} glossary terms. Every page on this site is itself built from a PostgreSQL database." + copyRule
+	case "edu":
+		return "This site currently holds {{art_compliance_pages}} compliance and regulation pages (student privacy law among them), {{art_papers}} research papers in its library, {{art_tools}} AI tools and {{glossary_terms}} glossary terms." + copyRule
+	case "eco":
+		return "This site currently tracks {{art_tickers}} listed AI-related instruments with daily prices, {{art_ma_filings}} merger and acquisition filings, {{art_company_pages}} company pages, {{art_all_cases}} active AI lawsuits, {{art_compliance_pages}} compliance and regulation pages, {{art_tools}} AI tools and {{glossary_terms}} glossary terms." + copyRule
+	case "res":
+		return "This site currently holds {{art_papers}} research papers in its library, {{art_claims}} claims extracted from research works, {{art_book_titles}} AI books in its catalogue, {{art_sci_models}} scientific models, {{art_tools}} AI tools and {{glossary_terms}} glossary terms. Content on this site never links to the Consensus search tool; it links to the original paper." + copyRule
+	case "med":
+		return "This site currently tracks {{art_med_models}} medical AI models, {{art_sci_models}} scientific models, {{art_pl_cases}} active product liability and wrongful death lawsuits against AI companies, {{art_compliance_pages}} compliance and regulation pages, {{art_tools}} AI tools and {{glossary_terms}} glossary terms." + copyRule
+	case "fin":
+		return "This site currently tracks {{art_company_pages}} company pages, {{art_ma_filings}} merger and acquisition filings, {{art_tickers}} listed AI-related instruments, {{art_compliance_pages}} compliance and regulation pages, {{art_all_cases}} active AI lawsuits, {{art_tools}} AI tools and {{glossary_terms}} glossary terms." + copyRule
+	case "law":
+		return "This site currently tracks {{art_all_cases}} active AI lawsuits ({{art_ip_cases}} of them intellectual property), {{art_caselaw}} AI case law precedents, {{art_compliance_pages}} compliance and regulation pages, {{art_bills}} state AI bills, {{art_tools}} AI tools and {{glossary_terms}} glossary terms." + copyRule
+	}
+	return "This site currently tracks {{art_image_models}} live image generation models, {{art_video_models}} video models, {{art_audio_models}} audio models, {{art_tools}} AI tools, {{art_ip_cases}} active intellectual property lawsuits (of which {{art_music_cases}} involve AI music services), and {{glossary_terms}} glossary terms." + copyRule
+}
+
+// numericLine is what the model was told before row 467, with the figures
+// written in. Each section gets the
 // figures that bear on it, because a number that does not belong on the page
 // is a number the model will reach for anyway.
-func (f twoaiArtFacts) line(section string) string {
+func (f twoaiArtFacts) numericLine(section string) string {
 	if section == "sql" {
 		return fmt.Sprintf("This site currently tracks %d active Model Context Protocol servers, %d of them for SQL databases and warehouses, %d research papers in its library, %d AI tools and %d glossary terms. Every page on this site is itself built from a PostgreSQL database.",
 			f.MCPTotal, f.DBMCP, f.Papers, f.Tools, f.GlossaryTerms)
@@ -362,6 +391,8 @@ func twoaiArtExpand(db *sql.DB, nodes []twoaiArtNode, facts twoaiArtFacts) (int,
 			kidsOf[c.Parent] = append(kidsOf[c.Parent], c.Name)
 		}
 	}
+	// Row 467: readings written with typed counts move to tokens first.
+	twoaiArtTokenMigrate(db, nodes, facts, kidsOf)
 	for _, n := range nodes {
 		if n.Kind == "topic" || written >= twoaiArtCap {
 			continue

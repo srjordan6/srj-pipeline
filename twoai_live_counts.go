@@ -57,6 +57,7 @@ func twoaiLiveCounts(db *sql.DB) map[string]string {
 	one("lifesci_pages_total", `SELECT count(*) FROM twoai_section_pages WHERE section = 'lsc' AND status = 'live'`)
 	one("care_pages_total", `SELECT count(*) FROM twoai_section_pages WHERE section = 'hcd' AND status = 'live'`)
 	one("sourced_facts_total", `SELECT count(*) FROM twoai_sourced_facts WHERE status = 'live'`)
+	twoaiArtLiveCounts(db, v)
 	if y, ok := v["works_earliest_year"]; ok {
 		v["works_earliest_year"] = strings.ReplaceAll(y, ",", "")
 	}
