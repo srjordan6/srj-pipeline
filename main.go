@@ -298,7 +298,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_build", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -386,6 +386,14 @@ func main() {
 	if src == "twoai_freshness" {
 		if err := twoaiFreshnessAudit(db, os.Getenv("TWOAI_FRESHNESS_PREVIEW") != ""); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_freshness:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	// twoai_ext_library: the IntuitionLabs library on the Healthcare page.
+	if src == "twoai_ext_library" {
+		if err := twoaiExtLibrary(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_ext_library:", err)
 			os.Exit(1)
 		}
 		return
@@ -6274,8 +6282,15 @@ func twoaiPublishR2(db *sql.DB) error {
 			 || CASE WHEN b.m IS NULL THEN '{}'::jsonb
 			         ELSE jsonb_build_object('readings', b.m) END
 			 || CASE WHEN n.m IS NULL THEN '{}'::jsonb
-			         ELSE jsonb_build_object('pinned_news', n.m) END)::text
+			         ELSE jsonb_build_object('pinned_news', n.m) END
+			 || COALESCE(x.m, '{}'::jsonb))::text
 		FROM twoai_pages p
+		LEFT JOIN LATERAL (
+			-- PAGE EXTRAS, 2026-10-04: a block another stage attaches to a page
+			-- it does not build (the IntuitionLabs library on Healthcare),
+			-- merged here like readings so the page's own builder cannot drop it.
+			SELECT jsonb_object_agg(pe.key, pe.value) AS m FROM twoai_page_extras pe WHERE pe.page_path = p.path
+		) x ON true
 		LEFT JOIN LATERAL (
 			-- PINNED NEWS, 2026-09-28. twoai_page_news held a story chosen for a
 			-- page (by Stephen, or by the accounting feed) and nothing read it,
@@ -10551,8 +10566,13 @@ func twoaiPublish(db *sql.DB) error {
 			 || CASE WHEN b.m IS NULL THEN '{}'::jsonb
 			         ELSE jsonb_build_object('readings', b.m) END
 			 || CASE WHEN n.m IS NULL THEN '{}'::jsonb
-			         ELSE jsonb_build_object('pinned_news', n.m) END))
+			         ELSE jsonb_build_object('pinned_news', n.m) END
+			 || COALESCE(x.m, '{}'::jsonb)))
 		FROM twoai_pages p
+		LEFT JOIN LATERAL (
+			-- PAGE EXTRAS; see the first publisher's query.
+			SELECT jsonb_object_agg(pe.key, pe.value) AS m FROM twoai_page_extras pe WHERE pe.page_path = p.path
+		) x ON true
 		LEFT JOIN LATERAL (
 			-- PINNED NEWS, 2026-09-28; see the first publisher's query.
 			SELECT jsonb_agg(jsonb_build_object('headline', pn.headline,
