@@ -465,6 +465,25 @@ func twoaiSourcePages(db *sql.DB, today string) (int, error) {
 			WHERE path = $1 AND EXISTS (SELECT 1 FROM jsonb_array_elements(data->'points') q WHERE q->>'source' = $2 AND COALESCE(q->>'reading_path','') <> $3)`,
 			"industries/"+p.slug+".json", p.url, base+p.uid+"/")
 	}
+	// SAY WHY THERE IS NO SUMMARY, theworldofai row 444 (wording approved
+	// 2026-10-04). A point whose source site failed both the plain read and
+	// the browser read carries source_unreadable, and the industry page shows
+	// "Summary not available, the source site could not be read." under its
+	// source link. The flag goes as soon as the site is read or a summary
+	// exists.
+	if res, err := db.Exec(`WITH bad AS (SELECT domain FROM twoai_site_crawl WHERE crawl_status = 'unreadable-browser'),
+		pg AS (SELECT p.path, (SELECT jsonb_agg(CASE
+				WHEN COALESCE(pt->>'reading_path','') = '' AND lower(regexp_replace(substring(pt->>'source' from '^https?://([^/:]+)'), '^www[.]', '')) IN (SELECT domain FROM bad)
+					THEN pt || '{"source_unreadable": true}'::jsonb
+				ELSE pt - 'source_unreadable' END ORDER BY ord)
+				FROM jsonb_array_elements(p.data->'points') WITH ORDINALITY AS e(pt, ord)) AS pts
+			FROM twoai_pages p WHERE p.path LIKE 'industries/%' AND p.path NOT LIKE 'industries/source-%' AND jsonb_typeof(p.data->'points') = 'array')
+		UPDATE twoai_pages t SET data = jsonb_set(t.data, '{points}', pg.pts), updated_at = now()
+		FROM pg WHERE t.path = pg.path AND pg.pts IS NOT NULL AND t.data->'points' IS DISTINCT FROM pg.pts`); err != nil {
+		fmt.Println("twoai_source_pages: unreadable flags:", err)
+	} else if n, _ := res.RowsAffected(); n > 0 {
+		fmt.Printf("twoai_source_pages: unreadable-source notes changed on %d industry pages\n", n)
+	}
 	fmt.Printf("twoai_source_pages: written=%d skipped_unchanged=%d unusable=%d published=%d of %d cited sources\n",
 		written, skipped, unusable, published, len(jobs))
 	return published, nil
