@@ -5225,15 +5225,28 @@ func twoaiBuild(db *sql.DB) error {
 	// Deliberately a warning, not a merge. Auto-copying between two tables
 	// whose shapes differ would invent slugs silently, and a slug is a URL that
 	// can never move once published.
-	var syncedActive, inLibrary int
-	db.QueryRow(`SELECT count(*) FROM synced_glossary_terms WHERE is_active`).Scan(&syncedActive)
-	db.QueryRow(`SELECT jsonb_array_length(data->'terms') FROM site_content
-		WHERE path='resources/glossary.json'`).Scan(&inLibrary)
-	if syncedActive > 0 && inLibrary > 0 && syncedActive != inLibrary {
+	//
+	// The library is the record. audit_sync copies it into
+	// synced_glossary_terms after this stage in the same run, so a library
+	// ahead of the mirror is normal (row 477: 720 against 690, equal again by
+	// the end of the run). Only a term in the mirror and missing from the
+	// library is drift, because it would never publish.
+	var orphans []string
+	if rows, err := db.Query(`SELECT s.term FROM synced_glossary_terms s WHERE s.is_active
+		AND NOT EXISTS (SELECT 1 FROM site_content c, jsonb_array_elements(c.data->'terms') t
+			WHERE c.path='resources/glossary.json' AND t->>'term' = s.term) ORDER BY 1 LIMIT 20`); err == nil {
+		for rows.Next() {
+			var t string
+			if rows.Scan(&t) == nil {
+				orphans = append(orphans, t)
+			}
+		}
+		rows.Close()
+	}
+	if len(orphans) > 0 {
 		fmt.Fprintf(os.Stderr,
-			"twoai_build: GLOSSARY DRIFT: synced_glossary_terms has %d active, site_content library has %d. "+
-				"Only the library renders. Terms present in one and not the other will not publish.\n",
-			syncedActive, inLibrary)
+			"twoai_build: GLOSSARY DRIFT: %d active term(s) in synced_glossary_terms are missing from the site_content library and will not publish: %s\n",
+			len(orphans), strings.Join(orphans, "; "))
 	}
 
 	var glossary string
