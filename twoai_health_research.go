@@ -121,6 +121,7 @@ type twoaiHRQuery struct {
 }
 
 var (
+	twoaiHRLpaRe    = regexp.MustCompile(`(?i)lipoprotein\s*\(\s*a\s*\)|\blp\s*\(\s*a\s*\)|apolipoprotein\s*\(\s*a\s*\)|\bapo\s*\(\s*a\s*\)|pelacarsen|olpasiran|lepodisiran|zerlasiran|muvalaplin|\bctx-?320\b`)
 	twoaiHRKidneyRe = regexp.MustCompile(`(?i)kidney|\brenal\b|\bckd\b|\bdkd\b|nephropath\w*|albuminuri\w*|\begfr\b|dialysis`)
 	twoaiHRHeartRe  = regexp.MustCompile(`(?i)heart failure|cardiovascular|\bcardiac\b|\bmace\b|myocardial|\bhfpef\b|\bhfref\b|coronary|\bstroke\b`)
 	twoaiHRType1Re  = regexp.MustCompile(`(?i)type 1 diabet\w*|\bt1d\b|\bt1dm\b|autoimmun\w*|\bislets?\b|beta[- ]cells?|β[- ]cells?|hypoimmune`)
@@ -368,6 +369,7 @@ type hrRun struct {
 	calls, queriesRun          int
 	newRows, refreshed         int
 	ftChecked, ftSaved, closed int
+	offTopic                   int
 	oaStopped                  bool
 	notices                    []string
 }
@@ -505,8 +507,8 @@ func twoaiHealthResearch(db *sql.DB) error {
 		// Stdout, not stderr: PowerShell logs stderr as a NativeCommandError.
 		fmt.Println("twoai_health_research: notice:", n)
 	}
-	fmt.Printf("twoai_health_research: queries=%d calls=%d new=%d refreshed=%d ft_checked=%d ft_saved=%d closed=%d ok=true\n",
-		r.queriesRun, r.calls, r.newRows, r.refreshed, r.ftChecked, r.ftSaved, r.closed)
+	fmt.Printf("twoai_health_research: queries=%d calls=%d new=%d refreshed=%d ft_checked=%d ft_saved=%d closed=%d off_topic=%d ok=true\n",
+		r.queriesRun, r.calls, r.newRows, r.refreshed, r.ftChecked, r.ftSaved, r.closed, r.offTopic)
 	return nil
 }
 
@@ -670,6 +672,13 @@ func (r *hrRun) upsert(q twoaiHRQuery, doi string, w twoaiHRWork) error {
 		return fmt.Errorf("work has no title")
 	}
 	abstract := twoaiOAAbstract(w.AbstractII)
+	// OpenAlex search drops "(a)", so "lp(a)" matched any "lp" and the gene
+	// editing query brought PCSK9 editors and a paper on phosphate tolerance
+	// in plants. An Lp(a) paper must name Lp(a) or one of its drugs.
+	if q.topic == "lpa" && !twoaiHRLpaRe.MatchString(title+" "+abstract) {
+		r.offTopic++
+		return nil
+	}
 	sub, why := twoaiHRSubtopic(q, title+" "+abstract)
 	match := "query=" + q.key + " subtopic=" + sub
 	if why != "" {

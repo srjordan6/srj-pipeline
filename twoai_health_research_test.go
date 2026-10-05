@@ -258,3 +258,16 @@ func TestHRBridgeBody(t *testing.T) {
 		t.Error("bridge body has an em dash")
 	}
 }
+
+func TestTwoaiHRLpaRe(t *testing.T) {
+	for _, s := range []string{"Lipoprotein(a) and risk", "elevated Lp(a) levels", "olpasiran in OCEAN(a)", "apolipoprotein (a) isoforms", "CTX320 first in human"} {
+		if !twoaiHRLpaRe.MatchString(s) {
+			t.Errorf("missed %q", s)
+		}
+	}
+	for _, s := range []string{"A potent epigenetic editor targeting human PCSK9", "LPA receptor signalling in fibrosis", "phosphate deficiency tolerance in rice"} {
+		if twoaiHRLpaRe.MatchString(s) {
+			t.Errorf("matched %q", s)
+		}
+	}
+}

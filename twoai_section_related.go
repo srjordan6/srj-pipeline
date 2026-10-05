@@ -27,6 +27,14 @@ import (
 // Sections whose papers come from twoai_health_papers, not twoai_works.
 var sectionHealthLibrary = map[string]bool{"dmed": true, "lpa": true}
 
+// A paper shown on those pages names the subject in its title; the harvest
+// files broad reviews too (a global burden of disease study ranked first
+// on the GLP-1 page by citations). Postgres regular expressions.
+var sectionHealthTitleRe = map[string]string{
+	"dmed": `diabet|glyc|insulin|glp|semaglutide|tirzepatide|retatrutide|incretin|islet|beta.cell|sglt|obes|a1c|glucose|cgm|teplizumab|amylin|cagrilintide`,
+	"lpa":  `lipoprotein ?\( ?a ?\)|lp ?\( ?a ?\)|apolipoprotein|pelacarsen|olpasiran|lepodisiran|zerlasiran|muvalaplin|ctx-?320`,
+}
+
 // Words of each section's domain, one of which a matched record must carry.
 var sectionDomainWords = map[string]string{
 	"lsc":  "pharmaceutical | pharma | drug | drugs | biotech | biotechnology | clinical | fda | ema | medical | medicine | patient | health | biology | therapeutic | protein | antibody | gmp | pharmacovigilance | medtech",
@@ -269,7 +277,9 @@ func sectionRelated(db *sql.DB, ix sectionRelatedIndex, p sectionPage, selfPath,
 		}
 		if rows, err := db.Query(`SELECT title, COALESCE(year,0), COALESCE(citations,0), doi FROM twoai_health_papers
 			WHERE topic = $1 AND ($2 = '' OR subtopic = $2) AND COALESCE(title,'') <> '' AND COALESCE(status,'') <> 'rejected'
-			ORDER BY citations DESC NULLS LAST, year DESC NULLS LAST LIMIT 5`, p.Section, sub); err == nil {
+			  AND title ~* $3
+			ORDER BY COALESCE(promising, false) DESC, citations DESC NULLS LAST, year DESC NULLS LAST LIMIT 5`,
+			p.Section, sub, sectionHealthTitleRe[p.Section]); err == nil {
 			var papers []map[string]any
 			for rows.Next() {
 				var title, doi string
