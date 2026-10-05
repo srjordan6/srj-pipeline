@@ -35,6 +35,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"encoding/xml"
@@ -308,7 +309,16 @@ func twoaiDart(db *sql.DB) error {
 	if err := twoaiDartEnsure(db); err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: 60 * time.Second}
+	// opendart.fss.or.kr offers only RSA key exchange, which Go stopped
+	// offering by default, so every call failed with "tls: handshake failure"
+	// (row 477, 2026-10-05). The ECDHE suites stay first, should DART add them.
+	client := &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, CipherSuites: []uint16{
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_RSA_WITH_AES_128_GCM_SHA256, tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		}},
+	}}
 	if err := twoaiDartRefreshCorps(db, key, client); err != nil {
 		// A stale register is survivable: codes already resolved keep working.
 		fmt.Fprintln(os.Stderr, "twoai_dart:", err)

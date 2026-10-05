@@ -60,8 +60,11 @@ var twoaiFredSeries = []fredSeries{
 		"Bureau of Labor Statistics", "Power usage effectiveness", "US dollars per kWh"},
 	{"PCU335311335311", "Producer price index: power, distribution and specialty transformers",
 		"Bureau of Labor Statistics", "Critical equipment lead times", "index, 1982 = 100"},
-	{"PCU3353133353132", "Producer price index: switchgear and switchboard apparatus",
-		"Bureau of Labor Statistics", "Critical equipment lead times", "index"},
+	// PCU3353133353132 was a product-level code FRED does not carry (404).
+	// The industry-level series below was checked on fred.stlouisfed.org on
+	// 2026-10-05, it resolves and runs from June 1985.
+	{"PCU335313335313", "Producer price index: switchgear and switchboard apparatus manufacturing",
+		"Bureau of Labor Statistics", "Critical equipment lead times", "index, June 1985 = 100"},
 	{"IPG3344S", "Industrial production: semiconductors and electronic components",
 		"Federal Reserve Board", "HBM supply concentration", "index, 2017 = 100"},
 	{"PCU334413334413", "Producer price index: semiconductors and related devices",

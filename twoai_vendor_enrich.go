@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -215,6 +216,7 @@ func twoaiVendorEnrich(db *sql.DB) error {
 	// Per-host pacing: several hundred posts can share one vendor, and a
 	// burst at one company's blog is rude regardless of robots.txt.
 	lastHost := map[string]time.Time{}
+	failWhy := map[string]int{}
 	// STOP BEFORE THE RUNNER STOPS US. The scheduled run gives each stage 20
 	// minutes and kills it at the deadline - which it did on 2026-09-14,
 	// mid-batch, losing the post in flight and the summary line. With the
@@ -249,6 +251,7 @@ func twoaiVendorEnrich(db *sql.DB) error {
 		if err != nil {
 			db.Exec(`UPDATE twoai_vendor_posts SET enrich_attempts=enrich_attempts+1 WHERE slug=$1`, p.slug)
 			failed++
+			failWhy[host+" no answer"]++
 			continue
 		}
 		bodyB, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
@@ -257,6 +260,7 @@ func twoaiVendorEnrich(db *sql.DB) error {
 		if code != 200 {
 			db.Exec(`UPDATE twoai_vendor_posts SET enrich_attempts=enrich_attempts+1 WHERE slug=$1`, p.slug)
 			failed++
+			failWhy[fmt.Sprintf("%s http %d", host, code)]++
 			continue
 		}
 
@@ -354,5 +358,19 @@ func twoaiVendorEnrich(db *sql.DB) error {
 		FROM twoai_vendor_posts WHERE retired_at IS NULL`).Scan(&remaining, &total)
 	fmt.Printf("twoai_vendor_enrich: filled=%d (metadata=%d body=%d) no_description=%d site_tagline_rejected=%d failed=%d | %d of %d posts still without a summary\n",
 		filled, fromMeta, fromBody, empty, boiler, failed, remaining, total)
+	// Say who refused, so failed=31 reads as one site blocking us rather than
+	// a broken stage (row 477). A post stops being tried after three attempts.
+	if len(failWhy) > 0 {
+		keys := make([]string, 0, len(failWhy))
+		for k := range failWhy {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool { return failWhy[keys[i]] > failWhy[keys[j]] })
+		parts := []string{}
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("%s x%d", k, failWhy[k]))
+		}
+		fmt.Printf("twoai_vendor_enrich: failures by site: %s\n", strings.Join(parts, ", "))
+	}
 	return nil
 }

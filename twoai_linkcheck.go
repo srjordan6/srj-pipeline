@@ -192,7 +192,7 @@ func twoaiLinkCheck(db *sql.DB) error {
 	if derr == nil {
 		type deadLink struct {
 			URL, Kind, Since string
-			Status            int
+			Status           int
 		}
 		var list []map[string]any
 		for drows.Next() {
@@ -234,8 +234,13 @@ func twoaiLinkProbe(client *http.Client, u string) (int, string) {
 		resp.Body.Close()
 		return resp.StatusCode
 	}
+	// Any HEAD answer that is not a success is confirmed with a GET before it
+	// counts. Until 2026-10-05 only 403, 405, 429 and 5xx were retried, and
+	// three live pages were marked dead on HEAD alone: techcommunity.microsoft.com
+	// answers HEAD with 400, wipro.com with 406 and thenextweb.com with 404,
+	// while all three serve the page with 200 to a GET.
 	code := try("HEAD")
-	if code == 0 || code == 403 || code == 405 || code == 429 || code >= 500 {
+	if code < 200 || code >= 400 {
 		code = try("GET")
 	}
 	switch {
