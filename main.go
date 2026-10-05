@@ -4281,6 +4281,8 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"Mistral AI", "https://mistral.ai/rss.xml"},
 		{"Stability AI (coverage)", "https://news.google.com/rss/search?q=%22Stability+AI%22&hl=en-US&gl=US&ceid=US:en"},
 		{"AI21 Labs (coverage)", "https://news.google.com/rss/search?q=%22AI21+Labs%22&hl=en-US&gl=US&ceid=US:en"},
+		// Mercor and its founders, tracked from 2026-10-04 (theworldofai rows 446, 447).
+		{"Mercor (coverage)", "https://news.google.com/rss/search?q=%22Mercor%22+AI+OR+%22Brendan+Foody%22+OR+%22Adarsh+Hiremath%22+OR+%22Surya+Midha%22&hl=en-US&gl=US&ceid=US:en"},
 		{"The Alan Turing Institute", "https://www.turing.ac.uk/rss.xml"},
 		{"INRIA", "https://inria.fr/en/rss.xml"},
 		{"RIKEN AIP", "https://www.riken.jp/en/feed/"},
@@ -7360,6 +7362,31 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 					}
 				}
 				payload["company"] = enriched
+			}
+			// FOUNDERS, theworldofai row 447 (2026-10-04, Mercor and its three
+			// founders): the people this site has a page for who founded the
+			// company, from the entity graph, so the founder's page and the
+			// company page link both ways. Founders only: executive_of links
+			// carry no end date, and one names an OpenAI policy lead from the
+			// article reporting his departure, so they cannot say who leads a
+			// company today.
+			if pr, err := db.Query(`SELECT DISTINCT ON (g.other_uid) g.other_uid, p.data->>'name'
+				FROM twoai_graph g JOIN twoai_pages p ON p.path = 'people/' || g.other_uid || '.json'
+				WHERE g.kind = 'company' AND g.uid = $1 AND g.other_kind = 'person' AND g.confidence <> 'candidate'
+				  AND g.relation = 'founder_of' AND COALESCE(p.data->>'name','') <> ''
+				ORDER BY g.other_uid`, c.UID); err == nil {
+				var people []map[string]string
+				for pr.Next() {
+					var uid, name string
+					if pr.Scan(&uid, &name) == nil {
+						people = append(people, map[string]string{"name": name, "href": "/ai-ecosystem/ecosystem-entities-market-and-operations/" + uid + "/", "role": "Founder"})
+					}
+				}
+				pr.Close()
+				sort.Slice(people, func(i, j int) bool { return people[i]["name"] < people[j]["name"] })
+				if len(people) > 0 {
+					payload["people"] = people
+				}
 			}
 			if err := upsert("companies/"+c.UID+".json", "company", payload); err != nil {
 				return count, err

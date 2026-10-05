@@ -69,7 +69,7 @@ var freshDatasets = []freshDataset{
 				WHEN results->>'retrieved' ~ '^\d{4}-\d{2}-\d{2}' THEN left(results->>'retrieved',10)::date
 				WHEN results->>'as_of' ~ '^\d{4}-\d{2}-\d{2}' THEN left(results->>'as_of',10)::date
 				WHEN results->>'as_of' ~ '^\d{4}-\d{2}$' THEN (results->>'as_of' || '-01')::date END,
-			CASE WHEN slug IN (` + freshBenchWeekly + `) THEN 7 WHEN slug LIKE 'mlperf%' THEN 90 ELSE review_interval_days END
+			CASE WHEN results->>'paper_only' = 'true' THEN 365 WHEN slug IN (` + freshBenchWeekly + `) THEN 7 WHEN slug LIKE 'mlperf%' THEN 90 ELSE review_interval_days END
 			FROM twoai_benchmarks`},
 	{Key: "model_catalog", Label: "Model catalog", Cadence: 1, Auto: true, Stage: "twoai_model_watch",
 		How: "Hugging Face and provider model lists", Items: `SELECT 'catalog', max(fetched_at)::date, NULL::int FROM twoai_model_catalog`},
