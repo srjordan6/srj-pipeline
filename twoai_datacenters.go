@@ -494,6 +494,8 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			"shape": "dc-metric", "uid": u, "tax": "data-centers", "generated": today,
 			"metric": m, "siblings": siblings,
 			"parent": map[string]any{"uid": twoaiUID("section:data-centers"), "name": name},
+			// The category's own page (row 451).
+			"category_hub": map[string]any{"uid": dcCategoryUID(m.Category), "name": m.Category},
 		}
 		mj, _ := json.Marshal(mdoc)
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count)
@@ -760,6 +762,26 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 			ON CONFLICT (path) DO UPDATE SET data=EXCLUDED.data, url_count=1, updated_at=now()`, string(sj))
 	}
 
+	// One hub page per metric category (theworldofai row 451).
+	var catMetrics []dcCatMetric
+	for _, m := range metrics {
+		catMetrics = append(catMetrics, dcCatMetric{Track: m.Track, Category: m.Category, Metric: m.Metric,
+			Definition: m.Definition, UID: metricUID[m.Metric]})
+	}
+	var catFacs []dcCatFacility
+	for _, ef := range enriched {
+		catFacs = append(catFacs, dcCatFacility{UID: ef.UID, Name: ef.Name, Profile: ef.Profile})
+	}
+	builderUID := map[string]string{}
+	for _, b := range builderPages {
+		builderUID[b.Label] = b.UID
+	}
+	var catBuilders []dcCatBuilder
+	for _, c := range capex {
+		catBuilders = append(catBuilders, dcCatBuilder{Name: c.Name, End: c.End, Latest: c.Latest, UID: builderUID[c.Name]})
+	}
+	categoryHubs := twoaiDCCategoryHubs(db, today, name, catMetrics, catFacs, catBuilders, keepPaths)
+
 	doc := map[string]any{
 		"shape": "datacenters", "uid": twoaiUID("section:data-centers"),
 		"tax": "data-centers", "generated": today, "name": name, "blurb": blurb,
@@ -767,6 +789,7 @@ func twoaiDatacenters(db *sql.DB, today string) (int, error) {
 		"operators":     operators,
 		"power_cooling": powerCooling, "power_terms": powerTerms,
 		"metric_pages": metricPages, "builder_pages": builderPages,
+		"category_hubs":       categoryHubs,
 		"operator_pages":      operatorPages,
 		"operators_index_uid": twoaiUID("dc-operators-index"),
 		"states_index_uid":    twoaiUID("dc-states-index"),
