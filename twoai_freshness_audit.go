@@ -75,12 +75,11 @@ var freshDatasets = []freshDataset{
 		How: "Hugging Face and provider model lists", Items: `SELECT 'catalog', max(fetched_at)::date, NULL::int FROM twoai_model_catalog`},
 	{Key: "model_prices", Label: "Model prices", Cadence: 1, Auto: true, How: "provider price lists",
 		Items: `SELECT 'prices', max(day), NULL::int FROM twoai_model_prices`},
-	// A lookup table seeded once on 2026-08-18; the family histories use
-	// its Wikipedia titles. Nothing refreshes it yet, so overdue means a
-	// decision. (twoai_model_deprecations is not on the site, so it is not
-	// listed.)
-	{Key: "wikidata_models", Label: "Model records from Wikidata", Cadence: 90, Auto: false, How: "Wikidata, seeded once, no refresher yet",
-		Items: `SELECT 'wikidata', max(fetched_on), NULL::int FROM twoai_wikidata_models`},
+	// A lookup table the family histories use for Wikipedia titles, seeded
+	// 2026-08-18 and refreshed by twoaiWikidataModelsRefresh every 90 days.
+	// (twoai_model_deprecations is not on the site, so it is not listed.)
+	{Key: "wikidata_models", Label: "Model records from Wikidata", Cadence: 90, Auto: true, How: "Wikidata query service, re-queried every 90 days",
+		Items: `SELECT 'wikidata', min(fetched_on), NULL::int FROM twoai_wikidata_models`},
 	{Key: "model_families", Label: "Model family pages", Cadence: 7, Auto: true, How: "rebuilt from the model catalog each run",
 		Items: `SELECT name, page_built_on, NULL::int FROM twoai_model_families WHERE page_built_on IS NOT NULL`},
 	// Fourteen days, not seven: intel checks up to twelve dockets a run,

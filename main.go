@@ -5940,6 +5940,9 @@ func twoaiBuild(db *sql.DB) error {
 	// After twoaiModels, which rewrites models/llms.json, so the family list
 	// attached to that page survives the run.
 	twoaiModelFamilies(db, today)
+	// The Wikidata model table the histories read, refreshed every 90 days
+	// (theworldofai row 444).
+	twoaiWikidataModelsRefresh(db)
 	// History section on each family page (theworldofai row 423), attached
 	// after the family docs are rewritten.
 	twoaiFamilyHistory(db)
