@@ -119,9 +119,11 @@ func twoaiDartEnsure(db *sql.DB) error {
 		return err
 	}
 	// The two HBM suppliers EDGAR does not cover. Names as DART spells them;
-	// the codes are resolved on the first run.
+	// the codes are resolved on the first run. SK hynix is "SK하이닉스" in the
+	// register (stock code 000660), not the phonetic 에스케이하이닉스, which
+	// matched nothing from 2026-09 until 2026-10-06.
 	_, err := db.Exec(`INSERT INTO twoai_dart_watch (name, note) VALUES
-		('에스케이하이닉스', 'SK hynix. HBM supplier; not an SEC filer'),
+		('SK하이닉스', 'SK hynix. HBM supplier; not an SEC filer'),
 		('삼성전자', 'Samsung Electronics. HBM supplier; not an SEC filer')
 		ON CONFLICT (name) DO NOTHING`)
 	return err
