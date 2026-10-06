@@ -142,6 +142,7 @@ func twoaiFeedSummary(vals ...string) string {
 }
 
 func twoaiVendorFeeds(db *sql.DB) error {
+	englishSet := twoaiVendorEnglishSet(db)
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_vendor_feeds (
 		vendor text PRIMARY KEY,
 		feed_url text NOT NULL,
@@ -281,9 +282,8 @@ func twoaiVendorFeeds(db *sql.DB) error {
 				(slug, vendor, title, url, summary, posted_on, entity_uid, entity_kind, source)
 				VALUES ($1,$2,$3,$4,$5,$6::date,$7,$8,'feed')
 				ON CONFLICT (slug) DO UPDATE SET
-					vendor=EXCLUDED.vendor, title=EXCLUDED.title, url=EXCLUDED.url,
-					summary=CASE WHEN EXCLUDED.summary <> '' THEN EXCLUDED.summary
-					             ELSE twoai_vendor_posts.summary END,
+					vendor=EXCLUDED.vendor, url=EXCLUDED.url,
+					`+englishSet+`,
 					entity_uid=COALESCE(EXCLUDED.entity_uid, twoai_vendor_posts.entity_uid),
 					entity_kind=COALESCE(EXCLUDED.entity_kind, twoai_vendor_posts.entity_kind),
 					source='feed', last_seen=now()`,

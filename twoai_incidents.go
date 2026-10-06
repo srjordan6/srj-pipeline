@@ -15,6 +15,10 @@ package main
 //	            and we do not reproduce the publisher article excerpt the
 //	            feed carries. Neither is ours to republish.
 //
+// A headline in another language is shown in English, labelled with the
+// language it was translated from, and the publisher's wording is kept in
+// title_original (Stephen's rule, bridge row 508, 2026-10-06).
+//
 // AIID is credited by name and link wherever these rows render, with its
 // licence stated. The rows are marked cite_only so they never enter the
 // training corpus, exactly like the ODbL facility registry.
@@ -71,7 +75,8 @@ func twoaiIncidentsHarvest(db *sql.DB) {
 		fmt.Printf("twoai_incidents: feed unparsed: %v items=%d\n", err, len(f.Items))
 		return
 	}
-	stored, skipped := 0, 0
+	twoaiEnglishSchema(db)
+	stored, skipped, translated := 0, 0, 0
 	for _, it := range f.Items {
 		link := strings.TrimSpace(it.Link)
 		title := strings.TrimSpace(it.Title)
@@ -110,29 +115,190 @@ func twoaiIncidentsHarvest(db *sql.DB) {
 		if guid == "" {
 			guid = fmt.Sprintf("aiid:%d:%d", incID, repID)
 		}
+		// THE TITLE IN ENGLISH, AND NEVER BACK. Stephen's rule, bridge row
+		// 508, 2026-10-06: everything visitors see is in English. A foreign
+		// headline is translated here, the publisher's own wording kept in
+		// title_original, and a title that is already an English rendering,
+		// the pipeline's or one the content project wrote by hand (guids
+		// 82754709 and 1ee8bf63 on 2026-10-06), is never overwritten by the
+		// next harvest: only title_original follows the feed.
+		var cur incidentTitle
+		var curOrig, curLang sql.NullString
+		exists := db.QueryRow(`SELECT title, title_original, title_lang FROM twoai_incidents WHERE guid=$1`, guid).
+			Scan(&cur.Title, &curOrig, &curLang) == nil
+		cur.Original, cur.Lang = curOrig.String, curLang.String
+		feedLang, feedEN := twoaiEnglishLang(title), ""
+		if feedLang != "" {
+			if incidentTitleKept(exists, cur, title, true) {
+				if _, l, ok := twoaiEnglishCached(db, title); ok && l != "en" {
+					feedLang = l
+				}
+			} else if en, l, err := twoaiEnglish(db, "translate_title", title); err == nil {
+				if l == "en" {
+					feedLang = ""
+				} else {
+					feedLang, feedEN = l, en
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "twoai_incidents: %s left untranslated for now: %v\n", guid, err)
+			}
+		}
+		m := incidentTitleMerge(exists, cur, title, feedLang, feedEN)
+		if m.Original != "" && m.Title != m.Original {
+			translated++
+			if !exists || cur.Title != m.Title {
+				twoaiEnglishLogged(db, "twoai_incidents", guid, "title", m.Lang, m.Original, m.Title, "translate_title", "srj")
+			}
+		}
 		// NOTE: it.Description is deliberately never stored. It holds the
 		// publisher's article excerpt, which is not ours to republish.
 		if _, err := db.Exec(`INSERT INTO twoai_incidents
-			(guid, incident_id, report_id, title, url, domain, published)
-			VALUES ($1,$2,$3,$4,$5,$6,$7)
+			(guid, incident_id, report_id, title, url, domain, published, title_original, title_lang)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),NULLIF($9,''))
 			ON CONFLICT (guid) DO UPDATE SET incident_id=EXCLUDED.incident_id,
 				report_id=EXCLUDED.report_id, title=EXCLUDED.title, url=EXCLUDED.url,
-				domain=EXCLUDED.domain, published=EXCLUDED.published, last_seen=now()`,
-			guid, incID, repID, title, link, host, pub); err == nil {
+				domain=EXCLUDED.domain, published=EXCLUDED.published,
+				title_original=EXCLUDED.title_original, title_lang=EXCLUDED.title_lang, last_seen=now()`,
+			guid, incID, repID, m.Title, link, host, pub, m.Original, m.Lang); err == nil {
 			stored++
+		} else {
+			fmt.Fprintln(os.Stderr, "twoai_incidents: upsert:", err)
 		}
 	}
 	var total int
 	db.QueryRow(`SELECT count(*) FROM twoai_incidents`).Scan(&total)
-	fmt.Printf("twoai_incidents: feed items=%d stored=%d skipped=%d total=%d\n",
-		len(f.Items), stored, skipped, total)
+	fmt.Printf("twoai_incidents: feed items=%d stored=%d skipped=%d translated=%d total=%d\n",
+		len(f.Items), stored, skipped, translated, total)
+}
+
+// incidentTitle is a stored incident headline: the title shown, the
+// publisher's original when the title is a translation, and its language.
+// A row whose title equals its original is a foreign headline still waiting
+// for its translation.
+type incidentTitle struct {
+	Title, Original, Lang string
+}
+
+// incidentTitleKept reports whether the stored title is already an English
+// rendering of a foreign headline, which a re-harvest must leave alone.
+// Either the row says so (an original that differs from the title), or the
+// row predates title_original and holds English where the feed now carries a
+// foreign headline: a hand translation.
+func incidentTitleKept(exists bool, cur incidentTitle, feed string, foreign bool) bool {
+	if !exists {
+		return false
+	}
+	if cur.Original != "" && cur.Title != cur.Original {
+		return true
+	}
+	return cur.Original == "" && foreign && cur.Title != feed && twoaiEnglishLang(cur.Title) == ""
+}
+
+// incidentTitleMerge decides what a harvest writes. feedLang is "" when the
+// feed's headline is English, feedEN "" when no translation could be had.
+func incidentTitleMerge(exists bool, cur incidentTitle, feed, feedLang, feedEN string) incidentTitle {
+	foreign := feedLang != ""
+	if incidentTitleKept(exists, cur, feed, foreign) {
+		lang := cur.Lang
+		if foreign {
+			lang = feedLang
+		}
+		return incidentTitle{Title: cur.Title, Original: feed, Lang: lang}
+	}
+	if !foreign {
+		return incidentTitle{Title: feed}
+	}
+	if feedEN != "" && feedEN != feed {
+		return incidentTitle{Title: feedEN, Original: feed, Lang: feedLang}
+	}
+	return incidentTitle{Title: feed, Original: feed, Lang: feedLang}
+}
+
+// twoaiIncidentEnglish puts a stored incident title into English if it is not
+// yet, a row left waiting by the harvest or one stored before 2026-10-06,
+// writes the translation back to every row carrying that headline and
+// returns title, original and language. An English title passes through.
+func twoaiIncidentEnglish(db *sql.DB, id int, title, orig, lang string) (string, string, string) {
+	pending := orig != "" && title == orig
+	legacy := orig == "" && twoaiEnglishLang(title) != ""
+	if !pending && !legacy {
+		return title, orig, lang
+	}
+	en, l := twoaiTranslateTitle(db, title)
+	if l == "" || l == "en" || en == title {
+		return title, orig, lang
+	}
+	if res, err := db.Exec(`UPDATE twoai_incidents SET title=$1, title_original=$2, title_lang=$3
+		WHERE incident_id=$4 AND title=$2 AND (title_original IS NULL OR title_original=$2)`, en, title, l, id); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			twoaiEnglishLogged(db, "twoai_incidents", fmt.Sprintf("incident %d", id), "title", l, title, en, "translate_title", "srj")
+		}
+	}
+	return en, title, l
+}
+
+// twoaiIncidentReports reads every report of an incident, newest first, with
+// each outlet's headline in English and the original kept beside it.
+func twoaiIncidentReports(db *sql.DB, id int) []incidentReport {
+	rows, err := db.Query(`SELECT title, url, domain, COALESCE(published::text,''),
+			COALESCE(title_original,''), COALESCE(title_lang,'')
+		FROM twoai_incidents WHERE incident_id=$1
+		ORDER BY published DESC NULLS LAST, report_id`, id)
+	if err != nil {
+		return nil
+	}
+	var reps []incidentReport
+	for rows.Next() {
+		var r incidentReport
+		if rows.Scan(&r.Title, &r.URL, &r.Domain, &r.Published, &r.TitleOriginal, &r.TitleLang) == nil {
+			reps = append(reps, r)
+		}
+	}
+	rows.Close()
+	for i := range reps {
+		r := &reps[i]
+		r.Title, r.TitleOriginal, r.TitleLang = twoaiIncidentEnglish(db, id, r.Title, r.TitleOriginal, r.TitleLang)
+		if r.TitleOriginal == "" || r.TitleOriginal == r.Title {
+			r.TitleOriginal, r.TitleLang = "", ""
+		}
+	}
+	return reps
+}
+
+// twoaiIncidentEnglishPatch is what an archived incident page needs to read
+// in English: its reports re-read from twoai_incidents, and its headline,
+// which is one of those reports' titles in whichever language it was stored
+// in. Empty when nothing on the page was ever translated, so a page that was
+// always English is not rewritten.
+func twoaiIncidentEnglishPatch(db *sql.DB, id int, title string) map[string]any {
+	reps := twoaiIncidentReports(db, id)
+	patch := map[string]any{}
+	for _, r := range reps {
+		if r.TitleOriginal != "" {
+			patch["reports"] = reps
+			break
+		}
+	}
+	for _, r := range reps {
+		if r.TitleOriginal != "" && (title == r.TitleOriginal || title == r.Title) {
+			patch["title"], patch["title_en"] = r.Title, r.Title
+			patch["title_original"], patch["title_lang"] = r.TitleOriginal, r.TitleLang
+			break
+		}
+	}
+	return patch
 }
 
 type incidentReport struct {
-	Title     string `json:"title"`
-	URL       string `json:"url"`
-	Domain    string `json:"domain"`
-	Published string `json:"published"`
+	Title string `json:"title"`
+	// The outlet's own headline and its language when Title is our English
+	// rendering of it. The page shows Title with "Translated from <language>"
+	// beside it (bridge row 508: the source list is visitor text too).
+	TitleOriginal string `json:"title_original,omitempty"`
+	TitleLang     string `json:"title_lang,omitempty"`
+	URL           string `json:"url"`
+	Domain        string `json:"domain"`
+	Published     string `json:"published"`
 }
 
 type incidentOut struct {
@@ -147,12 +313,18 @@ type incidentOut struct {
 	// verbatim from the AIID feed and was never touched. TitleEN is ours, a
 	// translation, and is rendered as such; Title stays the publisher's own
 	// headline, still the label on the link, which is the AIID rule above.
-	TitleEN   string `json:"title_en,omitempty"`
-	TitleLang string `json:"title_lang,omitempty"`
-	URL       string `json:"url"`
-	Domain    string `json:"domain"`
-	Published string `json:"published"`
-	CiteURL   string `json:"cite_url"`
+	//
+	// Since 2026-10-06 (bridge row 508) Title itself is English: the
+	// translation is made at harvest and stored in twoai_incidents.title,
+	// with the publisher's headline in TitleOriginal. TitleEN repeats Title
+	// for pages built by older templates.
+	TitleEN       string `json:"title_en,omitempty"`
+	TitleLang     string `json:"title_lang,omitempty"`
+	TitleOriginal string `json:"title_original,omitempty"`
+	URL           string `json:"url"`
+	Domain        string `json:"domain"`
+	Published     string `json:"published"`
+	CiteURL       string `json:"cite_url"`
 	// An incident is a story, not a link. These carry the same treatment the
 	// daily briefing gives a news story: an original summary written from the
 	// reporting, and every outlet that carried it.
@@ -168,7 +340,8 @@ type incidentOut struct {
 func twoaiIncidentsRecent(db *sql.DB, n int) []incidentOut {
 	out := []incidentOut{}
 	rows, err := db.Query(`SELECT DISTINCT ON (incident_id)
-			incident_id, title, url, domain, COALESCE(published::text,'')
+			incident_id, title, url, domain, COALESCE(published::text,''),
+			COALESCE(title_original,''), COALESCE(title_lang,'')
 		FROM twoai_incidents
 		WHERE published IS NOT NULL
 		ORDER BY incident_id, published DESC, first_seen DESC`)
@@ -178,7 +351,7 @@ func twoaiIncidentsRecent(db *sql.DB, n int) []incidentOut {
 	defer rows.Close()
 	for rows.Next() {
 		var o incidentOut
-		if rows.Scan(&o.IncidentID, &o.Title, &o.URL, &o.Domain, &o.Published) != nil {
+		if rows.Scan(&o.IncidentID, &o.Title, &o.URL, &o.Domain, &o.Published, &o.TitleOriginal, &o.TitleLang) != nil {
 			continue
 		}
 		o.CiteURL = fmt.Sprintf("https://incidentdatabase.ai/cite/%d", o.IncidentID)
@@ -195,10 +368,24 @@ func twoaiIncidentsRecent(db *sql.DB, n int) []incidentOut {
 	if len(out) > n {
 		out = out[:n]
 	}
-	twoaiIncidentsEnrich(db, out)
+	// ROOT CAUSE OF INCIDENT 1722, 2026-10-06. The headline shown is the
+	// newest report's title, and for 1722 that was navbharattimes' Hindi
+	// headline. twoaiTranslateTitle returned it untranslated because it
+	// still required ANTHROPIC_API_KEY, which was removed on 2026-09-17, so
+	// title_en came back equal to the Hindi title with an empty language and
+	// the page led with it; the report list under it was never translated at
+	// all. The translation now happens at harvest through twoaiGenerate, and
+	// anything still foreign here is put into English before it is used.
 	for i := range out {
-		out[i].TitleEN, out[i].TitleLang = twoaiTranslateTitle(db, out[i].Title)
+		o := &out[i]
+		o.Title, o.TitleOriginal, o.TitleLang = twoaiIncidentEnglish(db, o.IncidentID, o.Title, o.TitleOriginal, o.TitleLang)
+		if o.TitleOriginal == "" || o.TitleOriginal == o.Title {
+			o.TitleOriginal, o.TitleLang = "", ""
+		} else {
+			o.TitleEN = o.Title
+		}
 	}
+	twoaiIncidentsEnrich(db, out)
 	return out
 }
 
@@ -206,63 +393,31 @@ func twoaiIncidentsRecent(db *sql.DB, n int) []incidentOut {
 // ISO 639-1 code of the language it was written in. English in, English out
 // with lang "en" and no call made once the cache holds it.
 //
-// One Haiku call per distinct headline, ever: the result is cached on the
+// One call per distinct headline, ever: the result is cached on the
 // headline's hash in twoai_translations, so a title seen on the briefing
 // today and on its incident page tomorrow costs one call, not two, and
 // nothing is retranslated on a rebuild. The model is asked for a literal
-// rendering, not a rewrite, and to leave names and proper nouns alone: a
-// translated headline is still the publisher's headline, in another language,
-// and the page labels it as a translation.
+// rendering, not a rewrite, and to leave names and proper nouns alone.
 //
-// Detection is left to the same call rather than a heuristic. A stopword
-// ratio misfires on a short headline full of names, and the call is made
-// once per title anyway. On any failure the original is returned as-is with
-// an empty lang, and the page shows the original, which is what it showed
-// before this existed.
+// Until 2026-10-06 this called Claude Haiku through twoaiClaudeCall and
+// returned the original untranslated whenever ANTHROPIC_API_KEY was unset,
+// which it has been since 2026-09-17; that is why incident 1722 led with
+// Hindi. It now goes through twoaiEnglish (twoai_english.go): an offline
+// language check first, so English costs nothing, then twoaiGenerate under
+// the stage name translate_title, on the pipeline model. On any failure the
+// original comes back with an empty lang and the sweep tries again later.
 func twoaiTranslateTitle(db *sql.DB, title string) (string, string) {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return "", ""
 	}
-	h := sha256.Sum256([]byte("title:" + title))
-	key := hex.EncodeToString(h[:8])
-	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_translations (
-		key text PRIMARY KEY, source text NOT NULL, lang text NOT NULL, english text NOT NULL,
-		model text, created_at timestamptz NOT NULL DEFAULT now())`)
-	var en, lang string
-	if db.QueryRow(`SELECT english, lang FROM twoai_translations WHERE key=$1`, key).Scan(&en, &lang) == nil {
+	if en, lang := twoaiEnglishLive(db, title); lang != "" {
 		return en, lang
 	}
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		return title, ""
+	if twoaiEnglishLang(title) == "" {
+		return title, "en"
 	}
-	model := os.Getenv("TWOAI_TRANSLATE_MODEL")
-	if model == "" {
-		model = "claude-haiku-4-5"
-	}
-	const sys = `You identify the language of a news headline and render it in English.
-Return ONLY a JSON object: {"lang":"<ISO 639-1 code>","english":"<headline in English>"}.
-If the headline is already English, return lang "en" and the headline unchanged.
-Translate literally and completely. Keep names, organisations, product names and numbers exactly as written. Do not summarise, shorten, editorialise or add words. No preamble, no markdown.`
-	out, err := twoaiClaudeCall(model, sys, title)
-	if err != nil {
-		return title, ""
-	}
-	out = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(out), "```json"), "```"))
-	var r struct {
-		Lang    string `json:"lang"`
-		English string `json:"english"`
-	}
-	if json.Unmarshal([]byte(out), &r) != nil || r.English == "" || len(r.Lang) < 2 {
-		return title, ""
-	}
-	r.Lang = strings.ToLower(r.Lang[:2])
-	if r.Lang == "en" {
-		r.English = title
-	}
-	db.Exec(`INSERT INTO twoai_translations (key, source, lang, english, model) VALUES ($1,$2,$3,$4,$5)
-		ON CONFLICT (key) DO NOTHING`, key, title, r.Lang, r.English, model)
-	return r.English, r.Lang
+	return title, ""
 }
 
 // EVERY OUTLET, AND AN ORIGINAL SUMMARY. Stephen, 2026-08-30: we are just
@@ -284,22 +439,11 @@ Translate literally and completely. Keep names, organisations, product names and
 // briefing uses, so an incident is summarised once and never again.
 func twoaiIncidentsEnrich(db *sql.DB, out []incidentOut) {
 	for i := range out {
-		rows, err := db.Query(`SELECT title, url, domain, COALESCE(published::text,'')
-			FROM twoai_incidents WHERE incident_id=$1
-			ORDER BY published DESC NULLS LAST, report_id`, out[i].IncidentID)
-		if err != nil {
-			continue
-		}
+		out[i].Reports = twoaiIncidentReports(db, out[i].IncidentID)
 		domains := map[string]bool{}
-		for rows.Next() {
-			var r incidentReport
-			if rows.Scan(&r.Title, &r.URL, &r.Domain, &r.Published) != nil {
-				continue
-			}
-			out[i].Reports = append(out[i].Reports, r)
+		for _, r := range out[i].Reports {
 			domains[r.Domain] = true
 		}
-		rows.Close()
 		out[i].OutletCount = len(domains)
 
 		// The summary comes from whichever report we can actually read.
@@ -515,7 +659,7 @@ func twoaiIncidentPages(db *sql.DB, incidents []incidentOut, today string) int {
 
 		doc := map[string]any{
 			"shape": "incident", "incident_id": inc.IncidentID, "title": inc.Title,
-			"title_en": inc.TitleEN, "title_lang": inc.TitleLang,
+			"title_en": inc.TitleEN, "title_lang": inc.TitleLang, "title_original": inc.TitleOriginal,
 			"summary": inc.Summary, "summary_domain": inc.SummaryDomain,
 			"summary_url": inc.SummaryURL, "reports": inc.Reports,
 			"outlet_count": inc.OutletCount, "published": inc.Published,
@@ -564,7 +708,11 @@ func twoaiIncidentPages(db *sql.DB, incidents []incidentOut, today string) int {
 		rows.Close()
 		filled := 0
 		for _, o := range olds {
-			patch := map[string]any{"archived": true, "refresh_every_days": 365}
+			// In English too (bridge row 508): an archived page keeps the
+			// headline and report titles it was built with, and before
+			// 2026-10-06 some of those were left in their own language.
+			patch := twoaiIncidentEnglishPatch(db, o.id, o.title)
+			patch["archived"], patch["refresh_every_days"] = true, 365
 			if o.summary == "" && filled < 6 {
 				t := o.rtitle
 				if t == "" {

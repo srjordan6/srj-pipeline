@@ -138,6 +138,15 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 				// come back raw unless the same rule runs here too.
 				headline = newsStripOutlet(headline, newsArticleDomains(s)...)
 				s["Headline"] = headline
+				// A headline or outlet title the English sweep has translated
+				// is translated again here from its cache, never by a model
+				// call, so a refresh from news.json cannot put the original
+				// language back (bridge row 508).
+				if _, ch := twoaiEnglishDoc(s, true, twoaiEnglishCacheOnly(db)); len(ch) > 0 {
+					if h, ok := s["Headline"].(string); ok && h != "" {
+						headline = h
+					}
+				}
 				s["uid"] = twoaiUID("story:" + slug)
 				if arts, ok := s["Articles"].([]any); ok && len(arts) > twoaiNewsArchiveMaxArticles {
 					s["Articles"] = arts[:twoaiNewsArchiveMaxArticles]

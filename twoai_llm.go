@@ -148,6 +148,10 @@ var twoaiBulkStages = map[string]bool{
 	"model_family_reading": true,
 	// Topic sorting for the IntuitionLabs library on Healthcare, a 530 title backlog.
 	"library_topics": true, "ext_summaries": true, "ext_fact_check": true,
+	// Every visitor-facing table put into English, sixty values a run (bridge
+	// row 508). The harvest-time translator, translate_title, is not here: a
+	// new headline must be English the day it is shown.
+	"twoai_english_sweep": true,
 }
 
 var twoaiPeakNoted sync.Map

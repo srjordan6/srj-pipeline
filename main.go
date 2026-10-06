@@ -88,6 +88,9 @@ var twoaiStageDeadline = map[string]time.Duration{
 	// 494): about 25 pages a family two seconds apart, then the model reads.
 	// It stops itself at 26 minutes (TWOAI_FAMILY_SOURCES_MINUTES).
 	"twoai_family_sources": 30 * time.Minute,
+	// Sixty translations at most, a few seconds each, plus a read of every
+	// swept table (bridge row 508).
+	"twoai_english_sweep": 15 * time.Minute,
 	// A Cloudflare build that re-uploads most of the site takes over 18
 	// minutes; deploy_site waits up to 32 for it (2026-10-05).
 	"deploy_site": 35 * time.Minute,
@@ -320,7 +323,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -920,6 +923,14 @@ func main() {
 		return
 	}
 
+	if src == "twoai_english_sweep" {
+		// Put every non-English value a visitor can see into English, keep
+		// the original beside it, log it and tell theworldofai (bridge row
+		// 508). Off-peak only, like every backlog stage.
+		twoaiEnglishSweep(db)
+		return
+	}
+
 	if src == "dc_topics" {
 		twoaiDCTopics(db, time.Now().Format("2006-01-02"))
 		return
@@ -997,6 +1008,9 @@ func main() {
 			if _, err := twoaiLangPages(db, today); err != nil {
 				fmt.Fprintln(os.Stderr, "backlog lang_pages:", err)
 			}
+			// Everything visitors see in English (bridge row 508), within
+			// its own per-run cap of model calls.
+			did += twoaiEnglishSweep(db)
 			took := time.Since(started)
 			fmt.Printf("backlog: pass %d took %s, counted writers considered %d, %s left before the deadline\n",
 				passes, took.Round(time.Second), did, time.Until(deadline).Round(time.Minute))
@@ -2839,6 +2853,11 @@ func publishNews(db *sql.DB) error {
 		Domains                   []string
 		Persons, Orgs             []string
 		Articles                  []map[string]string
+		// The outlet's own headline and its language when Headline is our
+		// English for it (bridge row 508); each article carries Title_original
+		// and Title_lang the same way. The story page labels them.
+		HeadlineOriginal string `json:"Headline_original,omitempty"`
+		HeadlineLang     string `json:"Headline_lang,omitempty"`
 	}
 	var stories []story
 	big := []string{}
@@ -2874,6 +2893,14 @@ func publishNews(db *sql.DB) error {
 			continue
 		}
 		seen[sl] = true
+		// IN ENGLISH (bridge row 508). The slug above is cut from the
+		// headline as published, so a URL never changes; the headline shown
+		// and every outlet title under it are put into English here, with
+		// the original kept beside each.
+		hOrig, hLang := "", ""
+		if en, lang := twoaiEnglishLive(db, h); lang != "" {
+			hOrig, hLang, h = h, lang, en
+		}
 		dm := map[string]bool{}
 		dl := []string{}
 		as := []map[string]string{}
@@ -2883,7 +2910,13 @@ func publishNews(db *sql.DB) error {
 				dl = append(dl, a.Domain)
 			}
 			if len(as) < 15 {
-				as = append(as, map[string]string{"Title": a.Title, "URL": a.URL, "Domain": a.Domain, "Date": a.Date})
+				am := map[string]string{"Title": a.Title, "URL": a.URL, "Domain": a.Domain, "Date": a.Date}
+				if t := html.UnescapeString(a.Title); t != "" {
+					if en, lang := twoaiEnglishLive(db, t); lang != "" {
+						am["Title"], am["Title_original"], am["Title_lang"] = en, t, lang
+					}
+				}
+				as = append(as, am)
 			}
 		}
 		if len(dl) > 12 {
@@ -2928,7 +2961,7 @@ func publishNews(db *sql.DB) error {
 			summary, sumURL, sumDomain = dt.summary, a.URL, a.Domain
 			break
 		}
-		stories = append(stories, story{Slug: sl, Headline: h, Summary: summary, SummaryURL: sumURL, SummaryDomain: sumDomain, ArticleCount: len(c.arts), DomainCount: len(dm), Domains: dl, Persons: topPersons(c), Orgs: topOrgs(c), Articles: as})
+		stories = append(stories, story{Slug: sl, Headline: h, Summary: summary, SummaryURL: sumURL, SummaryDomain: sumDomain, ArticleCount: len(c.arts), DomainCount: len(dm), Domains: dl, Persons: topPersons(c), Orgs: topOrgs(c), Articles: as, HeadlineOriginal: hOrig, HeadlineLang: hLang})
 		if len(big) < 4 {
 			big = append(big, h)
 		}
@@ -8614,6 +8647,8 @@ func twoaiVendorLab(vendor string) bool {
 }
 
 func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (int, error) {
+	// The upsert below keeps an English title or summary English.
+	englishSet := twoaiVendorEnglishSet(db)
 	// Display names for feeds whose vendor column holds a hostname. Anything
 	// not listed renders as stored.
 	display := map[string]string{
@@ -8746,13 +8781,14 @@ func twoaiVendorNews(db *sql.DB, upsert func(path, kind string, v any) error) (i
 			if it.Slug == "" {
 				continue
 			}
+			// A title or summary the English sweep translated stays English
+			// while the feed still carries the same original (bridge row 508).
 			if _, err := db.Exec(`INSERT INTO twoai_vendor_posts
 				(slug, vendor, title, url, summary, posted_on)
 				VALUES ($1,$2,$3,$4,$5,$6::date)
 				ON CONFLICT (slug) DO UPDATE SET
-					vendor=EXCLUDED.vendor, title=EXCLUDED.title, url=EXCLUDED.url,
-					summary=CASE WHEN EXCLUDED.summary <> '' THEN EXCLUDED.summary
-					             ELSE twoai_vendor_posts.summary END,
+					vendor=EXCLUDED.vendor, url=EXCLUDED.url,
+					`+englishSet+`,
 					posted_on=LEAST(twoai_vendor_posts.posted_on, EXCLUDED.posted_on),
 					last_seen=now()`,
 				it.Slug, vendor, it.Title, it.URL, it.Summary, it.Date); err != nil {
