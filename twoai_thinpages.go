@@ -137,8 +137,15 @@ func twoaiThinPages(db *sql.DB) {
 	// stops early. A pass that fills nothing new ends the run, and the whole
 	// thing is bounded by a wall clock, default four hours, so the cron can
 	// never run into the next day's. Both are environment-overridable.
-	maxPasses := thinBudget("PASSES", 12)
-	deadline := time.Now().Add(time.Duration(thinBudget("MINUTES", 240)) * time.Minute)
+	//
+	// Five passes and ninety minutes since 2026-10-06 (Stephen: are we
+	// actually getting anything from this). The run of 2026-10-05 took 211
+	// minutes over eight passes: pass one cleared 161 thin pages and passes
+	// three to five wrote 538 page readings, then passes six to eight wrote
+	// two between them, while the run held the pipeline lock and kept the
+	// full run waiting. Twelve and 240 were the old defaults.
+	maxPasses := thinBudget("PASSES", 5)
+	deadline := time.Now().Add(time.Duration(thinBudget("MINUTES", 90)) * time.Minute)
 	prev := -1
 	for pass := 1; pass <= maxPasses; pass++ {
 		if time.Now().After(deadline) {
@@ -154,7 +161,11 @@ func twoaiThinPages(db *sql.DB) {
 		twoaiThinFillCompany(db)
 		// After the company's own site has been tried, because a fact the
 		// company publishes about itself outranks a third-party record of it.
-		twoaiThinFillWikidata(db)
+		// Once a run: it picked the same 60 companies every pass and counted
+		// the same seven as gaining a date, eight times over.
+		if pass == 1 {
+			twoaiThinFillWikidata(db)
+		}
 		twoaiThinFillFacilities(db)
 		twoaiThinAdapters(db)
 		twoaiThinSense(db)
