@@ -425,6 +425,31 @@ func twoaiCheriPlace(db *sql.DB) (int, int) {
 		}
 		rows.Close()
 	}
+	// A person the site has a page for is linked where a fact names them
+	// (theworldofai row 503: Peter G. Neumann, CHERI's principal
+	// investigator). The claim is split around the name so the page can link
+	// it in place; the longest name wins.
+	type cheriPerson struct{ name, path string }
+	var people []cheriPerson
+	if rows, err := db.Query(`SELECT data->>'name', data->>'uid' FROM twoai_pages
+		WHERE path ~ '^people/[0-9a-f]{8}\.json$' AND length(COALESCE(data->>'name','')) >= 8 AND COALESCE(data->>'uid','') <> ''
+		ORDER BY length(data->>'name') DESC`); err == nil {
+		for rows.Next() {
+			var n, u string
+			if rows.Scan(&n, &u) == nil {
+				people = append(people, cheriPerson{n, "/ai-ecosystem/ecosystem-entities-market-and-operations/" + u + "/"})
+			}
+		}
+		rows.Close()
+	}
+	for _, f := range facts {
+		for _, p := range people {
+			if i := strings.Index(f["claim"], p.name); i >= 0 {
+				f["pre"], f["person"], f["post"], f["person_path"] = f["claim"][:i], p.name, f["claim"][i+len(p.name):], p.path
+				break
+			}
+		}
+	}
 	var items []map[string]any
 	var tracked int
 	db.QueryRow(`SELECT count(*) FROM twoai_cheri_watch WHERE status NOT IN ('skipped','hidden')`).Scan(&tracked)
