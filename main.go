@@ -80,6 +80,10 @@ var twoaiStageDeadline = map[string]time.Duration{
 	// OpenAlex harvest and open access full text for the same hubs (row
 	// 485), at most 60 calls a run. It stops 90 seconds before this.
 	"twoai_health_research": 15 * time.Minute,
+	// The developer's own site behind each model family page (rows 493 and
+	// 494): about 25 pages a family two seconds apart, then the model reads.
+	// It stops itself at 26 minutes (TWOAI_FAMILY_SOURCES_MINUTES).
+	"twoai_family_sources": 30 * time.Minute,
 }
 
 const twoaiStageDeadlineDefault = 20 * time.Minute
@@ -309,7 +313,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_health_research", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_health_research", "twoai_family_sources", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -906,6 +910,14 @@ func main() {
 
 	if src == "research_education" {
 		twoaiResearchEducation(db)
+		return
+	}
+
+	if src == "twoai_family_sources" {
+		// Crawl, extract and explain from each family developer's own site
+		// (theworldofai rows 493 and 494). The family pages read its tables
+		// in twoai_build, which runs after it.
+		twoaiFamilySources(db)
 		return
 	}
 

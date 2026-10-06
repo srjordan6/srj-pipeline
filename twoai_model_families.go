@@ -711,9 +711,9 @@ func famDoc(db *sql.DB, g *famGroup, uid, today string, companies map[string]fam
 		"providers": providers, "generated": today,
 		"source": map[string]string{"name": "OpenRouter model catalog", "url": "https://openrouter.ai/models"},
 	}
-	if c, ok := companies[strings.ToLower(g.DevName)]; ok {
-		doc["developer_company"] = map[string]string{"uid": c.UID, "name": c.Name, "href": "/companies/" + c.UID + "/"}
-	} else if c, ok := companies[strings.ToLower(g.LineName)]; ok {
+	// The developer's name, then the line's, then the company it belongs to
+	// (row 493: "ByteDance Seed" is ByteDance's, and had no company link).
+	if c, ok := famFindCompany(companies, g); ok {
 		doc["developer_company"] = map[string]string{"uid": c.UID, "name": c.Name, "href": "/companies/" + c.UID + "/"}
 	}
 	doc["answer"] = famAnswer(doc)
@@ -781,6 +781,10 @@ func famDoc(db *sql.DB, g *famGroup, uid, today string, companies map[string]fam
 		rows.Close()
 	}
 	doc["news"] = news
+	// Rows 493 and 494: the developer's own site (twoai_family_sources) and
+	// the data blocks built from records the site holds.
+	famSrcAttach(db, uid, doc)
+	famBlocks(db, g, doc)
 	return doc
 }
 
@@ -793,8 +797,26 @@ func famAnswer(doc map[string]any) string {
 	latest, _ := doc["latest_release"].(string)
 	latestModel, _ := doc["latest_model"].(string)
 	lic, _ := doc["licence"].(string)
-	s := fmt.Sprintf("%s is %s's model line, with %d versions listed in the OpenRouter catalog, the first released %s and the newest, %s, on %s.",
-		name, dev, n, first, strings.TrimSpace(latestModel[strings.Index(latestModel, ":")+1:]), latest)
+	// Row 493: "ByteDance Seed is ByteDance Seed's model line". When the
+	// family is named after its developer, say whose it is from the company
+	// record instead, or nothing, never the same name twice.
+	subject := fmt.Sprintf("%s is %s's model line", name, dev)
+	if strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(dev)) {
+		company := ""
+		if dc, ok := doc["developer_company"].(map[string]string); ok {
+			company = dc["name"]
+		}
+		switch {
+		case company != "" && !strings.EqualFold(company, name):
+			subject = fmt.Sprintf("%s is a model family from %s", name, company)
+		case company != "":
+			subject = fmt.Sprintf("%s is a model family from the company of the same name", name)
+		default:
+			subject = fmt.Sprintf("%s is a model family", name)
+		}
+	}
+	s := fmt.Sprintf("%s, with %d versions listed in the OpenRouter catalog, the first released %s and the newest, %s, on %s.",
+		subject, n, first, strings.TrimSpace(latestModel[strings.Index(latestModel, ":")+1:]), latest)
 	switch lic {
 	case "Open weights":
 		s += " Every version publishes open weights."
