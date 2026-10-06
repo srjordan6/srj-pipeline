@@ -428,8 +428,12 @@ func twoaiCheriPlace(db *sql.DB) (int, int) {
 	var items []map[string]any
 	var tracked int
 	db.QueryRow(`SELECT count(*) FROM twoai_cheri_watch WHERE status NOT IN ('skipped','hidden')`).Scan(&tracked)
-	if rows, err := db.Query(`SELECT url, title, source, COALESCE(item_date::text,''), kind FROM twoai_cheri_watch
-		WHERE status NOT IN ('skipped','hidden')
+	// One line per title: Zenodo gives a paper a concept DOI and a version
+	// DOI, and both arrive from OpenAlex (2026-10-06, the same paper twice).
+	if rows, err := db.Query(`SELECT url, title, source, d, kind FROM (
+			SELECT DISTINCT ON (lower(title)) url, title, source, COALESCE(item_date::text,'') d, kind, item_date, found_at
+			FROM twoai_cheri_watch WHERE status NOT IN ('skipped','hidden')
+			ORDER BY lower(title), item_date DESC NULLS LAST, found_at DESC) x
 		ORDER BY item_date DESC NULLS LAST, found_at DESC LIMIT $1`, twoaiCheriShow); err == nil {
 		for rows.Next() {
 			var u, t, s, d, k string
