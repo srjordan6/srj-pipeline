@@ -90,6 +90,13 @@ var glossaryCandidates = []glossCandidate{
 	{"Biometric Spoofing", "AI Security & Assurance"}, {"Compute Hijacking", "AI Security & Assurance"},
 	{"Liveness Detection", "AI Security & Assurance"}, {"Synthetic Identity Fraud", "AI Security & Assurance"},
 	{"OT Ransomware", "AI Security & Assurance"}, {"AI Incident Database (AIID)", "AI Security & Assurance"},
+	// Memory safety in hardware, for the CHERI section of Architecture and
+	// Engineering (theworldofai row 501, 2026-10-06). "Hardware Capability"
+	// rather than "Capability (Hardware)": the passage search drops a
+	// trailing bracket, and "capability" alone would anchor the definition
+	// to the AI sense of the word used across the site.
+	{"CHERI (Capability Hardware Enhanced RISC Instructions)", "AI Security & Assurance"}, {"Hardware Capability", "AI Security & Assurance"},
+	{"CHERIoT", "AI Security & Assurance"}, {"Morello (Arm)", "AI Security & Assurance"},
 	// AI law
 	{"Impact Assessment", "AI Law"}, {"Private Right of Action", "AI Law"}, {"Deployer", "AI Law"},
 	{"Companion Chatbot", "AI Law"}, {"Whistleblower Protection", "AI Law"}, {"Frontier Developer", "AI Law"},
