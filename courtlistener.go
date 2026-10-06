@@ -5,32 +5,24 @@ package main
 // Three stages read CourtListener: intel (docket refresh, resolve, discover),
 // twoai_recap (RECAP documents) and twoai_lawsuit_classify (nature of suit,
 // inside twoai_lawsuit_fill). Each had its own idea of a rate limit, and on
-// the morning run of 2026-10-05 all three lost. CourtListener answered with
-// Retry-After windows of 46 to 51 seconds. clGet treated any wait of thirty
-// seconds or more as a spent quota and latched, so twoai_recap stopped after
-// 2 of 12 dockets having used 14 seconds of an eight minute deadline; intel
-// waited three windows out by hand and checked 9 dockets in five minutes;
-// discover gave up on its first call; and the classifier, on its own client
-// with a fixed 5, 10, 15 second ladder that ignored Retry-After, saw HTTP 429
-// twice and recorded nothing. With 129 of 147 federal dockets never answered,
-// the freshness report showed them all overdue.
+// the morning run of 2026-10-05 all three lost. Every caller now goes through
+// clFetch, which checks the stage's time budget before every wait and every
+// request, and returns errCLBudget, rather than sleeping into the stage
+// deadline and being killed, when the wait would not fit.
 //
-// A minute-long window is a short throttle, not a spent quota, and the stage
-// can afford to wait it out as long as there is time left. So every caller
-// now goes through clFetch, which:
-//
-//   - honours Retry-After, in seconds or as an HTTP date, up to clMaxWait;
-//     a longer window really is a spent quota and ends the work at once;
-//   - backs off exponentially when no Retry-After is sent, for at most
-//     clMaxRetries attempts;
-//   - checks the stage's time budget before every wait and every request,
-//     and returns errCLBudget, rather than sleeping into the stage deadline
-//     and being killed, when the wait would not fit.
-//
-// The latch from 2026-08-30 stays: once CourtListener has said wait, every
-// later call in the run waits for the same window instead of asking again.
-// What changed is that the latch is waited out while the budget allows,
-// instead of failing every later call on sight.
+// RATIONED, 2026-10-06 (content project bridge row 518, approved by Stephen).
+// Since 7 May 2026 a free CourtListener account gets 5 requests a minute, 50
+// an hour and 125 a day, all on rolling windows. The 2026-10-05 client waited
+// out the minute windows and so walked straight into the hourly and daily
+// ones: on 2026-10-06 every CourtListener stage of every run ended on a
+// Retry-After of up to fifty minutes, and twoai_lawsuit_classify read nothing
+// at all. So every request now first takes a slot from the ledger in
+// courtlistener_ledger.go, which spaces calls twelve seconds apart across
+// processes, stops at 50 in any rolling hour and at 125 in the UTC day, and
+// shares the day out between the stages. An HTTP 429 is no longer waited
+// out: it means the server counts differently from the ledger, so it is
+// recorded and every stage stops CourtListener work for the rest of the UTC
+// day instead of asking again into the wall.
 //
 // errCLBudget is not a failure. A stage that gets it stops cleanly, prints
 // one line saying how far it got, and leaves the rest of its dockets at the
@@ -52,12 +44,11 @@ import (
 
 const (
 	clAPIBase = "https://www.courtlistener.com/api/rest/v4"
-	// The longest Retry-After worth waiting for. CourtListener's short
-	// windows run about fifty seconds; anything past two minutes is the
-	// hourly quota and no amount of waiting inside one stage will help.
+	// The longest Retry-After worth waiting for on a 502, 503 or 504.
 	clMaxWait = 2 * time.Minute
-	// Attempts per request, the first included.
-	clMaxRetries = 4
+	// Attempts per request, the first included. Only a 502, 503 or 504 is
+	// tried again, and every attempt costs a slot of the day's 125.
+	clMaxRetries = 2
 	// First backoff step when the server sends no Retry-After; it doubles.
 	clBackoffBase = 5 * time.Second
 	// Kept free after any wait, so the request that follows it, and the
@@ -68,15 +59,14 @@ const (
 	clDefaultBudget = 3 * time.Minute
 )
 
-// errCLBudget means the stage's CourtListener time is spent. The message
-// keeps the words "rate limited" because older callers match on them.
+// errCLBudget means the stage's CourtListener time or share is spent. The
+// message keeps the words "rate limited" because older callers match on them.
 var errCLBudget = errors.New("courtlistener rate limited, stage budget spent")
 
 var (
-	clMu             sync.Mutex
-	clDeadline       time.Time // when this stage's CourtListener work must stop
-	clThrottledUntil time.Time // the server's last Retry-After, as a time
-	clHTTP           = &http.Client{Timeout: 30 * time.Second}
+	clMu       sync.Mutex
+	clDeadline time.Time // when this stage's CourtListener work must stop
+	clHTTP     = &http.Client{Timeout: 30 * time.Second}
 	// Every stage runs as its own subprocess, so process start is stage start.
 	clProcessStart = time.Now()
 )
@@ -161,34 +151,6 @@ func clFits(w, left time.Duration) bool {
 	return w+clMargin <= left
 }
 
-func clLatch(d time.Duration) {
-	clMu.Lock()
-	defer clMu.Unlock()
-	if until := time.Now().Add(d); until.After(clThrottledUntil) {
-		clThrottledUntil = until
-	}
-}
-
-// clWaitOutLatch sleeps through an open throttle window when it fits in the
-// budget, and returns errCLBudget when it does not.
-func clWaitOutLatch(what string) error {
-	clMu.Lock()
-	w := time.Until(clThrottledUntil)
-	clMu.Unlock()
-	left := clBudgetLeft()
-	if w <= 0 {
-		if left < clMargin {
-			return fmt.Errorf("%w: %s (%s left)", errCLBudget, what, left.Round(time.Second))
-		}
-		return nil
-	}
-	if w > clMaxWait || !clFits(w, left) {
-		return fmt.Errorf("%w: %s (window %s, %s left)", errCLBudget, what, w.Round(time.Second), left.Round(time.Second))
-	}
-	time.Sleep(w + time.Second)
-	return nil
-}
-
 // clFetch reads one CourtListener URL into out. It returns the last HTTP
 // status seen (0 when no answer arrived) and an error, which is errCLBudget
 // wrapped when the stage should stop for this run.
@@ -196,11 +158,15 @@ func clFetch(u string, out any) (int, error) {
 	what := strings.TrimPrefix(u, clAPIBase)
 	status := 0
 	for attempt := 1; attempt <= clMaxRetries; attempt++ {
-		if err := clWaitOutLatch(what); err != nil {
+		// One slot of the day per request, taken before it is sent: the
+		// server counts what it receives, refusals included.
+		slot, err := clReserve(what)
+		if err != nil {
 			return http.StatusTooManyRequests, err
 		}
 		req, err := http.NewRequest("GET", u, nil)
 		if err != nil {
+			clRecord(slot, 0)
 			return 0, err
 		}
 		req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
@@ -209,37 +175,45 @@ func clFetch(u string, out any) (int, error) {
 		}
 		resp, err := clHTTP.Do(req)
 		if err != nil {
+			clRecord(slot, 0)
 			return 0, err
 		}
 		status = resp.StatusCode
+		clRecord(slot, status)
 		switch {
 		case status == http.StatusOK:
 			err := json.NewDecoder(resp.Body).Decode(out)
 			resp.Body.Close()
 			return status, err
-		case status == http.StatusTooManyRequests || status == http.StatusBadGateway ||
-			status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout:
+		case status == http.StatusTooManyRequests:
+			// The server counts differently from the ledger, or something
+			// else spent the account. Asking again only digs the hole
+			// deeper, so the day is over for every stage.
+			wait, _ := clRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			clLatchDay()
+			fmt.Printf("CourtListener: HTTP 429 on %s (Retry-After %s), no more CourtListener calls until 00:00 UTC\n",
+				trunc(what, 120), wait.Round(time.Second))
+			return status, fmt.Errorf("%w: %s (HTTP 429, latched for the UTC day)", errCLBudget, what)
+		case status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout:
 			wait, ok := clRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 			if !ok {
 				wait = clBackoff(attempt)
 			}
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			if wait > clMaxWait {
-				// The hourly quota, not a burst. Latch it so every later
-				// call in this run stops at once rather than asking again.
-				clLatch(wait)
-				return status, fmt.Errorf("%w: %s (server asked for %s)", errCLBudget, what, wait.Round(time.Second))
+			if attempt == clMaxRetries {
+				continue
 			}
-			clLatch(wait)
-			// The wait itself happens at the top of the loop, budget checked.
+			if wait > clMaxWait || !clFits(wait, clBudgetLeft()) {
+				return status, fmt.Errorf("%w: %s (HTTP %d, window %s does not fit)", errCLBudget, what, status, wait.Round(time.Second))
+			}
+			time.Sleep(wait)
 		default:
 			resp.Body.Close()
 			return status, fmt.Errorf("courtlistener %s: %s", what, resp.Status)
 		}
-	}
-	if status == http.StatusTooManyRequests {
-		return status, fmt.Errorf("%w: %s (still throttled after %d attempts)", errCLBudget, what, clMaxRetries)
 	}
 	return status, fmt.Errorf("courtlistener %s: http %d after %d attempts", what, status, clMaxRetries)
 }

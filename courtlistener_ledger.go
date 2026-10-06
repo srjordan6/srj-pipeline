@@ -1,0 +1,551 @@
+package main
+
+// THE COURTLISTENER LEDGER, 2026-10-06 (content project bridge row 518,
+// approved by Stephen the same day).
+//
+// A free CourtListener account gets 5 requests a minute, 50 an hour and 125
+// a day, counted on rolling windows (Free Law Project API v4 overview, and
+// the membership page: "5/minute, 50/hour, 125/day"). Every stage runs as
+// its own process, so the count has to live in the database, and every
+// request through clFetch takes one slot here first:
+//
+//   - SPACING. At least twelve seconds since the last call by any stage, so
+//     the minute window (5) is never the one that bites;
+//   - HOUR. Never more than 50 calls in the last sixty minutes, and never
+//     more than 35 of them for the docket refresh, so the stages behind it
+//     in the same run still find room; a stage that would have to wait past
+//     its budget for the window stops instead;
+//   - DAY. Never more than 125 in the UTC day, shared out as below;
+//   - 429. A 429 means the server counted something the ledger did not.
+//     It is recorded, and every stage stops for the rest of the UTC day.
+//
+// THE DAILY SHARES. refresh 70, recap 25, discovery 15, classify 10 and a
+// reserve of 5 for hand runs. The first run of the day takes up to its
+// share, later runs take what is left of it. After 18:00 UTC whatever the
+// recap, discovery and classify shares have not used rolls to the docket
+// refresh, which is the work that most needs it. The reserve is touched only
+// by a caller whose bucket is "reserve" or a run with CL_RESERVE=1 set, and
+// only once its own share is spent; nothing else may take the day past 120.
+//
+// Tables (schema in Go, IF NOT EXISTS):
+//
+//	twoai_courtlistener_budget  (day, stage) -> calls, last_call_at; stage
+//	                            is the share charged: refresh, recap,
+//	                            discovery, classify, reserve
+//	twoai_courtlistener_calls   one row per request: called_at, stage,
+//	                            path, status (0 until answered, 429 latches
+//	                            the day); pruned after two days
+//	twoai_courtlistener_state   small key/value: the last successful
+//	                            discovery date and the defendant rotation
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	clDayLimit  = 125
+	clHourLimit = 50
+	clSpacing   = 12 * time.Second
+	// From this hour (UTC) unused recap, discovery and classify shares roll
+	// to the docket refresh.
+	clRolloverHourUTC = 18
+	clCallsKeep       = 48 * time.Hour
+	// One advisory lock key for every process that takes a slot.
+	clLedgerLockKey = 5182026
+)
+
+const (
+	clBucketRefresh   = "refresh"
+	clBucketRecap     = "recap"
+	clBucketDiscovery = "discovery"
+	clBucketClassify  = "classify"
+	clBucketReserve   = "reserve"
+)
+
+var clShares = map[string]int{
+	clBucketRefresh: 70, clBucketRecap: 25, clBucketDiscovery: 15, clBucketClassify: 10, clBucketReserve: 5,
+}
+
+// clBucketOrder is the order the report line names the shares in.
+var clBucketOrder = []string{clBucketRefresh, clBucketRecap, clBucketDiscovery, clBucketClassify, clBucketReserve}
+
+var (
+	clLedgerMu sync.Mutex
+	clLedgerDB *sql.DB
+	// clLedgerOff skips the database entirely. Tests only: a run with no
+	// ledger would have no limit at all.
+	clLedgerOff bool
+	clBucket    string
+	// clLatchedDay is the UTC day this process saw a 429 on, so the latch
+	// holds even if writing it to the database failed.
+	clLatchedDay string
+	clEnsured    bool
+	clStopNoted  bool
+)
+
+// clUTCDay is the start of t's day in UTC.
+func clUTCDay(t time.Time) time.Time {
+	t = t.UTC()
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+// clUse names the share this process's calls are charged to and the
+// database the ledger lives in. Every stage calls it before its first
+// CourtListener request.
+func clUse(db *sql.DB, bucket string) {
+	clLedgerMu.Lock()
+	clLedgerDB = db
+	clBucket = bucket
+	clStopNoted = false
+	clLedgerMu.Unlock()
+	clEnsureLedger(db)
+}
+
+func clEnsureLedger(db *sql.DB) {
+	clLedgerMu.Lock()
+	done := clEnsured
+	clEnsured = true
+	clLedgerMu.Unlock()
+	if done || db == nil {
+		return
+	}
+	for _, q := range []string{
+		`CREATE TABLE IF NOT EXISTS twoai_courtlistener_budget (day date NOT NULL, stage text NOT NULL,
+			calls int NOT NULL DEFAULT 0, last_call_at timestamptz, PRIMARY KEY (day, stage))`,
+		`CREATE TABLE IF NOT EXISTS twoai_courtlistener_calls (id bigserial PRIMARY KEY,
+			called_at timestamptz NOT NULL DEFAULT now(), stage text NOT NULL, path text, status int NOT NULL DEFAULT 0)`,
+		`CREATE INDEX IF NOT EXISTS twoai_courtlistener_calls_at ON twoai_courtlistener_calls (called_at)`,
+		`CREATE TABLE IF NOT EXISTS twoai_courtlistener_state (key text PRIMARY KEY, value text, updated_at timestamptz DEFAULT now())`,
+		`CREATE TABLE IF NOT EXISTS twoai_cl_docket_cache (docket_id bigint PRIMARY KEY, fetched_at timestamptz NOT NULL,
+			date_modified timestamptz, body jsonb)`,
+		`ALTER TABLE ai_lawsuits ADD COLUMN IF NOT EXISTS priority int NOT NULL DEFAULT 0`,
+		`ALTER TABLE ai_lawsuits ADD COLUMN IF NOT EXISTS docket_ok_at timestamptz`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			fmt.Println("CourtListener ledger schema:", err)
+		}
+	}
+	db.Exec(`DELETE FROM twoai_courtlistener_calls WHERE called_at < $1`, time.Now().Add(-clCallsKeep))
+}
+
+// clAllowance says which share a call is charged to and how many calls
+// that share still has today. used holds today's calls per share.
+func clAllowance(bucket string, used map[string]int, now time.Time, reserveOK bool) (string, int) {
+	total := 0
+	for _, n := range used {
+		total += n
+	}
+	dayRoom := clDayLimit - total
+	if dayRoom <= 0 {
+		return bucket, 0
+	}
+	if bucket != clBucketReserve {
+		own := clShares[bucket] - used[bucket]
+		if bucket == clBucketRefresh && now.UTC().Hour() >= clRolloverHourUTC {
+			for _, b := range []string{clBucketRecap, clBucketDiscovery, clBucketClassify} {
+				own += max(0, clShares[b]-used[b])
+			}
+		}
+		// Nothing but the reserve may take the day past 120.
+		ordinary := (clDayLimit - clShares[clBucketReserve]) - (total - used[clBucketReserve])
+		own = min(own, ordinary, dayRoom)
+		if own > 0 {
+			return bucket, own
+		}
+		if !reserveOK {
+			return bucket, 0
+		}
+	}
+	r := min(clShares[clBucketReserve]-used[clBucketReserve], dayRoom)
+	if r > 0 {
+		return clBucketReserve, r
+	}
+	return bucket, 0
+}
+
+// clHourCaps holds the most calls one share may make in a rolling hour,
+// where that is less than the hour itself. The refresh runs first in the
+// sequence and has the largest share, so without a cap it fills the hour
+// and the classifier and the RECAP harvest behind it in the same run get
+// nothing; with the full runs at 10:00 and 18:00 UTC only, they would get
+// nothing all day. 35 leaves them 15 of every hour.
+var clHourCaps = map[string]int{clBucketRefresh: 35}
+
+// clHourWait is how long until a call fits a rolling hour that allows
+// limit calls, given the times of the calls already made. Zero when it
+// fits now.
+func clHourWait(recent []time.Time, now time.Time, limit int) time.Duration {
+	var in []time.Time
+	for _, t := range recent {
+		if t.After(now.Add(-time.Hour)) && !t.After(now) {
+			in = append(in, t)
+		}
+	}
+	if limit <= 0 || len(in) < limit {
+		return 0
+	}
+	sort.Slice(in, func(i, j int) bool { return in[i].Before(in[j]) })
+	// Room for one more once all but limit-1 of them have aged out.
+	oldest := in[len(in)-limit]
+	return oldest.Add(time.Hour).Sub(now) + time.Second
+}
+
+// clSpacingWait is how long until clSpacing has passed since the last call.
+func clSpacingWait(last, now time.Time) time.Duration {
+	if last.IsZero() {
+		return 0
+	}
+	if w := last.Add(clSpacing).Sub(now); w > 0 {
+		return w
+	}
+	return 0
+}
+
+func clLatchDay() {
+	clLedgerMu.Lock()
+	clLatchedDay = clUTCDay(time.Now()).Format("2006-01-02")
+	clLedgerMu.Unlock()
+}
+
+func clLedger() *sql.DB {
+	clLedgerMu.Lock()
+	defer clLedgerMu.Unlock()
+	if clLedgerDB == nil && !clLedgerOff {
+		if db, err := sql.Open("postgres", os.Getenv("DATABASE_URL")); err == nil && db.Ping() == nil {
+			clLedgerDB = db
+		}
+	}
+	return clLedgerDB
+}
+
+// clRefuse prints why the ledger said no, once per process, and returns
+// the error the stage stops on.
+func clRefuse(format string, a ...any) error {
+	msg := fmt.Sprintf(format, a...)
+	clLedgerMu.Lock()
+	noted := clStopNoted
+	clStopNoted = true
+	clLedgerMu.Unlock()
+	if !noted {
+		fmt.Println("CourtListener: " + msg)
+	}
+	return fmt.Errorf("%w: %s", errCLBudget, msg)
+}
+
+// clReserve takes one slot for a request to path, waiting for the spacing
+// or the hour window when the wait fits the stage budget. It returns the
+// call's ledger id, which clRecord later stamps with the HTTP status.
+func clReserve(path string) (int64, error) {
+	clLedgerMu.Lock()
+	latched := clLatchedDay == clUTCDay(time.Now()).Format("2006-01-02")
+	bucket := clBucket
+	clLedgerMu.Unlock()
+	if latched {
+		return 0, clRefuse("HTTP 429 earlier today, no calls until 00:00 UTC")
+	}
+	reserveOK := os.Getenv("CL_RESERVE") != ""
+	if bucket == "" {
+		if !reserveOK {
+			return 0, clRefuse("no share named for this caller (call clUse, or set CL_RESERVE=1 for a hand run)")
+		}
+		bucket = clBucketReserve
+	}
+	if clLedgerOff {
+		return 0, nil
+	}
+	db := clLedger()
+	if db == nil {
+		return 0, clRefuse("ledger database unreachable, not calling without it")
+	}
+	clEnsureLedger(db)
+	for {
+		now := time.Now()
+		day := clUTCDay(now)
+		tx, err := db.Begin()
+		if err != nil {
+			return 0, clRefuse("ledger: %v", err)
+		}
+		if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, clLedgerLockKey); err != nil {
+			tx.Rollback()
+			return 0, clRefuse("ledger lock: %v", err)
+		}
+		var hit bool
+		tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM twoai_courtlistener_calls WHERE status = 429 AND called_at >= $1)`, day).Scan(&hit)
+		if hit {
+			tx.Rollback()
+			clLatchDay()
+			return 0, clRefuse("HTTP 429 earlier today, no calls until 00:00 UTC")
+		}
+		used := map[string]int{}
+		rows, err := tx.Query(`SELECT stage, calls FROM twoai_courtlistener_budget WHERE day = $1`, day)
+		if err != nil {
+			tx.Rollback()
+			return 0, clRefuse("ledger read: %v", err)
+		}
+		for rows.Next() {
+			var s string
+			var n int
+			if rows.Scan(&s, &n) == nil {
+				used[s] = n
+			}
+		}
+		rows.Close()
+		charge, left := clAllowance(bucket, used, now, reserveOK)
+		if left <= 0 {
+			tx.Rollback()
+			total := 0
+			for _, n := range used {
+				total += n
+			}
+			return 0, clRefuse("%s share spent (%d of %d used by %s today, %d of %d in all)",
+				bucket, used[bucket], clShares[bucket], bucket, total, clDayLimit)
+		}
+		var recent, mine []time.Time
+		rows, err = tx.Query(`SELECT called_at, stage FROM twoai_courtlistener_calls WHERE called_at > $1`, now.Add(-time.Hour))
+		if err != nil {
+			tx.Rollback()
+			return 0, clRefuse("ledger read: %v", err)
+		}
+		var last time.Time
+		for rows.Next() {
+			var t time.Time
+			var s string
+			if rows.Scan(&t, &s) == nil {
+				recent = append(recent, t)
+				if s == charge {
+					mine = append(mine, t)
+				}
+				if t.After(last) {
+					last = t
+				}
+			}
+		}
+		rows.Close()
+		hourWait := max(clHourWait(recent, now, clHourLimit), clHourWait(mine, now, clHourCaps[charge]))
+		wait := max(hourWait, clSpacingWait(last, now))
+		if wait > 0 {
+			tx.Rollback()
+			if !clFits(wait, clBudgetLeft()) {
+				if hourWait > 0 {
+					return 0, clRefuse("%d calls in the last hour (%d by %s), the window opens in %s, past this stage's budget",
+						len(recent), len(mine), charge, wait.Round(time.Second))
+				}
+				return 0, clRefuse("stage budget spent")
+			}
+			if hourWait > 0 {
+				fmt.Printf("CourtListener: %d calls in the last hour (%d by %s), waiting %s for the window\n",
+					len(recent), len(mine), charge, wait.Round(time.Second))
+			}
+			time.Sleep(wait)
+			continue
+		}
+		var id int64
+		if err := tx.QueryRow(`INSERT INTO twoai_courtlistener_calls (called_at, stage, path) VALUES ($1, $2, $3) RETURNING id`,
+			now, charge, trunc(path, 500)).Scan(&id); err != nil {
+			tx.Rollback()
+			return 0, clRefuse("ledger write: %v", err)
+		}
+		if _, err := tx.Exec(`INSERT INTO twoai_courtlistener_budget (day, stage, calls, last_call_at) VALUES ($1, $2, 1, $3)
+			ON CONFLICT (day, stage) DO UPDATE SET calls = twoai_courtlistener_budget.calls + 1, last_call_at = EXCLUDED.last_call_at`,
+			day, charge, now); err != nil {
+			tx.Rollback()
+			return 0, clRefuse("ledger write: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, clRefuse("ledger commit: %v", err)
+		}
+		return id, nil
+	}
+}
+
+// clRecord stamps a call with the status the server answered (0 when no
+// answer arrived). A 429 here is what latches the day for every stage.
+func clRecord(id int64, status int) {
+	if id == 0 || clLedgerOff {
+		return
+	}
+	if db := clLedger(); db != nil {
+		db.Exec(`UPDATE twoai_courtlistener_calls SET status = $2 WHERE id = $1`, id, status)
+	}
+}
+
+// clStateGet and clStateSet keep the few values discovery needs between days.
+func clStateGet(db *sql.DB, key string) string {
+	var v sql.NullString
+	db.QueryRow(`SELECT value FROM twoai_courtlistener_state WHERE key = $1`, key).Scan(&v)
+	return v.String
+}
+
+func clStateSet(db *sql.DB, key, value string) {
+	db.Exec(`INSERT INTO twoai_courtlistener_state (key, value, updated_at) VALUES ($1, $2, now())
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, key, value)
+}
+
+// clDayUse is today's ledger, for the report line.
+type clDayUse struct {
+	Total   int
+	By      map[string]int
+	Latched bool
+	Status  map[int]int // answers by HTTP status, 0 for none
+}
+
+func clUsageToday(db *sql.DB, now time.Time) clDayUse {
+	u := clDayUse{By: map[string]int{}, Status: map[int]int{}}
+	day := clUTCDay(now)
+	if rows, err := db.Query(`SELECT stage, calls FROM twoai_courtlistener_budget WHERE day = $1`, day); err == nil {
+		for rows.Next() {
+			var s string
+			var n int
+			if rows.Scan(&s, &n) == nil {
+				u.By[s] = n
+				u.Total += n
+			}
+		}
+		rows.Close()
+	}
+	if rows, err := db.Query(`SELECT status, count(*) FROM twoai_courtlistener_calls WHERE called_at >= $1 AND called_at < $2 GROUP BY status`,
+		day, day.Add(24*time.Hour)); err == nil {
+		for rows.Next() {
+			var s, n int
+			if rows.Scan(&s, &n) == nil {
+				u.Status[s] = n
+			}
+		}
+		rows.Close()
+	}
+	u.Latched = u.Status[http.StatusTooManyRequests] > 0
+	return u
+}
+
+// clUsageLine is the one line every CourtListener stage ends on and the
+// freshness bridge carries.
+func clUsageLine(u clDayUse, overdue int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "CourtListener: used %d of %d today (refresh %d, recap %d, discovery %d, classify %d",
+		u.Total, clDayLimit, u.By[clBucketRefresh], u.By[clBucketRecap], u.By[clBucketDiscovery], u.By[clBucketClassify])
+	if n := u.By[clBucketReserve]; n > 0 {
+		fmt.Fprintf(&b, ", reserve %d", n)
+	}
+	fmt.Fprintf(&b, "); %d dockets overdue", overdue)
+	if u.Latched {
+		fmt.Fprintf(&b, "; HTTP 429 seen %d times, stopped for the UTC day", u.Status[http.StatusTooManyRequests])
+	}
+	return b.String()
+}
+
+// clUsageSummary is a day's use without the docket count, for yesterday.
+func clUsageSummary(u clDayUse) string {
+	s := fmt.Sprintf("used %d of %d (refresh %d, recap %d, discovery %d, classify %d, reserve %d)",
+		u.Total, clDayLimit, u.By[clBucketRefresh], u.By[clBucketRecap], u.By[clBucketDiscovery],
+		u.By[clBucketClassify], u.By[clBucketReserve])
+	if n := u.Status[http.StatusTooManyRequests]; n > 0 {
+		s += fmt.Sprintf(", HTTP 429 %d times", n)
+	}
+	return s
+}
+
+// clReportLine measures the day and the docket schedule and returns the
+// report line.
+func clReportLine(db *sql.DB) string {
+	now := time.Now()
+	clEnsureLedger(db)
+	overdue := 0
+	if plan, err := clDocketPlan(db, now); err == nil {
+		for _, c := range plan {
+			if c.Overdue {
+				overdue++
+			}
+		}
+	}
+	return clUsageLine(clUsageToday(db, now), overdue)
+}
+
+// clServerUsage reads CourtListener's own count from its usage API, which
+// has a throttle of its own and keeps answering after the main one is spent,
+// so it is read outside the ledger. The line is empty when it cannot be read.
+func clServerUsage() string {
+	tok := os.Getenv("COURTLISTENER_TOKEN")
+	if tok == "" {
+		return ""
+	}
+	req, err := http.NewRequest("GET", clAPIBase+"/api-usage/", nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
+	req.Header.Set("Authorization", "Token "+tok)
+	resp, err := clHTTP.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Sprintf("CourtListener server count: usage API answered HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Current []map[string]any `json:"current_usage"`
+		History map[string]any   `json:"historical_usage"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return ""
+	}
+	return clServerUsageLine(out.Current, out.History, time.Now())
+}
+
+// clServerUsageLine formats the usage API's answer: the rolling windows of
+// the main "user" scope and the server's count for today.
+func clServerUsageLine(current []map[string]any, history map[string]any, now time.Time) string {
+	var parts []string
+	for _, s := range current {
+		if scope, _ := s["scope"].(string); scope != "" && scope != "user" {
+			continue
+		}
+		win := clAnyInt(s["window_seconds"])
+		label := map[int]string{60: "minute", 3600: "hour", 86400: "day"}[win]
+		if label == "" {
+			label = fmt.Sprintf("%ds", win)
+		}
+		p := fmt.Sprintf("%s %d of %d", label, clAnyInt(s["used"]), clAnyInt(s["limit"]))
+		if b, _ := s["blocked"].(bool); b {
+			p += " BLOCKED"
+		}
+		parts = append(parts, p)
+	}
+	today := clUTCDay(now).Format("2006-01-02")
+	if v, ok := history[today]; ok {
+		parts = append(parts, fmt.Sprintf("server history for %s: %d requests", today, clAnyInt(v)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "CourtListener server count: " + strings.Join(parts, ", ")
+}
+
+func clAnyInt(v any) int {
+	switch x := v.(type) {
+	case float64:
+		return int(x)
+	case int:
+		return x
+	case string:
+		var n int
+		fmt.Sscanf(x, "%d", &n)
+		return n
+	case map[string]any:
+		// A history entry may be an object with a count in it.
+		for _, k := range []string{"count", "total", "requests"} {
+			if n, ok := x[k]; ok {
+				return clAnyInt(n)
+			}
+		}
+	}
+	return 0
+}

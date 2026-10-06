@@ -89,6 +89,11 @@ var freshDatasets = []freshDataset{
 	// (docket_ok_at), not when a fetch was attempted; a state case is
 	// followed from reporting and stamped by the state case watch. An
 	// overdue docket reopens intel for the second run of the day.
+	// Since 2026-10-06 (bridge row 518) the refresh itself works to a
+	// schedule of its own, daily, weekly or monthly by how recently a docket
+	// moved, closed cases only when the news names them; this measure stays
+	// at fourteen days so the numbers before and after compare, and the
+	// dockets past their own schedule are listed in the bridge row below.
 	{Key: "lawsuits", Label: "Lawsuit dockets", Cadence: 14, Auto: true, Stage: "intel",
 		How: "CourtListener dockets, as many a run as the rate limit allows, never answered first; state cases from established outlets",
 		Items: `SELECT slug, CASE WHEN courtlistener_url IS NOT NULL THEN docket_ok_at::date ELSE docket_checked_at::date END, NULL::int
@@ -350,6 +355,19 @@ func twoaiFreshnessAudit(db *sql.DB, preview bool) error {
 	}
 	fmt.Fprintf(&b, "Freshness audit (row 439), %s. %d of %d datasets within cadence, %d items overdue, %d fixed today.\n",
 		today.Format("2006-01-02"), within, datasets, overdueItems, fixedToday)
+	// CourtListener rationing, bridge row 518: the day so far, the whole of
+	// yesterday, and every docket that missed its scheduled check.
+	fmt.Fprintf(&b, "\n%s (UTC day so far)\n", clReportLine(db))
+	fmt.Fprintf(&b, "CourtListener yesterday: %s\n", clUsageSummary(clUsageToday(db, time.Now().Add(-24*time.Hour))))
+	if missed, n := clMissedChecks(db, 15); n > 0 {
+		fmt.Fprintf(&b, "Dockets that missed their scheduled check (%d):\n", n)
+		for _, s := range missed {
+			b.WriteString("- " + s + "\n")
+		}
+		if n > len(missed) {
+			fmt.Fprintf(&b, "- and %d more\n", n-len(missed))
+		}
+	}
 	if len(decide) > 0 {
 		b.WriteString("\nNEED A DECISION (the pipeline cannot fix these by itself):\n")
 		for _, s := range decide {

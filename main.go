@@ -57,9 +57,13 @@ var twoaiStageDeadline = map[string]time.Duration{
 	"twoai_claims":       25 * time.Minute,
 	"twoai_lawsuit_fill": 30 * time.Minute, // up to 40 cases a run through Ollama
 	"twoai_jobs":         25 * time.Minute,
-	"intel":              10 * time.Minute, // the stage that proved the need
-	"twoai_recap":        8 * time.Minute,  // RECAP filing harvest, dockets until the budget is spent
-	"export_corpus":      20 * time.Minute,
+	// The stage that proved the need. Fifteen minutes since 2026-10-06: at
+	// one CourtListener call every twelve seconds the refresh needs about
+	// ten of them to spend its share, and it ends at once when the share
+	// is spent, so the extra time is used only when there is work for it.
+	"intel":         15 * time.Minute,
+	"twoai_recap":   8 * time.Minute, // RECAP filing harvest, dockets until the budget is spent
+	"export_corpus": 20 * time.Minute,
 	// twoai_publish pushes the whole changed set as ONE commit through the git
 	// data API: read the ref, build trees from it, commit, move the ref. About
 	// nine requests whatever the day looks like, so it finishes in seconds.
@@ -116,7 +120,11 @@ const twoaiStageDeadlineDefault = 20 * time.Minute
 //	               changed. Eight truncated sweeps are worth less than one
 //	               that finishes, and each carries a wall-clock deadline
 //	               (ten and eight minutes) that the run pays whether or not
-//	               the sweep completes.
+//	               the sweep completes. Since 2026-10-06 the CourtListener
+//	               ledger (courtlistener_ledger.go) is what limits them:
+//	               twoai_recap is off the list and takes what is left of its
+//	               daily share each run, and intel, which the freshness
+//	               audit reopens whenever a docket is overdue, does too.
 //	twoai_onet     already skips on freshness, but the call still costs.
 //	twoai_openlibrary, twoai_case_studies, twoai_companyfacts, twoai_orgfacts,
 //	               docwatch, openalex_watch, export_corpus
@@ -145,7 +153,10 @@ const twoaiStageDeadlineDefault = 20 * time.Minute
 // same politeness per request, against an API with no monthly quota to
 // exhaust. It runs every time.
 var twoaiDailyOnly = map[string]bool{
-	"legiscan": true, "twoai_claims": true, "intel": true, "twoai_recap": true, "twoai_lawsuit_fill": true,
+	// twoai_recap left this list on 2026-10-06: the CourtListener ledger
+	// gives it 25 calls a day, the first run takes them and later runs take
+	// what is left, ending at once when nothing is (bridge row 518).
+	"legiscan": true, "twoai_claims": true, "intel": true, "twoai_lawsuit_fill": true,
 	"twoai_onet": true, "twoai_openlibrary": true, "twoai_case_studies": true,
 	"twoai_companyfacts": true, "twoai_orgfacts": true, "docwatch": true,
 	"twoai_etf_holdings": true, "openalex_watch": true, "export_corpus": true, "appsec_research": true,
@@ -323,7 +334,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "twoai_recap", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -333,9 +344,13 @@ func main() {
 		// twoai_lawsuit_fill rides directly behind intel: intel promotes new
 		// cases and refreshes every docket, and the fill stage reads those
 		// dockets, so a case promoted this run can be described this run.
+		// twoai_recap moved from in front of intel to behind the fill stage
+		// on 2026-10-06: it shares CourtListener's rolling hour with the
+		// docket refresh, the refresh is the work the site most needs, and
+		// recap then reads the docket dates the refresh has just written.
 		for i, s := range seq {
 			if s == "intel" {
-				seq = append(seq[:i+1], append([]string{"twoai_lawsuit_fill"}, seq[i+1:]...)...)
+				seq = append(seq[:i+1], append([]string{"twoai_lawsuit_fill", "twoai_recap"}, seq[i+1:]...)...)
 				break
 			}
 		}
@@ -478,6 +493,15 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("publish_intel: ok")
+		return
+	}
+	// cl_usage prints the CourtListener ledger, CourtListener's own count and
+	// the docket schedule, and calls nothing that counts against the day.
+	if src == "cl_usage" {
+		if err := clUsageReport(db); err != nil {
+			fmt.Fprintln(os.Stderr, "cl_usage:", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if src == "intel" {
@@ -3628,6 +3652,9 @@ func putToRepoTok(tok, repo, path, message string, payload []byte) error {
 
 // The CourtListener client, clGet and clFetch, lives in courtlistener.go with
 // its rate-limit history: the 2026-08-30 latch and the 2026-10-05 budget.
+// Since 2026-10-06 every call takes a slot from the daily ledger in
+// courtlistener_ledger.go, and the docket schedule is in
+// courtlistener_dockets.go (bridge row 518).
 
 // twoaiCourtListenerURL returns the docket URL a reader can actually open.
 // On 2026-09-04 Stephen found three lawsuit pages linking to
@@ -3662,8 +3689,6 @@ type clSearch struct {
 	} `json:"results"`
 }
 
-var docketIDRe = regexp.MustCompile(`/docket/(\d+)/`)
-
 // intelRefresh checks tracked cases for docket movement.
 //
 // SWEEP BUDGET. This used to walk every active case on every run, which was
@@ -3687,40 +3712,32 @@ var docketIDRe = regexp.MustCompile(`/docket/(\d+)/`)
 // docket_ok_at, showed them all overdue. Now the order is docket_ok_at, the
 // last real answer, oldest and never first, so each run picks up where the
 // last one stopped. Cases are taken until the refresh share of the stage
-// budget is spent (see clSetStageDeadline), waiting out short throttles on
-// the way, and each case is stamped the moment it is done.
-func intelRefresh(db *sql.DB) (checked, updated int, err error) {
-	// The most cases one run will look at. The time budget stops the sweep
-	// well before this on a throttled day; it is a ceiling, not a target.
-	const sweepLimit = 60
-	// The refresh may run until five minutes before the intel deadline, which
-	// leaves resolve, discover and the AI feed watch their own time.
-	clSetStageDeadline("intel", 5*time.Minute)
-	// docket_ok_at is set only when CourtListener answered, so the
-	// freshness audit measures real checks, not attempts (row 439).
-	db.Exec(`ALTER TABLE ai_lawsuits ADD COLUMN IF NOT EXISTS docket_ok_at timestamptz`)
-	rows, err := db.Query(`SELECT id, slug, courtlistener_url, COALESCE(latest_development_date::text,''), COALESCE(timeline::text,'[]')
-		FROM ai_lawsuits WHERE is_active AND courtlistener_url IS NOT NULL
-		ORDER BY docket_ok_at ASC NULLS FIRST, docket_checked_at ASC NULLS FIRST, latest_development_date DESC NULLS LAST
-		LIMIT $1`, sweepLimit)
+// budget is spent (see clSetStageDeadline), and each case is stamped the
+// moment it is done.
+//
+// RATIONED, 2026-10-06 (bridge row 518). The refresh now has 70 calls a day
+// (courtlistener_ledger.go) and takes only the dockets that are due, in
+// priority order (courtlistener_dockets.go): a new entry in the last week
+// first, then a hearing or deadline in the next two weeks, then the cases
+// Stephen named, then the rest, each on a cadence of daily, weekly or
+// monthly by how recently it moved. Each docket costs one call: the entries
+// modified since CourtListener last answered, three fields of them. reserve
+// is the time kept back for resolve and the AI feed watch.
+func intelRefresh(db *sql.DB, reserve time.Duration) (checked, updated int, err error) {
+	clUse(db, clBucketRefresh)
+	clSetStageDeadline("intel", reserve)
+	now := time.Now()
+	plan, err := clDocketPlan(db, now)
 	if err != nil {
 		return 0, 0, err
 	}
-	type caseRow struct {
-		id                 int64
-		slug, clURL, since string
-		timeline           string
-	}
-	var cases []caseRow
-	for rows.Next() {
-		var c caseRow
-		if err := rows.Scan(&c.id, &c.slug, &c.clURL, &c.since, &c.timeline); err != nil {
-			rows.Close()
-			return checked, updated, err
+	var cases []clCase
+	for _, c := range plan {
+		if c.Due && c.DocketID != "" {
+			cases = append(cases, c)
 		}
-		cases = append(cases, c)
 	}
-	rows.Close()
+	clSortByPriority(cases, now)
 	// A case is stamped the moment it is done, so a run that stops on the
 	// budget keeps everything it finished. docket_ok_at only when
 	// CourtListener answered for the docket; docket_checked_at for any
@@ -3737,46 +3754,37 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 	}
 	stopped := false
 	for _, c := range cases {
-		m := docketIDRe.FindStringSubmatch(c.clURL)
-		if m == nil {
-			continue
-		}
-		did := m[1]
-		var docket struct {
-			DateLastFiling string `json:"date_last_filing"`
-			AbsoluteURL    string `json:"absolute_url"`
-		}
-		if err := clGet("/dockets/"+did+"/", nil, &docket); err != nil {
-			if clIsBudget(err) {
-				// The refresh share of the budget is spent. The rest of the
-				// cases keep their place and are first in line next run.
-				stopped = true
-				break
-			}
-			fmt.Fprintln(os.Stderr, "intel refresh", c.slug, "docket fetch:", err)
-			done(c.id, false)
-			time.Sleep(2 * time.Second)
-			continue
-		}
+		did := c.DocketID
 		// THE LINK A READER CAN OPEN. CourtListener refuses /docket/<id>/ and
 		// answers only /docket/<id>/<slug>/. Stephen, 2026-09-21: none of the
 		// docket links work. 13 cases held the bare form and every timeline row
 		// on 110 cases was built as the bare form below. The docket record
 		// carries its own absolute_url, so the case URL heals itself here and
-		// every new timeline row links to it.
-		caseURL := c.clURL
-		if docket.AbsoluteURL != "" {
-			caseURL = twoaiCourtListenerURL(docket.AbsoluteURL, 0)
-			if caseURL != c.clURL {
-				db.Exec(`UPDATE ai_lawsuits SET courtlistener_url = $2,
-					source_url = CASE WHEN source_url = $3 THEN $2 ELSE source_url END, updated_at = now() WHERE id = $1`,
-					c.id, caseURL, c.clURL)
+		// every new timeline row links to it. Since 2026-10-06 the record is
+		// read only when something needs it, a bare link or an unclassified
+		// case with nothing cached, and it is cached for the classifier.
+		caseURL := c.URL
+		if !c.Cached && (c.Category == "unclassified" || bareDocketURLRe.MatchString(c.URL)) {
+			docket, _, err := clDocket(db, did)
+			if err != nil {
+				if clIsBudget(err) {
+					// The refresh share is spent. The rest of the cases keep
+					// their place and are first in line next run.
+					stopped = true
+					break
+				}
+				fmt.Fprintln(os.Stderr, "intel refresh", c.Slug, "docket fetch:", err)
+				done(c.ID, false)
+				continue
 			}
-		}
-		if docket.DateLastFiling == "" || (c.since != "" && docket.DateLastFiling <= c.since) {
-			done(c.id, true)
-			time.Sleep(2 * time.Second)
-			continue
+			if docket.AbsoluteURL != "" {
+				caseURL = twoaiCourtListenerURL(docket.AbsoluteURL, 0)
+				if caseURL != c.URL {
+					db.Exec(`UPDATE ai_lawsuits SET courtlistener_url = $2,
+						source_url = CASE WHEN source_url = $3 THEN $2 ELSE source_url END, updated_at = now() WHERE id = $1`,
+						c.ID, caseURL, c.URL)
+				}
+			}
 		}
 		var entries struct {
 			Results []struct {
@@ -3785,24 +3793,31 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 				Description string          `json:"description"`
 			} `json:"results"`
 		}
-		if err := clGet("/docket-entries/", map[string]string{
-			"docket": did, "order_by": "-date_filed", "page_size": "5",
-		}, &entries); err != nil {
+		// Only what changed since CourtListener last answered for this
+		// docket, an hour of overlap for clock drift; 20 is the endpoint's
+		// fixed page size. A docket never answered gets its newest page.
+		params := map[string]string{
+			"docket": did, "order_by": "-date_filed", "page_size": "20",
+			"fields": "date_filed,entry_number,description",
+		}
+		if !c.LastOK.IsZero() {
+			params["date_modified__gt"] = c.LastOK.Add(-time.Hour).UTC().Format(time.RFC3339)
+		}
+		if err := clGet("/docket-entries/", params, &entries); err != nil {
 			if clIsBudget(err) {
 				// Not stamped: the new filings are still unread, so the case
-				// stays in front and both reads happen again next run.
+				// stays in front and is read again next run.
 				stopped = true
 				break
 			}
-			// The docket itself answered, so it counts as checked; the new
-			// entries are read when the case next comes round.
-			fmt.Fprintln(os.Stderr, "intel refresh", c.slug, "entries fetch:", err)
-			done(c.id, true)
-			time.Sleep(2 * time.Second)
+			// A refusal such as a 404 belongs to this docket: it rotates
+			// behind the others without counting as answered.
+			fmt.Fprintln(os.Stderr, "intel refresh", c.Slug, "entries fetch:", err)
+			done(c.ID, false)
 			continue
 		}
 		var existing []map[string]any
-		json.Unmarshal([]byte(c.timeline), &existing)
+		json.Unmarshal([]byte(c.Timeline), &existing)
 		seen := map[string]bool{}
 		for _, e := range existing {
 			d, _ := e["date"].(string)
@@ -3831,32 +3846,41 @@ func intelRefresh(db *sql.DB) (checked, updated int, err error) {
 				return di > dj
 			})
 			payload, _ := json.Marshal(merged)
-			newest := fresh[0]
+			// The newest entry of the merged timeline, not of this page: an
+			// entry modified today can have been filed long ago.
+			newest := merged[0]
 			if _, err := db.Exec(`UPDATE ai_lawsuits SET timeline=$1, latest_development=$2,
 				latest_development_date=$3, updated_at=now() WHERE id=$4`,
-				payload, newest["title"], newest["date"], c.id); err != nil {
-				fmt.Fprintln(os.Stderr, "intel refresh", c.slug, "update:", err)
+				payload, newest["title"], newest["date"], c.ID); err != nil {
+				fmt.Fprintln(os.Stderr, "intel refresh", c.Slug, "update:", err)
 				continue
 			}
 			updated++
-			fmt.Printf("intel refresh %s: %d new docket entries through %v\n", c.slug, len(fresh), newest["date"])
+			fmt.Printf("intel refresh %s: %d new docket entries through %v\n", c.Slug, len(fresh), newest["date"])
 		}
-		done(c.id, true)
-		time.Sleep(2 * time.Second)
+		done(c.ID, true)
 	}
 	if stopped {
 		// Out of budget is not a failure: say how far the sweep got, once,
 		// on stdout, and let the next run carry on from here.
-		fmt.Printf("intel refresh: rate limited, %d of %d dockets done, rest next run ok=true\n", checked, len(cases))
+		fmt.Printf("intel refresh: rate limited, %d of %d due dockets done, rest next run ok=true\n", checked, len(cases))
+	} else {
+		fmt.Printf("intel refresh: %d of %d due dockets done, %d federal dockets on the tracker ok=true\n", checked, len(cases), len(plan))
 	}
 	return checked, updated, nil
 }
+
+// bareDocketURLRe matches a docket link without CourtListener's slug.
+var bareDocketURLRe = regexp.MustCompile(`/docket/\d+/?$`)
 
 // intelResolve fills docket numbers still marked pending verification straight
 // from CourtListener search.
 func intelResolve(db *sql.DB) (resolved int, err error) {
 	// Resolve and discover share CourtListener time until three minutes
-	// before the intel deadline; the AI feed watch has the rest.
+	// before the intel deadline; the AI feed watch has the rest. Resolving
+	// is charged to the discovery share, and runs after discovery so the
+	// day's two searches always get their slots first.
+	clUse(db, clBucketDiscovery)
 	clSetStageDeadline("intel", 3*time.Minute)
 	rows, err := db.Query(`SELECT id, slug, case_name, COALESCE(defendants,'')
 		FROM ai_lawsuits WHERE docket ILIKE '%pending%' AND is_active`)
@@ -3911,7 +3935,6 @@ func intelResolve(db *sql.DB) (resolved int, err error) {
 			}
 			break
 		}
-		time.Sleep(2 * time.Second)
 	}
 	return resolved, nil
 }
@@ -3935,9 +3958,23 @@ func intelResolve(db *sql.DB) (resolved int, err error) {
 // publicity and deepfakes, biometric privacy, and AI-washing securities fraud.
 // A tracker that only watched copyright would have shown a shrinking field while
 // the actual field expanded.
+//
+// TWO CALLS A DAY, 2026-10-06 (bridge row 518). The two passes used to cost
+// 27 searches a run, a fifth of the day's 125 before a single docket was
+// read. Discovery now runs once a day, in the run that starts between 09:00
+// and 11:59 UTC (05:00 CDT), as ONE search with every subject family OR'd
+// together, filed after the last day discovery succeeded (three days of
+// overlap, because CourtListener learns of some filings days late), plus ONE
+// defendant from the list, a different one each day in turn. Promotion of
+// the queue is separate and runs every time (intelPromote, from intelSync).
 func intelDiscover(db *sql.DB) (added int, err error) {
+	clUse(db, clBucketDiscovery)
 	clSetStageDeadline("intel", 3*time.Minute)
-	since := time.Now().AddDate(0, 0, -45).Format("2006-01-02")
+	today := clUTCDay(time.Now())
+	since := today.AddDate(0, 0, -45).Format("2006-01-02")
+	if last, perr := time.Parse("2006-01-02", clStateGet(db, "discover_last_ok")); perr == nil {
+		since = last.AddDate(0, 0, -3).Format("2006-01-02")
+	}
 
 	// Defendants worth watching by name. Precision comes from the party, so
 	// these need no topical qualifier at all.
@@ -4024,77 +4061,60 @@ func intelDiscover(db *sql.DB) (added int, err error) {
 		}
 	}
 
-	// Discovery makes 25 API calls across the two passes. When CourtListener
-	// throttles, each one costs about ninety seconds of backoff, which is over
-	// half an hour of a run spent achieving nothing. Stop at the first sign of
-	// it: discovery is a daily sweep, and missing one day costs a candidate
-	// being queued tomorrow instead of today. Since 2026-10-05 clGet waits
-	// out short throttles itself, so a rate-limited error here means the
-	// stage budget is spent, not that one window was open.
-	throttled := false
-	for _, q := range subjects {
-		if throttled {
-			break
-		}
-		var res clSearch
-		if e := clGet("/search/", map[string]string{
-			"type": "r", "q": q, "filed_after": since, "order_by": "dateFiled desc",
-		}, &res); e != nil {
-			fmt.Fprintln(os.Stderr, "intel discover subject:", e)
-			if strings.Contains(e.Error(), "rate limited") {
-				throttled = true
-			}
-			continue
-		}
-		for i, h := range res.Results {
-			if i >= 25 {
-				break
-			}
-			queue(h, 0)
-		}
-		time.Sleep(2 * time.Second)
+	// ONE SUBJECT SEARCH, every claim family OR'd together. A family that is
+	// noisy now competes with the others in one ranked list, which is the
+	// price of asking once; the scoring below still keeps the noise out of
+	// the queue.
+	var res clSearch
+	if e := clGet("/search/", map[string]string{
+		"type": "r", "q": "(" + strings.Join(subjects, ") OR (") + ")",
+		"filed_after": since, "order_by": "dateFiled desc",
+	}, &res); e != nil {
+		fmt.Fprintln(os.Stderr, "intel discover subject:", e)
+		fmt.Println("intel discover: the subject search did not answer, tried again in tomorrow's morning run")
+		return added, nil
 	}
+	for _, h := range res.Results {
+		queue(h, 0)
+	}
+	// The search answered, so today is done, whatever the defendant search
+	// does, and tomorrow's search starts from here.
+	clStateSet(db, "discover_last_ok", today.Format("2006-01-02"))
 
-	// Defendant sweep runs on a longer window: a suit against a known AI
-	// company is worth tracking whenever it was filed, not only in the last
-	// 45 days. The base score of 3 reflects that the party alone is the
-	// evidence.
-	dsince := time.Now().AddDate(0, 0, -365).Format("2006-01-02")
-	for _, d := range defendants {
-		if throttled {
-			break
-		}
-		var res clSearch
-		if e := clGet("/search/", map[string]string{
-			"type": "r", "q": fmt.Sprintf(`caseName:("%s")`, d),
-			"filed_after": dsince, "order_by": "dateFiled desc",
-		}, &res); e != nil {
-			fmt.Fprintln(os.Stderr, "intel discover defendant", d, ":", e)
-			if strings.Contains(e.Error(), "rate limited") {
-				throttled = true
-			}
-			continue
-		}
-		for i, h := range res.Results {
-			if i >= 20 {
-				break
-			}
+	// ONE DEFENDANT A DAY, in turn, on a longer window: a suit against a
+	// known AI company is worth tracking whenever it was filed, not only in
+	// the last 45 days. The base score of 3 reflects that the party alone is
+	// the evidence. The turn moves on only when the search answered.
+	next, _ := strconv.Atoi(clStateGet(db, "discover_defendant_next"))
+	d := defendants[((next%len(defendants))+len(defendants))%len(defendants)]
+	dsince := today.AddDate(0, 0, -365).Format("2006-01-02")
+	var dres clSearch
+	if e := clGet("/search/", map[string]string{
+		"type": "r", "q": fmt.Sprintf(`caseName:("%s")`, d),
+		"filed_after": dsince, "order_by": "dateFiled desc",
+	}, &dres); e != nil {
+		fmt.Fprintln(os.Stderr, "intel discover defendant", d, ":", e)
+	} else {
+		for _, h := range dres.Results {
 			queue(h, 3)
 		}
-		time.Sleep(2 * time.Second)
+		clStateSet(db, "discover_defendant_next", strconv.Itoa(next+1))
 	}
-
-	if throttled {
-		fmt.Println("intel discover: rate limited, discovery cut short this run")
-	}
-	promoted, perr := intelPromote(db)
-	if perr != nil {
-		return added, perr
-	}
-	if promoted > 0 {
-		fmt.Printf("intel discover: promoted %d candidates to the tracker\n", promoted)
-	}
+	fmt.Printf("intel discover: subjects filed after %s and defendant %s searched, %d queued\n", since, d, added)
 	return added, nil
+}
+
+// intelDiscoverDue says whether this run is the day's discovery run: the
+// stage started between 09:00 and 11:59 UTC and discovery has not yet
+// succeeded today. CL_DISCOVER=1 forces it for a hand run.
+func intelDiscoverDue(db *sql.DB, start time.Time) bool {
+	if os.Getenv("CL_DISCOVER") != "" {
+		return true
+	}
+	if h := start.UTC().Hour(); h < 9 || h >= 12 {
+		return false
+	}
+	return clStateGet(db, "discover_last_ok") != clUTCDay(start).Format("2006-01-02")
 }
 
 // intelPromote publishes high-confidence candidates into ai_lawsuits so a newly
@@ -4640,20 +4660,38 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 func intelSync(db *sql.DB) error {
 	ok := true
 	var details []string
-	checked, updated, err := intelRefresh(db)
+	// CourtListener is rationed (courtlistener_ledger.go). Discovery runs in
+	// one run a day, and goes first in that run: its two searches are the
+	// day's only chance, while the refresh has the evening run as well.
+	clEnsureLedger(db)
+	lawAdded := 0
+	if intelDiscoverDue(db, clProcessStart) {
+		n, err := intelDiscover(db)
+		lawAdded = n
+		if err != nil {
+			ok = false
+			details = append(details, "discover: "+err.Error())
+		}
+	} else {
+		fmt.Println("intel discover: not this run, once a day in the run that starts 09:00 to 11:59 UTC")
+	}
+	// The refresh may run until three minutes before the intel deadline,
+	// which leaves resolve and the AI feed watch their own time.
+	checked, updated, err := intelRefresh(db, 3*time.Minute)
 	if err != nil {
 		ok = false
 		details = append(details, "refresh: "+err.Error())
+	}
+	if promoted, err := intelPromote(db); err != nil {
+		ok = false
+		details = append(details, "promote: "+err.Error())
+	} else if promoted > 0 {
+		fmt.Printf("intel discover: promoted %d candidates to the tracker\n", promoted)
 	}
 	resolved, err := intelResolve(db)
 	if err != nil {
 		ok = false
 		details = append(details, "resolve: "+err.Error())
-	}
-	lawAdded, err := intelDiscover(db)
-	if err != nil {
-		ok = false
-		details = append(details, "discover: "+err.Error())
 	}
 	intelAdded, err := intelAIWatch(db)
 	if err != nil {
@@ -4667,6 +4705,10 @@ func intelSync(db *sql.DB) error {
 		ok, checked, updated, lawAdded, intelAdded, detail)
 	fmt.Printf("intel: checked=%d updated=%d resolved=%d lawsuit_candidates=%d intel_candidates=%d ok=%v\n",
 		checked, updated, resolved, lawAdded, intelAdded, ok)
+	fmt.Println(clReportLine(db))
+	if s := clServerUsage(); s != "" {
+		fmt.Println(s)
+	}
 	if !ok {
 		return fmt.Errorf("intel jobs failed: %s", strings.Join(details, "; "))
 	}

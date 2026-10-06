@@ -24,6 +24,13 @@ package main
 // budget, and cases are taken oldest nos_checked_at first, stamped as soon
 // as CourtListener answers, so a run that stops on the budget leaves the
 // unread ones first in line and the ones left for review go to the back.
+//
+// CACHE FIRST, 2026-10-06 (bridge row 518). The classifier has 10
+// CourtListener calls a day (courtlistener_ledger.go). A nature of suit
+// already in twoai_cl_docket_cache, which the docket refresh fills, costs
+// nothing; a docket record is fetched at most once a UTC day across every
+// stage; and a docket whose cached record carries no nature of suit is not
+// asked again for thirty days, only searched.
 
 import (
 	"database/sql"
@@ -55,6 +62,7 @@ var lawsuitDocketIDRe = regexp.MustCompile(`courtlistener\.com/docket/(\d+)`)
 func twoaiLawsuitClassify(db *sql.DB) error {
 	// The page writer behind this step needs most of the stage's thirty
 	// minutes, so CourtListener gets three of them.
+	clUse(db, clBucketClassify)
 	clSetBudget(3 * time.Minute)
 	db.Exec(`ALTER TABLE ai_lawsuits ADD COLUMN IF NOT EXISTS nos_checked_at timestamptz`)
 	rows, err := db.Query(`SELECT slug, courtlistener_url FROM ai_lawsuits
@@ -82,7 +90,7 @@ func twoaiLawsuitClassify(db *sql.DB) error {
 		// pipeline already holds; the search endpoint is the fallback. The
 		// first run used search only and 12 of 22 came back empty, most likely
 		// throttled, which the old code could not tell from no data.
-		nos, status, err := lawsuitNOSFromDocket(tok, x.id)
+		nos, status, err := lawsuitNOSFromDocket(db, tok, x.id)
 		if nos == "" && !clIsBudget(err) {
 			var s2 int
 			nos, s2, err = lawsuitNOSFromSearch(x.id)
@@ -96,7 +104,6 @@ func twoaiLawsuitClassify(db *sql.DB) error {
 			stopped = true
 			break
 		}
-		time.Sleep(700 * time.Millisecond)
 		read++
 		// CourtListener answered one way or another, so the case goes to the
 		// back of the line, a code left for review included.
@@ -125,6 +132,7 @@ func twoaiLawsuitClassify(db *sql.DB) error {
 		fmt.Printf("twoai_lawsuit_classify: rate limited, %d of %d dockets done, rest next run ok=true\n", read, len(cs))
 	}
 	fmt.Printf("twoai_lawsuit_classify: unclassified=%d read=%d classified=%d left_for_review=%d ok=true\n", len(cs), read, classified, left)
+	fmt.Println(clReportLine(db))
 	return nil
 }
 
@@ -135,15 +143,24 @@ func lawsuitCLGet(u string, into any) (int, error) {
 	return clFetch(u, into)
 }
 
-func lawsuitNOSFromDocket(tok, id string) (string, int, error) {
+// lawsuitNOSFromDocket reads the nature of suit from the docket record,
+// from twoai_cl_docket_cache when it holds one (status 200, no call made).
+func lawsuitNOSFromDocket(db *sql.DB, tok, id string) (string, int, error) {
+	if rec, at, ok := clCachedDocket(db, id); ok {
+		if nos := strings.TrimSpace(rec.NatureOfSuit); nos != "" {
+			return nos, 200, nil
+		}
+		if time.Since(at) < 30*24*time.Hour {
+			// Asked within the month and the court recorded none; the
+			// search fallback is the only other place to look.
+			return "", 200, nil
+		}
+	}
 	if tok == "" {
 		return "", 0, nil
 	}
-	var d struct {
-		NatureOfSuit string `json:"nature_of_suit"`
-	}
-	s, err := lawsuitCLGet(clAPIBase+"/dockets/"+id+"/?fields=nature_of_suit", &d)
-	return strings.TrimSpace(d.NatureOfSuit), s, err
+	rec, s, err := clDocket(db, id)
+	return strings.TrimSpace(rec.NatureOfSuit), s, err
 }
 
 func lawsuitNOSFromSearch(id string) (string, int, error) {
