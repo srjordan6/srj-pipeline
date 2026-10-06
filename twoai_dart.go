@@ -164,12 +164,34 @@ func twoaiDartRefreshCorps(db *sql.DB, key string, client *http.Client) error {
 	if age.Valid && age.Int64 < 7 {
 		return nil
 	}
-	resp, err := client.Get(dartBase + "corpCode.xml?crtfc_key=" + url.QueryEscape(key))
-	if err != nil {
-		return fmt.Errorf("corpCode: %s", dartRedact(err, key))
+	// The register is a zip of a few megabytes from Korea. The client's 60
+	// second limit covers the whole body, and a read error was ignored, so a
+	// slow transfer arrived cut short and failed as "not a valid zip file"
+	// (2026-10-06). It gets five minutes, a checked read and three tries.
+	long := *client
+	long.Timeout = 5 * time.Minute
+	var body []byte
+	for attempt := 1; ; attempt++ {
+		resp, err := long.Get(dartBase + "corpCode.xml?crtfc_key=" + url.QueryEscape(key))
+		if err != nil {
+			if attempt < 3 {
+				continue
+			}
+			return fmt.Errorf("corpCode: %s", dartRedact(err, key))
+		}
+		b, rerr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+		resp.Body.Close()
+		short := resp.ContentLength > 0 && int64(len(b)) < resp.ContentLength
+		if (rerr != nil || short) && attempt < 3 {
+			fmt.Printf("twoai_dart: corpCode download cut short at %d bytes, trying again\n", len(b))
+			continue
+		}
+		if rerr != nil {
+			return fmt.Errorf("corpCode: read %d bytes: %s", len(b), dartRedact(rerr, key))
+		}
+		body = b
+		break
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	// An error comes back as XML, not as a zip. Read it rather than failing on
 	// a corrupt archive and leaving the reason unsaid.
 	if !bytes.HasPrefix(body, []byte("PK")) {
