@@ -27,6 +27,24 @@ package main
 // the sub-hub classifier and the verify tagger each write the words that
 // fired into detail, so a wrong classification can be seen and fixed.
 //
+// NOISE IS SKIPPED AT HARVEST (bridge row 496). The content project reviewed
+// the first 391 rows and asked that FDA labelling supplements, generic
+// approvals, journal corrections, letters and issue furniture never reach
+// the daily list. Those rows are still stored, so a URL is never fetched
+// twice, but at status 'skipped' with detail->>'skip_reason' and the words
+// that fired in detail->>'skip_matched'.
+//
+// COVERAGE IS RESOLVED TO ITS PRIMARY (bridge row 496). Each run takes up to
+// thirty coverage rows and looks for the company release, regulator record,
+// registry entry or paper behind the story: first among the newsroom items
+// and stored primaries dated from fourteen days before the story to four
+// after, then through the links on the publisher's page. A candidate is accepted only when its title shares
+// a drug or product name and one more distinctive term with the coverage
+// headline. The primary is filed as its own row with
+// detail->>'resolved_from', and the coverage row goes to status 'resolved'
+// with detail->>'primary_url'. A row gets three tries, twelve hours apart,
+// before it is left at 'needs primary' and named in the daily bridge row.
+//
 // NOTHING HERE CALLS A MODEL. Classification is keyword tables, tested in
 // twoai_health_watch_test.go, so the stage is neither a bulk stage nor
 // daily-only.
@@ -38,6 +56,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -60,6 +79,17 @@ const (
 	// Time kept back from the stage deadline for the bridge rows and the
 	// summary line, so fetching stops cleanly before the runner kills us.
 	twoaiHealthReserve = 90 * time.Second
+	// Coverage resolution: rows tried per run, page fetches that work may
+	// spend per run, links followed from one publisher page, and the tries
+	// a row gets, at least twelve hours apart, before it is given up.
+	twoaiHealthResolveRows    = 30
+	twoaiHealthResolveFetches = 120
+	twoaiHealthResolveLinks   = 4
+	twoaiHealthResolveTries   = 3
+	twoaiHealthResolveGap     = 12 * time.Hour
+	// Publisher and company pages are fetched as a browser-compatible client
+	// that still names itself, because many news sites refuse a bare bot UA.
+	twoaiHealthPageUA = "Mozilla/5.0 (compatible; srj-pipeline health watch; +https://srjconsultingservices.com)"
 )
 
 // ---------------------------------------------------------------------
@@ -386,6 +416,139 @@ var twoaiHealthFDADrugs = []string{
 }
 
 // ---------------------------------------------------------------------
+// Noise skipped at harvest. Calibrated on 2026-10-05 against the 391 rows
+// the content project reviewed (bridge row 496): every rule below fires on
+// rows it skipped, and none fires on any of the 44 rows it used, which
+// TestHwSkipReasonNeverSkipsUsed keeps true.
+// ---------------------------------------------------------------------
+
+// hwSkipTitles are title shapes that are not articles worth reading: notices
+// about other papers, letters and replies, and the furniture of an issue.
+// They apply to journal feed items and PubMed records only, so a company
+// release such as Lilly's "An open letter ..." is never caught.
+var hwSkipTitles = []struct {
+	reason string
+	re     *regexp.Regexp
+}{
+	{"correction or retraction notice", regexp.MustCompile(`(?i)^(correction|corrigendum|erratum|errata)(\s*(to\b|:|\.|-|\[)|\s*$)|^(retraction|retracted|notice of retraction|expression of concern)\b`)},
+	{"letter, comment or reply", regexp.MustCompile(`(?i)^(reply|in reply|authors?'? reply|response to (comment|letter)s?|comments? on|letter to the editor|letter)\b|\breply to\b.*\[letter\]|\[letter\]\s*$|\.\s*reply\.?\s*$`)},
+	{"not an article", regexp.MustCompile(`(?i)^(about the (artist|editor|cover)\b|(on the )?cover( (image|art|illustration|page|story))?\s*(:|$)|in this issue\b|table of contents\b|issues and events\s*$|up front\s*$|masthead\s*$|editorial board\s*$|reviewer acknowledg)`)},
+}
+
+// hwSkipSections are the Lancet's own section labels, the "[Comment]" that
+// opens each feed title, that mark an item as not an article.
+var hwSkipSections = map[string]string{
+	"comment":               "letter, comment or reply",
+	"correspondence":        "letter, comment or reply",
+	"editorial":             "editorial",
+	"corrections":           "correction or retraction notice",
+	"correction":            "correction or retraction notice",
+	"department of error":   "correction or retraction notice",
+	"retraction":            "correction or retraction notice",
+	"expression of concern": "correction or retraction notice",
+	"in focus":              "not an article",
+	"world report":          "not an article",
+	"perspectives":          "not an article",
+	"obituary":              "not an article",
+}
+
+// hwSkipPubtypes are the PubMed publication types that mark a record as not
+// an article. Editorial is deliberately absent: PubMed files invited
+// commentary under it, and the content project used one such record,
+// "Lipoprotein(a) After HORIZON", on the Lp(a) hub.
+var hwSkipPubtypes = map[string]string{
+	"Letter":                    "letter, comment or reply",
+	"Comment":                   "letter, comment or reply",
+	"Published Erratum":         "correction or retraction notice",
+	"Retraction of Publication": "correction or retraction notice",
+	"Retracted Publication":     "correction or retraction notice",
+	"Expression of Concern":     "correction or retraction notice",
+}
+
+// NEJM's DOI says what an item is: NEJMoa an original article, NEJMc a
+// letter, NEJMe an editorial, NEJMx a correction, NEJMicm an image.
+var hwNEJMTypeRe = regexp.MustCompile(`(?i)/10\.1056/(NEJM(?:c|e|x|icm))\d`)
+
+var hwNEJMSkip = map[string]string{
+	"nejmc":   "letter, comment or reply",
+	"nejme":   "editorial",
+	"nejmx":   "correction or retraction notice",
+	"nejmicm": "not an article",
+}
+
+var hwSectionRe = regexp.MustCompile(`^\[([A-Za-z][A-Za-z '&-]{1,40})\]\s*(.+)$`)
+
+// hwFeedSection splits a leading section label, "[Comment] Title", off a
+// feed title. A title without one comes back whole with an empty section.
+func hwFeedSection(title string) (string, string) {
+	if m := hwSectionRe.FindStringSubmatch(title); m != nil {
+		return m[1], strings.TrimSpace(m[2])
+	}
+	return "", title
+}
+
+// hwStrings reads a detail value that is a list of strings, as built in
+// Go or as read back from JSON.
+func hwStrings(v any) []string {
+	switch x := v.(type) {
+	case []string:
+		return x
+	case []any:
+		var out []string
+		for _, e := range x {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// hwSkipReason says why an item should be stored as skipped, and what it
+// matched on, or returns two empty strings for an item worth reading.
+func hwSkipReason(kind, title, link string, d map[string]any) (string, string) {
+	switch kind {
+	case "fda":
+		if appl := hwStr(d["application"]); strings.HasPrefix(appl, "ANDA") {
+			return "ANDA generic approval", appl
+		}
+		for _, k := range []string{"submission_class", "submission_class_code"} {
+			if c := hwStr(d[k]); strings.HasPrefix(strings.ToLower(c), "labeling") {
+				return "FDA labelling-only supplement", c
+			}
+		}
+		if hwStr(d["status"]) == "TA" {
+			// Every tentative approval in the first runs was a generic or a
+			// new dosage form held back by patents, and none can be sold.
+			return "FDA tentative approval", "TA"
+		}
+	case "journal", "pubmed":
+		if sec := hwStr(d["section"]); sec != "" {
+			if why := hwSkipSections[strings.ToLower(sec)]; why != "" {
+				return why, "[" + sec + "]"
+			}
+		}
+		if m := hwNEJMTypeRe.FindStringSubmatch(link); m != nil {
+			if why := hwNEJMSkip[strings.ToLower(m[1])]; why != "" {
+				return why, m[1]
+			}
+		}
+		for _, pt := range hwStrings(d["pubtype"]) {
+			if why := hwSkipPubtypes[pt]; why != "" {
+				return why, "pubtype " + pt
+			}
+		}
+		for _, s := range hwSkipTitles {
+			if m := s.re.FindString(title); m != "" {
+				return s.reason, strings.TrimSpace(m)
+			}
+		}
+	}
+	return "", ""
+}
+
+// ---------------------------------------------------------------------
 // The run.
 // ---------------------------------------------------------------------
 
@@ -405,9 +568,17 @@ type hwRun struct {
 	resolved int
 	seen     map[string]int
 	added    map[string]int
+	skipped  map[string]int
 	byTopic  map[string]int
 	notices  []string
 	stopped  bool
+	// Coverage resolution: every item the newsroom, society and regulator
+	// feeds carried this run, filtered or not, the page fetches spent, and
+	// the rows resolved and given up.
+	newsroom    []hwCand
+	fetches     int
+	covResolved int
+	covGaveUp   int
 }
 
 // hwFamily maps a row kind to the counter it reports under.
@@ -467,21 +638,31 @@ func (r *hwRun) save(it hwItem) bool {
 			it.detail["verify_via"] = "pattern"
 		}
 	}
+	status := "new"
+	if why, m := hwSkipReason(it.kind, it.title, it.url, it.detail); why != "" {
+		status = "skipped"
+		it.detail["skip_reason"] = why
+		it.detail["skip_matched"] = m
+	}
 	if len(it.title) > 1000 {
 		it.title = it.title[:1000]
 	}
 	dj, _ := json.Marshal(it.detail)
 	fam := hwFamily(it.kind)
 	r.seen[fam]++
-	res, err := r.db.Exec(`INSERT INTO twoai_health_watch (url, topic, source, title, item_date, kind, sub_hub, detail)
-		VALUES ($1,$2,$3,$4,NULLIF($5,'')::date,$6,$7,$8::jsonb)
+	res, err := r.db.Exec(`INSERT INTO twoai_health_watch (url, topic, source, title, item_date, kind, sub_hub, status, detail)
+		VALUES ($1,$2,$3,$4,NULLIF($5,'')::date,$6,$7,$8,$9::jsonb)
 		ON CONFLICT (url) DO NOTHING`,
-		it.url, it.topic, it.source, it.title, it.date, it.kind, hub, string(dj))
+		it.url, it.topic, it.source, it.title, it.date, it.kind, hub, status, string(dj))
 	if err != nil {
 		r.notice("insert %s: %v", it.url, err)
 		return false
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
+		if status == "skipped" {
+			r.skipped[fam]++
+			return true
+		}
 		r.added[fam]++
 		r.byTopic[it.topic]++
 		return true
@@ -526,7 +707,7 @@ func twoaiHealthWatch(db *sql.DB) error {
 	r := &hwRun{
 		db: db, stop: start.Add(limit - twoaiHealthReserve),
 		ncbiKey: os.Getenv("NCBI_API_KEY"),
-		seen:    map[string]int{}, added: map[string]int{}, byTopic: map[string]int{},
+		seen:    map[string]int{}, added: map[string]int{}, skipped: map[string]int{}, byTopic: map[string]int{},
 	}
 
 	r.pubmed()
@@ -535,6 +716,7 @@ func twoaiHealthWatch(db *sql.DB) error {
 	r.feeds()
 	r.coverage()
 	r.verifyCoverage()
+	r.resolveCoverage()
 
 	for _, topic := range []string{"diabetes", "lpa"} {
 		r.bridge(topic)
@@ -545,14 +727,17 @@ func twoaiHealthWatch(db *sql.DB) error {
 		// PowerShell logs anything on stderr as a NativeCommandError.
 		fmt.Printf("twoai_health_watch: notice: %s\n", n)
 	}
-	total := 0
+	total, skipped := 0, 0
 	for _, n := range r.added {
 		total += n
 	}
-	fmt.Printf("twoai_health_watch: pubmed=%d trials=%d fda=%d ema=%d journals=%d companies=%d societies=%d coverage=%d diabetes=%d lpa=%d new=%d resolved=%d notices=%d elapsed=%s ok=true\n",
+	for _, n := range r.skipped {
+		skipped += n
+	}
+	fmt.Printf("twoai_health_watch: pubmed=%d trials=%d fda=%d ema=%d journals=%d companies=%d societies=%d coverage=%d diabetes=%d lpa=%d new=%d skipped=%d resolved=%d primaries_found=%d primaries_given_up=%d notices=%d elapsed=%s ok=true\n",
 		r.added["pubmed"], r.added["trials"], r.added["fda"], r.added["ema"], r.added["journals"],
 		r.added["companies"], r.added["societies"], r.added["coverage"], r.byTopic["diabetes"], r.byTopic["lpa"],
-		total, r.resolved, len(r.notices), time.Since(start).Round(time.Second))
+		total, skipped, r.resolved, r.covResolved, r.covGaveUp, len(r.notices), time.Since(start).Round(time.Second))
 	return nil
 }
 
@@ -1040,7 +1225,9 @@ func (r *hwRun) openFDA() {
 
 	// Drug approvals by ingredient. Each submission in the window is its own
 	// row, keyed by a fragment on the application page. Manufacturing (CMC)
-	// supplements are skipped for the same reason as the PMA notices.
+	// supplements are dropped for the same reason as the PMA notices.
+	// Labelling supplements, generic (ANDA) approvals and tentative
+	// approvals are stored at status 'skipped' by hwSkipReason.
 	terms := make([]string, len(twoaiHealthFDADrugs))
 	for i, d := range twoaiHealthFDADrugs {
 		terms[i] = "products.active_ingredients.name:" + d
@@ -1057,11 +1244,12 @@ func (r *hwRun) openFDA() {
 					} `json:"active_ingredients"`
 				} `json:"products"`
 				Submissions []struct {
-					Type   string `json:"submission_type"`
-					Number string `json:"submission_number"`
-					Status string `json:"submission_status"`
-					Date   string `json:"submission_status_date"`
-					Class  string `json:"submission_class_code_description"`
+					Type      string `json:"submission_type"`
+					Number    string `json:"submission_number"`
+					Status    string `json:"submission_status"`
+					Date      string `json:"submission_status_date"`
+					Class     string `json:"submission_class_code_description"`
+					ClassCode string `json:"submission_class_code"`
 				} `json:"submissions"`
 			} `json:"results"`
 		}
@@ -1104,7 +1292,8 @@ func (r *hwRun) openFDA() {
 				r.save(hwItem{url: "https://www.accessdata.fda.gov/scripts/cder/daf/index.cfm?event=overview.process&ApplNo=" + num + "#" + s.Type + "-" + s.Number,
 					source: "FDA (openFDA drugs)", title: title, date: hwYMD(s.Date), kind: "fda", topic: topic,
 					detail: map[string]any{"application": a.Appl, "sponsor": a.Sponsor, "brands": brands, "ingredients": ings,
-						"submission": label, "status": s.Status}})
+						"submission": label, "status": s.Status,
+						"submission_class": s.Class, "submission_class_code": s.ClassCode}})
 			}
 		}
 	}
@@ -1199,10 +1388,20 @@ func (r *hwRun) feeds() {
 		}
 		for _, it := range items {
 			link := it.URL()
-			title := hwClean(it.Title)
+			section, title := hwFeedSection(hwClean(it.Title))
 			summary := twoaiFeedSummary(it.Description, it.Summary, it.Content)
 			if link == "" || title == "" {
 				continue
+			}
+			if f.kind == "ema" {
+				link = hwEMAKey(link, title)
+			}
+			date := twoaiFeedDate(it.PubDate, it.Published, it.Updated, it.Date)
+			if f.kind != "journal" {
+				// Kept before the topic filter: a release the filter drops
+				// can still be the primary behind a coverage story.
+				r.newsroom = append(r.newsroom, hwCand{url: link, title: title, source: f.source,
+					kind: f.kind, date: date, via: "newsroom feed"})
 			}
 			topic, matched := twoaiHealthTopicOf(title+" "+summary, f.topics)
 			if topic == "" {
@@ -1211,18 +1410,17 @@ func (r *hwRun) feeds() {
 				}
 				topic = f.topics[0]
 			}
-			if f.kind == "ema" {
-				link = hwEMAKey(link, title)
-			}
 			d := map[string]any{"feed": f.url}
 			if matched != "" {
 				d["topic_matched"] = matched
 			}
+			if section != "" {
+				d["section"] = section
+			}
 			if summary != "" {
 				d["summary"] = summary
 			}
-			r.save(hwItem{url: link, source: f.source, title: title,
-				date: twoaiFeedDate(it.PubDate, it.Published, it.Updated, it.Date),
+			r.save(hwItem{url: link, source: f.source, title: title, date: date,
 				kind: f.kind, topic: topic, classify: title + " " + summary, detail: d})
 		}
 	}
@@ -1346,6 +1544,723 @@ func (r *hwRun) verifyCoverage() {
 }
 
 // ---------------------------------------------------------------------
+// Coverage resolved to its primary source.
+// ---------------------------------------------------------------------
+
+// hwDomain is one host whose pages count as a primary source, with the
+// owner named as the row's source and the row kind it is filed under.
+// Kind "wire" is a newswire carrying a company's release word for word,
+// filed as kind company.
+type hwDomain struct{ domain, owner, kind string }
+
+// twoaiHealthPrimaryDomains maps hosts to owners. A host matches its domain
+// or any subdomain, so lilly.com covers investor.lilly.com. The companies
+// are those the watch follows plus their partners in the same programmes
+// (Boehringer runs survodutide with Zealand, Roche petrelintide).
+var twoaiHealthPrimaryDomains = []hwDomain{
+	{"novonordisk.com", "Novo Nordisk", "company"},
+	{"novonordisk-us.com", "Novo Nordisk", "company"},
+	{"lilly.com", "Eli Lilly", "company"},
+	{"sanofi.com", "Sanofi", "company"},
+	{"sanofi.us", "Sanofi", "company"},
+	{"insulet.com", "Insulet", "company"},
+	{"omnipod.com", "Insulet", "company"},
+	{"dexcom.com", "Dexcom", "company"},
+	{"zealandpharma.com", "Zealand Pharma", "company"},
+	{"novartis.com", "Novartis", "company"},
+	{"amgen.com", "Amgen", "company"},
+	{"ionis.com", "Ionis", "company"},
+	{"abbott.com", "Abbott", "company"},
+	{"abbott.mediaroom.com", "Abbott", "company"},
+	{"medtronic.com", "Medtronic", "company"},
+	{"minimed.com", "MiniMed (Medtronic Diabetes)", "company"},
+	{"vrtx.com", "Vertex", "company"},
+	{"mannkindcorp.com", "MannKind", "company"},
+	{"crisprtx.com", "CRISPR Therapeutics", "company"},
+	{"silence-therapeutics.com", "Silence Therapeutics", "company"},
+	{"boehringer-ingelheim.com", "Boehringer Ingelheim", "company"},
+	{"roche.com", "Roche", "company"},
+	{"astrazeneca.com", "AstraZeneca", "company"},
+	{"merck.com", "Merck", "company"},
+	{"globenewswire.com", "GlobeNewswire", "wire"},
+	{"prnewswire.com", "PR Newswire", "wire"},
+	{"businesswire.com", "Business Wire", "wire"},
+	{"heart.org", "American Heart Association", "society"},
+	{"acc.org", "ACC", "society"},
+	{"escardio.org", "ESC", "society"},
+	{"eas-society.org", "European Atherosclerosis Society", "society"},
+	{"diabetes.org", "American Diabetes Association", "society"},
+	{"easd.org", "EASD", "society"},
+	{"fda.gov", "FDA", "fda"},
+	{"ema.europa.eu", "EMA", "ema"},
+	{"clinicaltrials.gov", "ClinicalTrials.gov", "trial"},
+	{"sec.gov", "SEC EDGAR", "company"},
+	{"pubmed.ncbi.nlm.nih.gov", "PubMed", "pubmed"},
+	{"doi.org", "DOI", "journal"},
+	{"nejm.org", "NEJM", "journal"},
+	{"thelancet.com", "The Lancet", "journal"},
+	{"diabetesjournals.org", "ADA journals", "journal"},
+	{"jamanetwork.com", "JAMA Network", "journal"},
+	{"nature.com", "Nature", "journal"},
+	{"ahajournals.org", "AHA journals", "journal"},
+	{"jacc.org", "JACC", "journal"},
+	{"link.springer.com", "Springer", "journal"},
+	{"bmj.com", "BMJ", "journal"},
+	{"academic.oup.com", "Oxford Academic", "journal"},
+}
+
+func hwPrimaryDomain(host string) (hwDomain, bool) {
+	host = strings.TrimPrefix(strings.ToLower(host), "www.")
+	for _, d := range twoaiHealthPrimaryDomains {
+		if host == d.domain || strings.HasSuffix(host, "."+d.domain) {
+			return d, true
+		}
+	}
+	return hwDomain{}, false
+}
+
+// hwRowKind is the twoai_health_watch kind a primary domain files under.
+func hwRowKind(d hwDomain) string {
+	if d.kind == "wire" {
+		return "company"
+	}
+	return d.kind
+}
+
+var (
+	hwHrefRe    = regexp.MustCompile(`(?is)<a\s[^>]*?href\s*=\s*["']([^"'#\s]+)`)
+	hwNCTRe     = regexp.MustCompile(`\bNCT\d{8}\b`)
+	hwDOIRe     = regexp.MustCompile(`\b10\.\d{4,9}/[-._;()/:A-Za-z0-9]+`)
+	hwPMIDRe    = regexp.MustCompile(`pubmed\.ncbi\.nlm\.nih\.gov/(\d+)`)
+	hwJunkPath  = regexp.MustCompile(`(?i)\.(jpe?g|png|gif|svg|webp|ico|css|js|woff2?|xml|rss|pdf)$|/(tracker|share|sharer|login|signin|subscribe|search|privacy|cookies?|contact|terms|careers|feed)\b`)
+	hwOGTitleRe = []*regexp.Regexp{
+		regexp.MustCompile(`(?is)<meta[^>]+(?:property|name)\s*=\s*["'](?:og:title|twitter:title|citation_title)["'][^>]*?content\s*=\s*["']([^"']+)["']`),
+		regexp.MustCompile(`(?is)<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]*?(?:property|name)\s*=\s*["'](?:og:title|twitter:title|citation_title)["']`),
+		regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`),
+	}
+	hwHeadingRe = regexp.MustCompile(`(?is)<h[12][^>]*>(.*?)</h[12]>`)
+	hwPubDateRe = regexp.MustCompile(`(?is)(?:article:published_time["'][^>]*?content\s*=\s*["']|"datePublished"\s*:\s*"|citation_publication_date["'][^>]*?content\s*=\s*["'])(\d{4})[-/](\d{2})[-/](\d{2})`)
+)
+
+// hwPrimaryURL decides whether a link is a primary source, and gives its
+// canonical form: a DOI as doi.org, a trial as its ClinicalTrials.gov study
+// page and a PubMed record as its plain PMID page, so a primary found this
+// way lands on the same row the other harvesters write. Home pages, short
+// navigation paths, assets and share links are refused, and a wire link
+// must be a release.
+func hwPrimaryURL(raw string) (string, hwDomain, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", hwDomain{}, false
+	}
+	d, ok := hwPrimaryDomain(u.Hostname())
+	if !ok {
+		return "", hwDomain{}, false
+	}
+	full := u.String()
+	path := strings.Trim(u.Path, "/")
+	if hwJunkPath.MatchString("/" + path) {
+		return "", hwDomain{}, false
+	}
+	switch {
+	case d.domain == "clinicaltrials.gov":
+		if m := hwNCTRe.FindString(full); m != "" {
+			return "https://clinicaltrials.gov/study/" + m, d, true
+		}
+		return "", hwDomain{}, false
+	case d.domain == "doi.org":
+		if m := hwDOIRe.FindString(path); m != "" {
+			return "https://doi.org/" + strings.TrimRight(m, ".,;)"), d, true
+		}
+		return "", hwDomain{}, false
+	case d.domain == "pubmed.ncbi.nlm.nih.gov":
+		if m := hwPMIDRe.FindStringSubmatch(full); m != nil {
+			return hwPubmedURL(m[1]), d, true
+		}
+		return "", hwDomain{}, false
+	case d.kind == "wire":
+		lp := strings.ToLower(path)
+		if !strings.Contains(lp, "news-release") && !strings.HasPrefix(lp, "news/home/") {
+			return "", hwDomain{}, false
+		}
+	case d.kind == "fda" || d.kind == "ema":
+		if len(path) < 3 {
+			return "", hwDomain{}, false
+		}
+	default:
+		// Company, society and journal pages: an article has a long path
+		// or an id, a section page a short word or two.
+		if len(path) < 10 && !strings.ContainsAny(path, "0123456789") {
+			return "", hwDomain{}, false
+		}
+	}
+	u.Fragment = ""
+	return u.String(), d, true
+}
+
+// hwPrimaryLinks returns the primary-source links on a publisher page, best
+// first and at most max of them: regulators, companies, wires and societies
+// before registries and journals, the SEC last. Links back to the page's
+// own host are left out, and trial ids and DOIs written in the text count
+// as links.
+func hwPrimaryLinks(page, base string, max int) []string {
+	bu, _ := url.Parse(base)
+	type link struct {
+		u    string
+		rank int
+	}
+	var out []link
+	seen := map[string]bool{}
+	add := func(raw string) {
+		pu, d, ok := hwPrimaryURL(raw)
+		if !ok || seen[pu] {
+			return
+		}
+		if bu != nil {
+			if lu, err := url.Parse(pu); err == nil && strings.EqualFold(lu.Hostname(), bu.Hostname()) {
+				return
+			}
+		}
+		seen[pu] = true
+		rank := 0
+		switch {
+		case d.owner == "SEC EDGAR":
+			rank = 2
+		case d.kind == "trial" || d.kind == "pubmed" || d.kind == "journal":
+			rank = 1
+		}
+		out = append(out, link{pu, rank})
+	}
+	for _, m := range hwHrefRe.FindAllStringSubmatch(page, -1) {
+		href := html.UnescapeString(m[1])
+		if bu != nil {
+			if ru, err := bu.Parse(href); err == nil {
+				href = ru.String()
+			}
+		}
+		add(href)
+	}
+	text := stripTags(page)
+	for _, m := range hwNCTRe.FindAllString(text, -1) {
+		add("https://clinicaltrials.gov/study/" + m)
+	}
+	for _, m := range hwDOIRe.FindAllString(text, -1) {
+		add("https://doi.org/" + m)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].rank < out[j].rank })
+	var urls []string
+	for _, l := range out {
+		if len(urls) == max {
+			break
+		}
+		urls = append(urls, l.u)
+	}
+	return urls
+}
+
+// hwPageTitle reads a page's own title, preferring og:title, and drops a
+// short trailing " | Site name" when what is left still reads as a title.
+// A title of three words or fewer is a template's ("News Details" on every
+// novonordisk.com release, probed 2026-10-05), and then the first heading
+// of five words or more stands in for it.
+func hwPageTitle(page string) string {
+	t := ""
+	for _, re := range hwOGTitleRe {
+		if m := re.FindStringSubmatch(page); m != nil {
+			if t = hwClean(m[1]); t != "" {
+				break
+			}
+		}
+	}
+	if len(strings.Fields(t)) <= 3 {
+		for _, m := range hwHeadingRe.FindAllStringSubmatch(page, 20) {
+			if h := hwClean(m[1]); len(strings.Fields(h)) >= 5 {
+				t = h
+				break
+			}
+		}
+	}
+	for _, sep := range []string{" | ", " – ", " - "} {
+		if i := strings.LastIndex(t, sep); i >= 20 && len(t)-i-len(sep) <= 40 {
+			t = strings.TrimSpace(t[:i])
+		}
+	}
+	return t
+}
+
+// hwPageDate reads a page's publication date from its metadata, or "".
+func hwPageDate(page string) string {
+	if m := hwPubDateRe.FindStringSubmatch(page); m != nil {
+		return hwYMD(m[1] + "-" + m[2] + "-" + m[3])
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------
+// Title matching. A candidate is the primary behind a coverage story only
+// when the two titles share a named drug or product and one more
+// distinctive term, or two named drugs, or a class word (insulin, GLP-1,
+// ketone) and two more distinctive terms. Company names, topic words and
+// news verbs do not count, so "Insulet stock gains" never matches "Insulet
+// announces results date".
+// ---------------------------------------------------------------------
+
+// hwDrugTerms are named drugs, brands, devices and trial-stage codes.
+var hwDrugTerms = map[string]bool{}
+
+// hwClassTerms are drug and device classes: shared, they say the two titles
+// are about the same kind of thing, not the same thing.
+var hwClassTerms = map[string]bool{}
+
+// hwStopTerms carry no identity: function words, news verbs, the topic
+// words every item shares, and the company names.
+var hwStopTerms = map[string]bool{}
+
+func init() {
+	for _, w := range strings.Fields(`semaglutide tirzepatide liraglutide dulaglutide exenatide lixisenatide
+		retatrutide orforglipron cagrilintide cagrisema amycretin survodutide mazdutide petrelintide dapiglutide
+		maridebart cafraglutide maritide ecnoglutide pemvidutide nisotirostide pelacarsen olpasiran lepodisiran
+		zerlasiran muvalaplin enlicitide inclisiran evolocumab alirocumab obicetrapib teplizumab tzield zimislecel
+		donislecel efsitora onswik icodec awiqli icosema iglarlixi denecimig mim8 afrezza technosphere ozempic
+		wegovy rybelsus mounjaro zepbound foundayo saxenda victoza trulicity jardiance farxiga invokana kerendia
+		finerenone empagliflozin dapagliflozin canagliflozin sotagliflozin ertugliflozin omnipod stelo g6 g7 g8
+		libre minimed tandem mobi garzulys bysumlog ctx320 ctx310 vx-880 amg133 amg-133 sln360 tqj230 inaxaplin`) {
+		hwDrugTerms[w] = true
+	}
+	for _, w := range strings.Fields(`insulin glp-1 glp1 gip amylin incretin sglt2 sglt-2 lpa cgm ketone pump
+		biosensor sensor sirna antisense statin pcsk9 biosimilar generic`) {
+		hwClassTerms[w] = true
+	}
+	for _, w := range strings.Fields(`a an the and or of in on for to with at by from as is are be been its it this
+		that these their his her has have had was were will would could may can into about over under after before
+		than more most less up down vs versus how why what who when where which new news first latest plus also
+		announce announced announcement report reported says said update company companie corp inc ltd plc ag stock stocks
+		studie therapie weekly daily monthly recap
+		share shares price prices investor investors market data result study trial phase patient people adult
+		drug drugs medicine medicines treatment therapy treat global week year today amid ahead us u.s s
+		diabete diabetic obesity obese weight loss type heart health healthcare medical clinical pharma pharmaceutical
+		biotech novo nordisk lilly eli sanofi dexcom insulet zealand novartis amgen ionis abbott medtronic vertex
+		mannkind boehringer ingelheim roche astrazeneca merck crispr therapeutic`) {
+		hwStopTerms[w] = true
+	}
+}
+
+var hwTokenRe = regexp.MustCompile(`[a-z0-9]+(?:[.\-][a-z0-9]+)*`)
+var hwYearRe = regexp.MustCompile(`^(19|20)\d\d$`)
+
+// hwTokens lowercases a title into its terms. Lp(a) becomes lpa, plurals
+// lose their s, and single characters and bare years are dropped.
+func hwTokens(s string) []string {
+	s = strings.ToLower(hwClean(s))
+	s = strings.NewReplacer("lp(a)", "lpa", "lp (a)", "lpa", "lipoprotein(a)", "lpa", "’", "'", "®", " ", "™", " ").Replace(s)
+	var out []string
+	seen := map[string]bool{}
+	for _, t := range hwTokenRe.FindAllString(s, -1) {
+		listed := hwStopTerms[t] || hwDrugTerms[t] || hwClassTerms[t] // "novartis" keeps its s
+		if !listed && len(t) > 4 && strings.HasSuffix(t, "s") && !strings.HasSuffix(t, "ss") {
+			t = t[:len(t)-1]
+		}
+		if len(t) < 2 || hwYearRe.MatchString(t) || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	return out
+}
+
+// hwIsDrugTerm reports a named drug, brand or device, including the
+// development codes ("ly3457263", "amg-133") the lexicon does not list.
+var hwCodeRe = regexp.MustCompile(`^[a-z]{2,5}-?\d{3,}[a-z]?$`)
+
+func hwIsDrugTerm(t string) bool {
+	return hwDrugTerms[t] || (hwCodeRe.MatchString(t) && !strings.HasPrefix(t, "nct"))
+}
+
+// hwTitleMatch reports whether a candidate title names the same thing as a
+// coverage headline, with the shared terms that decided it.
+func hwTitleMatch(coverage, candidate string) (bool, []string) {
+	cand := map[string]bool{}
+	for _, t := range hwTokens(candidate) {
+		cand[t] = true
+	}
+	var drugs, classes, distinct []string
+	for _, t := range hwTokens(coverage) {
+		if !cand[t] || hwStopTerms[t] {
+			continue
+		}
+		switch {
+		case hwIsDrugTerm(t):
+			drugs = append(drugs, t)
+		case hwClassTerms[t]:
+			classes = append(classes, t)
+		case len(t) >= 3 || strings.ContainsAny(t, "0123456789"):
+			distinct = append(distinct, t)
+		}
+	}
+	shared := append(append(append([]string{}, drugs...), classes...), distinct...)
+	ok := (len(drugs) >= 1 && len(distinct) >= 1) || len(drugs) >= 2 ||
+		(len(classes) >= 1 && len(distinct) >= 2)
+	return ok, shared
+}
+
+// A primary may be dated up to fourteen days before its coverage and four
+// after. News trails the release: Medical Dialogues reported the FDA's
+// ketone monitor authorisation of 2026-08-25 on 2026-09-07, and Bol News
+// Lilly's insulin approval of 2026-09-23 on 2026-10-04. Four days after
+// allows for a release dated in another time zone or a late feed date.
+const (
+	hwWindowBefore = 14
+	hwWindowAfter  = 4
+)
+
+// hwInWindow reports whether a primary dated prim can be the source of
+// coverage dated cov, both YYYY-MM-DD.
+func hwInWindow(cov, prim string) bool {
+	tc, err1 := time.Parse("2006-01-02", cov)
+	tp, err2 := time.Parse("2006-01-02", prim)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return !tp.Before(tc.AddDate(0, 0, -hwWindowBefore)) && !tp.After(tc.AddDate(0, 0, hwWindowAfter))
+}
+
+// ---------------------------------------------------------------------
+// The resolver.
+// ---------------------------------------------------------------------
+
+// hwCand is a possible primary source for a coverage row.
+type hwCand struct {
+	url, title, source, kind, date, via string
+}
+
+type hwCov struct {
+	url, title, topic, date, status string
+	tries                           int
+	detail                          map[string]any
+}
+
+type hwResolution struct {
+	primary   hwCand
+	matched   []string
+	publisher string
+	note      string
+	self      bool // the publisher page is itself the primary
+}
+
+var hwPageClient = &http.Client{Timeout: 20 * time.Second}
+
+// fetchPage gets a page for the resolver and returns its body and the URL
+// it ended on after redirects. Every call counts against the run's budget.
+func (r *hwRun) fetchPage(u string) (string, string, error) {
+	r.fetches++
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("User-Agent", twoaiHealthPageUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8")
+	resp, err := hwPageClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 3<<20))
+	return string(b), resp.Request.URL.String(), err
+}
+
+// candidate reads a primary link's title. A DOI is read from Crossref and
+// a trial from the ClinicalTrials.gov API, because the journal pages and
+// the study page often refuse or need a script to show a title.
+func (r *hwRun) candidate(u string, d hwDomain) (hwCand, error) {
+	c := hwCand{url: u, source: d.owner, kind: hwRowKind(d), via: "publisher link"}
+	switch d.domain {
+	case "doi.org":
+		doi := strings.TrimPrefix(u, "https://doi.org/")
+		body, _, err := r.fetchPage("https://api.crossref.org/works/" + doi + "?mailto=" + twoaiHealthNCBIEmail)
+		if err != nil {
+			return c, err
+		}
+		var res struct {
+			Message struct {
+				Title     []string `json:"title"`
+				Container []string `json:"container-title"`
+				Published struct {
+					Parts [][]int `json:"date-parts"`
+				} `json:"published"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(body), &res); err != nil {
+			return c, err
+		}
+		if len(res.Message.Title) > 0 {
+			c.title = hwClean(res.Message.Title[0])
+		}
+		if len(res.Message.Container) > 0 {
+			c.source = hwClean(res.Message.Container[0])
+		}
+		if p := res.Message.Published.Parts; len(p) > 0 && len(p[0]) == 3 {
+			c.date = fmt.Sprintf("%04d-%02d-%02d", p[0][0], p[0][1], p[0][2])
+		}
+		return c, nil
+	case "clinicaltrials.gov":
+		nct := hwNCTRe.FindString(u)
+		v := url.Values{}
+		v.Set("filter.ids", nct)
+		v.Set("fields", twoaiHealthTrialFields)
+		body, _, err := r.fetchPage("https://clinicaltrials.gov/api/v2/studies?" + v.Encode())
+		if err != nil {
+			return c, err
+		}
+		trials, _, err := hwParseTrials([]byte(body))
+		if err != nil || len(trials) == 0 {
+			return c, fmt.Errorf("no study %s", nct)
+		}
+		t := trials[0]
+		c.title, c.date = t.Title, t.Updated
+		if t.Acronym != "" && !strings.Contains(c.title, t.Acronym) {
+			c.title += " (" + t.Acronym + ")"
+		}
+		return c, nil
+	}
+	page, final, err := r.fetchPage(u)
+	if err != nil {
+		return c, err
+	}
+	// A redirect can leave the primary domain (a wire tracker going to a
+	// home page); the row is filed under where the page really is.
+	if pu, pd, ok := hwPrimaryURL(final); ok {
+		c.url, c.source, c.kind = pu, pd.owner, hwRowKind(pd)
+	}
+	c.title, c.date = hwPageTitle(page), hwPageDate(page)
+	if d.kind == "wire" {
+		c.source = hwOwnerIn(c.title, d.owner)
+	}
+	return c, nil
+}
+
+// hwOwnerIn names the company a wire release is from: of the companies the
+// watch knows, the one named first in its title, and the wire otherwise.
+func hwOwnerIn(title, fallback string) string {
+	lt := strings.ToLower(title)
+	best, at := fallback, -1
+	for _, d := range twoaiHealthPrimaryDomains {
+		if d.kind != "company" || d.owner == "SEC EDGAR" {
+			continue
+		}
+		i := strings.Index(lt, strings.ToLower(strings.SplitN(d.owner, " (", 2)[0]))
+		if i >= 0 && (at < 0 || i < at) {
+			best, at = d.owner, i
+		}
+	}
+	return best
+}
+
+// matchKnown looks for the primary among the items the newsroom, society
+// and regulator feeds carried this run and the rows already stored, dated
+// within the window around the coverage (hwInWindow).
+func (r *hwRun) matchKnown(c hwCov) (hwCand, []string) {
+	pool := append([]hwCand{}, r.newsroom...)
+	rows, err := r.db.Query(`SELECT url, title, source, kind, COALESCE(item_date::text,'') FROM twoai_health_watch
+		WHERE kind <> 'coverage' AND item_date BETWEEN $1::date - $2::int AND $1::date + $3::int`,
+		c.date, hwWindowBefore, hwWindowAfter)
+	if err == nil {
+		for rows.Next() {
+			var p hwCand
+			if rows.Scan(&p.url, &p.title, &p.source, &p.kind, &p.date) == nil {
+				p.via = "stored row"
+				pool = append(pool, p)
+			}
+		}
+		rows.Close()
+	}
+	for _, p := range pool {
+		if !hwInWindow(c.date, p.date) {
+			continue
+		}
+		if ok, m := hwTitleMatch(c.title, p.title); ok {
+			return p, m
+		}
+	}
+	return hwCand{}, nil
+}
+
+// resolveOne looks for one coverage row's primary. It returns false when
+// the deadline or the fetch budget cut the try short, which then does not
+// count as a try.
+func (r *hwRun) resolveOne(c hwCov) (hwResolution, bool) {
+	var res hwResolution
+	if p, m := r.matchKnown(c); p.url != "" {
+		res.primary, res.matched = p, m
+		return res, true
+	}
+	pub := c.url
+	if p := hwStr(c.detail["resolve_publisher"]); p != "" {
+		pub = p
+	}
+	if isGoogleNewsURL(pub) {
+		r.fetches += 2
+		pub = resolveGoogleNews(pub)
+		if isGoogleNewsURL(pub) {
+			res.note = "the Google News link did not resolve to a publisher"
+			return res, true
+		}
+	}
+	res.publisher = pub
+	if r.late("coverage resolution") || r.fetches >= twoaiHealthResolveFetches {
+		return res, false
+	}
+	page, final, err := r.fetchPage(pub)
+	if err != nil {
+		res.note = "publisher page: " + err.Error()
+		return res, true
+	}
+	// The story may sit on a primary domain already, a wire release or a
+	// company's own newsroom, and is then its own primary.
+	if pu, d, ok := hwPrimaryURL(final); ok {
+		t := hwPageTitle(page)
+		if t == "" {
+			t = c.title
+		}
+		src := d.owner
+		if d.kind == "wire" {
+			src = hwOwnerIn(t, d.owner)
+		}
+		res.primary = hwCand{url: pu, title: t, source: src, kind: hwRowKind(d), date: hwPageDate(page), via: "publisher page is primary"}
+		res.matched, res.self = []string{"publisher domain " + d.domain}, true
+		return res, true
+	}
+	links := hwPrimaryLinks(page, final, twoaiHealthResolveLinks)
+	if len(links) == 0 {
+		res.note = "no primary-source links on the publisher page"
+		return res, true
+	}
+	var tried []string
+	for _, l := range links {
+		if r.late("coverage resolution") || r.fetches >= twoaiHealthResolveFetches {
+			return res, false
+		}
+		_, d, _ := hwPrimaryURL(l)
+		cand, err := r.candidate(l, d)
+		if err != nil {
+			tried = append(tried, l+" ("+err.Error()+")")
+			continue
+		}
+		if ok, m := hwTitleMatch(c.title, cand.title); ok && cand.title != "" {
+			res.primary, res.matched = cand, m
+			return res, true
+		}
+		tried = append(tried, l+" (title did not match)")
+	}
+	res.note = "no linked page matched the headline: " + strings.Join(tried, "; ")
+	return res, true
+}
+
+// record writes one try: the primary as its own row and the coverage row
+// to 'resolved', or the try counted and, on the last, 'needs primary'.
+func (r *hwRun) record(c hwCov, res hwResolution) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	tries := c.tries + 1
+	patch := map[string]any{"resolve_tries": tries, "resolve_last": now}
+	if res.publisher != "" {
+		patch["resolve_publisher"] = res.publisher
+	}
+	status := c.status
+	p := res.primary
+	switch {
+	case p.url != "" && p.url == c.url:
+		// The coverage row's own URL is the primary: refile it in place.
+		patch["resolved_from"] = "coverage row refiled, its page is the primary"
+		patch["resolve_matched"] = strings.Join(res.matched, ", ")
+		patch["resolve_via"] = p.via
+		pj, _ := json.Marshal(patch)
+		if _, err := r.db.Exec(`UPDATE twoai_health_watch SET kind=$2, source=$3, status='new', detail = detail || $4::jsonb
+			WHERE url=$1 AND status IN ('new','needs primary')`, c.url, p.kind, p.source, string(pj)); err != nil {
+			r.notice("refile %s: %v", c.url, err)
+			return
+		}
+		r.covResolved++
+		return
+	case p.url != "":
+		it := hwItem{url: p.url, source: p.source, title: p.title, date: p.date, kind: p.kind, topic: c.topic,
+			detail: map[string]any{"resolved_from": c.url, "resolved_matched": strings.Join(res.matched, ", "), "resolved_via": p.via}}
+		if !r.save(it) {
+			// Already stored: link it, and leave its status to the content
+			// project, which may have read it already.
+			r.db.Exec(`UPDATE twoai_health_watch SET detail = detail || jsonb_build_object('resolved_from', $2::text)
+				WHERE url=$1 AND NOT detail ? 'resolved_from'`, p.url, c.url)
+		}
+		status = "resolved"
+		patch["primary_url"] = p.url
+		patch["resolved_at"] = now
+		patch["resolve_matched"] = strings.Join(res.matched, ", ")
+		patch["resolve_via"] = p.via
+		r.covResolved++
+	default:
+		patch["resolve_note"] = res.note
+		if tries >= twoaiHealthResolveTries {
+			status = "needs primary"
+			patch["resolve_gave_up"] = now
+			r.covGaveUp++
+		}
+	}
+	pj, _ := json.Marshal(patch)
+	if _, err := r.db.Exec(`UPDATE twoai_health_watch SET status=$2, detail = detail || $3::jsonb
+		WHERE url=$1 AND status IN ('new','needs primary')`, c.url, status, string(pj)); err != nil {
+		r.notice("resolution of %s: %v", c.url, err)
+	}
+}
+
+// resolveCoverage tries the coverage rows still without a primary, newest
+// first and today's before the backlog, within the per-run bounds.
+func (r *hwRun) resolveCoverage() {
+	if r.late("coverage resolution") {
+		return
+	}
+	rows, err := r.db.Query(`SELECT url, title, topic, COALESCE(item_date, found_on)::text, status, detail
+		FROM twoai_health_watch
+		WHERE kind='coverage' AND status IN ('new','needs primary')
+		AND COALESCE((detail->>'resolve_tries')::int, 0) < $1
+		AND (detail->>'resolve_last' IS NULL OR (detail->>'resolve_last')::timestamptz < $2)
+		ORDER BY status='new' DESC, found_at DESC LIMIT $3`,
+		twoaiHealthResolveTries, time.Now().Add(-twoaiHealthResolveGap), twoaiHealthResolveRows)
+	if err != nil {
+		r.notice("coverage resolution query: %v", err)
+		return
+	}
+	var covs []hwCov
+	for rows.Next() {
+		var c hwCov
+		var dj []byte
+		if rows.Scan(&c.url, &c.title, &c.topic, &c.date, &c.status, &dj) != nil {
+			continue
+		}
+		json.Unmarshal(dj, &c.detail)
+		if c.detail == nil {
+			c.detail = map[string]any{}
+		}
+		if n, ok := c.detail["resolve_tries"].(float64); ok {
+			c.tries = int(n)
+		}
+		covs = append(covs, c)
+	}
+	rows.Close()
+	for _, c := range covs {
+		if r.late("coverage resolution") || r.fetches >= twoaiHealthResolveFetches {
+			return
+		}
+		res, complete := r.resolveOne(c)
+		if !complete {
+			return
+		}
+		r.record(c, res)
+	}
+}
+
+// ---------------------------------------------------------------------
 // The daily bridge row, one per topic.
 // ---------------------------------------------------------------------
 
@@ -1360,13 +2275,18 @@ type hwRow struct {
 
 var twoaiHealthLabels = map[string]string{"diabetes": "Diabetes watch", "lpa": "Lp(a) watch"}
 
-// hwBridgeBody writes the bridge message. It stays near forty lines
-// whatever the day looks like: the counts are one line each and the item
-// list is cut to fit.
-func hwBridgeBody(label, today, since string, n int, hubs, sources, verify []hwCount, rows []hwRow) string {
+// hwBridgeBody writes the bridge message. It stays near fifty lines
+// whatever the day looks like: the counts are one line each and the two
+// item lists are cut to fit. resolved is the number of coverage rows
+// resolved to a primary since the last row, and unresolved lists those
+// given up after their last try.
+func hwBridgeBody(label, today, since string, n int, hubs, sources, verify []hwCount, rows []hwRow, resolved int, unresolved []hwRow) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s, %s: %d new items since %s.\n", label, today, n, since)
-	b.WriteString("All items are primary sources (PubMed, ClinicalTrials.gov, FDA, EMA, journal feeds, company and society newsrooms) except those marked coverage, which are news reports found through Google News and need a primary source before anything is published.\n")
+	b.WriteString("All items are primary sources (PubMed, ClinicalTrials.gov, FDA, EMA, journal feeds, company and society newsrooms) except those marked coverage, which are news reports found through Google News and need a primary source before anything is published. Corrections, letters, labelling supplements, generic approvals and issue furniture are stored as skipped and not counted.\n")
+	if resolved > 0 {
+		fmt.Fprintf(&b, "Coverage resolved to its primary since then: %d (the primary is its own row with detail->>'resolved_from', the coverage row is status resolved).\n", resolved)
+	}
 	join := func(cs []hwCount, max int) string {
 		parts := []string{}
 		rest := 0
@@ -1387,11 +2307,7 @@ func hwBridgeBody(label, today, since string, n int, hubs, sources, verify []hwC
 	if len(verify) > 0 {
 		fmt.Fprintf(&b, "Verify list hits (detail->>'verify'): %s.\n", join(verify, 12))
 	}
-	b.WriteString("Newest:\n")
-	for i, r := range rows {
-		if i == 32 {
-			break
-		}
+	line := func(r hwRow) {
 		t := r.title
 		if len(t) > 160 {
 			t = t[:157] + "..."
@@ -1409,8 +2325,27 @@ func hwBridgeBody(label, today, since string, n int, hubs, sources, verify []hwC
 		}
 		fmt.Fprintf(&b, "- %s%s (%s, %s) %s\n", tag, t, r.source, date, r.url)
 	}
+	if len(rows) > 0 {
+		b.WriteString("Newest:\n")
+	}
+	for i, r := range rows {
+		if i == 32 {
+			break
+		}
+		line(r)
+	}
 	if len(rows) > 32 {
 		fmt.Fprintf(&b, "... and %d more.\n", n-32)
+	}
+	if len(unresolved) > 0 {
+		fmt.Fprintf(&b, "No primary found after %d tries, left at status needs primary (detail->>'resolve_note' says why):\n", twoaiHealthResolveTries)
+		for i, r := range unresolved {
+			if i == 6 {
+				fmt.Fprintf(&b, "... and %d more.\n", len(unresolved)-6)
+				break
+			}
+			line(r)
+		}
 	}
 	b.WriteString("All rows are in twoai_health_watch, status new until you change it. srj owns the stage, send code needs by bridge.")
 	return b.String()
@@ -1449,7 +2384,26 @@ func (r *hwRun) bridge(topic string) {
 	}
 	const scope = `FROM twoai_health_watch WHERE topic=$1 AND status='new' AND found_at > $2`
 	var n int
-	if err := r.db.QueryRow(`SELECT count(*) `+scope, topic, cutoff).Scan(&n); err != nil || n == 0 {
+	if err := r.db.QueryRow(`SELECT count(*) `+scope, topic, cutoff).Scan(&n); err != nil {
+		return
+	}
+	var resolved int
+	r.db.QueryRow(`SELECT count(*) FROM twoai_health_watch WHERE topic=$1 AND kind='coverage' AND status='resolved'
+		AND (detail->>'resolved_at')::timestamptz > $2`, topic, cutoff).Scan(&resolved)
+	var unresolved []hwRow
+	if rows, err := r.db.Query(`SELECT kind, title, source, COALESCE(item_date::text,''), url, COALESCE(detail->>'verify','')
+		FROM twoai_health_watch WHERE topic=$1 AND kind='coverage' AND status='needs primary'
+		AND (detail->>'resolve_gave_up')::timestamptz > $2
+		ORDER BY item_date DESC NULLS LAST, found_at DESC LIMIT 50`, topic, cutoff); err == nil {
+		for rows.Next() {
+			var x hwRow
+			if rows.Scan(&x.kind, &x.title, &x.source, &x.date, &x.url, &x.verify) == nil {
+				unresolved = append(unresolved, x)
+			}
+		}
+		rows.Close()
+	}
+	if n == 0 && len(unresolved) == 0 {
 		return
 	}
 	hubs := r.counts(`SELECT COALESCE(sub_hub,'none'), count(*) `+scope+` GROUP BY 1 ORDER BY 2 DESC, 1`, topic, cutoff)
@@ -1467,7 +2421,10 @@ func (r *hwRun) bridge(topic string) {
 		rows.Close()
 	}
 	subject := fmt.Sprintf("%s: %d new items", label, n)
-	body := hwBridgeBody(label, time.Now().UTC().Format("2006-01-02"), since, n, hubs, sources, verify, list)
+	if len(unresolved) > 0 {
+		subject += fmt.Sprintf(", %d coverage without a primary", len(unresolved))
+	}
+	body := hwBridgeBody(label, time.Now().UTC().Format("2006-01-02"), since, n, hubs, sources, verify, list, resolved, unresolved)
 	if _, err := r.db.Exec(`INSERT INTO project_bridge (from_project, to_project, topic, body) VALUES ('srj','theworldofai',$1,$2)`, subject, body); err != nil {
 		r.notice("bridge row for %s: %v", topic, err)
 		return
