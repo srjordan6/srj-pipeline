@@ -284,6 +284,13 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 	}); err != nil {
 		return 0, err
 	}
+	// THE FRONT PAGE PIN, theworldofai row 498 (Stephen, 2026-10-05: put it
+	// at the top of /ai-news/ today). A story pinned to news/front.json in
+	// twoai_page_news leads the AI News page; the publisher merges the pins
+	// onto this small document like any page's, and a pin stands for 36 hours.
+	db.Exec(`UPDATE twoai_page_news SET active = false, retired_reason = 'front page pin expired'
+		WHERE page_path = 'news/front.json' AND active AND added_at < now() - interval '36 hours'`)
+	upsert("news/front.json", "news-front", map[string]any{"shape": "news-front", "date": now.Format("2006-01-02")})
 	fmt.Printf("twoai_build: news archive stories=%d ok=true\n", len(stories))
 	return len(stories), nil
 }
