@@ -173,6 +173,12 @@ func twoaiGATop(db *sql.DB) error {
 		return nil
 	}
 
+	// Every page, every day, before the top five (bridge row 529). Its own
+	// failure is logged and never stops the footer list.
+	if err := twoaiGAPages(db, prop, token); err != nil {
+		fmt.Printf("twoai_ga_pages: skipped, %v\n", err)
+	}
+
 	start := os.Getenv("GA_TOP_WINDOW")
 	if start == "" {
 		start = "7daysAgo"
@@ -189,33 +195,14 @@ func twoaiGATop(db *sql.DB) error {
 	// the Data API allows. The list is overridable, comma separated, because
 	// the operators will change fingerprint and the fix should be an env line,
 	// not a rebuild. Set GA_BOT_RESOLUTIONS=none to switch the filter off.
-	botRes := []string{"1366x1366", "1280x1280", "1024x1024", "2000x2000", "800x600"}
-	if v := strings.TrimSpace(os.Getenv("GA_BOT_RESOLUTIONS")); v != "" {
-		botRes = nil
-		if v != "none" {
-			for _, r := range strings.Split(v, ",") {
-				if r = strings.TrimSpace(r); r != "" {
-					botRes = append(botRes, r)
-				}
-			}
-		}
-	}
+	botRes := gaBotResolutions()
 	report := map[string]any{
 		"dateRanges": []map[string]string{{"startDate": start, "endDate": "yesterday"}},
 		"dimensions": []map[string]string{{"name": "pagePath"}},
 		"metrics":    []map[string]string{{"name": "screenPageViews"}},
 		"limit":      50,
 	}
-	if len(botRes) > 0 {
-		report["dimensionFilter"] = map[string]any{
-			"notExpression": map[string]any{
-				"filter": map[string]any{
-					"fieldName":    "screenResolution",
-					"inListFilter": map[string]any{"values": botRes},
-				},
-			},
-		}
-	}
+	gaFilterBots(report, botRes)
 	reqBody, _ := json.Marshal(report)
 	req, _ := http.NewRequest("POST",
 		"https://analyticsdata.googleapis.com/v1beta/properties/"+prop+":runReport",
@@ -360,4 +347,132 @@ func gaIsIndexPage(p string) bool {
 	}
 	// /ai-ecosystem/<category>/ is a category front page.
 	return segs[0] == "ai-ecosystem" && len(segs) == 2
+}
+
+// gaBotResolutions is the list of screen sizes only the botnet reports (see
+// twoaiGATop), overridable with GA_BOT_RESOLUTIONS; "none" switches it off.
+func gaBotResolutions() []string {
+	botRes := []string{"1366x1366", "1280x1280", "1024x1024", "2000x2000", "800x600"}
+	if v := strings.TrimSpace(os.Getenv("GA_BOT_RESOLUTIONS")); v != "" {
+		botRes = nil
+		if v != "none" {
+			for _, r := range strings.Split(v, ",") {
+				if r = strings.TrimSpace(r); r != "" {
+					botRes = append(botRes, r)
+				}
+			}
+		}
+	}
+	return botRes
+}
+
+// gaFilterBots adds the bot screen sizes to a report as an exclusion.
+func gaFilterBots(report map[string]any, botRes []string) {
+	if len(botRes) == 0 {
+		return
+	}
+	report["dimensionFilter"] = map[string]any{
+		"notExpression": map[string]any{
+			"filter": map[string]any{
+				"fieldName":    "screenResolution",
+				"inListFilter": map[string]any{"values": botRes},
+			},
+		},
+	}
+}
+
+// twoaiGAPages writes every page's day to twoai_ga_pages, so traffic is in
+// SQL and can decide order wherever it should: the docket alert list
+// (courtlistener_alerts.go) first, the thin page and freshness queues next
+// (bridge row 529, 2026-10-07).
+//
+// WINDOW. The first run backfills 90 days. After that each run asks from the
+// last day stored through yesterday, so the last day is read again until it
+// settles; GA4 keeps adjusting a day for some hours after it ends. Rows are
+// upserted on (day, path) and never deleted. The bot screen sizes are
+// excluded exactly as for the footer list.
+func twoaiGAPages(db *sql.DB, prop, token string) error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS twoai_ga_pages (
+		day date NOT NULL,
+		path text NOT NULL,
+		views int NOT NULL,
+		active_users int NOT NULL,
+		engagement_seconds double precision NOT NULL,
+		fetched_at timestamptz NOT NULL DEFAULT now(),
+		PRIMARY KEY (day, path))`); err != nil {
+		return err
+	}
+	start := "90daysAgo"
+	var last sql.NullTime
+	db.QueryRow(`SELECT max(day) FROM twoai_ga_pages`).Scan(&last)
+	if last.Valid {
+		start = last.Time.Format("2006-01-02")
+	}
+	const pageSize = 50000
+	botRes := gaBotResolutions()
+	stored, days := 0, map[string]bool{}
+	for offset := 0; ; offset += pageSize {
+		report := map[string]any{
+			"dateRanges": []map[string]string{{"startDate": start, "endDate": "yesterday"}},
+			"dimensions": []map[string]string{{"name": "date"}, {"name": "pagePath"}},
+			"metrics": []map[string]string{{"name": "screenPageViews"}, {"name": "activeUsers"},
+				{"name": "userEngagementDuration"}},
+			"limit":  pageSize,
+			"offset": offset,
+		}
+		gaFilterBots(report, botRes)
+		reqBody, _ := json.Marshal(report)
+		req, _ := http.NewRequest("POST",
+			"https://analyticsdata.googleapis.com/v1beta/properties/"+prop+":runReport",
+			bytes.NewReader(reqBody))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+		if err != nil {
+			return fmt.Errorf("GA4 unreachable: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("GA4 %d %s", resp.StatusCode, string(body[:min(len(body), 200)]))
+		}
+		var rr struct {
+			RowCount int `json:"rowCount"`
+			Rows     []struct {
+				DimensionValues []struct{ Value string }
+				MetricValues    []struct{ Value string }
+			}
+		}
+		if err := json.Unmarshal(body, &rr); err != nil {
+			return fmt.Errorf("response unusable: %v", err)
+		}
+		for _, r := range rr.Rows {
+			if len(r.DimensionValues) < 2 || len(r.MetricValues) < 3 {
+				continue
+			}
+			day, err := time.Parse("20060102", r.DimensionValues[0].Value)
+			if err != nil {
+				continue
+			}
+			var views, users int
+			var secs float64
+			fmt.Sscanf(r.MetricValues[0].Value, "%d", &views)
+			fmt.Sscanf(r.MetricValues[1].Value, "%d", &users)
+			fmt.Sscanf(r.MetricValues[2].Value, "%g", &secs)
+			if _, err := db.Exec(`INSERT INTO twoai_ga_pages (day, path, views, active_users, engagement_seconds)
+				VALUES ($1, $2, $3, $4, $5)
+				ON CONFLICT (day, path) DO UPDATE SET views = EXCLUDED.views, active_users = EXCLUDED.active_users,
+					engagement_seconds = EXCLUDED.engagement_seconds, fetched_at = now()`,
+				day, trunc(r.DimensionValues[1].Value, 2000), views, users, secs); err != nil {
+				return err
+			}
+			stored++
+			days[day.Format("2006-01-02")] = true
+		}
+		if len(rr.Rows) < pageSize || offset+pageSize >= rr.RowCount {
+			break
+		}
+	}
+	fmt.Printf("twoai_ga_pages: %d page days stored across %d days from %s\n", stored, len(days), start)
+	return nil
 }
