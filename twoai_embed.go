@@ -432,6 +432,7 @@ var twoaiEmbedByDesign = map[string]string{
 	"ecosystem/index.json":           "the home page map, every section in it is indexed by its own page",
 	"meta/dead-links.json":           "maintenance data, not a page for readers",
 	"meta/popular-pages.json":        "maintenance data, not a page for readers",
+	"meta/sitemap-core.json":         "maintenance data, not a page for readers",
 	"talent/matches.json":            "member records, never indexed",
 	"talent/options.json":            "form options, not a page",
 	"talent/profiles.json":           "member records, never indexed",

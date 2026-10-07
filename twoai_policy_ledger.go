@@ -111,7 +111,10 @@ func twoaiPolicyLedger(db *sql.DB, today string) error {
 		"slug": "policy-ledger", "title": "AI Policy Ledger", "subtitle": "Every AI law, rule and executive action tracked, in one dated table",
 		"parent":    "global-ai-laws",
 		"short":     fmt.Sprintf("%d AI laws, rules and executive actions across the states, the federal government, the EU and China, each with who it applies to, its effective date and its penalty ceiling as the text states it.", len(rows)),
-		"seo_title": "AI Policy Ledger: Every AI Law, Rule and Executive Action, Dated", "meta_description": fmt.Sprintf("A dated table of %d AI laws, rules and executive actions across US states, the federal government, the EU and China: who each applies to, when it takes effect, and its penalty ceiling as the text states it.", len(rows)),
+		// Row 549: the page was on page one (position 5.1) and drew no click,
+		// so the title and description now say what the searcher gets, with
+		// the count and the cadence.
+		"seo_title": fmt.Sprintf("AI Laws Tracker: %d AI Laws, Rules and Executive Actions in One Table, Updated Daily", len(rows)), "meta_description": fmt.Sprintf("Look up any AI law in one table: %d AI laws, rules and executive actions across US states, the federal government, the EU and China, each with who it applies to, when it takes effect and its penalty ceiling. Updated daily.", len(rows)),
 		"focus_keyword": "AI policy ledger", "body_html": b.String(), "generated": today, "built_at": time.Now().Format(time.RFC3339),
 		"uid": twoaiUID("section:policy-ledger"), "page_uid": twoaiUID("section:policy-ledger"), "verified": today, "refresh_every_days": 1,
 		"citations": []map[string]string{{"author": "European Union", "journal": "Regulation (EU) 2024/1689, Article 99", "year": "2024", "quote": "Administrative fines of up to EUR 35 000 000 or 7 percent of total worldwide annual turnover for non-compliance with the prohibited practices."}},

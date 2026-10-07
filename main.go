@@ -63,6 +63,8 @@ var twoaiStageDeadline = map[string]time.Duration{
 	// is spent, so the extra time is used only when there is work for it.
 	"intel":       15 * time.Minute,
 	"twoai_recap": 8 * time.Minute, // RECAP filing harvest, dockets until the budget is spent
+	// Search Console analytics and up to 1,800 URL inspections a day (row 548).
+	"twoai_gsc": 15 * time.Minute,
 	// Whole-site company crawl, 250 pages a run 1.5 seconds apart (row 531).
 	"twoai_company_sitemap": 10 * time.Minute,
 	// Docket alert subscriptions, at most 20 an hour seven seconds apart.
@@ -338,7 +340,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "cl_webhooks", "cl_alerts", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_company_sitemap", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "cl_webhooks", "cl_alerts", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_company_sitemap", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "twoai_gsc", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -514,6 +516,13 @@ func main() {
 	// failing may stop the run.
 	// twoai_company_sitemap reads every page a company lists in its sitemap
 	// (twoai_company_sitemap.go, theworldofai row 531). Never fatal.
+	// twoai_gsc reads Search Console into SQL (twoai_gsc.go, rows 548, 549).
+	if src == "twoai_gsc" {
+		if err := twoaiGSC(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_gsc:", err)
+		}
+		return
+	}
 	if src == "twoai_company_sitemap" {
 		if err := twoaiCompanySitemap(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_company_sitemap:", err)
@@ -2414,7 +2423,7 @@ func publishNews(db *sql.DB) error {
 	// Filtering at publish leaves the corpus intact, keeps every archived page
 	// answering, and means the briefing corrects itself on the next run rather
 	// than waiting a day and a half for bad records to age out.
-	skipped := 0
+	skipped, stale := 0, 0
 	seenURL := map[string]bool{}
 	for rows.Next() {
 		var a art
@@ -2430,11 +2439,21 @@ func publishNews(db *sql.DB) error {
 			}
 			seenURL[cu] = true
 			a.Date = d.String
+			// GDELT refetches old coverage: a 2026-07-17 article sat in a
+			// 2026-10-06 cluster (row 547). Older than 14 days by its own
+			// date, it does not count toward a story.
+			if newsTooOld(a.Date, asOf) {
+				stale++
+				continue
+			}
 			arts = append(arts, a)
 		}
 	}
 	if skipped > 0 {
 		fmt.Printf("publishNews: %d non-AI headlines skipped, %d kept\n", skipped, len(arts))
+	}
+	if stale > 0 {
+		fmt.Printf("publishNews: %d articles older than 14 days by their own date left out\n", stale)
 	}
 	// THE VENDOR-NEWS INTAKE COUNTS AS COVERAGE. RTHK and The Business Times
 	// carried the World Labs deal through the Google News coverage feeds,
@@ -2445,7 +2464,7 @@ func publishNews(db *sql.DB) error {
 	// safety check (news_gap) instead.
 	nCand := 0
 	for _, c := range newsCandidateArticles(db, asOf, 72) {
-		if !twoaiTitleIsAI(c.Title) || twoaiIsIndexPage(c.Title, c.URL) || seenURL[c.URL] {
+		if !twoaiTitleIsAI(c.Title) || twoaiIsIndexPage(c.Title, c.URL) || seenURL[c.URL] || newsTooOld(c.Date, asOf) {
 			continue
 		}
 		seenURL[c.URL] = true
@@ -2679,6 +2698,36 @@ func publishNews(db *sql.DB) error {
 		}
 		seedEnt[i] = m
 	}
+	// ROW 547: names and rare words. Each cluster's GDELT people and
+	// organisations as it formed (bylines and agencies out), and the names
+	// and headline words so common this window that they identify no event.
+	seedNames := make([]map[string]bool, len(cls))
+	for i, c := range cls {
+		var lists []string
+		for _, a := range c.arts {
+			lists = append(lists, a.persons, a.orgs)
+		}
+		seedNames[i] = newsNameSet(lists)
+	}
+	commonAt := len(cls) / 30
+	if commonAt < 5 {
+		commonAt = 5
+	}
+	commonNames := newsCommon(seedNames, commonAt)
+	rareWords := map[string]bool{}
+	{
+		df := map[string]int{}
+		for _, m := range seedTk {
+			for k := range m {
+				df[k]++
+			}
+		}
+		for k, n := range df {
+			if n <= 3 && len(k) >= 5 {
+				rareWords[k] = true
+			}
+		}
+	}
 	for merged := true; merged; {
 		merged = false
 		for i := 0; i < len(cls) && !merged; i++ {
@@ -2693,7 +2742,13 @@ func publishNews(db *sql.DB) error {
 					(newsSharedEntities(seedEnt[i], seedEnt[j], ubiq) >= 2 && overlap >= 0.25) ||
 					// One product name both name, carried by few headlines:
 					// "Gemini 4 Argon" in five differently worded headlines.
-					(newsSharedEntities(seedProd[i], seedProd[j], nil) >= 1 && overlap >= 0.15)
+					(newsSharedEntities(seedProd[i], seedProd[j], nil) >= 1 && overlap >= 0.15) ||
+					// Row 547: the same named people and organisations, not
+					// common this window (four witnesses at one inquiry), or
+					// two words almost no other story used (Minnesota,
+					// nudification).
+					newsSameEventByNames(seedNames[i], seedNames[j], commonNames, overlap) ||
+					newsSameEventByRareWords(seedTk[i], seedTk[j], rareWords)
 				// Two clusters from one outlet: the row 414 test, not these.
 				if d := oneOutlet(cls[i], cls[j]); d != "" {
 					same = newsSameOutletStory(cls[i].seed, cls[j].seed, seedEnt[i], seedEnt[j], d)
@@ -2709,6 +2764,7 @@ func publishNews(db *sql.DB) error {
 				seedTk = append(seedTk[:j], seedTk[j+1:]...)
 				seedEnt = append(seedEnt[:j], seedEnt[j+1:]...)
 				seedProd = append(seedProd[:j], seedProd[j+1:]...)
+				seedNames = append(seedNames[:j], seedNames[j+1:]...)
 				merged = true
 				break
 			}
@@ -2982,7 +3038,16 @@ func publishNews(db *sql.DB) error {
 			dl = dl[:12]
 		}
 		summary, sumURL, sumDomain := "", "", ""
+		// The headline's own article first, then the rest, and a summary
+		// must be about the headline (row 547: cd3219df printed a summary
+		// about Anthropic under a headline about the ABC).
+		order := []art{lead}
 		for _, a := range c.arts {
+			if a.URL != lead.URL {
+				order = append(order, a)
+			}
+		}
+		for _, a := range order {
 			dt, okd := docs[a.URL]
 			if !okd || (dt.summary == "" && dt.text == "") {
 				continue
@@ -3015,6 +3080,10 @@ func publishNews(db *sql.DB) error {
 			} else if isRefusal(dt.summary) {
 				// Already cached from an earlier run, before this guard existed.
 				fmt.Fprintf(os.Stderr, "publish_news: cached refusal skipped: %s\n", a.URL)
+				continue
+			}
+			if !newsSummaryFits(h, dt.summary) {
+				fmt.Fprintf(os.Stderr, "publish_news: summary of %s is not about %q, trying next article\n", a.URL, trunc(h, 80))
 				continue
 			}
 			summary, sumURL, sumDomain = dt.summary, a.URL, a.Domain
@@ -5547,6 +5616,47 @@ func twoaiBuild(db *sql.DB) error {
 			if err := upsert("meta/popular-pages.json", "meta", map[string]any{
 				"slug": "popular-pages", "day": popDay, "generated": today,
 				"pages": pops,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	// ---- The core sitemap tier (theworldofai row 548, 2026-10-07). Search
+	// Console had 6,046 pages Discovered, currently not indexed, all never
+	// crawled: crawl budget on a two month old domain, with thousands of
+	// detail pages queued alongside the pages that matter. The site writes a
+	// sitemap-core file from this list, ahead of everything else, so Google
+	// meets hubs, sections, companies, people, model families, laws, lawsuits,
+	// compliance and the health and life sciences pages first. The bulk
+	// families are left to the second sitemap: political bills and members
+	// (industries/pol-), source summaries, data centre children, art topics,
+	// news stories and vendor posts. CVE, CWE, incident and research paper
+	// detail pages leave the sitemap entirely on the site side and stay
+	// published and linked from their hubs.
+	if rows, err := db.Query(`SELECT r.url FROM twoai_url_registry r
+		WHERE r.resolution IS NULL AND r.last_seen_at > now() - interval '7 days' AND (
+			r.kind IN ('home', 'company', 'state-law', 'lawsuit', 'compliance', 'research-topic', 'static', 'tool',
+				'benchmark', 'calculator', 'prompt-page', 'ecosystem-category', 'news-daily')
+			OR r.kind LIKE '%-hub'
+			OR (r.kind = 'ecosystem-entity' AND EXISTS (
+				SELECT 1 FROM twoai_pages p WHERE p.data->>'uid' = substring(r.url from '/([0-9a-f]{8})/?$')
+				  AND p.kind NOT IN ('tech-dc-child', 'art-topic', 'cve', 'cwe', 'incident', 'research-paper', 'mcp-server')
+				  AND p.path !~ '^industries/(pol|source)-' AND p.path !~ '^tech/dc-')))
+		ORDER BY r.url`); err == nil {
+		var core []string
+		for rows.Next() {
+			var u string
+			if rows.Scan(&u) == nil {
+				if pu, perr := url.Parse(u); perr == nil {
+					core = append(core, pu.Path)
+				}
+			}
+		}
+		rows.Close()
+		if len(core) > 0 {
+			if err := upsert("meta/sitemap-core.json", "meta", map[string]any{
+				"slug": "sitemap-core", "generated": today, "count": len(core), "paths": core,
 			}); err != nil {
 				return err
 			}
