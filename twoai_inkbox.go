@@ -28,6 +28,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -232,6 +233,14 @@ func inkboxPull(db *sql.DB) error {
 					continue
 				}
 				text := ibStr(m, "text", "body_text", "bodyText", "body", "snippet", "preview")
+				// THE LIST GIVES A PREVIEW, NOT THE MAIL. 2026-10-07: the Gmail
+				// forwarding confirmation reached the bridge as 280 characters,
+				// cut off before the confirmation link, because the mailbox
+				// listing carries a snippet of each message. The message is
+				// fetched whole before it is recorded; a CourtListener alert
+				// has its docket entries in the body, so the preview would
+				// have lost those too.
+				text = ibFullText(key, id.mailbox, msgID, text)
 				// A COURTLISTENER DOCKET ALERT IS DATA, NOT MAIL FOR THE BRIDGE
 				// (row 565). It is logged in cl_alert_emails and its entries
 				// merged into the case; marked read once stored, whether or not
@@ -315,4 +324,35 @@ func ibQueuedByUs(db *sql.DB, handle, subject string) bool {
 	db.QueryRow(`SELECT true FROM inkbox_outbox WHERE from_handle=$1 AND subject=$2
 		AND created_at > now() - interval '30 days' LIMIT 1`, handle, subject).Scan(&hit)
 	return hit
+}
+
+// ibFullText fetches one message and returns its text, falling back to the
+// listing's preview when the message cannot be read. An HTML-only message is
+// reduced to its text.
+func ibFullText(key, mailbox, msgID, preview string) string {
+	raw, err := ibDo(key, "GET", "/mail/mailboxes/"+url.PathEscape(mailbox)+"/messages/"+url.PathEscape(msgID), nil)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "inkbox_pull read message:", err)
+		return preview
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil || m == nil {
+		return preview
+	}
+	for _, k := range []string{"data", "message", "item"} {
+		if inner, ok := m[k].(map[string]any); ok {
+			m = inner
+			break
+		}
+	}
+	if t := ibStr(m, "text", "body_text", "bodyText", "text_body", "textBody", "plain", "body", "content"); len(t) > len(preview) {
+		return t
+	}
+	if h := ibStr(m, "html", "body_html", "bodyHtml", "html_body"); h != "" {
+		t := strings.TrimSpace(html.UnescapeString(twoaiTagStrip.ReplaceAllString(strings.ReplaceAll(strings.ReplaceAll(h, "<br>", "\n"), "</p>", "\n"), " ")))
+		if len(t) > len(preview) {
+			return t
+		}
+	}
+	return preview
 }
