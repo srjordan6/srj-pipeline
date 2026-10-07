@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -213,8 +214,13 @@ func clApplyMailEntries(db *sql.DB, msgID, docket string, entries []clEntry) (in
 		return 0, slug
 	}
 	db.Exec(`UPDATE ai_lawsuits SET docket_ok_at = now(), docket_checked_at = now() WHERE id = $1`, id)
-	db.Exec(`UPDATE cl_alert_emails SET applied = $2, note = 'docket ' || $3 || ' ' || $4 || ': ' || $2 || ' new of ' || $5 WHERE message_id = $1`,
-		msgID, n, docket, slug, len(entries))
+	// $2 is an integer for the column and text in the note, so the text use
+	// is cast: a parameter read two ways uncast is "inconsistent types
+	// deduced" and the statement fails. Found on the first real mail.
+	if _, err := db.Exec(`UPDATE cl_alert_emails SET applied = $2, note = 'docket ' || $3 || ' ' || $4 || ': ' || $2::text || ' new of ' || $5::text WHERE message_id = $1`,
+		msgID, n, docket, slug, len(entries)); err != nil {
+		fmt.Fprintln(os.Stderr, "cl_mail note:", err)
+	}
 	return n, slug
 }
 
