@@ -2414,7 +2414,7 @@ func publishNews(db *sql.DB) error {
 	// Filtering at publish leaves the corpus intact, keeps every archived page
 	// answering, and means the briefing corrects itself on the next run rather
 	// than waiting a day and a half for bad records to age out.
-	skipped := 0
+	skipped, stale := 0, 0
 	seenURL := map[string]bool{}
 	for rows.Next() {
 		var a art
@@ -2430,11 +2430,21 @@ func publishNews(db *sql.DB) error {
 			}
 			seenURL[cu] = true
 			a.Date = d.String
+			// GDELT refetches old coverage: a 2026-07-17 article sat in a
+			// 2026-10-06 cluster (row 547). Older than 14 days by its own
+			// date, it does not count toward a story.
+			if newsTooOld(a.Date, asOf) {
+				stale++
+				continue
+			}
 			arts = append(arts, a)
 		}
 	}
 	if skipped > 0 {
 		fmt.Printf("publishNews: %d non-AI headlines skipped, %d kept\n", skipped, len(arts))
+	}
+	if stale > 0 {
+		fmt.Printf("publishNews: %d articles older than 14 days by their own date left out\n", stale)
 	}
 	// THE VENDOR-NEWS INTAKE COUNTS AS COVERAGE. RTHK and The Business Times
 	// carried the World Labs deal through the Google News coverage feeds,
@@ -2445,7 +2455,7 @@ func publishNews(db *sql.DB) error {
 	// safety check (news_gap) instead.
 	nCand := 0
 	for _, c := range newsCandidateArticles(db, asOf, 72) {
-		if !twoaiTitleIsAI(c.Title) || twoaiIsIndexPage(c.Title, c.URL) || seenURL[c.URL] {
+		if !twoaiTitleIsAI(c.Title) || twoaiIsIndexPage(c.Title, c.URL) || seenURL[c.URL] || newsTooOld(c.Date, asOf) {
 			continue
 		}
 		seenURL[c.URL] = true
@@ -2679,6 +2689,36 @@ func publishNews(db *sql.DB) error {
 		}
 		seedEnt[i] = m
 	}
+	// ROW 547: names and rare words. Each cluster's GDELT people and
+	// organisations as it formed (bylines and agencies out), and the names
+	// and headline words so common this window that they identify no event.
+	seedNames := make([]map[string]bool, len(cls))
+	for i, c := range cls {
+		var lists []string
+		for _, a := range c.arts {
+			lists = append(lists, a.persons, a.orgs)
+		}
+		seedNames[i] = newsNameSet(lists)
+	}
+	commonAt := len(cls) / 30
+	if commonAt < 5 {
+		commonAt = 5
+	}
+	commonNames := newsCommon(seedNames, commonAt)
+	rareWords := map[string]bool{}
+	{
+		df := map[string]int{}
+		for _, m := range seedTk {
+			for k := range m {
+				df[k]++
+			}
+		}
+		for k, n := range df {
+			if n <= 3 && len(k) >= 5 {
+				rareWords[k] = true
+			}
+		}
+	}
 	for merged := true; merged; {
 		merged = false
 		for i := 0; i < len(cls) && !merged; i++ {
@@ -2693,7 +2733,13 @@ func publishNews(db *sql.DB) error {
 					(newsSharedEntities(seedEnt[i], seedEnt[j], ubiq) >= 2 && overlap >= 0.25) ||
 					// One product name both name, carried by few headlines:
 					// "Gemini 4 Argon" in five differently worded headlines.
-					(newsSharedEntities(seedProd[i], seedProd[j], nil) >= 1 && overlap >= 0.15)
+					(newsSharedEntities(seedProd[i], seedProd[j], nil) >= 1 && overlap >= 0.15) ||
+					// Row 547: the same named people and organisations, not
+					// common this window (four witnesses at one inquiry), or
+					// two words almost no other story used (Minnesota,
+					// nudification).
+					newsSameEventByNames(seedNames[i], seedNames[j], commonNames, overlap) ||
+					newsSameEventByRareWords(seedTk[i], seedTk[j], rareWords)
 				// Two clusters from one outlet: the row 414 test, not these.
 				if d := oneOutlet(cls[i], cls[j]); d != "" {
 					same = newsSameOutletStory(cls[i].seed, cls[j].seed, seedEnt[i], seedEnt[j], d)
@@ -2709,6 +2755,7 @@ func publishNews(db *sql.DB) error {
 				seedTk = append(seedTk[:j], seedTk[j+1:]...)
 				seedEnt = append(seedEnt[:j], seedEnt[j+1:]...)
 				seedProd = append(seedProd[:j], seedProd[j+1:]...)
+				seedNames = append(seedNames[:j], seedNames[j+1:]...)
 				merged = true
 				break
 			}
@@ -2982,7 +3029,16 @@ func publishNews(db *sql.DB) error {
 			dl = dl[:12]
 		}
 		summary, sumURL, sumDomain := "", "", ""
+		// The headline's own article first, then the rest, and a summary
+		// must be about the headline (row 547: cd3219df printed a summary
+		// about Anthropic under a headline about the ABC).
+		order := []art{lead}
 		for _, a := range c.arts {
+			if a.URL != lead.URL {
+				order = append(order, a)
+			}
+		}
+		for _, a := range order {
 			dt, okd := docs[a.URL]
 			if !okd || (dt.summary == "" && dt.text == "") {
 				continue
@@ -3015,6 +3071,10 @@ func publishNews(db *sql.DB) error {
 			} else if isRefusal(dt.summary) {
 				// Already cached from an earlier run, before this guard existed.
 				fmt.Fprintf(os.Stderr, "publish_news: cached refusal skipped: %s\n", a.URL)
+				continue
+			}
+			if !newsSummaryFits(h, dt.summary) {
+				fmt.Fprintf(os.Stderr, "publish_news: summary of %s is not about %q, trying next article\n", a.URL, trunc(h, 80))
 				continue
 			}
 			summary, sumURL, sumDomain = dt.summary, a.URL, a.Domain
