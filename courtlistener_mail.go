@@ -192,7 +192,9 @@ func clAlertMail(db *sql.DB, msgID, from, subject, text string) (int, error) {
 // host is compared whole after parsing, not matched by a pattern in the
 // text, so a link to another site that mentions the name does not count.
 func clMailDocketID(text string) string {
-	for _, tok := range strings.FieldsFunc(text, func(r rune) bool { return r == ' ' || r == '\n' || r == '\t' || r == '<' || r == '>' || r == '"' || r == ')' || r == '(' }) {
+	for _, tok := range strings.FieldsFunc(text, func(r rune) bool {
+		return r == ' ' || r == '\n' || r == '\t' || r == '<' || r == '>' || r == '"' || r == ')' || r == '('
+	}) {
 		if !strings.HasPrefix(tok, "http://") && !strings.HasPrefix(tok, "https://") {
 			continue
 		}
