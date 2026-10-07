@@ -37,6 +37,23 @@ var (
 	clMailDateRe    = regexp.MustCompile(`(?i)^(?:date\s+)?filed\s*[:]?\s*(.+?)\s*$`)
 	clMailDescRe    = regexp.MustCompile(`(?i)^description\s*[:]\s*(.+?)\s*$`)
 	clMailURLRe     = regexp.MustCompile(`^https?://`)
+	// THE REAL MAIL IS A TABLE FLATTENED TO TEXT. The first forwarded alert
+	// (2026-10-07, NYT v Microsoft entry 1645) read, after the header:
+	//   Document
+	//   Number Date Filed Description Download PDF
+	//   1645
+	//   <https://www.courtlistener.com/docket/68117049/1645/the-new-york-.../>
+	//   Oct
+	//   7, 2026 Order on Motion for Leave to File Document From RECAP with PACER
+	//   fallback
+	//   <https://www.courtlistener.com/docket/68117049/1645/...?redirect_to_download=True>
+	// so each entry is the link that carries the docket id and the entry
+	// number, followed by the date, the description and the download column's
+	// words, wrapped wherever Gmail wrapped them. clMailEntryLinkRe finds the
+	// entry links; the text up to the next link is the entry.
+	clMailEntryLinkRe = regexp.MustCompile(`<?(https?://(?:www\.)?courtlistener\.com/docket/(\d+)/(\d+)/[^\s>]*)>?`)
+	clMailLeadDateRe  = regexp.MustCompile(`^((?:[A-Z][a-z]+\.?|\d{1,2}/)\s*\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})\s*(.*)$`)
+	clMailTrailRe     = regexp.MustCompile(`(?i)\s+(From RECAP.*|Buy on PACER.*|Download PDF.*|Download.*|View on PACER.*)$`)
 )
 
 // clIsAlertMail says whether a mail in the inkbox is a CourtListener docket
@@ -91,6 +108,12 @@ func clMailDate(s string) string {
 // before the entry's document number or date.
 func clParseAlertMail(text string) (docket string, entries []clEntry) {
 	docket = clMailDocketID(text)
+	if d, es := clParseAlertTable(text); len(es) > 0 {
+		if docket == "" {
+			docket = d
+		}
+		return docket, es
+	}
 	var cur clEntry
 	var curNo, lastText string
 	flush := func() {
@@ -164,27 +187,35 @@ func clAlertMail(db *sql.DB, msgID, from, subject, text string) (int, error) {
 		db.Exec(`UPDATE cl_alert_emails SET note = 'docket ' || $2 || ': no entries read from the text; raw kept for the parser' WHERE message_id = $1`, msgID, docket)
 		return 0, nil
 	}
+	n, slug := clApplyMailEntries(db, msgID, docket, entries)
+	if n > 0 {
+		fmt.Printf("cl_mail %s: %d new docket entries\n", slug, n)
+		clNoteChange(db, fmt.Sprintf("email: %d entries for %s", n, slug))
+	}
+	return n, nil
+}
+
+// clApplyMailEntries merges a mail's entries into the case its docket id
+// names and records the outcome on the mail's row. It returns how many
+// entries were new and the case slug.
+func clApplyMailEntries(db *sql.DB, msgID, docket string, entries []clEntry) (int, string) {
 	var id int64
 	var slug, url, timeline string
 	if db.QueryRow(`SELECT id, slug, courtlistener_url, COALESCE(timeline::text, '[]') FROM ai_lawsuits
 		WHERE courtlistener_url ~ ('/docket/' || $1 || '(/|$)') ORDER BY is_active DESC, id LIMIT 1`, docket).
 		Scan(&id, &slug, &url, &timeline) != nil {
 		db.Exec(`UPDATE cl_alert_emails SET note = 'docket ' || $2 || ': not on the tracker' WHERE message_id = $1`, msgID, docket)
-		return 0, nil
+		return 0, ""
 	}
-	n, newest, err := clMergeEntries(db, id, timeline, url, entries)
+	n, _, err := clMergeEntries(db, id, timeline, url, entries)
 	if err != nil {
 		db.Exec(`UPDATE cl_alert_emails SET note = 'docket ' || $2 || ' ' || $3 || ': ' || $4 WHERE message_id = $1`, msgID, docket, slug, trunc(err.Error(), 200))
-		return 0, nil
+		return 0, slug
 	}
 	db.Exec(`UPDATE ai_lawsuits SET docket_ok_at = now(), docket_checked_at = now() WHERE id = $1`, id)
 	db.Exec(`UPDATE cl_alert_emails SET applied = $2, note = 'docket ' || $3 || ' ' || $4 || ': ' || $2 || ' new of ' || $5 WHERE message_id = $1`,
 		msgID, n, docket, slug, len(entries))
-	if n > 0 {
-		fmt.Printf("cl_mail %s: %d new docket entries through %s\n", slug, n, newest)
-		clNoteChange(db, fmt.Sprintf("email: %d entries for %s", n, slug))
-	}
-	return n, nil
+	return n, slug
 }
 
 // clMailDocketID finds the CourtListener docket id in the mail: the first
@@ -211,4 +242,47 @@ func clMailDocketID(text string) string {
 		}
 	}
 	return ""
+}
+
+// clParseAlertTable reads the entries out of CourtListener's own layout, the
+// docket entry table flattened to text (see clMailEntryLinkRe). Each entry
+// link that is not a download link opens an entry; the words up to the next
+// link are its date and description.
+func clParseAlertTable(text string) (docket string, entries []clEntry) {
+	text = strings.ReplaceAll(text, "\r", "")
+	locs := clMailEntryLinkRe.FindAllStringSubmatchIndex(text, -1)
+	for i, loc := range locs {
+		link := text[loc[2]:loc[3]]
+		if strings.Contains(link, "redirect_to_download") || strings.Contains(link, "?") && strings.Contains(link, "download") {
+			continue
+		}
+		if docket == "" {
+			docket = text[loc[4]:loc[5]]
+		}
+		entryNo := text[loc[6]:loc[7]]
+		end := len(text)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		seg := strings.Join(strings.Fields(text[loc[1]:end]), " ")
+		m := clMailLeadDateRe.FindStringSubmatch(seg)
+		if m == nil {
+			continue
+		}
+		date := clMailDate(m[1])
+		if date == "" {
+			continue
+		}
+		desc := strings.TrimSpace(clMailTrailRe.ReplaceAllString(strings.TrimSpace(m[2]), ""))
+		if desc == "" {
+			continue
+		}
+		entries = append(entries, clEntry{
+			Docket:      json.RawMessage(docket),
+			DateFiled:   date,
+			EntryNumber: json.RawMessage(`"` + entryNo + `"`),
+			Description: desc,
+		})
+	}
+	return docket, entries
 }
