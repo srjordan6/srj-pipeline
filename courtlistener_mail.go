@@ -41,7 +41,19 @@ var (
 // clIsAlertMail says whether a mail in the inkbox is a CourtListener docket
 // alert, by sender or by subject (a forward keeps the subject).
 func clIsAlertMail(from, subject string) bool {
-	return strings.Contains(strings.ToLower(from), "courtlistener.com") || clMailSubjectRe.MatchString(strings.TrimSpace(subject))
+	return clMailDomain(from) == "courtlistener.com" || clMailSubjectRe.MatchString(strings.TrimSpace(subject))
+}
+
+// clMailDomain is the domain of a From header, whatever its display form:
+// "CourtListener <alerts@courtlistener.com>" and "alerts@courtlistener.com"
+// both give courtlistener.com. The whole domain is compared, never a
+// substring, so no other host that contains the name passes.
+func clMailDomain(from string) string {
+	from = strings.ToLower(strings.TrimSpace(from))
+	if i := strings.LastIndex(from, "@"); i >= 0 {
+		from = from[i+1:]
+	}
+	return strings.Trim(strings.TrimSpace(from), "<>\"'")
 }
 
 func clEnsureAlertMail(db *sql.DB) {
@@ -145,13 +157,12 @@ func clAlertMail(db *sql.DB, msgID, from, subject, text string) (int, error) {
 	if k, _ := res.RowsAffected(); k == 0 {
 		return 0, nil // seen before
 	}
-	note := func(n string) { db.Exec(`UPDATE cl_alert_emails SET note = $2 WHERE message_id = $1`, msgID, n) }
 	if docket == "" {
-		note("no /docket/<id>/ link in the mail; unparsed, raw kept")
+		db.Exec(`UPDATE cl_alert_emails SET note = 'no /docket/<id>/ link in the mail; unparsed, raw kept' WHERE message_id = $1`, msgID)
 		return 0, nil
 	}
 	if len(entries) == 0 {
-		note("docket " + docket + ": no entries read from the text; raw kept for the parser")
+		db.Exec(`UPDATE cl_alert_emails SET note = 'docket ' || $2 || ': no entries read from the text; raw kept for the parser' WHERE message_id = $1`, msgID, docket)
 		return 0, nil
 	}
 	var id int64
@@ -159,17 +170,17 @@ func clAlertMail(db *sql.DB, msgID, from, subject, text string) (int, error) {
 	if db.QueryRow(`SELECT id, slug, courtlistener_url, COALESCE(timeline::text, '[]') FROM ai_lawsuits
 		WHERE courtlistener_url ~ ('/docket/' || $1 || '(/|$)') ORDER BY is_active DESC, id LIMIT 1`, docket).
 		Scan(&id, &slug, &url, &timeline) != nil {
-		note("docket " + docket + ": not on the tracker")
+		db.Exec(`UPDATE cl_alert_emails SET note = 'docket ' || $2 || ': not on the tracker' WHERE message_id = $1`, msgID, docket)
 		return 0, nil
 	}
 	n, newest, err := clMergeEntries(db, id, timeline, url, entries)
 	if err != nil {
-		note("docket " + docket + " " + slug + ": " + trunc(err.Error(), 200))
+		db.Exec(`UPDATE cl_alert_emails SET note = 'docket ' || $2 || ' ' || $3 || ': ' || $4 WHERE message_id = $1`, msgID, docket, slug, trunc(err.Error(), 200))
 		return 0, nil
 	}
 	db.Exec(`UPDATE ai_lawsuits SET docket_ok_at = now(), docket_checked_at = now() WHERE id = $1`, id)
-	db.Exec(`UPDATE cl_alert_emails SET applied = $2, note = $3 WHERE message_id = $1`,
-		msgID, n, fmt.Sprintf("docket %s %s: %d new of %d", docket, slug, n, len(entries)))
+	db.Exec(`UPDATE cl_alert_emails SET applied = $2, note = 'docket ' || $3 || ' ' || $4 || ': ' || $2 || ' new of ' || $5 WHERE message_id = $1`,
+		msgID, n, docket, slug, len(entries))
 	if n > 0 {
 		fmt.Printf("cl_mail %s: %d new docket entries through %s\n", slug, n, newest)
 		clNoteChange(db, fmt.Sprintf("email: %d entries for %s", n, slug))

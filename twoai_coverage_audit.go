@@ -106,7 +106,7 @@ func twoaiCoverageAudit(db *sql.DB) error {
 			}
 			if isGoogleNewsURL(link) {
 				link = resolveGoogleNews(link)
-				if link == "" || strings.Contains(link, "news.google.") {
+				if link == "" || isGoogleNewsURL(link) {
 					continue
 				}
 			}
@@ -144,12 +144,12 @@ func twoaiCoverageAudit(db *sql.DB) error {
 			}
 			var docID sql.NullInt64
 			if outcome == "" {
-				raw := fmt.Sprintf(`{"url":%q,"date":%q,"title":%q,"domain":%q,"intake":"coverage_audit","query":%q,"hand":"twoai_coverage_audit %s: not in our stories or corpus of the last 72 hours"}`,
-					link, date+"T12:00:00Z", title, publisherFromURL(link), src.name, today)
 				if err := db.QueryRow(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, published_at, fetched_at, raw)
-					SELECT $1, md5($2), md5($2), $2, $3, $4::date, now(), $5::jsonb
+					SELECT $1, md5($2), md5($2), $2, $3, $4::date, now(),
+					       jsonb_build_object('url', $2, 'date', $4 || 'T12:00:00Z', 'title', $3, 'domain', $5, 'intake', 'coverage_audit',
+					                          'query', $6, 'hand', 'twoai_coverage_audit ' || $7 || ': not in our stories or corpus of the last 72 hours')
 					WHERE NOT EXISTS (SELECT 1 FROM pipeline.documents WHERE url=$2) RETURNING id`,
-					sourceID, link, title, date, raw).Scan(&docID); err == nil && docID.Valid {
+					sourceID, link, title, date, publisherFromURL(link), src.name, today).Scan(&docID); err == nil && docID.Valid {
 					outcome = "harvested"
 					harvested++
 					held[canon] = true
@@ -173,7 +173,7 @@ func twoaiCoverageAudit(db *sql.DB) error {
 	// The morning row, once a day: what was read, what was ours, what was
 	// harvested and will cluster in this run, and what could not be reached.
 	var already bool
-	db.QueryRow(`SELECT EXISTS (SELECT 1 FROM project_bridge WHERE from_project='srj' AND topic = $1)`, "Coverage audit "+today).Scan(&already)
+	db.QueryRow(`SELECT EXISTS (SELECT 1 FROM project_bridge WHERE from_project='srj' AND topic = 'Coverage audit ' || $1)`, today).Scan(&already)
 	if !already && read > 0 {
 		var b strings.Builder
 		fmt.Fprintf(&b, "Coverage audit %s (twoai_coverage_audit, row 567). Read %d items from %d aggregator feeds: %d already in a story of the last 72 hours, %d already in the corpus, %d harvested as new documents for this run's publish_news to cluster (a story needs three domains, so a single-outlet find becomes a story only when others follow).\n",
@@ -195,7 +195,7 @@ func twoaiCoverageAudit(db *sql.DB) error {
 			}
 		}
 		b.WriteString("\nAP, Reuters, Politico and the Post are read through site: queries on Google News, since none of them serves a feed this pipeline can fetch. Every item and its outcome is in twoai_coverage_audit.")
-		db.Exec(`INSERT INTO project_bridge (from_project, to_project, topic, body) VALUES ('srj','theworldofai',$1,$2)`, "Coverage audit "+today, b.String())
+		db.Exec(`INSERT INTO project_bridge (from_project, to_project, topic, body) VALUES ('srj','theworldofai', 'Coverage audit ' || $1, $2)`, today, b.String())
 	}
 	return nil
 }

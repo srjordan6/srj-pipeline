@@ -322,6 +322,7 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 				resp.Body.Close()
 			}
 			blockedStatus := status == 401 || status == 403 || status == 429 || status == 451 || status == 402
+			viaBrowser := false
 			if e.repeat && browserOK && !blockedStatus && (status != 200 || extract == "") {
 				hmu.Lock()
 				take := browserLeft > 0
@@ -332,7 +333,7 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 				if take {
 					if st2, body2, _, err2 := crawlFetchBrowser(browser, site); err2 == nil && st2 == 200 {
 						if x := strings.ToValidUTF8(twoaiHarvestExtract(body2), "\uFFFD"); x != "" {
-							status, extract, via = 200, x, via+"+browser"
+							status, extract, viaBrowser = 200, x, true
 							feedURL = twoaiDiscoverFeedInHTML(site, body2)
 						}
 					}
@@ -351,10 +352,10 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 			if status == 200 && extract != "" {
 				fetched++
 				if _, err := db.Exec(`INSERT INTO twoai_company_harvest (uid, name, url, resolved_via, http_status, extract, content_hash, fetched_on)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,current_date)
-				ON CONFLICT (uid) DO UPDATE SET name=$2, url=$3, resolved_via=$4, http_status=$5,
+				VALUES ($1,$2,$3,CASE WHEN $8 THEN $4 || '+browser' ELSE $4 END,$5,$6,$7,current_date)
+				ON CONFLICT (uid) DO UPDATE SET name=$2, url=$3, resolved_via=EXCLUDED.resolved_via, http_status=$5,
 					extract=$6, content_hash=$7, fetched_on=current_date`,
-					e.uid, e.name, site, via, status, extract, hex.EncodeToString(h[:8])); err != nil {
+					e.uid, e.name, site, via, status, extract, hex.EncodeToString(h[:8]), viaBrowser); err != nil {
 					// One row failing to store is not worth abandoning the sweep,
 					// and inside a worker there is nobody to return the error to.
 					fmt.Fprintf(os.Stderr, "twoai_company_harvest: store %s: %v\n", e.name, err)

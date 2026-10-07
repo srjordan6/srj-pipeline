@@ -12020,9 +12020,9 @@ func twoaiLawsuitsPage(db *sql.DB, today string, upsert func(path, kind string, 
 		// with the same key and the same normalized shape the first 93 use.
 		caseUID := twoaiUID("lawsuit:" + slug)
 		db.Exec(`INSERT INTO twoai_entities (uid, kind, name, normalized, aliases)
-			VALUES ($1,'lawsuit',$2,$3, jsonb_build_array($2::text))
+			VALUES ($1,'lawsuit',$2,$3 || '#' || $4, jsonb_build_array($2::text))
 			ON CONFLICT DO NOTHING`,
-			caseUID, strings.TrimSpace(name), twoaiNormalizeEntityName(name)+"#"+slug)
+			caseUID, strings.TrimSpace(name), twoaiNormalizeEntityName(name), slug)
 		cases = append(cases, map[string]any{
 			"uid":  caseUID,
 			"slug": slug, "case_name": name, "court": court, "docket": docket,

@@ -242,7 +242,7 @@ func twoaiVendorEnrich(db *sql.DB) error {
 		// 2026-10-02 (see twoai_vendor_feeds.go); its releases arrive through
 		// Google News with title and date, and that is what the post keeps.
 		// Trying it again every run was seven 403s and five hangs a day.
-		if strings.HasSuffix(host, "pib.gov.in") {
+		if host == "pib.gov.in" || strings.HasSuffix(host, ".pib.gov.in") {
 			db.Exec(`UPDATE twoai_vendor_posts SET enrich_attempts=3 WHERE slug=$1`, p.slug)
 			failWhy["pib.gov.in not fetched: its edge refuses our addresses, title and date kept from the feed"]++
 			continue

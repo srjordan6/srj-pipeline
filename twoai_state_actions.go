@@ -257,8 +257,8 @@ func twoaiGovWatch(db *sql.DB) error {
 				}
 			}
 			res, err := db.Exec(`INSERT INTO twoai_state_actions (state_code, kind, acted_on, title, what, source_url, source_title, status, added_by, note)
-				VALUES ($1,$2,$3::date,$4,$5,$6,$7,$8,'twoai_gov_watch',$9) ON CONFLICT (source_url) DO NOTHING`,
-				stateCode, kind, date, trunc(title, 300), trunc(desc, 400), link, f.name, st, "from the newsroom feed "+url+" on "+today)
+				VALUES ($1,$2,$3::date,$4,$5,$6,$7,$8,'twoai_gov_watch', 'from the newsroom feed ' || $9 || ' on ' || $10) ON CONFLICT (source_url) DO NOTHING`,
+				stateCode, kind, date, trunc(title, 300), trunc(desc, 400), link, f.name, st, url, today)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "twoai_gov_watch: %s: %v\n", f.code, err)
 				continue
@@ -274,11 +274,12 @@ func twoaiGovWatch(db *sql.DB) error {
 			// The release is also a document for the news intake, so the
 			// morning briefing clusters it with the outlets that report it.
 			if sourceID > 0 {
-				raw := fmt.Sprintf(`{"url":%q,"date":%q,"title":%q,"domain":%q,"intake":"gov_watch","query":%q,"hand":"twoai_gov_watch %s, official release"}`,
-					link, date+"T12:00:00Z", title, publisherFromURL(link), f.name, f.code)
 				if r2, err := db.Exec(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, published_at, fetched_at, raw)
-					SELECT $1, md5($2), md5($2), $2, $3, $4::date, now(), $5::jsonb
-					WHERE NOT EXISTS (SELECT 1 FROM pipeline.documents WHERE url=$2)`, sourceID, link, title, date, raw); err == nil {
+					SELECT $1, md5($2), md5($2), $2, $3, $4::date, now(),
+					       jsonb_build_object('url', $2, 'date', $4 || 'T12:00:00Z', 'title', $3, 'domain', $5, 'intake', 'gov_watch',
+					                          'query', $6, 'hand', 'twoai_gov_watch ' || $7 || ', official release')
+					WHERE NOT EXISTS (SELECT 1 FROM pipeline.documents WHERE url=$2)`,
+					sourceID, link, title, date, publisherFromURL(link), f.name, f.code); err == nil {
 					if k, _ := r2.RowsAffected(); k > 0 {
 						docs++
 					}
