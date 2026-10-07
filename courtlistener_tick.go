@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -103,8 +104,9 @@ func clReparseAlertMail(db *sql.DB) {
 			continue
 		}
 		ej, _ := json.Marshal(entries)
-		if _, err := db.Exec(`UPDATE cl_alert_emails SET entries = $2::jsonb, parsed = $3, docket_id = COALESCE(docket_id, NULLIF($4,'')), note = 'reparse ' || $5 || ': ' || $3::text || ' entries read' WHERE message_id = $1`,
-			r.id, string(ej), len(entries), docket, time.Now().UTC().Format("2006-01-02")); err != nil {
+		// The count goes twice, integer and text: one parameter, one type.
+		if _, err := db.Exec(`UPDATE cl_alert_emails SET entries = $2::jsonb, parsed = $3, docket_id = COALESCE(docket_id, NULLIF($4,'')), note = 'reparse ' || $5 || ': ' || $6 || ' entries read' WHERE message_id = $1`,
+			r.id, string(ej), len(entries), docket, time.Now().UTC().Format("2006-01-02"), strconv.Itoa(len(entries))); err != nil {
 			fmt.Fprintln(os.Stderr, "cl_mail reparse note:", err)
 			outcome = append(outcome, "update failed: "+trunc(err.Error(), 120))
 		}

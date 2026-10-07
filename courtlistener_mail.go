@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -214,11 +215,13 @@ func clApplyMailEntries(db *sql.DB, msgID, docket string, entries []clEntry) (in
 		return 0, slug
 	}
 	db.Exec(`UPDATE ai_lawsuits SET docket_ok_at = now(), docket_checked_at = now() WHERE id = $1`, id)
-	// $2 is an integer for the column and text in the note, so the text use
-	// is cast: a parameter read two ways uncast is "inconsistent types
-	// deduced" and the statement fails. Found on the first real mail.
-	if _, err := db.Exec(`UPDATE cl_alert_emails SET applied = $2, note = 'docket ' || $3 || ' ' || $4 || ': ' || $2::text || ' new of ' || $5::text WHERE message_id = $1`,
-		msgID, n, docket, slug, len(entries)); err != nil {
+	// ONE PARAMETER, ONE TYPE. $2 was the integer for the column and, cast,
+	// the text in the note; Postgres types a parameter once, a cast on it
+	// sets that type, and the two uses were "inconsistent types deduced for
+	// parameter". The count is passed twice, as the integer and as text.
+	// Found on the first real mail, 2026-10-07, after a tick reported it.
+	if _, err := db.Exec(`UPDATE cl_alert_emails SET applied = $2, note = 'docket ' || $3 || ' ' || $4 || ': ' || $6 || ' new of ' || $5 WHERE message_id = $1`,
+		msgID, n, docket, slug, strconv.Itoa(len(entries)), strconv.Itoa(n)); err != nil {
 		fmt.Fprintln(os.Stderr, "cl_mail note:", err)
 	}
 	return n, slug
