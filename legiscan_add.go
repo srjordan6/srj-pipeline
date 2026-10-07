@@ -59,7 +59,7 @@ func legiscanAdd(db *sql.DB, args []string) error {
 	sb, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	var sr struct {
-		Status       string `json:"status"`
+		Status       string                     `json:"status"`
 		SearchResult map[string]json.RawMessage `json:"searchresult"`
 	}
 	if json.Unmarshal(sb, &sr) != nil || sr.Status != "OK" {
@@ -150,4 +150,53 @@ func legiscanAdd(db *sql.DB, args []string) error {
 	fmt.Printf("legiscan_add: added %s %s (bill_id %d): %s\n", state, bill, billID, bp.Bill.Title)
 	fmt.Println("legiscan_add: it renders on /ai-laws/ after the next twoai run, and the daily sweep keeps it current from here")
 	return nil
+}
+
+// THE QUEUE. legiscan_add is a hand run on Stephen's PC, where the LegiScan
+// key lives. A session elsewhere that knows a bill belongs here (theworldofai
+// row 553, 2026-10-07: CA AB 1864, gene synthesis screening, signed with the
+// AI package on 2026-09-30 and not AI by vocabulary) has no way to run it. So
+// it names the bill in twoai_legiscan_queue, and the daily legiscan stage
+// drains the queue through legiscanAdd, the same door, marking each row done
+// or recording why it failed. A bill_id in the row covers an adjourned
+// session, as the third argument does by hand.
+func legiscanEnsureQueue(db *sql.DB) {
+	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_legiscan_queue (id serial PRIMARY KEY, state text NOT NULL, bill text NOT NULL,
+		bill_id int, requested_by text, reason text, queued_at timestamptz NOT NULL DEFAULT now(),
+		done_at timestamptz, outcome text)`)
+}
+
+func legiscanDrainQueue(db *sql.DB) {
+	legiscanEnsureQueue(db)
+	rows, err := db.Query(`SELECT id, state, bill, COALESCE(bill_id, 0) FROM twoai_legiscan_queue WHERE done_at IS NULL ORDER BY id LIMIT 20`)
+	if err != nil {
+		return
+	}
+	type item struct {
+		id, billID  int
+		state, bill string
+	}
+	var items []item
+	for rows.Next() {
+		var it item
+		if rows.Scan(&it.id, &it.state, &it.bill, &it.billID) == nil {
+			items = append(items, it)
+		}
+	}
+	rows.Close()
+	for _, it := range items {
+		args := []string{it.state, it.bill}
+		if it.billID > 0 {
+			args = append(args, fmt.Sprintf("%d", it.billID))
+		}
+		err := legiscanAdd(db, args)
+		outcome := "added"
+		if err != nil {
+			outcome = "failed: " + trunc(err.Error(), 300)
+			fmt.Printf("legiscan queue: %s %s: %v\n", it.state, it.bill, err)
+		} else {
+			fmt.Printf("legiscan queue: %s %s added\n", it.state, it.bill)
+		}
+		db.Exec(`UPDATE twoai_legiscan_queue SET done_at = now(), outcome = $2 WHERE id = $1`, it.id, outcome)
+	}
 }
