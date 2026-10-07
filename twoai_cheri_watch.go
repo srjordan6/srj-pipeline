@@ -48,6 +48,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -450,6 +451,42 @@ func twoaiCheriPlace(db *sql.DB) (int, int) {
 			}
 		}
 	}
+	// EVERY NAME WITH A PAGE, 2026-10-07 (theworldofai rows 530 and 532): the
+	// facts also name SRI International, which now has a company page, and
+	// may name glossary terms. Each fact carries parts, text runs with an
+	// href where a run is a person, company or glossary term this site has a
+	// page for, each target linked at its first mention in the section only.
+	// pre/person/post stay for a site build that predates parts.
+	var targets []cheriLinkTarget
+	for _, p := range people {
+		targets = append(targets, cheriLinkTarget{p.name, p.path})
+	}
+	if rows, err := db.Query(`SELECT name, uid FROM twoai_company_profiles WHERE length(COALESCE(name,'')) >= 4`); err == nil {
+		for rows.Next() {
+			var n, u string
+			if rows.Scan(&n, &u) == nil {
+				targets = append(targets, cheriLinkTarget{n, "/companies/" + u + "/"})
+			}
+		}
+		rows.Close()
+	}
+	for _, t := range twoaiGlossaryTerms(db) {
+		for _, n := range t.names {
+			targets = append(targets, cheriLinkTarget{n, "/ai-glossary/" + t.slug + "/"})
+		}
+	}
+	linked := map[string]bool{}
+	var factsOut []map[string]any
+	for _, f := range facts {
+		o := map[string]any{}
+		for k, v := range f {
+			o[k] = v
+		}
+		if parts := cheriLinkParts(f["claim"], targets, linked); len(parts) > 1 {
+			o["parts"] = parts
+		}
+		factsOut = append(factsOut, o)
+	}
 	var items []map[string]any
 	var tracked int
 	db.QueryRow(`SELECT count(*) FROM twoai_cheri_watch WHERE status NOT IN ('skipped','hidden')`).Scan(&tracked)
@@ -475,7 +512,7 @@ func twoaiCheriPlace(db *sql.DB) (int, int) {
 		db.Exec(`DELETE FROM twoai_page_extras WHERE page_path=$1 AND key=$2`, twoaiCheriPagePath, twoaiCheriExtrasKey)
 		return 0, 0
 	}
-	v, _ := json.Marshal(map[string]any{"facts": facts, "items": items, "tracked": tracked,
+	v, _ := json.Marshal(map[string]any{"facts": factsOut, "items": items, "tracked": tracked,
 		"as_of": time.Now().UTC().Format("2006-01-02")})
 	if _, err := db.Exec(`INSERT INTO twoai_page_extras (page_path, key, value) VALUES ($1, $2, $3::jsonb)
 		ON CONFLICT (page_path, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
@@ -577,4 +614,83 @@ func (c *cheriRun) bridge() {
 	}
 	c.db.Exec(`INSERT INTO twoai_cheri_watch_bridge (items, bridge_topic) VALUES ($1,$2) ON CONFLICT DO NOTHING`, n, subject)
 	fmt.Printf("twoai_cheri_watch: bridge row sent, %s\n", subject)
+}
+
+type cheriLinkTarget struct{ name, href string }
+
+// cheriLinkParts splits text into runs, linking each target's first
+// whole-word mention, longest name first, skipping a target whose href is
+// already in linked (an earlier fact took it).
+func cheriLinkParts(text string, targets []cheriLinkTarget, linked map[string]bool) []map[string]string {
+	sorted := append([]cheriLinkTarget(nil), targets...)
+	sort.SliceStable(sorted, func(i, j int) bool { return len(sorted[i].name) > len(sorted[j].name) })
+	type span struct {
+		i, j int
+		href string
+	}
+	var spans []span
+	used := make([]bool, len(text))
+	for _, t := range sorted {
+		if linked[t.href] || t.name == "" {
+			continue
+		}
+		at := cheriWordIndex(text, t.name)
+		if at < 0 {
+			continue
+		}
+		end := at + len(t.name)
+		clash := false
+		for k := at; k < end; k++ {
+			if used[k] {
+				clash = true
+				break
+			}
+		}
+		if clash {
+			continue
+		}
+		for k := at; k < end; k++ {
+			used[k] = true
+		}
+		linked[t.href] = true
+		spans = append(spans, span{at, end, t.href})
+	}
+	sort.Slice(spans, func(a, b int) bool { return spans[a].i < spans[b].i })
+	var parts []map[string]string
+	pos := 0
+	for _, sp := range spans {
+		if sp.i > pos {
+			parts = append(parts, map[string]string{"text": text[pos:sp.i]})
+		}
+		parts = append(parts, map[string]string{"text": text[sp.i:sp.j], "href": sp.href})
+		pos = sp.j
+	}
+	if pos < len(text) {
+		parts = append(parts, map[string]string{"text": text[pos:]})
+	}
+	return parts
+}
+
+// cheriWordIndex finds name in text as whole words, case-sensitive, since
+// the targets are proper names and terms as written.
+func cheriWordIndex(text, name string) int {
+	from := 0
+	for {
+		i := strings.Index(text[from:], name)
+		if i < 0 {
+			return -1
+		}
+		i += from
+		end := i + len(name)
+		before := i == 0 || !cheriWordRune(text[i-1])
+		after := end >= len(text) || !cheriWordRune(text[end])
+		if before && after {
+			return i
+		}
+		from = i + 1
+	}
+}
+
+func cheriWordRune(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
 }
