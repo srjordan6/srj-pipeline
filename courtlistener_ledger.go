@@ -25,7 +25,8 @@ package main
 // recap, discovery and classify shares have not used rolls to the docket
 // refresh, which is the work that most needs it. The reserve is touched only
 // by a caller whose bucket is "reserve" or a run with CL_RESERVE=1 set, and
-// only once its own share is spent; nothing else may take the day past 120.
+// only once its own share is spent; nothing else may take the day past 120
+// (on the free tier; the day less the reserve on any tier).
 //
 // Tables (schema in Go, IF NOT EXISTS):
 //
@@ -37,6 +38,16 @@ package main
 //	                            the day); pruned after two days
 //	twoai_courtlistener_state   small key/value: the last successful
 //	                            discovery date and the defendant rotation
+//
+// TIER 1, 2026-10-07. Stephen took a CourtListener Tier 1 membership: 10 a
+// minute, 75 an hour and 300 a day (TIER_1_RATES in the Free Law Project's
+// cl/api/constants.py), and unlimited docket alerts. The limits and shares
+// now come from clTiers, picked by CL_TIER (free, 1, 2, 3 or 4; 1 when
+// unset), so a change of membership is one environment variable rather than
+// a code change. The free tier keeps the numbers above. Tier 1 adds an
+// alerts share, which subscribes the tracked dockets to CourtListener docket
+// alerts (courtlistener_alerts.go); like recap, discovery and classify,
+// whatever it has not used rolls to the refresh after 18:00 UTC.
 
 import (
 	"database/sql"
@@ -50,10 +61,14 @@ import (
 	"time"
 )
 
+// The limits of the membership in use, set from clTiers by clApplyTier.
+var (
+	clDayLimit  int
+	clHourLimit int
+	clSpacing   time.Duration
+)
+
 const (
-	clDayLimit  = 125
-	clHourLimit = 50
-	clSpacing   = 12 * time.Second
 	// From this hour (UTC) unused recap, discovery and classify shares roll
 	// to the docket refresh.
 	clRolloverHourUTC = 18
@@ -67,15 +82,91 @@ const (
 	clBucketRecap     = "recap"
 	clBucketDiscovery = "discovery"
 	clBucketClassify  = "classify"
+	clBucketAlerts    = "alerts"
 	clBucketReserve   = "reserve"
 )
 
-var clShares = map[string]int{
-	clBucketRefresh: 70, clBucketRecap: 25, clBucketDiscovery: 15, clBucketClassify: 10, clBucketReserve: 5,
+// clMembership is one CourtListener membership: its three rolling limits, the
+// spacing that keeps the minute window from being the one that bites, and
+// how the day is shared out. Shares add up to the day.
+type clMembership struct {
+	Day, Hour int
+	Spacing   time.Duration
+	Shares    map[string]int
+	HourCaps  map[string]int
+}
+
+var clTiers = map[string]clMembership{
+	// 5/min, 50/hour, 125/day.
+	"free": {Day: 125, Hour: 50, Spacing: 12 * time.Second,
+		Shares: map[string]int{clBucketRefresh: 70, clBucketRecap: 25, clBucketDiscovery: 15, clBucketClassify: 10,
+			clBucketReserve: 5},
+		HourCaps: map[string]int{clBucketRefresh: 35}},
+	// 10/min, 75/hour, 300/day. Seven seconds apart is under 9 a minute.
+	// The alerts share subscribes about 150 dockets over three days, then
+	// sits nearly idle and rolls to the refresh each evening.
+	"1": {Day: 300, Hour: 75, Spacing: 7 * time.Second,
+		Shares: map[string]int{clBucketRefresh: 130, clBucketRecap: 50, clBucketDiscovery: 25, clBucketClassify: 25,
+			clBucketAlerts: 60, clBucketReserve: 10},
+		HourCaps: map[string]int{clBucketRefresh: 45, clBucketAlerts: 20}},
+	// 15/min, 150/hour, 600/day.
+	"2": {Day: 600, Hour: 150, Spacing: 5 * time.Second,
+		Shares: map[string]int{clBucketRefresh: 300, clBucketRecap: 120, clBucketDiscovery: 50, clBucketClassify: 50,
+			clBucketAlerts: 60, clBucketReserve: 20},
+		HourCaps: map[string]int{clBucketRefresh: 90, clBucketAlerts: 30}},
+	// 20/min, 250/hour, 1000/day.
+	"3": {Day: 1000, Hour: 250, Spacing: 4 * time.Second,
+		Shares: map[string]int{clBucketRefresh: 520, clBucketRecap: 200, clBucketDiscovery: 80, clBucketClassify: 80,
+			clBucketAlerts: 80, clBucketReserve: 40},
+		HourCaps: map[string]int{clBucketRefresh: 150, clBucketAlerts: 40}},
+	// 25/min, 300/hour, 1400/day.
+	"4": {Day: 1400, Hour: 300, Spacing: 3 * time.Second,
+		Shares: map[string]int{clBucketRefresh: 740, clBucketRecap: 280, clBucketDiscovery: 110, clBucketClassify: 110,
+			clBucketAlerts: 100, clBucketReserve: 60},
+		HourCaps: map[string]int{clBucketRefresh: 180, clBucketAlerts: 50}},
+}
+
+// clDefaultTier is the membership held since 2026-10-07.
+const clDefaultTier = "1"
+
+var (
+	clTierName string
+	clShares   map[string]int
+	// clHourCaps holds the most calls one share may make in a rolling hour,
+	// where that is less than the hour itself. The refresh runs first in the
+	// sequence and has the largest share, so without a cap it fills the hour
+	// and the classifier and the RECAP harvest behind it in the same run get
+	// nothing; with the full runs twice a day, they would get nothing all day.
+	clHourCaps map[string]int
+)
+
+func init() {
+	name := strings.TrimSpace(strings.ToLower(os.Getenv("CL_TIER")))
+	name = strings.TrimPrefix(name, "tier")
+	name = strings.TrimSpace(name)
+	if _, ok := clTiers[name]; !ok {
+		if name != "" {
+			fmt.Printf("CourtListener: CL_TIER=%q is not a known membership, using tier %s\n", os.Getenv("CL_TIER"), clDefaultTier)
+		}
+		name = clDefaultTier
+	}
+	clApplyTier(name)
+}
+
+// clApplyTier sets the limits and shares of a membership in clTiers.
+func clApplyTier(name string) {
+	t := clTiers[name]
+	clTierName = name
+	clDayLimit, clHourLimit, clSpacing = t.Day, t.Hour, t.Spacing
+	clShares, clHourCaps = t.Shares, t.HourCaps
 }
 
 // clBucketOrder is the order the report line names the shares in.
-var clBucketOrder = []string{clBucketRefresh, clBucketRecap, clBucketDiscovery, clBucketClassify, clBucketReserve}
+var clBucketOrder = []string{clBucketRefresh, clBucketRecap, clBucketDiscovery, clBucketClassify, clBucketAlerts, clBucketReserve}
+
+// clRollover lists the shares whose unused calls go to the refresh after
+// clRolloverHourUTC.
+var clRollover = []string{clBucketRecap, clBucketDiscovery, clBucketClassify, clBucketAlerts}
 
 var (
 	clLedgerMu sync.Mutex
@@ -150,11 +241,11 @@ func clAllowance(bucket string, used map[string]int, now time.Time, reserveOK bo
 	if bucket != clBucketReserve {
 		own := clShares[bucket] - used[bucket]
 		if bucket == clBucketRefresh && now.UTC().Hour() >= clRolloverHourUTC {
-			for _, b := range []string{clBucketRecap, clBucketDiscovery, clBucketClassify} {
+			for _, b := range clRollover {
 				own += max(0, clShares[b]-used[b])
 			}
 		}
-		// Nothing but the reserve may take the day past 120.
+		// Nothing but the reserve may take the day past its last few calls.
 		ordinary := (clDayLimit - clShares[clBucketReserve]) - (total - used[clBucketReserve])
 		own = min(own, ordinary, dayRoom)
 		if own > 0 {
@@ -170,14 +261,6 @@ func clAllowance(bucket string, used map[string]int, now time.Time, reserveOK bo
 	}
 	return bucket, 0
 }
-
-// clHourCaps holds the most calls one share may make in a rolling hour,
-// where that is less than the hour itself. The refresh runs first in the
-// sequence and has the largest share, so without a cap it fills the hour
-// and the classifier and the RECAP harvest behind it in the same run get
-// nothing; with the full runs at 10:00 and 18:00 UTC only, they would get
-// nothing all day. 35 leaves them 15 of every hour.
-var clHourCaps = map[string]int{clBucketRefresh: 35}
 
 // clHourWait is how long until a call fits a rolling hour that allows
 // limit calls, given the times of the calls already made. Zero when it
@@ -431,6 +514,9 @@ func clUsageLine(u clDayUse, overdue int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "CourtListener: used %d of %d today (refresh %d, recap %d, discovery %d, classify %d",
 		u.Total, clDayLimit, u.By[clBucketRefresh], u.By[clBucketRecap], u.By[clBucketDiscovery], u.By[clBucketClassify])
+	if n := u.By[clBucketAlerts]; n > 0 {
+		fmt.Fprintf(&b, ", alerts %d", n)
+	}
 	if n := u.By[clBucketReserve]; n > 0 {
 		fmt.Fprintf(&b, ", reserve %d", n)
 	}
@@ -443,9 +529,9 @@ func clUsageLine(u clDayUse, overdue int) string {
 
 // clUsageSummary is a day's use without the docket count, for yesterday.
 func clUsageSummary(u clDayUse) string {
-	s := fmt.Sprintf("used %d of %d (refresh %d, recap %d, discovery %d, classify %d, reserve %d)",
+	s := fmt.Sprintf("used %d of %d (refresh %d, recap %d, discovery %d, classify %d, alerts %d, reserve %d)",
 		u.Total, clDayLimit, u.By[clBucketRefresh], u.By[clBucketRecap], u.By[clBucketDiscovery],
-		u.By[clBucketClassify], u.By[clBucketReserve])
+		u.By[clBucketClassify], u.By[clBucketAlerts], u.By[clBucketReserve])
 	if n := u.Status[http.StatusTooManyRequests]; n > 0 {
 		s += fmt.Sprintf(", HTTP 429 %d times", n)
 	}

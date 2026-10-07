@@ -9,17 +9,64 @@ import (
 var clTestMorning = time.Date(2026, 10, 6, 10, 5, 0, 0, time.UTC)
 var clTestEvening = time.Date(2026, 10, 6, 18, 5, 0, 0, time.UTC)
 
+// clTestTier applies a membership for one test and restores the default.
+func clTestTier(t *testing.T, name string) {
+	t.Helper()
+	prev := clTierName
+	clApplyTier(name)
+	t.Cleanup(func() { clApplyTier(prev) })
+}
+
 func TestCLSharesAddUpToTheDay(t *testing.T) {
-	sum := 0
-	for _, b := range clBucketOrder {
-		sum += clShares[b]
+	for name, tier := range clTiers {
+		sum := 0
+		for b, n := range tier.Shares {
+			sum += n
+			found := false
+			for _, o := range clBucketOrder {
+				found = found || o == b
+			}
+			if !found {
+				t.Errorf("tier %s: share %s is not in clBucketOrder", name, b)
+			}
+		}
+		if sum != tier.Day {
+			t.Errorf("tier %s: shares add up to %d, the day is %d", name, sum, tier.Day)
+		}
+		for b, n := range tier.HourCaps {
+			if n >= tier.Hour {
+				t.Errorf("tier %s: %s hour cap %d leaves nothing of the hour (%d)", name, b, n, tier.Hour)
+			}
+		}
+		// The spacing alone must keep the minute window from biting.
+		perMin := map[string]int{"free": 5, "1": 10, "2": 15, "3": 20, "4": 25}[name]
+		if int(time.Minute/tier.Spacing) > perMin {
+			t.Errorf("tier %s: %s apart allows %d a minute, the limit is %d", name, tier.Spacing, int(time.Minute/tier.Spacing), perMin)
+		}
 	}
-	if sum != clDayLimit {
-		t.Fatalf("shares add up to %d, the day is %d", sum, clDayLimit)
+}
+
+// Tier 1 is the default since 2026-10-07: 300 a day, 75 an hour.
+func TestCLTier1(t *testing.T) {
+	clTestTier(t, "1")
+	if clDayLimit != 300 || clHourLimit != 75 {
+		t.Fatalf("tier 1: got %d a day, %d an hour", clDayLimit, clHourLimit)
+	}
+	if _, left := clAllowance(clBucketRefresh, map[string]int{}, clTestMorning, false); left != 130 {
+		t.Errorf("tier 1 refresh share: got %d, want 130", left)
+	}
+	// After 18:00 an untouched alerts share rolls to the refresh too.
+	used := map[string]int{clBucketRefresh: 130, clBucketRecap: 50, clBucketDiscovery: 25, clBucketClassify: 25}
+	if _, left := clAllowance(clBucketRefresh, used, clTestEvening, false); left != 60 {
+		t.Errorf("tier 1 evening rollover of the alerts share: got %d, want 60", left)
+	}
+	if _, left := clAllowance(clBucketAlerts, map[string]int{clBucketAlerts: 59}, clTestMorning, false); left != 1 {
+		t.Errorf("tier 1 alerts share: got %d left, want 1", left)
 	}
 }
 
 func TestCLAllowance(t *testing.T) {
+	clTestTier(t, "free")
 	cases := []struct {
 		name       string
 		bucket     string
@@ -59,6 +106,7 @@ func TestCLAllowance(t *testing.T) {
 }
 
 func TestCLHourWait(t *testing.T) {
+	clTestTier(t, "free")
 	now := clTestMorning
 	var calls []time.Time
 	for i := 0; i < 49; i++ {
@@ -85,6 +133,7 @@ func TestCLHourWait(t *testing.T) {
 
 // The refresh stops at 35 in the hour and leaves the rest to the others.
 func TestCLRefreshHourCap(t *testing.T) {
+	clTestTier(t, "free")
 	now := clTestMorning
 	var refresh []time.Time
 	for i := 0; i < 35; i++ {
@@ -102,6 +151,7 @@ func TestCLRefreshHourCap(t *testing.T) {
 }
 
 func TestCLSpacingWait(t *testing.T) {
+	clTestTier(t, "free")
 	now := clTestMorning
 	if w := clSpacingWait(time.Time{}, now); w != 0 {
 		t.Errorf("no last call: want 0, got %s", w)
@@ -261,6 +311,7 @@ func TestCLCaseParties(t *testing.T) {
 }
 
 func TestCLUsageLine(t *testing.T) {
+	clTestTier(t, "free")
 	u := clDayUse{Total: 61, By: map[string]int{clBucketRefresh: 40, clBucketRecap: 14, clBucketDiscovery: 2, clBucketClassify: 5},
 		Status: map[int]int{}}
 	got := clUsageLine(u, 7)
@@ -276,6 +327,7 @@ func TestCLUsageLine(t *testing.T) {
 }
 
 func TestCLServerUsageLine(t *testing.T) {
+	clTestTier(t, "free")
 	current := []map[string]any{
 		{"scope": "user", "window_seconds": float64(60), "used": float64(1), "limit": float64(5)},
 		{"scope": "user", "window_seconds": float64(3600), "used": float64(12), "limit": float64(50)},

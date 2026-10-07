@@ -61,8 +61,10 @@ var twoaiStageDeadline = map[string]time.Duration{
 	// one CourtListener call every twelve seconds the refresh needs about
 	// ten of them to spend its share, and it ends at once when the share
 	// is spent, so the extra time is used only when there is work for it.
-	"intel":         15 * time.Minute,
-	"twoai_recap":   8 * time.Minute, // RECAP filing harvest, dockets until the budget is spent
+	"intel":       15 * time.Minute,
+	"twoai_recap": 8 * time.Minute, // RECAP filing harvest, dockets until the budget is spent
+	// Docket alert subscriptions, at most 20 an hour seven seconds apart.
+	"cl_alerts":     5 * time.Minute,
 	"export_corpus": 20 * time.Minute,
 	// twoai_publish pushes the whole changed set as ONE commit through the git
 	// data API: read the ref, build trees from it, commit, move the ref. About
@@ -334,7 +336,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "cl_webhooks", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -348,9 +350,13 @@ func main() {
 		// on 2026-10-06: it shares CourtListener's rolling hour with the
 		// docket refresh, the refresh is the work the site most needs, and
 		// recap then reads the docket dates the refresh has just written.
+		// cl_webhooks sits in front of intel so docket alerts pushed since the
+		// last run are applied before the refresh decides what is due, and
+		// cl_alerts behind recap, the last CourtListener reader, so new
+		// subscriptions never take the hour from the refresh (2026-10-07).
 		for i, s := range seq {
 			if s == "intel" {
-				seq = append(seq[:i+1], append([]string{"twoai_lawsuit_fill", "twoai_recap"}, seq[i+1:]...)...)
+				seq = append(seq[:i+1], append([]string{"twoai_lawsuit_fill", "twoai_recap", "cl_alerts"}, seq[i+1:]...)...)
 				break
 			}
 		}
@@ -497,6 +503,21 @@ func main() {
 	}
 	// cl_usage prints the CourtListener ledger, CourtListener's own count and
 	// the docket schedule, and calls nothing that counts against the day.
+	// cl_alerts subscribes tracked dockets to CourtListener docket alerts and
+	// cl_webhooks applies what they push (courtlistener_alerts.go). Neither
+	// failing may stop the run.
+	if src == "cl_alerts" {
+		if err := clAlertsStage(db); err != nil {
+			fmt.Fprintln(os.Stderr, "cl_alerts:", err)
+		}
+		return
+	}
+	if src == "cl_webhooks" {
+		if err := clWebhooksStage(db); err != nil {
+			fmt.Fprintln(os.Stderr, "cl_webhooks:", err)
+		}
+		return
+	}
 	if src == "cl_usage" {
 		if err := clUsageReport(db); err != nil {
 			fmt.Fprintln(os.Stderr, "cl_usage:", err)
@@ -3816,47 +3837,18 @@ func intelRefresh(db *sql.DB, reserve time.Duration) (checked, updated int, err 
 			done(c.ID, false)
 			continue
 		}
-		var existing []map[string]any
-		json.Unmarshal([]byte(c.Timeline), &existing)
-		seen := map[string]bool{}
-		for _, e := range existing {
-			d, _ := e["date"].(string)
-			n, _ := e["doc_no"].(string)
-			seen[d+"|"+n] = true
-		}
-		var fresh []map[string]any
+		var fresh []clEntry
 		for _, en := range entries.Results {
-			desc := strings.TrimSpace(en.Description)
-			docNo := strings.Trim(string(en.EntryNumber), `"null`)
-			if en.DateFiled == "" || desc == "" || seen[en.DateFiled+"|"+docNo] {
-				continue
-			}
-			fresh = append(fresh, map[string]any{
-				"date":   en.DateFiled,
-				"title":  trunc(desc, 300),
-				"doc_no": docNo,
-				"url":    caseURL,
-			})
+			fresh = append(fresh, clEntry{DateFiled: en.DateFiled, EntryNumber: en.EntryNumber, Description: en.Description})
 		}
-		if len(fresh) > 0 {
-			merged := append(fresh, existing...)
-			sort.Slice(merged, func(i, j int) bool {
-				di, _ := merged[i]["date"].(string)
-				dj, _ := merged[j]["date"].(string)
-				return di > dj
-			})
-			payload, _ := json.Marshal(merged)
-			// The newest entry of the merged timeline, not of this page: an
-			// entry modified today can have been filed long ago.
-			newest := merged[0]
-			if _, err := db.Exec(`UPDATE ai_lawsuits SET timeline=$1, latest_development=$2,
-				latest_development_date=$3, updated_at=now() WHERE id=$4`,
-				payload, newest["title"], newest["date"], c.ID); err != nil {
-				fmt.Fprintln(os.Stderr, "intel refresh", c.Slug, "update:", err)
-				continue
-			}
+		n, newest, err := clMergeEntries(db, c.ID, c.Timeline, caseURL, fresh)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "intel refresh", c.Slug, "update:", err)
+			continue
+		}
+		if n > 0 {
 			updated++
-			fmt.Printf("intel refresh %s: %d new docket entries through %v\n", c.Slug, len(fresh), newest["date"])
+			fmt.Printf("intel refresh %s: %d new docket entries through %s\n", c.Slug, n, newest)
 		}
 		done(c.ID, true)
 	}

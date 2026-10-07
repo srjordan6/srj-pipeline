@@ -80,6 +80,7 @@ type clCase struct {
 	Upcoming    time.Time // earliest hearing or deadline in the next 14 days
 	NewsMention time.Time // newest news or AIID mention, closed cases only
 	Cached      bool      // a docket record is in twoai_cl_docket_cache
+	Alerted     bool      // on a docket alert while webhooks arrive
 
 	Next    time.Time // scheduled check; zero means now
 	Polled  bool      // false for a closed case nothing has named
@@ -90,6 +91,16 @@ type clCase struct {
 // clCadence is how often a docket is checked, from how long it has been
 // since its last new entry (or its filing, when no entry is known).
 func clCadence(c clCase, now time.Time) time.Duration {
+	d := clQuietCadence(c, now)
+	// A docket alert pushes every new entry, so the poll is only a backstop.
+	if c.Alerted && d < clAlertBackstop {
+		return clAlertBackstop
+	}
+	return d
+}
+
+// clQuietCadence is the cadence from how long the docket has been quiet.
+func clQuietCadence(c clCase, now time.Time) time.Duration {
 	ref := c.LastEntry
 	if ref.IsZero() {
 		ref = c.Filed
@@ -304,8 +315,10 @@ func clDocketPlan(db *sql.DB, now time.Time) ([]clCase, error) {
 		out = append(out, c)
 	}
 	rows.Close()
+	alerted, _ := clAlertedDockets(db, now)
 	for i := range out {
 		c := &out[i]
+		c.Alerted = c.DocketID != "" && alerted[c.DocketID]
 		if c.Closed {
 			p, d := clCaseParties(c.CaseName)
 			if p != "" && d != "" {
@@ -440,6 +453,8 @@ func clUsageReport(db *sql.DB) error {
 			cadence["closed, not polled"]++
 		case c.Closed:
 			cadence["closed, named in the news"]++
+		case c.Alerted:
+			cadence["docket alert, backstop every "+clCadenceLabel(clCadence(c, now))]++
 		default:
 			cadence["every "+clCadenceLabel(clCadence(c, now))]++
 		}

@@ -29,6 +29,7 @@ package main
 // front of the queue for the next run.
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -155,6 +156,21 @@ func clFits(w, left time.Duration) bool {
 // status seen (0 when no answer arrived) and an error, which is errCLBudget
 // wrapped when the stage should stop for this run.
 func clFetch(u string, out any) (int, error) {
+	return clSend("GET", u, nil, out)
+}
+
+// clPost sends body as JSON to an API path, relative to the v4 base, and
+// reads the answer into out. It is counted and rationed exactly like a read.
+func clPost(path string, body any, out any) (int, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return 0, err
+	}
+	return clSend("POST", clAPIBase+path, b, out)
+}
+
+// clSend is clFetch for any method; body is sent as JSON when not nil.
+func clSend(method, u string, body []byte, out any) (int, error) {
 	what := strings.TrimPrefix(u, clAPIBase)
 	status := 0
 	for attempt := 1; attempt <= clMaxRetries; attempt++ {
@@ -164,7 +180,11 @@ func clFetch(u string, out any) (int, error) {
 		if err != nil {
 			return http.StatusTooManyRequests, err
 		}
-		req, err := http.NewRequest("GET", u, nil)
+		var rd io.Reader
+		if body != nil {
+			rd = bytes.NewReader(body)
+		}
+		req, err := http.NewRequest(method, u, rd)
 		if err != nil {
 			clRecord(slot, 0)
 			return 0, err
@@ -172,6 +192,9 @@ func clFetch(u string, out any) (int, error) {
 		req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
 		if tok := os.Getenv("COURTLISTENER_TOKEN"); tok != "" {
 			req.Header.Set("Authorization", "Token "+tok)
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
 		}
 		resp, err := clHTTP.Do(req)
 		if err != nil {
@@ -181,7 +204,7 @@ func clFetch(u string, out any) (int, error) {
 		status = resp.StatusCode
 		clRecord(slot, status)
 		switch {
-		case status == http.StatusOK:
+		case status == http.StatusOK || status == http.StatusCreated:
 			err := json.NewDecoder(resp.Body).Decode(out)
 			resp.Body.Close()
 			return status, err
@@ -211,7 +234,13 @@ func clFetch(u string, out any) (int, error) {
 			}
 			time.Sleep(wait)
 		default:
+			// The answer's own words, short: a 400 on a POST says which
+			// field it refused, and that is the whole diagnosis.
+			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
 			resp.Body.Close()
+			if m := strings.TrimSpace(string(msg)); m != "" && !strings.HasPrefix(m, "<") {
+				return status, fmt.Errorf("courtlistener %s: %s: %s", what, resp.Status, m)
+			}
 			return status, fmt.Errorf("courtlistener %s: %s", what, resp.Status)
 		}
 	}
