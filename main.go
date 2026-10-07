@@ -104,6 +104,10 @@ var twoaiStageDeadline = map[string]time.Duration{
 	// A Cloudflare build that re-uploads most of the site takes over 18
 	// minutes; deploy_site waits up to 32 for it (2026-10-05).
 	"deploy_site": 35 * time.Minute,
+	// Row 567: the audit reads nine feeds and resolves Google links; the
+	// governor watch probes twenty newsrooms. Neither may hold up the run.
+	"twoai_coverage_audit": 8 * time.Minute,
+	"twoai_gov_watch":      6 * time.Minute,
 }
 
 const twoaiStageDeadlineDefault = 20 * time.Minute
@@ -340,7 +344,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "cl_webhooks", "cl_alerts", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_company_sitemap", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "twoai_gsc", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "twoai_gov_watch", "legiscan", "gdelt", "twoai_coverage_audit", "govinfo", "mcp_registry", "cl_webhooks", "cl_alerts", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_company_sitemap", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "twoai_gsc", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -538,6 +542,18 @@ func main() {
 	if src == "cl_webhooks" {
 		if err := clWebhooksStage(db); err != nil {
 			fmt.Fprintln(os.Stderr, "cl_webhooks:", err)
+		}
+		return
+	}
+	if src == "twoai_gov_watch" {
+		if err := twoaiGovWatch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_gov_watch:", err)
+		}
+		return
+	}
+	if src == "twoai_coverage_audit" {
+		if err := twoaiCoverageAudit(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_coverage_audit:", err)
 		}
 		return
 	}
@@ -1389,9 +1405,16 @@ func main() {
 		if err := twoaiBackupWatch(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_backupwatch:", err)
 		}
+		// COURTLISTENER PUSHES RIDE HERE TOO (row 564, 2026-10-07): the daily
+		// cl_webhooks stage left five real pushes waiting fourteen hours in D1.
+		// Pull and apply every tick, then let the mail pull below apply the
+		// alert emails the same way, and rebuild the tracker page once an hour
+		// at most when either path changed a case.
+		clTick(db)
 		if err := inkboxPull(db); err != nil {
 			fmt.Fprintln(os.Stderr, "inkbox_tick: pull:", err)
 		}
+		clBuildIfPending(db)
 		if err := inkboxOutbox(db); err != nil {
 			fmt.Fprintln(os.Stderr, "inkbox_tick: outbox:", err)
 			os.Exit(1)
@@ -4846,16 +4869,34 @@ func archivePut(endpoint, token, key, contentType string, body []byte) error {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", contentType)
 	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	// A 500 FROM THE WORKER IS A WORKER EXCEPTION, NOT A BAD OBJECT. Row 563
+	// (2026-10-07): six to nine of eighty PUTs a run came back 500 error 1101,
+	// the same keys succeeding on a later run. 1101 is Cloudflare's "Worker
+	// threw an exception", which for a put-to-R2 handler is the R2 binding
+	// timing out or throwing under load. Three tries with a short backoff
+	// turn a transient into a success and leave a real fault visible.
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(2<<uint(attempt-1)) * time.Second)
+			req.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
-		return fmt.Errorf("archive PUT %s: %d %s", key, resp.StatusCode, b)
+		resp.Body.Close()
+		if resp.StatusCode == 200 {
+			return nil
+		}
+		lastErr = fmt.Errorf("archive PUT %s: %d %s", key, resp.StatusCode, b)
+		if resp.StatusCode < 500 {
+			return lastErr
+		}
 	}
-	return nil
+	return fmt.Errorf("%v (after 3 tries)", lastErr)
 }
 
 // archiveNews downloads article bodies for recent gdelt documents that have
@@ -5088,57 +5129,7 @@ func twoaiBuild(db *sql.DB) error {
 	// derived from its path, so the rule holds for all 65 kinds rather than
 	// only the ones that happen to describe an entity.
 	buildStamp := time.Now().Format(time.RFC3339)
-	upsert := func(path, kind string, v any) error {
-		j, _ := json.Marshal(v)
-		var m map[string]any
-		if json.Unmarshal(j, &m) == nil && m != nil {
-			m["built_at"] = buildStamp
-			if _, ok := m["generated"]; !ok {
-				m["generated"] = today
-			}
-			uid, _ := m["uid"].(string)
-			if uid == "" {
-				uid = twoaiUID("page:" + path)
-			}
-			m["page_uid"] = uid
-			if b, err := json.Marshal(m); err == nil {
-				j = b
-			}
-		}
-		// WRITE ONLY WHAT CHANGED, IGNORING THE PER-RUN TIMESTAMP.
-		//
-		// twoai_pages took 15,737 updates in a few hours against 5,235 rows, and
-		// 0.0 percent of them were HOT: 6 out of 15,737. Two expression indexes
-		// over data (twoai_pages_uid_idx and twoai_pages_case_uid_idx) mean
-		// PostgreSQL cannot prove the indexed expression is unchanged when data is
-		// rewritten, so it disqualifies HOT and every update rewrites every index
-		// entry. Lowering fillfactor to 70 did nothing here for that reason, and
-		// dropping the indexes is not available - case_uid_idx is in use.
-		//
-		// So make the writes not happen instead of making them cheaper.
-		//
-		// built_at is EXCLUDED from the comparison and this is the whole trick.
-		// It is stamped with the moment of the run - 2026-09-08T21:32:23-05:00 -
-		// so every page's JSON differs on every run whether or not a word of it
-		// changed. A naive IS DISTINCT FROM on data would have been true every
-		// time and saved nothing. generated is a DATE and is deliberately kept in
-		// the comparison: an unchanged page is still rewritten once a day when the
-		// date rolls, so the visible date stamp a reader uses to judge staleness
-		// stays honest rather than freezing at whenever the content last moved.
-		//
-		// The row keeps its old built_at when nothing else changed, which is
-		// correct: that field records when the document was last actually built,
-		// and a no-op is not a build.
-		_, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug)
-			VALUES ($1,$2,$3::jsonb,$4)
-			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
-				taxonomy_slug=EXCLUDED.taxonomy_slug, updated_at=now()
-			WHERE (twoai_pages.data - 'built_at') IS DISTINCT FROM (EXCLUDED.data - 'built_at')
-			   OR twoai_pages.kind IS DISTINCT FROM EXCLUDED.kind
-			   OR twoai_pages.taxonomy_slug IS DISTINCT FROM EXCLUDED.taxonomy_slug`,
-			path, kind, string(j), twoaiTaxonomyFor(kind))
-		return err
-	}
+	upsert := twoaiPageUpsert(db, buildStamp, today)
 	// Hand-written context, joined at render time. Cowork wrote a narrative
 	// into twoai_pages.data for these rows on 2026-09-05 and this stage
 	// destroyed it the same afternoon: the generator rewrites the whole data
@@ -5213,8 +5204,18 @@ func twoaiBuild(db *sql.DB) error {
 				}
 				pr.Close()
 			}
+			// GENERIC POLICY WORDS ARE NOT EVIDENCE OF ONE EVENT. Row 566
+			// (2026-10-07): "Utah Gov. Cox signs executive order on AI
+			// integration in government" shared signs, executive, order and
+			// ai with "What we're reading: Trump signs new AI executive
+			// order", four of its eight words, so the two became one event
+			// and the older roundup was shown on the Utah page while the Utah
+			// order was not. Those words say what kind of story it is, not
+			// which story; only the rest counts toward sameness.
 			stop := map[string]bool{"the": true, "a": true, "an": true, "of": true, "to": true, "in": true, "on": true, "for": true,
-				"and": true, "amid": true, "with": true, "as": true, "by": true, "at": true, "is": true, "new": true, "gov": true}
+				"and": true, "amid": true, "with": true, "as": true, "by": true, "at": true, "is": true, "new": true, "gov": true,
+				"ai": true, "signs": true, "signed": true, "sign": true, "executive": true, "order": true, "bill": true, "bills": true,
+				"law": true, "laws": true, "governor": true, "state": true, "says": true, "what": true, "we": true, "re": true, "reading": true, "more": true}
 			wordsOf := func(h string) map[string]bool {
 				if i := strings.Index(h, " - "); i > 0 {
 					h = h[:i]
@@ -5267,7 +5268,13 @@ func twoaiBuild(db *sql.DB) error {
 					if name == "Washington" && !regexp.MustCompile(`(?i)washington state|state of washington|olympia|gov\. ferguson|governor ferguson`).MatchString(text) {
 						continue
 					}
-					if !pins[slug][s.uid] && (!nameRe.MatchString(text) || !policy.MatchString(text)) {
+					// A STORY IS ABOUT A STATE WHEN ITS HEADLINE SAYS SO, or when
+					// one sentence of its summary names the state beside a policy
+					// word. A roundup that mentions Utah in its fourth paragraph
+					// ("What we're reading: Trump signs...", row 566) is not a
+					// Utah story, and a school cellphone piece that lists Utah
+					// districts is not Utah AI policy.
+					if !pins[slug][s.uid] && !twoaiStateStory(nameRe, policy, s.head, text) {
 						continue
 					}
 					var home *event
@@ -5283,10 +5290,12 @@ func twoaiBuild(db *sql.DB) error {
 					}
 					home.members = append(home.members, s)
 					// The shown story: a pinned one always wins; otherwise the
-					// earliest report, since stories arrive newest first.
+					// one whose headline names the state over one that does
+					// not (row 566); otherwise the earliest report, since
+					// stories arrive newest first.
 					if pins[slug][s.uid] {
 						home.rep, home.pinned = s, true
-					} else if !home.pinned {
+					} else if !home.pinned && (nameRe.MatchString(s.head) || !nameRe.MatchString(home.rep.head)) {
 						home.rep = s
 					}
 				}
@@ -5338,6 +5347,11 @@ func twoaiBuild(db *sql.DB) error {
 		}
 		if n := stateNews[slug]; len(n) > 0 {
 			stateDoc["news"] = n
+		}
+		// Executive orders, AG guidance and task forces, which never pass
+		// through LegiScan (row 566).
+		if acts := twoaiStateActions(db, code); len(acts) > 0 {
+			stateDoc["executive_actions"] = acts
 		}
 		if err := upsert("laws/"+slug+".json", "state-law", stateDoc); err != nil {
 			return err
@@ -5503,67 +5517,11 @@ func twoaiBuild(db *sql.DB) error {
 	}
 
 	// ---- F3: living lawsuit tracker from ai_lawsuits.
-	lr, err := db.Query(`SELECT COALESCE(slug,''), case_name, court, COALESCE(docket,''),
-			COALESCE(to_char(filed_date,'YYYY-MM-DD'),''), plaintiffs, defendants, category,
-			status, COALESCE(status_badge,''), COALESCE(latest_development,''),
-			COALESCE(to_char(latest_development_date,'YYYY-MM-DD'),''),
-			COALESCE(executive_summary,''), COALESCE(why_it_matters,''), COALESCE(summary,''),
-			COALESCE(claims,'[]'::jsonb)::text, COALESCE(timeline,'[]'::jsonb)::text,
-			COALESCE(courtlistener_url,''), COALESCE(source_url,''), COALESCE(judge,'')
-		FROM ai_lawsuits WHERE is_active IS NOT FALSE AND slug IS NOT NULL
-		ORDER BY display_order, case_name`)
+	nCases, err := twoaiLawsuitsPage(db, today, upsert)
 	if err != nil {
 		return err
 	}
-	var cases []map[string]any
-	for lr.Next() {
-		var slug, name, court, docket, filed, pl, de, cat, status, badge, dev, devDate,
-			exec, why, sum, claims, timeline, clURL, srcURL, judge string
-		if err := lr.Scan(&slug, &name, &court, &docket, &filed, &pl, &de, &cat, &status, &badge,
-			&dev, &devDate, &exec, &why, &sum, &claims, &timeline, &clURL, &srcURL, &judge); err != nil {
-			lr.Close()
-			return err
-		}
-		var cj, tj any
-		json.Unmarshal([]byte(claims), &cj)
-		json.Unmarshal([]byte(timeline), &tj)
-		// EVERY CASE CARRIES ITS UID. Stephen, 2026-09-17: I don't see uids on
-		// /ai-lawsuits/. The cases had them in twoai_entities, hashed from
-		// "lawsuit:" + slug, but the published JSON never carried one, so neither
-		// the tracker table nor a case page could show it. 20 of 113 active cases
-		// had no entity row at all, the newer ones, so the row is ensured here
-		// with the same key and the same normalized shape the first 93 use.
-		caseUID := twoaiUID("lawsuit:" + slug)
-		db.Exec(`INSERT INTO twoai_entities (uid, kind, name, normalized, aliases)
-			VALUES ($1,'lawsuit',$2,$3, jsonb_build_array($2::text))
-			ON CONFLICT DO NOTHING`,
-			caseUID, strings.TrimSpace(name), twoaiNormalizeEntityName(name)+"#"+slug)
-		cases = append(cases, map[string]any{
-			"uid":  caseUID,
-			"slug": slug, "case_name": name, "court": court, "docket": docket,
-			"filed_date": filed, "plaintiffs": pl, "defendants": de, "category": cat,
-			"status": status, "status_badge": badge, "latest_development": dev,
-			"latest_development_date": devDate, "executive_summary": exec,
-			"why_it_matters": why, "summary": sum, "claims": cj, "timeline": tj,
-			"courtlistener_url": clURL, "source_url": srcURL, "judge": judge,
-		})
-	}
-	lr.Close()
-	// How insurance would respond, by case category, published texts only.
-	// See twoai_lawsuit_insurance.go.
-	if ins := twoaiLawsuitInsurance(db); len(ins) > 0 {
-		for _, c := range cases {
-			if cat, _ := c["category"].(string); ins[cat] != nil {
-				c["insurance"] = ins[cat]
-			}
-		}
-	}
-	if err := upsert("lawsuits/lawsuits.json", "lawsuits", map[string]any{
-		"cases": cases, "count": len(cases), "generated": today,
-	}); err != nil {
-		return err
-	}
-	setURLs("lawsuits/lawsuits.json", len(cases)+1)
+	setURLs("lawsuits/lawsuits.json", nCases+1)
 
 	// ---- Static pages (about, contact, privacy, terms, disclaimer, disclosure).
 	// Copy lives in site_content under twoai/static/*.json so nothing is typed
@@ -6266,7 +6224,7 @@ func twoaiBuild(db *sql.DB) error {
 	// output). Each stage now has its own deadline.
 
 	fmt.Printf("twoai_build: states=%d bills=%d glossary=%v cases=%d statics=%d tools=%d weeks=%d ecosystem=%d compliance=%d mcp=%d people=%d companies=%d research=%d sources=%d vendor_news=%d arxiv_watch=%d timeline=%d jobs=%d news_archive=%d skills=%d downloads=%d ok=true\n",
-		len(index), total, glossary != "", len(cases), statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive, skillPages, downloads)
+		len(index), total, glossary != "", nCases, statics, toolPages, weeks, ecosystem, compliance, mcp, people, companies, research, sources, vendorNews, watchPapers, timeline, jobListings, newsArchive, skillPages, downloads)
 	return nil
 }
 
@@ -11965,4 +11923,145 @@ func openalexWatch(db *sql.DB) error {
 	}
 	fmt.Printf("openalex_watch: papers_added=%d scanned=%d window_days=%d ok=true\n", added, scanned, windowDays)
 	return nil
+}
+
+// twoaiPageUpsert writes one page into twoai_pages, stamped and compared the
+// way twoai_build does it. Factored out on 2026-10-07 (row 564) so the
+// five-minute tick can refresh one page (the lawsuit tracker) after a
+// CourtListener push without running the whole build.
+func twoaiPageUpsert(db *sql.DB, buildStamp, today string) func(path, kind string, v any) error {
+	return func(path, kind string, v any) error {
+		j, _ := json.Marshal(v)
+		var m map[string]any
+		if json.Unmarshal(j, &m) == nil && m != nil {
+			m["built_at"] = buildStamp
+			if _, ok := m["generated"]; !ok {
+				m["generated"] = today
+			}
+			uid, _ := m["uid"].(string)
+			if uid == "" {
+				uid = twoaiUID("page:" + path)
+			}
+			m["page_uid"] = uid
+			if b, err := json.Marshal(m); err == nil {
+				j = b
+			}
+		}
+		// WRITE ONLY WHAT CHANGED, IGNORING THE PER-RUN TIMESTAMP.
+		//
+		// twoai_pages took 15,737 updates in a few hours against 5,235 rows, and
+		// 0.0 percent of them were HOT: 6 out of 15,737. Two expression indexes
+		// over data (twoai_pages_uid_idx and twoai_pages_case_uid_idx) mean
+		// PostgreSQL cannot prove the indexed expression is unchanged when data is
+		// rewritten, so it disqualifies HOT and every update rewrites every index
+		// entry. Lowering fillfactor to 70 did nothing here for that reason, and
+		// dropping the indexes is not available - case_uid_idx is in use.
+		//
+		// So make the writes not happen instead of making them cheaper.
+		//
+		// built_at is EXCLUDED from the comparison and this is the whole trick.
+		// It is stamped with the moment of the run - 2026-09-08T21:32:23-05:00 -
+		// so every page's JSON differs on every run whether or not a word of it
+		// changed. A naive IS DISTINCT FROM on data would have been true every
+		// time and saved nothing. generated is a DATE and is deliberately kept in
+		// the comparison: an unchanged page is still rewritten once a day when the
+		// date rolls, so the visible date stamp a reader uses to judge staleness
+		// stays honest rather than freezing at whenever the content last moved.
+		//
+		// The row keeps its old built_at when nothing else changed, which is
+		// correct: that field records when the document was last actually built,
+		// and a no-op is not a build.
+		_, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug)
+				VALUES ($1,$2,$3::jsonb,$4)
+				ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data,
+					taxonomy_slug=EXCLUDED.taxonomy_slug, updated_at=now()
+				WHERE (twoai_pages.data - 'built_at') IS DISTINCT FROM (EXCLUDED.data - 'built_at')
+				   OR twoai_pages.kind IS DISTINCT FROM EXCLUDED.kind
+				   OR twoai_pages.taxonomy_slug IS DISTINCT FROM EXCLUDED.taxonomy_slug`,
+			path, kind, string(j), twoaiTaxonomyFor(kind))
+		return err
+	}
+}
+
+// twoaiLawsuitsPage renders lawsuits/lawsuits.json from ai_lawsuits and
+// returns the number of cases. twoai_build calls it every run; the
+// five-minute tick calls it after a CourtListener push (row 564), so a new
+// docket entry reaches the tracker page on the next build, not the next day.
+func twoaiLawsuitsPage(db *sql.DB, today string, upsert func(path, kind string, v any) error) (int, error) {
+	lr, err := db.Query(`SELECT COALESCE(slug,''), case_name, court, COALESCE(docket,''),
+			COALESCE(to_char(filed_date,'YYYY-MM-DD'),''), plaintiffs, defendants, category,
+			status, COALESCE(status_badge,''), COALESCE(latest_development,''),
+			COALESCE(to_char(latest_development_date,'YYYY-MM-DD'),''),
+			COALESCE(executive_summary,''), COALESCE(why_it_matters,''), COALESCE(summary,''),
+			COALESCE(claims,'[]'::jsonb)::text, COALESCE(timeline,'[]'::jsonb)::text,
+			COALESCE(courtlistener_url,''), COALESCE(source_url,''), COALESCE(judge,'')
+		FROM ai_lawsuits WHERE is_active IS NOT FALSE AND slug IS NOT NULL
+		ORDER BY display_order, case_name`)
+	if err != nil {
+		return 0, err
+	}
+	var cases []map[string]any
+	for lr.Next() {
+		var slug, name, court, docket, filed, pl, de, cat, status, badge, dev, devDate,
+			exec, why, sum, claims, timeline, clURL, srcURL, judge string
+		if err := lr.Scan(&slug, &name, &court, &docket, &filed, &pl, &de, &cat, &status, &badge,
+			&dev, &devDate, &exec, &why, &sum, &claims, &timeline, &clURL, &srcURL, &judge); err != nil {
+			lr.Close()
+			return 0, err
+		}
+		var cj, tj any
+		json.Unmarshal([]byte(claims), &cj)
+		json.Unmarshal([]byte(timeline), &tj)
+		// EVERY CASE CARRIES ITS UID. Stephen, 2026-09-17: I don't see uids on
+		// /ai-lawsuits/. The cases had them in twoai_entities, hashed from
+		// "lawsuit:" + slug, but the published JSON never carried one, so neither
+		// the tracker table nor a case page could show it. 20 of 113 active cases
+		// had no entity row at all, the newer ones, so the row is ensured here
+		// with the same key and the same normalized shape the first 93 use.
+		caseUID := twoaiUID("lawsuit:" + slug)
+		db.Exec(`INSERT INTO twoai_entities (uid, kind, name, normalized, aliases)
+			VALUES ($1,'lawsuit',$2,$3 || '#' || $4, jsonb_build_array($2::text))
+			ON CONFLICT DO NOTHING`,
+			caseUID, strings.TrimSpace(name), twoaiNormalizeEntityName(name), slug)
+		cases = append(cases, map[string]any{
+			"uid":  caseUID,
+			"slug": slug, "case_name": name, "court": court, "docket": docket,
+			"filed_date": filed, "plaintiffs": pl, "defendants": de, "category": cat,
+			"status": status, "status_badge": badge, "latest_development": dev,
+			"latest_development_date": devDate, "executive_summary": exec,
+			"why_it_matters": why, "summary": sum, "claims": cj, "timeline": tj,
+			"courtlistener_url": clURL, "source_url": srcURL, "judge": judge,
+		})
+	}
+	lr.Close()
+	// How insurance would respond, by case category, published texts only.
+	// See twoai_lawsuit_insurance.go.
+	if ins := twoaiLawsuitInsurance(db); len(ins) > 0 {
+		for _, c := range cases {
+			if cat, _ := c["category"].(string); ins[cat] != nil {
+				c["insurance"] = ins[cat]
+			}
+		}
+	}
+	if err := upsert("lawsuits/lawsuits.json", "lawsuits", map[string]any{
+		"cases": cases, "count": len(cases), "generated": today,
+	}); err != nil {
+		return 0, err
+	}
+	return len(cases), nil
+}
+
+// twoaiStateStory says whether a story is about a state's AI policy: the
+// headline names the state, or a sentence of the summary names it beside a
+// policy word. See the state news block in twoaiBuild (row 566).
+func twoaiStateStory(nameRe, policy *regexp.Regexp, head, text string) bool {
+	if nameRe.MatchString(head) {
+		return policy.MatchString(text)
+	}
+	for _, sent := range regexp.MustCompile(`[.!?]\s+|\n+`).Split(text, -1) {
+		if nameRe.MatchString(sent) && policy.MatchString(sent) {
+			return true
+		}
+	}
+	return false
 }

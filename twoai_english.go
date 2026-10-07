@@ -830,6 +830,12 @@ func twoaiEnglishSweep(db *sql.DB) int {
 					capped = true
 				} else {
 					failed++
+					// NAME THE VALUE. Row 563 (2026-10-07): failed=2 on every run
+					// for a week and nothing said which two, so nothing could be
+					// fixed or marked. The first few are printed with the reason.
+					if failed <= 5 {
+						fmt.Fprintf(os.Stderr, "%s: translate failed %s.%s key=%s: %v: %q\n", stage, c.Table, c.Col, x.k, err, trunc(x.v, 100))
+					}
 				}
 				continue
 			}
@@ -882,6 +888,9 @@ func twoaiEnglishSweep(db *sql.DB) int {
 						capped = true
 					} else {
 						failed++
+						if failed <= 5 {
+							fmt.Fprintf(os.Stderr, "%s: translate failed %s.%s key=%s: %v: %q\n", stage, c.Table, c.Col, x.k, err, trunc(s, 100))
+						}
 					}
 				}
 				return en, lang, err

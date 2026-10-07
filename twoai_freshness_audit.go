@@ -406,6 +406,9 @@ func twoaiFreshnessAudit(db *sql.DB, preview bool) error {
 		}
 		b.WriteString("All of them are in twoai_typed_counts.\n")
 	}
+	// CourtListener pushes and alert emails, row 564 ask 4: a pull gap shows
+	// here the day it opens.
+	b.WriteString("\n" + clWebhookCounts(db) + "\n")
 	b.WriteString("\nItems in twoai_freshness_items, datasets in twoai_freshness. srj owns the refreshers; send code needs by bridge.")
 	topic := fmt.Sprintf("Freshness: %d overdue, %d fixed, %d need a decision", overdueItems, fixedToday, len(decide))
 	if _, err := db.Exec(`INSERT INTO project_bridge (from_project, to_project, topic, body) VALUES ('srj','theworldofai',$1,$2)`, topic, b.String()); err == nil {
