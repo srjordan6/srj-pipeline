@@ -89,40 +89,55 @@ func clBuildIfPending(db *sql.DB) {
 		fmt.Println("cl_tick: a scheduled run holds the pipeline lock; the tracker rebuild waits for it (the run ships the change itself)")
 		return
 	}
-	if err := clWebhookBuild(db); err != nil {
+	shipped, err := clWebhookBuild(db)
+	// The outcome is a state row, so a tick that could not deploy is visible
+	// from SQL and not only in a log the runner keeps quiet. A failed publish
+	// stays pending and is retried on the next eligible tick; a page that
+	// was published but not deployed (no hook on this machine) is done for
+	// the hour, the next scheduled deploy ships it, and the tick must not
+	// republish the bundle every five minutes trying again.
+	if err != nil && !shipped {
+		clStateSet(db, "tick_build_note", time.Now().UTC().Format(time.RFC3339)+" failed: "+trunc(err.Error(), 200))
 		fmt.Fprintln(os.Stderr, "cl_tick build:", err)
 		return
 	}
 	clStateSet(db, clStateBuildAt, time.Now().UTC().Format(time.RFC3339))
 	clStateSet(db, clStateChangePending, "")
+	if err != nil {
+		clStateSet(db, "tick_build_note", time.Now().UTC().Format(time.RFC3339)+" published, not deployed: "+trunc(err.Error(), 200))
+		fmt.Println("cl_tick:", err)
+		return
+	}
+	clStateSet(db, "tick_build_note", time.Now().UTC().Format(time.RFC3339)+" built and deploy triggered ("+pending+")")
 	fmt.Printf("cl_tick: tracker page rebuilt and deploy triggered (%s)\n", pending)
 }
 
 // clWebhookBuild refreshes lawsuits/lawsuits.json, publishes the bundle and
-// fires the twoai deploy hook.
-func clWebhookBuild(db *sql.DB) error {
+// fires the twoai deploy hook. published says whether the bundle reached
+// R2; an error with published=true is a deploy that did not fire.
+func clWebhookBuild(db *sql.DB) (published bool, err error) {
 	now := time.Now()
 	today := now.Format("2006-01-02")
 	n, err := twoaiLawsuitsPage(db, today, twoaiPageUpsert(db, now.Format(time.RFC3339), today))
 	if err != nil {
-		return fmt.Errorf("lawsuits page: %w", err)
+		return false, fmt.Errorf("lawsuits page: %w", err)
 	}
 	if err := twoaiPublishR2(db); err != nil {
-		return fmt.Errorf("publish: %w", err)
+		return false, fmt.Errorf("publish: %w", err)
 	}
 	hook := strings.TrimSpace(os.Getenv("TWOAI_DEPLOY_HOOK"))
 	if hook == "" {
-		return fmt.Errorf("TWOAI_DEPLOY_HOOK not set: %d cases published to R2, the next scheduled deploy ships them", n)
+		return true, fmt.Errorf("TWOAI_DEPLOY_HOOK not set: %d cases published to R2, the next scheduled deploy ships them", n)
 	}
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Post(hook, "application/json", nil)
 	if err != nil {
-		return fmt.Errorf("deploy hook: %w", err)
+		return true, fmt.Errorf("deploy hook: %w", err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("deploy hook returned %d", resp.StatusCode)
+		return true, fmt.Errorf("deploy hook returned %d", resp.StatusCode)
 	}
-	return nil
+	return true, nil
 }
 
 // clWebhookCounts is the line the daily freshness row carries (row 564 ask
@@ -158,6 +173,15 @@ func clWebhookCounts(db *sql.DB) string {
 	if lastMail.Valid {
 		lastM = lastMail.Time.UTC().Format("2006-01-02 15:04") + " UTC"
 	}
-	return fmt.Sprintf("CourtListener pushes: %d pulled from D1, %d applied, %s waiting in D1%s, last received %s. Alert emails: %d received, %d parsed, %d docket entries applied from them, last %s.",
-		pulled, applied, pendingS, d1Note, lastS, mails, parsed, mailEntries, lastM)
+	tick := "never recorded"
+	var tickAt sql.NullTime
+	if db.QueryRow(`SELECT last_run_at FROM pipeline_stage_runs WHERE stage='inkbox_tick'`).Scan(&tickAt) == nil && tickAt.Valid {
+		tick = tickAt.Time.UTC().Format("2006-01-02 15:04") + " UTC"
+	}
+	build := clStateGet(db, "tick_build_note")
+	if build == "" {
+		build = "no tick build yet"
+	}
+	return fmt.Sprintf("CourtListener pushes: %d pulled from D1, %d applied, %s waiting in D1%s, last received %s. Alert emails: %d received, %d parsed, %d docket entries applied from them, last %s. inkbox_tick last ran %s; last tick build: %s.",
+		pulled, applied, pendingS, d1Note, lastS, mails, parsed, mailEntries, lastM, tick, build)
 }
