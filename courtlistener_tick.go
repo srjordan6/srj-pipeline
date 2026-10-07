@@ -49,6 +49,7 @@ func clTick(db *sql.DB) {
 	applied, entries, unknown, err := clApplyWebhooks(db)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "cl_tick apply:", err)
+		clReparseAlertMail(db)
 		return
 	}
 	if pulled > 0 || applied > 0 {
