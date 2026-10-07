@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1411,6 +1412,9 @@ func main() {
 		// alert emails the same way, and rebuild the tracker page once an hour
 		// at most when either path changed a case.
 		clTick(db)
+		// The tick stamps its binary's build so a rebuild that did not happen
+		// (an old instance holding the exe open, row 575) is visible from SQL.
+		clStateSet(db, "tick_binary", pipelineBuildStamp())
 		if err := inkboxPull(db); err != nil {
 			fmt.Fprintln(os.Stderr, "inkbox_tick: pull:", err)
 		}
@@ -12071,4 +12075,19 @@ func twoaiStateStory(nameRe, policy *regexp.Regexp, head, text string) bool {
 		}
 	}
 	return false
+}
+
+// pipelineBuildStamp names the running binary by its modification time, so a
+// tick can record which build it is. The source is not stamped at compile
+// time; the file time is what the runner compares against the sources too.
+func pipelineBuildStamp() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "unknown"
+	}
+	st, err := os.Stat(exe)
+	if err != nil {
+		return "unknown"
+	}
+	return st.ModTime().UTC().Format("2006-01-02T15:04:05Z") + " " + filepath.Base(exe)
 }
