@@ -66,3 +66,22 @@ func TestSitemapResearchFilter(t *testing.T) {
 		t.Error("education paper should not be kept")
 	}
 }
+
+func TestSitemapChrome(t *testing.T) {
+	chrome := map[string]bool{"AI": true, "Security": true, "Privacy Policy": true}
+	got := twoaiSitemapStripChrome("Alan Braun\nAI\nSecurity\nHe leads quantum sensor work.\nPrivacy Policy", chrome)
+	if got != "Alan Braun\nHe leads quantum sensor work." {
+		t.Fatalf("got %q", got)
+	}
+	if twoaiSitemapPeopleRe.MatchString(got) {
+		t.Fatal("a quantum physicist should not pass the AI and security filter once the menu is gone")
+	}
+	h := `<title>Alan Braun - SRI</title>`
+	if got := twoaiSitemapTitle(h, twoaiSitemapMeta(h), "SRI International"); got != "Alan Braun" {
+		t.Fatalf("title: %q", got)
+	}
+	h = `<title>Advanced Technology &#038; Systems | SRI</title>`
+	if got := twoaiSitemapTitle(h, twoaiSitemapMeta(h), "SRI International"); got != "Advanced Technology & Systems" {
+		t.Fatalf("entity title: %q", got)
+	}
+}
