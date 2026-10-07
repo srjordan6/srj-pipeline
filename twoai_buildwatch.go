@@ -36,6 +36,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -200,7 +201,27 @@ func twoaiBuildWatch(db *sql.DB) error {
 	// commit is evidence. Rule 2 still covers a site that has stopped building.
 	if !shipped && liveSHA != "" && now.Sub(pushedAt) > bwGrace && get("alerted_sha") != head.SHA {
 		set("alerted_sha", head.SHA)
-		queue(fmt.Sprintf("theworldofai.org build did not ship: %s", short),
+		// THE USUAL CAUSE IS A PUSH DURING A BUILD, NOT A FAILED BUILD. Row
+		// 563 (2026-10-07): 8d85c6c landed one minute after the pipeline's
+		// deploy started, the older build finished last and went live, and
+		// this alert read as a failure when the next scheduled run would ship
+		// it anyway. When the twoai deploy hook is set, trigger the rebuild
+		// here and say so; the next tick verifies it the normal way.
+		subject := fmt.Sprintf("theworldofai.org build did not ship: %s", short)
+		action := "No rebuild was triggered: TWOAI_DEPLOY_HOOK is not set on this machine, so the next scheduled run ships it.\n\n"
+		if hook := strings.TrimSpace(os.Getenv("TWOAI_DEPLOY_HOOK")); hook != "" {
+			if resp, err := (&http.Client{Timeout: 30 * time.Second}).Post(hook, "application/json", nil); err == nil && resp.StatusCode < 300 {
+				resp.Body.Close()
+				subject = fmt.Sprintf("theworldofai.org build pending, rebuild triggered: %s", short)
+				action = "A rebuild was triggered from this watch just now. If the push landed while an earlier build was running (the usual cause: the older build finishes last and goes live), this rebuild ships it in six to eight minutes and no further alert follows. If it does not ship, the build itself is failing.\n\n"
+			} else if err == nil {
+				resp.Body.Close()
+				action = fmt.Sprintf("The rebuild trigger answered %d; the next scheduled run ships it.\n\n", resp.StatusCode)
+			} else {
+				action = "The rebuild trigger could not be reached (" + err.Error() + "); the next scheduled run ships it.\n\n"
+			}
+		}
+		queue(subject, action+
 			fmt.Sprintf(`The newest commit on twoai-site main has not reached the live site.
 
 Commit:   %s

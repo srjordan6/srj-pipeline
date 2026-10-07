@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -204,7 +205,12 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 		return 0, err
 	}
 
-	rows, err := db.Query(`SELECT uid, name FROM twoai_entities WHERE kind='company' ORDER BY name`)
+	// A SUPERSEDED UID IS NOT A COMPANY TO FETCH. Row 563 (2026-10-07): 19
+	// entities named '<name> (superseded uid)' - the old uid kept after a
+	// merge so nothing that cited it breaks - were listed and fetched beside
+	// the live one, every run, as a second Airbus with no site.
+	rows, err := db.Query(`SELECT uid, name FROM twoai_entities WHERE kind='company'
+		AND name NOT LIKE '%(superseded uid)%' ORDER BY name`)
 	if err != nil {
 		return 0, err
 	}
@@ -230,7 +236,10 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 	// Site RESOLUTION stays sequential because it is database work and cheap.
 	// Only the network call is parallel.
 	fetched, skipped, nosite, failed, blocked := 0, 0, 0, 0, 0
-	type fetchJob struct{ uid, name, site, via string }
+	type fetchJob struct {
+		uid, name, site, via string
+		repeat               bool // failed on an earlier day too
+	}
 	var fetchJobs []fetchJob
 	for _, e := range ents {
 		// Freshness skip applies ONLY to rows that already hold readable text
@@ -241,7 +250,9 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 		// text retry every run: resolution is a database lookup, and a fetch
 		// only follows when resolution actually yields a site.
 		var last, lastExtract string
-		db.QueryRow(`SELECT fetched_on::text, extract FROM twoai_company_harvest WHERE uid=$1`, e.uid).Scan(&last, &lastExtract)
+		var lastStatus sql.NullInt64
+		db.QueryRow(`SELECT fetched_on::text, extract, http_status FROM twoai_company_harvest WHERE uid=$1`, e.uid).Scan(&last, &lastExtract, &lastStatus)
+		repeat := last != "" && last != todayStr && lastStatus.Valid && lastStatus.Int64 != 200
 		if last == todayStr && lastExtract != "" {
 			skipped++
 			continue
@@ -253,12 +264,22 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 				ON CONFLICT (uid) DO UPDATE SET fetched_on=current_date`, e.uid, e.name)
 			continue
 		}
-		fetchJobs = append(fetchJobs, fetchJob{e.uid, e.name, site, via})
+		fetchJobs = append(fetchJobs, fetchJob{e.uid, e.name, site, via, repeat})
 	}
 
 	var hmu sync.Mutex
 	var hwg sync.WaitGroup
 	hsem := make(chan struct{}, 8)
+	// A SITE THAT FAILS TWO DAYS RUNNING GETS THE BROWSER (row 563 fix 3).
+	// AMD, HPE, Qualcomm, CoreWeave and a dozen more answered the plain
+	// client with nothing (HTTP/2 INTERNAL_ERROR, a 202 interstitial, a
+	// timeout) every day. The browser path twoai_family_sources already uses
+	// renders the page in Cloudflare Browser Run; capped per run so the
+	// browser hours stay inside the plan, and which sites recover is printed.
+	browserOK := os.Getenv("CLOUDFLARE_ACCOUNT_ID") != "" && (os.Getenv("CLOUDFLARE_BROWSER_TOKEN") != "" || os.Getenv("CLOUDFLARE_API_TOKEN") != "")
+	browserLeft := 15
+	browser := &http.Client{Timeout: 90 * time.Second}
+	var recovered, stillFailing []string
 	for _, j := range fetchJobs {
 		hwg.Add(1)
 		go func(e fetchJob) {
@@ -300,6 +321,30 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 				}
 				resp.Body.Close()
 			}
+			blockedStatus := status == 401 || status == 403 || status == 429 || status == 451 || status == 402
+			if e.repeat && browserOK && !blockedStatus && (status != 200 || extract == "") {
+				hmu.Lock()
+				take := browserLeft > 0
+				if take {
+					browserLeft--
+				}
+				hmu.Unlock()
+				if take {
+					if st2, body2, _, err2 := crawlFetchBrowser(browser, site); err2 == nil && st2 == 200 {
+						if x := strings.ToValidUTF8(twoaiHarvestExtract(body2), "\uFFFD"); x != "" {
+							status, extract, via = 200, x, via+"+browser"
+							feedURL = twoaiDiscoverFeedInHTML(site, body2)
+						}
+					}
+					hmu.Lock()
+					if status == 200 && extract != "" {
+						recovered = append(recovered, e.name)
+					} else {
+						stillFailing = append(stillFailing, fmt.Sprintf("%s (%d)", e.name, status))
+					}
+					hmu.Unlock()
+				}
+			}
 			h := sha256.Sum256([]byte(extract))
 			hmu.Lock()
 			defer hmu.Unlock()
@@ -338,6 +383,12 @@ func twoaiCompanyHarvest(db *sql.DB, today string) (int, error) {
 	// faults cannot hide behind a stable number of bot walls.
 	fmt.Printf("twoai_company_harvest: fetched=%d unchanged_today=%d no_site=%d blocked=%d failed=%d of %d companies\n",
 		fetched, skipped, nosite, blocked, failed, len(ents))
+	if len(recovered)+len(stillFailing) > 0 {
+		sort.Strings(recovered)
+		sort.Strings(stillFailing)
+		fmt.Printf("twoai_company_harvest: browser retry for repeat failures: recovered %d (%s); still failing %d (%s)\n",
+			len(recovered), strings.Join(recovered, ", "), len(stillFailing), strings.Join(stillFailing, ", "))
+	}
 	if failed > 0 {
 		var names string
 		db.QueryRow(`SELECT string_agg(name || ' (' || COALESCE(http_status::text,'no response') || ')', ', ' ORDER BY name)

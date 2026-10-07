@@ -463,7 +463,37 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 		return u
 	}
 
+	// A SECTION PAGE WITH NO TAXONOMY ROW STILL HAS A PAGE. Row 563 (2026-10-07):
+	// 346 ecosystem documents were skipped "no url". They are The Art of AI
+	// topic pages (art-art-dance-mocap and the rest), built under a parent
+	// whose path they carry; each is served at its parent's domain path with
+	// its own uid, which twoai_url_registry confirms for every one checked.
+	if prefix == "ecosystem" {
+		if uid, _ := doc["uid"].(string); uid != "" {
+			for _, k := range []string{"parent_path", "hub_path"} {
+				if pp, _ := doc[k].(string); strings.HasPrefix(pp, "/ai-ecosystem/") {
+					dir := strings.TrimSuffix(pp, "/")
+					if i := strings.LastIndex(dir, "/"); i > 0 {
+						return base + dir[:i+1] + uid + "/"
+					}
+				}
+			}
+		}
+	}
+
 	switch prefix {
+	case "politics":
+		// The six politics files are the data behind the Politics of AI
+		// section pages (lobbying, bills, members, money, press, digest), not
+		// pages of their own; a reader who asks about them is sent to the
+		// section that renders the file, or to the hub.
+		if u, found := idx["tax:pol-"+name]; found && u != "" {
+			return u
+		}
+		if u, found := idx["tax:politics-of-ai"]; found && u != "" {
+			return u
+		}
+		return base + "/ai-ecosystem/enterprise-applications-governance-and-tools/d9480073/"
 	case "companies":
 		if name == "index" {
 			return ""

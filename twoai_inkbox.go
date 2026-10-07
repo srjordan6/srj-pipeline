@@ -181,7 +181,7 @@ func inkboxPull(db *sql.DB) error {
 		return err
 	}
 
-	totalMail, totalTasks, skipped, unreadable, ownAlerts := 0, 0, 0, 0, 0
+	totalMail, totalTasks, skipped, unreadable, ownAlerts, clMail := 0, 0, 0, 0, 0, 0
 
 	for _, id := range ibIdentities {
 		key := ibKey(id.handle)
@@ -232,6 +232,23 @@ func inkboxPull(db *sql.DB) error {
 					continue
 				}
 				text := ibStr(m, "text", "body_text", "bodyText", "body", "snippet", "preview")
+				// A COURTLISTENER DOCKET ALERT IS DATA, NOT MAIL FOR THE BRIDGE
+				// (row 565). It is logged in cl_alert_emails and its entries
+				// merged into the case; marked read once stored, whether or not
+				// the parser read it, since the raw text is kept either way.
+				if clIsAlertMail(from, subject) {
+					if _, err := clAlertMail(db, msgID, from, subject, text); err != nil {
+						fmt.Fprintln(os.Stderr, "inkbox_pull courtlistener alert:", err)
+						continue
+					}
+					clMail++
+					if _, err := ibDo(key, "PATCH",
+						"/mail/mailboxes/"+url.PathEscape(id.mailbox)+"/messages/"+url.PathEscape(msgID),
+						map[string]any{"is_read": true}); err != nil {
+						fmt.Fprintln(os.Stderr, "inkbox_pull mark alert read:", err)
+					}
+					continue
+				}
 				body := fmt.Sprintf("Inkbox mail to %s\nFrom: %s\n\n%s", id.mailbox, from, text)
 				fresh, err := ibRecord(db, "mail", msgID, id.project, subject, body)
 				if err != nil {
@@ -285,8 +302,8 @@ func inkboxPull(db *sql.DB) error {
 		}
 	}
 
-	fmt.Printf("inkbox_pull: mail=%d tasks=%d own_alerts=%d identities_skipped=%d unreadable=%d\n",
-		totalMail, totalTasks, ownAlerts, skipped, unreadable)
+	fmt.Printf("inkbox_pull: mail=%d tasks=%d own_alerts=%d cl_mail=%d identities_skipped=%d unreadable=%d\n",
+		totalMail, totalTasks, ownAlerts, clMail, skipped, unreadable)
 	return nil
 }
 

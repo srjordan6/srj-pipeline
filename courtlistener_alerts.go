@@ -70,6 +70,29 @@ type clEntry struct {
 	DateFiled   string          `json:"date_filed"`
 	EntryNumber json.RawMessage `json:"entry_number"`
 	Description string          `json:"description"`
+	// THE PUSH CARRIES ITS TEXT ON THE DOCUMENT, NOT THE ENTRY. Row 564
+	// (2026-10-07): results[0].description was "" on all five real pushes of
+	// the first day, while recap_documents[0].description held the entry's
+	// short title ("Order on Motion for Leave to File Document"). The docket
+	// entries endpoint fills description; the alert payload does not yet.
+	RecapDocuments []struct {
+		Description    string `json:"description"`
+		DocumentNumber string `json:"document_number"`
+	} `json:"recap_documents"`
+}
+
+// clEntryText is the entry's description, or the first document's when the
+// entry has none, so a push never writes an entry with no text.
+func clEntryText(en clEntry) string {
+	if d := strings.TrimSpace(en.Description); d != "" {
+		return d
+	}
+	for _, rd := range en.RecapDocuments {
+		if d := strings.TrimSpace(rd.Description); d != "" {
+			return d
+		}
+	}
+	return ""
 }
 
 // clMergeEntries adds the entries the timeline does not already hold, newest
@@ -86,8 +109,16 @@ func clMergeEntries(db *sql.DB, lawsuitID int64, timeline, caseURL string, entri
 	}
 	var fresh []map[string]any
 	for _, en := range entries {
-		desc := strings.TrimSpace(en.Description)
+		desc := clEntryText(en)
 		docNo := strings.Trim(string(en.EntryNumber), `"null`)
+		if docNo == "" {
+			for _, rd := range en.RecapDocuments {
+				if rd.DocumentNumber != "" {
+					docNo = rd.DocumentNumber
+					break
+				}
+			}
+		}
 		date := en.DateFiled
 		if len(date) > 10 {
 			date = date[:10]

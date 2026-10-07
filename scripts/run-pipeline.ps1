@@ -221,8 +221,22 @@ try {
   } else {
     Write-Log $header
     foreach ($l in $buildOut) { Write-Log $l }
-    & $exe $Stage 2>&1 | ForEach-Object { Write-Log "$_" }
+    $lastLine = ''
+    $sawError = $false
+    & $exe $Stage 2>&1 | ForEach-Object {
+      $s = "$_"
+      Write-Log $s
+      if ($s -ne '') { $lastLine = $s }
+      if ($s -match '(?i)(error|fail|panic|refused|timeout|fatal)') { $sawError = $true }
+    }
     $rc = $LASTEXITCODE
+    # A NON-ZERO EXIT WITH NO ERROR LINE IS STILL AN ERROR (row 563, 2026-10-07:
+    # "all exit=1 after 0.3 min" and not one line saying why). The binary ended
+    # without a message, or was killed; the log now says that, and what it
+    # printed last, so the cause is not a guess.
+    if ($rc -ne 0 -and -not $sawError) {
+      Write-Log "===== $Stage exit=$rc with no error line in its output. Last line printed: '$lastLine'. The binary exited without a message (an os.Exit with nothing written, a missing env var checked silently, or the process was killed). ====="
+    }
   }
   $mins = [math]::Round(((Get-Date) - $started).TotalMinutes, 1)
   $line = "$(Stamp) $Stage exit=$rc after $mins min$buildNote"

@@ -237,6 +237,16 @@ func twoaiVendorEnrich(db *sql.DB) error {
 				host = host[:j]
 			}
 		}
+		// PIB REFUSES EVERY ADDRESS WE HAVE (row 563 fix 6). pib.gov.in's Akamai
+		// edge answers the office network 403 and the browser path 406 since
+		// 2026-10-02 (see twoai_vendor_feeds.go); its releases arrive through
+		// Google News with title and date, and that is what the post keeps.
+		// Trying it again every run was seven 403s and five hangs a day.
+		if strings.HasSuffix(host, "pib.gov.in") {
+			db.Exec(`UPDATE twoai_vendor_posts SET enrich_attempts=3 WHERE slug=$1`, p.slug)
+			failWhy["pib.gov.in not fetched: its edge refuses our addresses, title and date kept from the feed"]++
+			continue
+		}
 		if t, ok := lastHost[host]; ok {
 			if d := time.Second*2 - time.Since(t); d > 0 {
 				time.Sleep(d)
