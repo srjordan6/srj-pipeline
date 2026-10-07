@@ -104,6 +104,10 @@ var twoaiStageDeadline = map[string]time.Duration{
 	// A Cloudflare build that re-uploads most of the site takes over 18
 	// minutes; deploy_site waits up to 32 for it (2026-10-05).
 	"deploy_site": 35 * time.Minute,
+	// Row 567: the audit reads nine feeds and resolves Google links; the
+	// governor watch probes twenty newsrooms. Neither may hold up the run.
+	"twoai_coverage_audit": 8 * time.Minute,
+	"twoai_gov_watch":      6 * time.Minute,
 }
 
 const twoaiStageDeadlineDefault = 20 * time.Minute
@@ -340,7 +344,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "cl_webhooks", "cl_alerts", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_company_sitemap", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "twoai_gsc", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "twoai_gov_watch", "legiscan", "gdelt", "twoai_coverage_audit", "govinfo", "mcp_registry", "cl_webhooks", "cl_alerts", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_company_sitemap", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "twoai_gsc", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -538,6 +542,18 @@ func main() {
 	if src == "cl_webhooks" {
 		if err := clWebhooksStage(db); err != nil {
 			fmt.Fprintln(os.Stderr, "cl_webhooks:", err)
+		}
+		return
+	}
+	if src == "twoai_gov_watch" {
+		if err := twoaiGovWatch(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_gov_watch:", err)
+		}
+		return
+	}
+	if src == "twoai_coverage_audit" {
+		if err := twoaiCoverageAudit(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_coverage_audit:", err)
 		}
 		return
 	}
@@ -5188,8 +5204,18 @@ func twoaiBuild(db *sql.DB) error {
 				}
 				pr.Close()
 			}
+			// GENERIC POLICY WORDS ARE NOT EVIDENCE OF ONE EVENT. Row 566
+			// (2026-10-07): "Utah Gov. Cox signs executive order on AI
+			// integration in government" shared signs, executive, order and
+			// ai with "What we're reading: Trump signs new AI executive
+			// order", four of its eight words, so the two became one event
+			// and the older roundup was shown on the Utah page while the Utah
+			// order was not. Those words say what kind of story it is, not
+			// which story; only the rest counts toward sameness.
 			stop := map[string]bool{"the": true, "a": true, "an": true, "of": true, "to": true, "in": true, "on": true, "for": true,
-				"and": true, "amid": true, "with": true, "as": true, "by": true, "at": true, "is": true, "new": true, "gov": true}
+				"and": true, "amid": true, "with": true, "as": true, "by": true, "at": true, "is": true, "new": true, "gov": true,
+				"ai": true, "signs": true, "signed": true, "sign": true, "executive": true, "order": true, "bill": true, "bills": true,
+				"law": true, "laws": true, "governor": true, "state": true, "says": true, "what": true, "we": true, "re": true, "reading": true, "more": true}
 			wordsOf := func(h string) map[string]bool {
 				if i := strings.Index(h, " - "); i > 0 {
 					h = h[:i]
@@ -5242,7 +5268,13 @@ func twoaiBuild(db *sql.DB) error {
 					if name == "Washington" && !regexp.MustCompile(`(?i)washington state|state of washington|olympia|gov\. ferguson|governor ferguson`).MatchString(text) {
 						continue
 					}
-					if !pins[slug][s.uid] && (!nameRe.MatchString(text) || !policy.MatchString(text)) {
+					// A STORY IS ABOUT A STATE WHEN ITS HEADLINE SAYS SO, or when
+					// one sentence of its summary names the state beside a policy
+					// word. A roundup that mentions Utah in its fourth paragraph
+					// ("What we're reading: Trump signs...", row 566) is not a
+					// Utah story, and a school cellphone piece that lists Utah
+					// districts is not Utah AI policy.
+					if !pins[slug][s.uid] && !twoaiStateStory(nameRe, policy, s.head, text) {
 						continue
 					}
 					var home *event
@@ -5258,10 +5290,12 @@ func twoaiBuild(db *sql.DB) error {
 					}
 					home.members = append(home.members, s)
 					// The shown story: a pinned one always wins; otherwise the
-					// earliest report, since stories arrive newest first.
+					// one whose headline names the state over one that does
+					// not (row 566); otherwise the earliest report, since
+					// stories arrive newest first.
 					if pins[slug][s.uid] {
 						home.rep, home.pinned = s, true
-					} else if !home.pinned {
+					} else if !home.pinned && (nameRe.MatchString(s.head) || !nameRe.MatchString(home.rep.head)) {
 						home.rep = s
 					}
 				}
@@ -5313,6 +5347,11 @@ func twoaiBuild(db *sql.DB) error {
 		}
 		if n := stateNews[slug]; len(n) > 0 {
 			stateDoc["news"] = n
+		}
+		// Executive orders, AG guidance and task forces, which never pass
+		// through LegiScan (row 566).
+		if acts := twoaiStateActions(db, code); len(acts) > 0 {
+			stateDoc["executive_actions"] = acts
 		}
 		if err := upsert("laws/"+slug+".json", "state-law", stateDoc); err != nil {
 			return err
@@ -12010,4 +12049,19 @@ func twoaiLawsuitsPage(db *sql.DB, today string, upsert func(path, kind string, 
 		return 0, err
 	}
 	return len(cases), nil
+}
+
+// twoaiStateStory says whether a story is about a state's AI policy: the
+// headline names the state, or a sentence of the summary names it beside a
+// policy word. See the state news block in twoaiBuild (row 566).
+func twoaiStateStory(nameRe, policy *regexp.Regexp, head, text string) bool {
+	if nameRe.MatchString(head) {
+		return policy.MatchString(text)
+	}
+	for _, sent := range regexp.MustCompile(`[.!?]\s+|\n+`).Split(text, -1) {
+		if nameRe.MatchString(sent) && policy.MatchString(sent) {
+			return true
+		}
+	}
+	return false
 }
