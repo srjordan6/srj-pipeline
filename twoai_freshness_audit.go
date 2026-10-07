@@ -359,6 +359,10 @@ func twoaiFreshnessAudit(db *sql.DB, preview bool) error {
 	// yesterday, and every docket that missed its scheduled check.
 	fmt.Fprintf(&b, "\n%s (UTC day so far)\n", clReportLine(db))
 	fmt.Fprintf(&b, "CourtListener yesterday: %s\n", clUsageSummary(clUsageToday(db, time.Now().Add(-24*time.Hour))))
+	// Search Console, rows 548 and 549.
+	if g := twoaiGSCReport(db); g != "" {
+		b.WriteString("\n" + g)
+	}
 	// Docket alerts, rows 526 and 527: which cases push and when.
 	if a := clAlertReport(db, 15); a != "" {
 		b.WriteString(a)

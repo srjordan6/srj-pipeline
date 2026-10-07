@@ -63,6 +63,8 @@ var twoaiStageDeadline = map[string]time.Duration{
 	// is spent, so the extra time is used only when there is work for it.
 	"intel":       15 * time.Minute,
 	"twoai_recap": 8 * time.Minute, // RECAP filing harvest, dockets until the budget is spent
+	// Search Console analytics and up to 1,800 URL inspections a day (row 548).
+	"twoai_gsc": 15 * time.Minute,
 	// Whole-site company crawl, 250 pages a run 1.5 seconds apart (row 531).
 	"twoai_company_sitemap": 10 * time.Minute,
 	// Docket alert subscriptions, at most 20 an hour seven seconds apart.
@@ -338,7 +340,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "cl_webhooks", "cl_alerts", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_company_sitemap", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "cl_webhooks", "cl_alerts", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_company_sitemap", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "twoai_gsc", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -514,6 +516,13 @@ func main() {
 	// failing may stop the run.
 	// twoai_company_sitemap reads every page a company lists in its sitemap
 	// (twoai_company_sitemap.go, theworldofai row 531). Never fatal.
+	// twoai_gsc reads Search Console into SQL (twoai_gsc.go, rows 548, 549).
+	if src == "twoai_gsc" {
+		if err := twoaiGSC(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_gsc:", err)
+		}
+		return
+	}
 	if src == "twoai_company_sitemap" {
 		if err := twoaiCompanySitemap(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_company_sitemap:", err)
@@ -5607,6 +5616,47 @@ func twoaiBuild(db *sql.DB) error {
 			if err := upsert("meta/popular-pages.json", "meta", map[string]any{
 				"slug": "popular-pages", "day": popDay, "generated": today,
 				"pages": pops,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	// ---- The core sitemap tier (theworldofai row 548, 2026-10-07). Search
+	// Console had 6,046 pages Discovered, currently not indexed, all never
+	// crawled: crawl budget on a two month old domain, with thousands of
+	// detail pages queued alongside the pages that matter. The site writes a
+	// sitemap-core file from this list, ahead of everything else, so Google
+	// meets hubs, sections, companies, people, model families, laws, lawsuits,
+	// compliance and the health and life sciences pages first. The bulk
+	// families are left to the second sitemap: political bills and members
+	// (industries/pol-), source summaries, data centre children, art topics,
+	// news stories and vendor posts. CVE, CWE, incident and research paper
+	// detail pages leave the sitemap entirely on the site side and stay
+	// published and linked from their hubs.
+	if rows, err := db.Query(`SELECT r.url FROM twoai_url_registry r
+		WHERE r.resolution IS NULL AND r.last_seen_at > now() - interval '7 days' AND (
+			r.kind IN ('home', 'company', 'state-law', 'lawsuit', 'compliance', 'research-topic', 'static', 'tool',
+				'benchmark', 'calculator', 'prompt-page', 'ecosystem-category', 'news-daily')
+			OR r.kind LIKE '%-hub'
+			OR (r.kind = 'ecosystem-entity' AND EXISTS (
+				SELECT 1 FROM twoai_pages p WHERE p.data->>'uid' = substring(r.url from '/([0-9a-f]{8})/?$')
+				  AND p.kind NOT IN ('tech-dc-child', 'art-topic', 'cve', 'cwe', 'incident', 'research-paper', 'mcp-server')
+				  AND p.path !~ '^industries/(pol|source)-' AND p.path !~ '^tech/dc-')))
+		ORDER BY r.url`); err == nil {
+		var core []string
+		for rows.Next() {
+			var u string
+			if rows.Scan(&u) == nil {
+				if pu, perr := url.Parse(u); perr == nil {
+					core = append(core, pu.Path)
+				}
+			}
+		}
+		rows.Close()
+		if len(core) > 0 {
+			if err := upsert("meta/sitemap-core.json", "meta", map[string]any{
+				"slug": "sitemap-core", "generated": today, "count": len(core), "paths": core,
 			}); err != nil {
 				return err
 			}
