@@ -4357,7 +4357,10 @@ func intelAIWatch(db *sql.DB) (added int, err error) {
 		{"INRIA", "https://inria.fr/en/rss.xml"},
 		{"RIKEN AIP", "https://www.riken.jp/en/feed/"},
 		{"MBZUAI (coverage)", "https://news.google.com/rss/search?q=MBZUAI+OR+%22Mohamed+bin+Zayed+University+of+Artificial+Intelligence%22&hl=en-US&gl=US&ceid=US:en"},
-		{"AI Singapore", "https://aisingapore.org/feed/"},
+		// aisingapore.org/feed/ answers with an HTML page rather than a feed
+		// (pipeline log, 2026-10-06), so AI Singapore is watched through Google
+		// News coverage like Turing and MBZUAI above.
+		{"AI Singapore (coverage)", "https://news.google.com/rss/search?q=%22AI+Singapore%22+OR+%22AISG%22+OR+%22SEA-LION%22&hl=en-SG&gl=SG&ceid=SG:en"},
 		// Policy, regulation, standards
 		{"European Commission AI", "https://digital-strategy.ec.europa.eu/en/rss.xml"},
 		{"UK DSIT", "https://www.gov.uk/government/organisations/department-for-science-innovation-and-technology.atom"},
