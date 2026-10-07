@@ -46,6 +46,20 @@ var twoaiPolicyNewsQueries = []string{
 	`AI Act enforcement`,
 	`school district artificial intelligence policy`,
 	`city council artificial intelligence`,
+	// FEDERAL PROGRAMMES AND CONGRESSIONAL DRAFTS, theworldofai rows 553, 557
+	// and 558 (2026-10-07). The FTC's investigation of OpenAI, Anthropic and
+	// METR, Rep. Trahan's CLAIM Act discussion draft, Sen. Cantwell's frontier
+	// AI framework and the Genesis Mission compute credits were all missed by
+	// GDELT and the 34 feeds in one week: a press release from an agency, a
+	// member's office or the White House is quoted by a handful of outlets
+	// that GDELT's slices do not carry. These queries cover that class.
+	`FTC artificial intelligence investigation`,
+	`"discussion draft" artificial intelligence Congress`,
+	`senator artificial intelligence framework`,
+	`"Genesis Mission"`,
+	`White House artificial intelligence announcement OSTP`,
+	`"Department of Energy" artificial intelligence`,
+	`"compute credits"`,
 }
 
 func twoaiPolicyNews(db *sql.DB) (fetched, added int, err error) {
