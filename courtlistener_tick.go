@@ -38,20 +38,30 @@ const (
 // clTick pulls new pushes from D1 and applies them. It is quiet when there is
 // nothing, so the runner keeps the tick out of the log.
 func clTick(db *sql.DB) {
+	// WHAT THE TICK DID IS A STATE ROW (tick_cl), because its output is kept
+	// out of the log unless a word matches, and on 2026-10-07 three ticks
+	// ran on a rebuilt binary with no trace of why a stored mail was not
+	// re-read.
 	if os.Getenv("CLOUDFLARE_API_TOKEN") == "" {
+		clStateSet(db, "tick_cl", time.Now().UTC().Format(time.RFC3339)+" no CLOUDFLARE_API_TOKEN in this tick's environment; no pull, no apply; mail reparse only")
+		clReparseAlertMail(db)
 		return
 	}
 	clEnsureAlerts(db)
 	pulled, err := clPullWebhooks(db)
+	pullNote := ""
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "cl_tick pull:", err)
+		pullNote = "; pull error: " + trunc(err.Error(), 120)
 	}
 	applied, entries, unknown, err := clApplyWebhooks(db)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "cl_tick apply:", err)
+		clStateSet(db, "tick_cl", time.Now().UTC().Format(time.RFC3339)+" apply error: "+trunc(err.Error(), 160)+pullNote)
 		clReparseAlertMail(db)
 		return
 	}
+	clStateSet(db, "tick_cl", fmt.Sprintf("%s pulled %d applied %d entries %d unknown %d%s", time.Now().UTC().Format(time.RFC3339), pulled, applied, entries, unknown, pullNote))
 	if pulled > 0 || applied > 0 {
 		fmt.Printf("cl_tick: %d pulled, %d applied, %d new docket entries, %d for dockets the tracker does not hold\n",
 			pulled, applied, entries, unknown)
@@ -69,6 +79,7 @@ func clReparseAlertMail(db *sql.DB) {
 	rows, err := db.Query(`SELECT message_id, COALESCE(from_addr,''), COALESCE(subject,''), COALESCE(raw,'') FROM cl_alert_emails
 		WHERE parsed = 0 AND raw IS NOT NULL AND COALESCE(note,'') LIKE '%no entries read%' AND COALESCE(note,'') NOT LIKE '%reparse%' LIMIT 20`)
 	if err != nil {
+		clStateSet(db, "tick_mail", time.Now().UTC().Format(time.RFC3339)+" reparse select failed: "+trunc(err.Error(), 160))
 		return
 	}
 	type row struct{ id, from, subject, raw string }
@@ -80,8 +91,13 @@ func clReparseAlertMail(db *sql.DB) {
 		}
 	}
 	rows.Close()
+	var outcome []string
+	defer func() {
+		clStateSet(db, "tick_mail", fmt.Sprintf("%s reparse candidates %d: %s", time.Now().UTC().Format(time.RFC3339), len(rs), strings.Join(outcome, "; ")))
+	}()
 	for _, r := range rs {
 		docket, entries := clParseAlertMail(r.raw)
+		outcome = append(outcome, fmt.Sprintf("%s docket %s entries %d raw %d chars", trunc(r.id, 8), docket, len(entries), len(r.raw)))
 		if len(entries) == 0 {
 			db.Exec(`UPDATE cl_alert_emails SET note = note || '; reparse ' || $2 || ': still no entries' WHERE message_id = $1`, r.id, time.Now().UTC().Format("2006-01-02"))
 			continue
@@ -90,6 +106,7 @@ func clReparseAlertMail(db *sql.DB) {
 		if _, err := db.Exec(`UPDATE cl_alert_emails SET entries = $2::jsonb, parsed = $3, docket_id = COALESCE(docket_id, NULLIF($4,'')), note = 'reparse ' || $5 || ': ' || $3::text || ' entries read' WHERE message_id = $1`,
 			r.id, string(ej), len(entries), docket, time.Now().UTC().Format("2006-01-02")); err != nil {
 			fmt.Fprintln(os.Stderr, "cl_mail reparse note:", err)
+			outcome = append(outcome, "update failed: "+trunc(err.Error(), 120))
 		}
 		n, slug := clApplyMailEntries(db, r.id, docket, entries)
 		if n > 0 {
