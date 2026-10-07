@@ -1441,6 +1441,9 @@ func main() {
 		fetched, added, runErr = federalRegister(db, sourceID)
 	case "legiscan":
 		fetched, added, runErr = legiscan(db, sourceID)
+		// Bills named by hand in twoai_legiscan_queue enter through the same
+		// door as a hand run of legiscan_add (theworldofai row 553).
+		legiscanDrainQueue(db)
 	case "gdelt":
 		fetched, added, runErr = gdelt(db, sourceID)
 		// The policy-news intake rides on the GDELT run and writes under the
@@ -5013,22 +5016,30 @@ func twoaiBuild(db *sql.DB) error {
 	// ---- F1: AI laws by state, from the LegiScan corpus. One row per bill
 	// (latest change wins), grouped by the "ST NUM: Title" prefix.
 	rows, err := db.Query(`SELECT DISTINCT ON (external_id) external_id, title, url,
-			COALESCE(to_char(published_at,'YYYY-MM-DD'),'') 
+			COALESCE(to_char(published_at,'YYYY-MM-DD'),''), COALESCE(raw->'bill'->>'status','')
 		FROM pipeline.documents WHERE source_id = 2
 		ORDER BY external_id, id DESC`)
 	if err != nil {
 		return err
 	}
+	// STATUS, theworldofai row 553 (2026-10-07). The table listed every bill
+	// with a date and nothing else, so on 2026-09-30 California's five vetoed
+	// AI bills (AB 2575, AB 2656, SB 903 among them) sat beside the sixteen
+	// signed ones looking identical. LegiScan's status code travels with the
+	// bill now: 1 introduced, 2 engrossed, 3 enrolled, 4 passed, 5 vetoed,
+	// 6 failed. "Passed" is LegiScan's word for signed into law.
 	type bill struct {
 		Number string `json:"number"`
 		Title  string `json:"title"`
 		URL    string `json:"url"`
 		Date   string `json:"date"`
+		Status string `json:"status,omitempty"`
 	}
+	statusLabel := map[string]string{"1": "Introduced", "2": "Engrossed", "3": "Enrolled", "4": "Passed", "5": "Vetoed", "6": "Failed"}
 	byState := map[string][]bill{}
 	for rows.Next() {
-		var ext, title, url, date string
-		if err := rows.Scan(&ext, &title, &url, &date); err != nil {
+		var ext, title, url, date, status string
+		if err := rows.Scan(&ext, &title, &url, &date, &status); err != nil {
 			rows.Close()
 			return err
 		}
@@ -5041,7 +5052,7 @@ func twoaiBuild(db *sql.DB) error {
 		if _, ok := twoaiStates[code]; !ok {
 			continue
 		}
-		b := bill{Number: strings.Join(head[1:], " "), URL: url, Date: date}
+		b := bill{Number: strings.Join(head[1:], " "), URL: url, Date: date, Status: statusLabel[status]}
 		if len(parts) == 2 {
 			b.Title = strings.TrimSpace(parts[1])
 		}
