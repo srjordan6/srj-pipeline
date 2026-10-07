@@ -63,6 +63,8 @@ var twoaiStageDeadline = map[string]time.Duration{
 	// is spent, so the extra time is used only when there is work for it.
 	"intel":       15 * time.Minute,
 	"twoai_recap": 8 * time.Minute, // RECAP filing harvest, dockets until the budget is spent
+	// Whole-site company crawl, 250 pages a run 1.5 seconds apart (row 531).
+	"twoai_company_sitemap": 10 * time.Minute,
 	// Docket alert subscriptions, at most 20 an hour seven seconds apart.
 	"cl_alerts":     5 * time.Minute,
 	"export_corpus": 20 * time.Minute,
@@ -336,7 +338,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "cl_webhooks", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "legiscan", "gdelt", "govinfo", "mcp_registry", "cl_webhooks", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_company_sitemap", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -506,6 +508,14 @@ func main() {
 	// cl_alerts subscribes tracked dockets to CourtListener docket alerts and
 	// cl_webhooks applies what they push (courtlistener_alerts.go). Neither
 	// failing may stop the run.
+	// twoai_company_sitemap reads every page a company lists in its sitemap
+	// (twoai_company_sitemap.go, theworldofai row 531). Never fatal.
+	if src == "twoai_company_sitemap" {
+		if err := twoaiCompanySitemap(db); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_company_sitemap:", err)
+		}
+		return
+	}
 	if src == "cl_alerts" {
 		if err := clAlertsStage(db); err != nil {
 			fmt.Fprintln(os.Stderr, "cl_alerts:", err)
@@ -7365,7 +7375,8 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 	if pr, err := db.Query(`SELECT uid, COALESCE(org_type,''), for_profit, founded,
 			COALESCE(headquarters,''), COALESCE(website,''), COALESCE(ticker,''),
 			COALESCE(cik,''), last_revenue_usd, last_revenue_end::text,
-			COALESCE(last_revenue_form,''), verified_on::text
+			COALESCE(last_revenue_form,''), verified_on::text,
+			employees, COALESCE(leadership,'[]'::jsonb)::text, COALESCE(sources,'[]'::jsonb)::text
 		FROM twoai_company_profiles`); err == nil {
 		for pr.Next() {
 			var uid, orgType, hq, website, ticker, cik, revForm string
@@ -7373,8 +7384,10 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 			var founded sql.NullInt32
 			var revUsd sql.NullInt64
 			var revEnd, verified sql.NullString
+			var employees sql.NullInt64
+			var leadershipJSON, sourcesJSON string
 			if pr.Scan(&uid, &orgType, &forProfit, &founded, &hq, &website, &ticker,
-				&cik, &revUsd, &revEnd, &revForm, &verified) != nil {
+				&cik, &revUsd, &revEnd, &revForm, &verified, &employees, &leadershipJSON, &sourcesJSON) != nil {
 				continue
 			}
 			p := map[string]any{}
@@ -7411,6 +7424,23 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 			if verified.Valid {
 				p["verified_on"] = verified.String
 			}
+			// LEADERSHIP, STAFF AND SOURCES, theworldofai rows 530 and 531
+			// (SRI International, 2026-10-07): the profile held them and no
+			// page showed them. Leadership is the company's own published
+			// roster, so it says who leads now, which executive_of edges
+			// cannot. A leader with a person page on this site is linked by
+			// exact name.
+			if employees.Valid && employees.Int64 > 0 {
+				p["employees"] = employees.Int64
+			}
+			var lead []map[string]any
+			if json.Unmarshal([]byte(leadershipJSON), &lead) == nil && len(lead) > 0 {
+				p["leadership"] = lead
+			}
+			var srcs []map[string]any
+			if json.Unmarshal([]byte(sourcesJSON), &srcs) == nil && len(srcs) > 0 {
+				p["sources"] = srcs
+			}
 			profiles[uid] = p
 		}
 		pr.Close()
@@ -7446,6 +7476,31 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 			}
 		}
 		return lawRef{}, false
+	}
+
+	// People with a page on this site, by exact lower-cased name, for the
+	// leadership rosters above.
+	personByName := map[string]string{}
+	if rows, err := db.Query(`SELECT lower(data->>'name'), data->>'uid' FROM twoai_pages
+		WHERE path ~ '^people/[0-9a-f]{8}\.json$' AND COALESCE(data->>'uid','') <> '' AND COALESCE(data->>'name','') <> ''`); err == nil {
+		for rows.Next() {
+			var n, u string
+			if rows.Scan(&n, &u) == nil {
+				personByName[n] = "/ai-ecosystem/ecosystem-entities-market-and-operations/" + u + "/"
+			}
+		}
+		rows.Close()
+	}
+	for _, p := range profiles {
+		if lead, ok := p["leadership"].([]map[string]any); ok {
+			for _, l := range lead {
+				if n, _ := l["name"].(string); n != "" {
+					if href := personByName[strings.ToLower(strings.TrimSpace(n))]; href != "" {
+						l["href"] = href
+					}
+				}
+			}
+		}
 	}
 
 	for _, v := range order {
@@ -7504,16 +7559,23 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 			// carry no end date, and one names an OpenAI policy lead from the
 			// article reporting his departure, so they cannot say who leads a
 			// company today.
-			if pr, err := db.Query(`SELECT DISTINCT ON (g.other_uid) g.other_uid, p.data->>'name'
+			if pr, err := db.Query(`SELECT DISTINCT ON (g.other_uid) g.other_uid, p.data->>'name', g.relation
 				FROM twoai_graph g JOIN twoai_pages p ON p.path = 'people/' || g.other_uid || '.json'
 				WHERE g.kind = 'company' AND g.uid = $1 AND g.other_kind = 'person' AND g.confidence <> 'candidate'
-				  AND g.relation = 'founder_of' AND COALESCE(p.data->>'name','') <> ''
-				ORDER BY g.other_uid`, c.UID); err == nil {
+				  AND g.relation IN ('founder_of', 'researcher_at') AND COALESCE(p.data->>'name','') <> ''
+				ORDER BY g.other_uid, g.relation = 'founder_of' DESC`, c.UID); err == nil {
+				// researcher_at added 2026-10-07 (row 530, Peter G. Neumann at
+				// SRI International): a research post is dated and evidenced,
+				// unlike executive_of, so it can be shown.
 				var people []map[string]string
 				for pr.Next() {
-					var uid, name string
-					if pr.Scan(&uid, &name) == nil {
-						people = append(people, map[string]string{"name": name, "href": "/ai-ecosystem/ecosystem-entities-market-and-operations/" + uid + "/", "role": "Founder"})
+					var uid, name, rel string
+					if pr.Scan(&uid, &name, &rel) == nil {
+						role := "Founder"
+						if rel == "researcher_at" {
+							role = "Researcher"
+						}
+						people = append(people, map[string]string{"name": name, "href": "/ai-ecosystem/ecosystem-entities-market-and-operations/" + uid + "/", "role": role})
 					}
 				}
 				pr.Close()
@@ -7521,6 +7583,10 @@ func twoaiCompanies(db *sql.DB, today string, upsert func(path, kind string, v a
 				if len(people) > 0 {
 					payload["people"] = people
 				}
+			}
+			// What the company's whole site says, from twoai_company_sitemap.
+			if site := twoaiCompanySiteSection(db, c.UID); site != nil {
+				payload["site"] = site
 			}
 			if err := upsert("companies/"+c.UID+".json", "company", payload); err != nil {
 				return count, err

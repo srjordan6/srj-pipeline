@@ -22,7 +22,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"sort"
 	"strings"
+	"sync"
 )
 
 const twoaiPersonReadingsPerRun = 12
@@ -97,11 +100,30 @@ func twoaiPersonContext(db *sql.DB, uid, name string, d map[string]any) {
 	}
 	db.QueryRow(`SELECT count(*) FROM twoai_news_stories WHERE EXISTS (SELECT 1 FROM unnest($1::text[]) t WHERE headline ILIKE '%' || t || '%')`, pq.Array(terms)).Scan(&storyTotal)
 
+	// Glossary terms the person's own record names (theworldofai row 532:
+	// RISKS Digest and Multics on Peter G. Neumann's page).
+	var profileText strings.Builder
+	for _, k := range []string{"hook", "quick_facts", "achievements", "timeline"} {
+		if v, ok := d[k]; ok {
+			b, _ := json.Marshal(v)
+			profileText.Write(b)
+			profileText.WriteString(" ")
+		}
+	}
+	// Values only: the timeline's own keys (year, event, impact) are not prose.
+	glossary := twoaiGlossaryNamed(db, glossKeyRe.ReplaceAllString(profileText.String(), " "), 8)
+
 	if len(companies)+len(lawsuits)+len(stories) == 0 {
+		if len(glossary) > 0 {
+			d["on_site"] = map[string]any{"glossary": glossary}
+		}
 		return
 	}
 	d["on_site"] = map[string]any{
 		"companies": companies, "lawsuits": lawsuits, "stories": stories, "story_total": storyTotal,
+	}
+	if len(glossary) > 0 {
+		d["on_site"].(map[string]any)["glossary"] = glossary
 	}
 
 	// The reading: where the person stands in AI now, from these records and
@@ -181,4 +203,120 @@ func twoaiPersonContext(db *sql.DB, uid, name string, d map[string]any) {
 		ON CONFLICT (uid) DO UPDATE SET body=EXCLUDED.body, data_hash=EXCLUDED.data_hash, model=EXCLUDED.model, generated_on=current_date`, uid, string(b), want, model)
 	d["standing"] = m
 	twoaiPersonReadingsWritten++
+}
+
+// glossTerm is one glossary entry as the matchers see it.
+type glossTerm struct {
+	slug, term string
+	names      []string // the term and its other names
+}
+
+var (
+	glossTermsOnce   sync.Once
+	glossTermsCached []glossTerm
+)
+
+// twoaiGlossaryTerms loads the glossary library once a process: every term
+// and its also_called names, slang left out.
+func twoaiGlossaryTerms(db *sql.DB) []glossTerm {
+	glossTermsOnce.Do(func() {
+		var raw string
+		if db.QueryRow(`SELECT data::text FROM site_content WHERE path='resources/glossary.json'`).Scan(&raw) != nil {
+			return
+		}
+		var g struct {
+			Terms []struct {
+				Slug       string   `json:"slug"`
+				Term       string   `json:"term"`
+				Category   string   `json:"category"`
+				AlsoCalled []string `json:"also_called"`
+			} `json:"terms"`
+		}
+		if json.Unmarshal([]byte(raw), &g) != nil {
+			return
+		}
+		for _, t := range g.Terms {
+			if t.Slug == "" || t.Term == "" || t.Category == "Slang & Culture" {
+				continue
+			}
+			gt := glossTerm{slug: t.Slug, term: t.Term}
+			for _, n := range append([]string{t.Term}, t.AlsoCalled...) {
+				// "Transformer (Electrical)" is matched as Transformer.
+				n = strings.TrimSpace(glossParenRe.ReplaceAllString(n, ""))
+				if len(n) >= 5 {
+					gt.names = append(gt.names, n)
+				}
+			}
+			if len(gt.names) > 0 {
+				glossTermsCached = append(glossTermsCached, gt)
+			}
+		}
+	})
+	return glossTermsCached
+}
+
+var glossKeyRe = regexp.MustCompile(`"[a-z_]+":`)
+
+var glossParenRe = regexp.MustCompile(`\s*\(.*?\)`)
+
+// twoaiGlossaryNamed returns the glossary terms named in text, whole words,
+// case-insensitive, longest name first so "RISKS Forum" is not also counted
+// as a shorter term inside it, at most limit of them.
+func twoaiGlossaryNamed(db *sql.DB, text string, limit int) []personLink {
+	type cand struct {
+		t    glossTerm
+		name string
+	}
+	var cands []cand
+	for _, t := range twoaiGlossaryTerms(db) {
+		for _, n := range t.names {
+			cands = append(cands, cand{t, n})
+		}
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return len(cands[i].name) > len(cands[j].name) })
+	low := strings.ToLower(text)
+	taken := make([]bool, len(low))
+	seen := map[string]bool{}
+	var out []personLink
+	for _, c := range cands {
+		if len(out) >= limit || seen[c.t.slug] {
+			continue
+		}
+		needle := strings.ToLower(c.name)
+		from := 0
+		for {
+			i := strings.Index(low[from:], needle)
+			if i < 0 {
+				break
+			}
+			i += from
+			end := i + len(needle)
+			from = i + 1
+			if (i > 0 && glossWordByte(low[i-1])) || (end < len(low) && glossWordByte(low[end])) {
+				continue
+			}
+			free := true
+			for k := i; k < end; k++ {
+				if taken[k] {
+					free = false
+					break
+				}
+			}
+			if !free {
+				continue
+			}
+			for k := i; k < end; k++ {
+				taken[k] = true
+			}
+			seen[c.t.slug] = true
+			out = append(out, personLink{Name: c.t.term, Path: "/ai-glossary/" + c.t.slug + "/"})
+			break
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func glossWordByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '_'
 }
