@@ -592,12 +592,12 @@ func twoaiCompanySiteSection(db *sql.DB, uid string) map[string]any {
 		}
 		rows.Close()
 	}
-	list := func(section, extra string, limit int) []map[string]any {
+	list := func(section string, datedOnly bool, limit int) []map[string]any {
 		var items []map[string]any
 		rows, err := db.Query(`SELECT url, title, COALESCE(published_on::text, ''), COALESCE(person_path, ''), COALESCE(work_id, '')
 			FROM twoai_company_site_urls WHERE uid = $1 AND section = $2 AND status = 200 AND keep AND gone_at IS NULL
-			  AND COALESCE(title, '') <> '' `+extra+`
-			ORDER BY published_on DESC NULLS LAST, title LIMIT $3`, uid, section, limit)
+			  AND COALESCE(title, '') <> '' AND (NOT $4 OR published_on IS NOT NULL)
+			ORDER BY published_on DESC NULLS LAST, title LIMIT $3`, uid, section, limit, datedOnly)
 		if err != nil {
 			return nil
 		}
@@ -617,9 +617,9 @@ func twoaiCompanySiteSection(db *sql.DB, uid string) map[string]any {
 		}
 		return items
 	}
-	press := list("press", "AND published_on IS NOT NULL", 12)
-	people := list("people", "", 60)
-	pubs := list("publication", "", 12)
+	press := list("press", true, 12)
+	people := list("people", false, 60)
+	pubs := list("publication", false, 12)
 	sort.SliceStable(people, func(i, j int) bool {
 		_, a := people[i]["person_path"]
 		_, b := people[j]["person_path"]
