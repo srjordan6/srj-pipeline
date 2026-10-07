@@ -52,6 +52,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -64,6 +65,9 @@ import (
 )
 
 const (
+	// The page reading in use. Pages read under an older one are read again:
+	// version 2 (2026-10-07) strips the site's own chrome before filtering.
+	twoaiSitemapParseV = 2
 	twoaiSitemapPerRun = 250
 	twoaiSitemapGap    = 1500 * time.Millisecond
 	twoaiSitemapUA     = "Mozilla/5.0 (compatible; theworldofai.org company directory; info@srjconsultingservices.com)"
@@ -95,6 +99,11 @@ func twoaiSitemapEnsure(db *sql.DB) {
 			fetched_at timestamptz, fetched_lastmod text, status int, title text, published_on date, description text,
 			body text, body_hash text, keep boolean, doi text, work_id text, person_path text, note text)`,
 		`CREATE INDEX IF NOT EXISTS twoai_company_site_urls_uid ON twoai_company_site_urls (uid, section)`,
+		`ALTER TABLE twoai_company_site_urls ADD COLUMN IF NOT EXISTS parse_v int`,
+		`CREATE TABLE IF NOT EXISTS twoai_company_innovation_reads (url text NOT NULL, body_hash text NOT NULL,
+			read_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (url, body_hash))`,
+		`CREATE TABLE IF NOT EXISTS twoai_company_site_chrome (uid text NOT NULL, line text NOT NULL, pages int NOT NULL,
+			PRIMARY KEY (uid, line))`,
 		`CREATE TABLE IF NOT EXISTS twoai_company_innovations (uid text NOT NULL, year int NOT NULL, title text NOT NULL,
 			detail text NOT NULL DEFAULT '', source_url text NOT NULL, model text, body_hash text,
 			added_on date NOT NULL DEFAULT current_date, PRIMARY KEY (uid, year, title))`,
@@ -229,9 +238,15 @@ func twoaiSitemapTitle(h string, meta map[string]string, site string) string {
 			t = htmlToText(m[1])
 		}
 	}
+	t = html.UnescapeString(t)
 	for _, sep := range []string{" | ", " - ", " – "} {
-		if i := strings.LastIndex(t, sep); i > 0 && strings.Contains(strings.ToLower(t[i:]), strings.ToLower(site)) {
-			t = t[:i]
+		if i := strings.LastIndex(t, sep); i > 0 {
+			suffix := strings.ToLower(strings.TrimSpace(t[i+len(sep):]))
+			// "Alan Braun - SRI" on SRI International's site: the suffix is
+			// the site's name or the start of it.
+			if suffix != "" && (strings.Contains(suffix, strings.ToLower(site)) || strings.HasPrefix(strings.ToLower(site), suffix)) {
+				t = t[:i]
+			}
 		}
 	}
 	return strings.TrimSpace(t)
@@ -280,11 +295,13 @@ func twoaiCompanySitemap(db *sql.DB) error {
 		if err != nil {
 			fmt.Printf("twoai_company_sitemap %s: sitemap: %v\n", s.name, err)
 		}
+		// The model reads history pages already stored, first and for at most
+		// three minutes, so the fetch below always has the rest of the stage.
+		innov := twoaiSitemapInnovations(db, s.uid, s.name, time.Now().Add(3*time.Minute))
 		fetched, kept := twoaiSitemapFetch(db, s.uid, s.name, deadline)
 		events := twoaiSitemapEvents(db, s.uid, s.name)
 		people := twoaiSitemapPeople(db, s.uid)
 		works := twoaiSitemapWorks(db, s.uid)
-		innov := twoaiSitemapInnovations(db, s.uid, s.name)
 		var total, done int
 		db.QueryRow(`SELECT count(*) FILTER (WHERE section NOT IN ('ja','taxonomy') AND gone_at IS NULL),
 			count(*) FILTER (WHERE section NOT IN ('ja','taxonomy') AND gone_at IS NULL AND fetched_at IS NOT NULL)
@@ -369,12 +386,22 @@ func twoaiSitemapList(db *sql.DB, uid, index string) (int, error) {
 
 // twoaiSitemapFetch reads due pages, in the order Stephen's ask ranks them.
 func twoaiSitemapFetch(db *sql.DB, uid, name string, deadline time.Time) (int, int) {
+	// THE SITE'S OWN CHROME. sri.com prints its whole menu, footer and cookie
+	// banner as text on every page, and the menu names AI and Security, so on
+	// 2026-10-07 all 132 people profiles read passed the AI and security
+	// filter. Rather than guess each site's markup, the chrome is learned from
+	// the site: a line on at least half of its core pages is chrome, and is
+	// cut from every page before it is filtered or stored. Until that is
+	// known only core pages are read, raw, and they are read again after.
+	chrome := twoaiSitemapChromeLines(db, uid)
+	onlyCore := len(chrome) == 0
 	rows, err := db.Query(`SELECT url, section FROM twoai_company_site_urls
-		WHERE uid=$1 AND gone_at IS NULL AND section NOT IN ('ja','taxonomy')
-		  AND (fetched_at IS NULL OR fetched_lastmod IS DISTINCT FROM lastmod)
-		ORDER BY CASE section WHEN 'core' THEN 0 WHEN 'people' THEN 1 WHEN 'press' THEN 2 WHEN 'other' THEN 3 ELSE 4 END,
+		WHERE uid=$1 AND gone_at IS NULL AND section NOT IN ('ja','taxonomy') AND (NOT $3 OR section = 'core')
+		  AND (fetched_at IS NULL OR fetched_lastmod IS DISTINCT FROM lastmod OR parse_v IS DISTINCT FROM $4)
+		ORDER BY CASE WHEN section = 'core' THEN 0 WHEN url ~* $5 THEN 1 WHEN section = 'people' THEN 2
+		    WHEN section = 'press' THEN 3 WHEN section = 'other' THEN 4 ELSE 5 END,
 		  lastmod DESC NULLS LAST, url
-		LIMIT $2`, uid, twoaiSitemapPerRun)
+		LIMIT $2`, uid, twoaiSitemapPerRun, onlyCore, twoaiSitemapParseV, twoaiSitemapInnovationURL)
 	if err != nil {
 		return 0, 0
 	}
@@ -407,18 +434,20 @@ func twoaiSitemapFetch(db *sql.DB, uid, name string, deadline time.Time) (int, i
 		if desc == "" {
 			desc = meta["description"]
 		}
-		text := htmlToText(h)
+		text := html.UnescapeString(htmlToText(h))
+		parseV := twoaiSitemapParseV
+		if onlyCore {
+			parseV = 1 // raw, for learning the chrome; read again after
+		} else {
+			text = twoaiSitemapStripChrome(text, chrome)
+		}
 		pub := twoaiSitemapDate(h, meta)
 		keep := true
-		switch d.section {
-		case "publication":
-			keep = twoaiSitemapResearchRe.MatchString(title + " " + desc + " " + trunc(text, 3000))
-		case "people":
-			keep = twoaiSitemapPeopleRe.MatchString(title + " " + desc + " " + trunc(text, 4000))
-		case "other":
-			// Not filed by path: kept in full only when it is on the
-			// subjects asked for, like a publication.
-			keep = twoaiSitemapResearchRe.MatchString(title + " " + desc + " " + trunc(text, 3000))
+		switch {
+		case twoaiSitemapInnovationRe.MatchString(d.url):
+			// A history page is the Innovations source, whatever its subject.
+		default:
+			keep = twoaiSitemapKeep(d.section, title, desc, text)
 		}
 		var body, hash, doi any
 		if keep {
@@ -435,11 +464,102 @@ func twoaiSitemapFetch(db *sql.DB, uid, name string, deadline time.Time) (int, i
 			pubOn = pub
 		}
 		db.Exec(`UPDATE twoai_company_site_urls SET fetched_at = now(), fetched_lastmod = lastmod, status = 200,
-			title = $2, description = $3, published_on = $4, body = $5, body_hash = $6, keep = $7, doi = $8, note = NULL
-			WHERE url = $1`, d.url, trunc(title, 500), trunc(desc, 1000), pubOn, body, hash, keep, doi)
+			title = $2, description = $3, published_on = $4, body = $5, body_hash = $6, keep = $7, doi = $8, note = NULL,
+			parse_v = $9 WHERE url = $1`, d.url, trunc(title, 500), trunc(desc, 1000), pubOn, body, hash, keep, doi, parseV)
 		fetched++
 	}
+	if onlyCore {
+		twoaiSitemapLearnChrome(db, uid)
+	}
 	return fetched, kept
+}
+
+// twoaiSitemapInnovationURL picks a company's own history pages: SRI
+// publishes its innovations as a series, one page each, under
+// /75-years-of-innovation/ and /press/story/75-years-of-innovation-...,
+// and an interactive timeline that is mostly script.
+const twoaiSitemapInnovationURL = `(timeline-of-innovation|years-of-innovation|/history/|our-history)`
+
+var twoaiSitemapInnovationRe = regexp.MustCompile("(?i)" + twoaiSitemapInnovationURL)
+
+// twoaiSitemapKeep says whether a page's text is kept, by section.
+func twoaiSitemapKeep(section, title, desc, text string) bool {
+	switch section {
+	case "publication", "other":
+		// Kept in full only when on the subjects asked for.
+		return twoaiSitemapResearchRe.MatchString(title + " " + desc + " " + trunc(text, 3000))
+	case "people":
+		return twoaiSitemapPeopleRe.MatchString(title + " " + desc + " " + trunc(text, 4000))
+	}
+	return true
+}
+
+// twoaiSitemapChromeLines is the company site's learned chrome.
+func twoaiSitemapChromeLines(db *sql.DB, uid string) map[string]bool {
+	out := map[string]bool{}
+	rows, err := db.Query(`SELECT line FROM twoai_company_site_chrome WHERE uid = $1`, uid)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var l string
+		if rows.Scan(&l) == nil {
+			out[l] = true
+		}
+	}
+	return out
+}
+
+// twoaiSitemapLearnChrome records every line on at least half of the
+// company's core pages, from their raw text. It needs ten pages to judge.
+func twoaiSitemapLearnChrome(db *sql.DB, uid string) {
+	rows, err := db.Query(`SELECT body FROM twoai_company_site_urls WHERE uid = $1 AND section = 'core' AND status = 200
+		AND body IS NOT NULL AND COALESCE(parse_v, 1) = 1`, uid)
+	if err != nil {
+		return
+	}
+	counts := map[string]int{}
+	pages := 0
+	for rows.Next() {
+		var b string
+		if rows.Scan(&b) != nil {
+			continue
+		}
+		pages++
+		seen := map[string]bool{}
+		for _, l := range strings.Split(html.UnescapeString(b), "\n") {
+			if l = strings.TrimSpace(l); l != "" && !seen[l] {
+				seen[l] = true
+				counts[l]++
+			}
+		}
+	}
+	rows.Close()
+	if pages < 10 {
+		return
+	}
+	n := 0
+	for l, c := range counts {
+		if c*2 >= pages {
+			db.Exec(`INSERT INTO twoai_company_site_chrome (uid, line, pages) VALUES ($1, $2, $3)
+				ON CONFLICT (uid, line) DO UPDATE SET pages = EXCLUDED.pages`, uid, l, c)
+			n++
+		}
+	}
+	fmt.Printf("twoai_company_sitemap: learned %d chrome lines from %d core pages\n", n, pages)
+}
+
+// twoaiSitemapStripChrome removes the site's chrome lines from page text.
+func twoaiSitemapStripChrome(text string, chrome map[string]bool) string {
+	var keep []string
+	for _, l := range strings.Split(text, "\n") {
+		if t := strings.TrimSpace(l); t != "" && chrome[t] {
+			continue
+		}
+		keep = append(keep, l)
+	}
+	return strings.TrimSpace(nlRe.ReplaceAllString(strings.Join(keep, "\n"), "\n\n"))
 }
 
 // twoaiSitemapEvents writes each dated press release to the company events
@@ -489,11 +609,15 @@ func twoaiSitemapWorks(db *sql.DB, uid string) int {
 
 // twoaiSitemapInnovations reads dated milestones from the company's own
 // timeline pages, once per version of each page.
-func twoaiSitemapInnovations(db *sql.DB, uid, name string) int {
+func twoaiSitemapInnovations(db *sql.DB, uid, name string, until time.Time) int {
 	rows, err := db.Query(`SELECT url, body, body_hash FROM twoai_company_site_urls
 		WHERE uid = $1 AND status = 200 AND body IS NOT NULL
-		  AND (url ~* 'timeline' OR url ~* 'years-of-innovation' OR url ~* 'history')
-		  AND NOT EXISTS (SELECT 1 FROM twoai_company_innovations i WHERE i.uid = $1 AND i.source_url = url AND i.body_hash = body_hash)`, uid)
+		  AND url ~* $2 AND COALESCE(parse_v, 1) = $3
+		  AND NOT EXISTS (SELECT 1 FROM twoai_company_innovation_reads r WHERE r.url = twoai_company_site_urls.url AND r.body_hash = twoai_company_site_urls.body_hash)
+		ORDER BY url LIMIT 15`,
+		// Fifteen pages a run keeps the model calls inside the stage's ten
+		// minutes; SRI's sixty history pages take four runs.
+		uid, twoaiSitemapInnovationURL, twoaiSitemapParseV)
 	if err != nil {
 		return twoaiSitemapInnovationCount(db, uid)
 	}
@@ -510,6 +634,9 @@ func twoaiSitemapInnovations(db *sql.DB, uid, name string) int {
 [{"year": 1969, "title": "short name of the innovation, in the page's own words", "detail": "one plain sentence on what it was, from the page"}]
 HARD RULES: only innovations the page itself states with a year; the year and the title words must appear in the page text; never add anything from general knowledge; no hyphens in prose.`
 	for _, p := range pages {
+		if time.Now().After(until) {
+			break
+		}
 		raw, model, err := twoaiGenerate("COMPANY_INNOVATIONS", system, fmt.Sprintf("COMPANY: %s\nPAGE: %s\n\nTEXT:\n%s", name, p.url, trunc(p.body, 24000)))
 		if err != nil {
 			fmt.Printf("twoai_company_sitemap innovations %s: %v\n", p.url, err)
@@ -541,8 +668,8 @@ HARD RULES: only innovations the page itself states with a year; the year and th
 				uid, it.Year, trunc(it.Title, 200), trunc(strings.TrimSpace(it.Detail), 400), p.url, model, p.hash)
 		}
 		// Recorded as read even when nothing passed, so the page is not
-		// sent again until it changes.
-		db.Exec(`UPDATE twoai_company_innovations SET body_hash = $3 WHERE uid = $1 AND source_url = $2`, uid, p.url, p.hash)
+		// sent to the model again until it changes.
+		db.Exec(`INSERT INTO twoai_company_innovation_reads (url, body_hash) VALUES ($1, $2) ON CONFLICT DO NOTHING`, p.url, p.hash)
 	}
 	return twoaiSitemapInnovationCount(db, uid)
 }
