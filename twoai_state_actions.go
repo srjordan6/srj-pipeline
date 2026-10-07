@@ -187,10 +187,16 @@ func twoaiGovWatch(db *sql.DB) error {
 	alive, dead, live, cands, docs := 0, 0, 0, 0, 0
 	var deadNotes []string
 	for _, f := range feeds {
-		status, items, body, ferr := 0, []twoaiFeedItem(nil), []byte(nil), error(nil)
-		url := f.url
+		status, items, ferr := 0, []twoaiFeedItem(nil), error(nil)
+		url, declared := f.url, ""
 		if url == "" {
-			// Probe: the declared feed in the home page's head, else /feed/.
+			// PROBE FROM OUR OWN LIST, NEVER FROM THE PAGE. The newsroom's home
+			// page may declare a feed in its head; that address is read here
+			// only to be written in the note, because a URL taken from a
+			// response body and then fetched is a request the remote page
+			// chose (CodeQL go/request-forgery). The fetch goes to the usual
+			// feed paths under the newsroom itself, and a declared feed that
+			// is not one of them is a line in the note for a person to add.
 			req, _ := http.NewRequest("GET", f.home, nil)
 			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; theworldofai.org government watch; info@srjconsultingservices.com)")
 			if resp, err := client.Do(req); err == nil {
@@ -198,26 +204,33 @@ func twoaiGovWatch(db *sql.DB) error {
 				resp.Body.Close()
 				status = resp.StatusCode
 				if resp.StatusCode == 200 {
-					url = twoaiDiscoverFeedInHTML(f.home, b)
+					declared = twoaiDiscoverFeedInHTML(f.home, b)
 				}
 			} else {
 				ferr = err
 			}
-			if url == "" && ferr == nil {
-				url = strings.TrimRight(f.home, "/") + "/feed/"
+			if ferr == nil {
+				base := strings.TrimRight(f.home, "/")
+				for _, cand := range []string{base + "/feed/", base + "/feed", base + "/rss.xml", base + "/rss", base + "/news/feed/", base + "/newsroom/feed/", base + "/press-releases/feed/", base + "/news/rss.xml"} {
+					if st, its, _, err := twoaiFetchFeed(client, cand); err == nil && len(its) > 0 {
+						url, status, items = cand, st, its
+						break
+					}
+				}
 			}
+		} else {
+			status, items, _, ferr = twoaiFetchFeed(client, url)
 		}
-		if url != "" {
-			status, items, body, ferr = twoaiFetchFeed(client, url)
-		}
-		_ = body
 		if ferr != nil || len(items) == 0 {
 			dead++
-			note := "no feed found"
+			note := "no feed at the usual paths"
 			if ferr != nil {
 				note = trunc(ferr.Error(), 160)
-			} else if len(items) == 0 {
+			} else if url != "" {
 				note = "feed answered with no items"
+			}
+			if declared != "" {
+				note += "; the page declares " + declared + ", add it to twoai_gov_feeds.feed_url if it is the newsroom feed"
 			}
 			deadNotes = append(deadNotes, fmt.Sprintf("%s (%s: %s)", f.code, url, note))
 			db.Exec(`UPDATE twoai_gov_feeds SET probed_at=now(), probe_status=$2, probe_note=$3, last_items=0 WHERE code=$1`, f.code, status, note)
