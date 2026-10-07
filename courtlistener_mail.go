@@ -24,6 +24,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -31,7 +32,7 @@ import (
 
 var (
 	clMailSubjectRe = regexp.MustCompile(`(?i)new docket entr(?:y|ies) for (.+?)(?:\s*\(([^)]*)\))?\s*$`)
-	clMailDocketRe  = regexp.MustCompile(`courtlistener\.com/docket/(\d+)/`)
+	clMailPathRe    = regexp.MustCompile(`^/docket/(\d+)/`)
 	clMailDocNoRe   = regexp.MustCompile(`(?i)^(?:document|doc\.?|entry)\s*(?:number|no\.?|#)?\s*[:#]?\s*(\d+)\s*$`)
 	clMailDateRe    = regexp.MustCompile(`(?i)^(?:date\s+)?filed\s*[:]?\s*(.+?)\s*$`)
 	clMailDescRe    = regexp.MustCompile(`(?i)^description\s*[:]\s*(.+?)\s*$`)
@@ -89,9 +90,7 @@ func clMailDate(s string) string {
 // are read by label; a description with no label is the last line of text
 // before the entry's document number or date.
 func clParseAlertMail(text string) (docket string, entries []clEntry) {
-	if m := clMailDocketRe.FindStringSubmatch(text); m != nil {
-		docket = m[1]
-	}
+	docket = clMailDocketID(text)
 	var cur clEntry
 	var curNo, lastText string
 	flush := func() {
@@ -186,4 +185,28 @@ func clAlertMail(db *sql.DB, msgID, from, subject, text string) (int, error) {
 		clNoteChange(db, fmt.Sprintf("email: %d entries for %s", n, slug))
 	}
 	return n, nil
+}
+
+// clMailDocketID finds the CourtListener docket id in the mail: the first
+// link whose host is courtlistener.com and whose path is /docket/<id>/. The
+// host is compared whole after parsing, not matched by a pattern in the
+// text, so a link to another site that mentions the name does not count.
+func clMailDocketID(text string) string {
+	for _, tok := range strings.FieldsFunc(text, func(r rune) bool { return r == ' ' || r == '\n' || r == '\t' || r == '<' || r == '>' || r == '"' || r == ')' || r == '(' }) {
+		if !strings.HasPrefix(tok, "http://") && !strings.HasPrefix(tok, "https://") {
+			continue
+		}
+		u, err := url.Parse(tok)
+		if err != nil {
+			continue
+		}
+		host := strings.ToLower(u.Hostname())
+		if host != "courtlistener.com" && host != "www.courtlistener.com" {
+			continue
+		}
+		if m := clMailPathRe.FindStringSubmatch(u.Path); m != nil {
+			return m[1]
+		}
+	}
+	return ""
 }
