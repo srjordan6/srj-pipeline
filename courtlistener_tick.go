@@ -20,6 +20,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -56,6 +57,42 @@ func clTick(db *sql.DB) {
 	}
 	if entries > 0 {
 		clNoteChange(db, fmt.Sprintf("webhook: %d entries", entries))
+	}
+	clReparseAlertMail(db)
+}
+
+// clReparseAlertMail gives a stored alert mail the parser could not read one
+// more try after the parser changes: rows with parsed=0 whose note still says
+// no entries were read. The raw text is kept for exactly this.
+func clReparseAlertMail(db *sql.DB) {
+	rows, err := db.Query(`SELECT message_id, COALESCE(from_addr,''), COALESCE(subject,''), COALESCE(raw,'') FROM cl_alert_emails
+		WHERE parsed = 0 AND raw IS NOT NULL AND COALESCE(note,'') LIKE '%no entries read%' AND COALESCE(note,'') NOT LIKE '%reparse%' LIMIT 20`)
+	if err != nil {
+		return
+	}
+	type row struct{ id, from, subject, raw string }
+	var rs []row
+	for rows.Next() {
+		var r row
+		if rows.Scan(&r.id, &r.from, &r.subject, &r.raw) == nil {
+			rs = append(rs, r)
+		}
+	}
+	rows.Close()
+	for _, r := range rs {
+		docket, entries := clParseAlertMail(r.raw)
+		if len(entries) == 0 {
+			db.Exec(`UPDATE cl_alert_emails SET note = note || '; reparse ' || $2 || ': still no entries' WHERE message_id = $1`, r.id, time.Now().UTC().Format("2006-01-02"))
+			continue
+		}
+		ej, _ := json.Marshal(entries)
+		db.Exec(`UPDATE cl_alert_emails SET entries = $2::jsonb, parsed = $3, docket_id = COALESCE(docket_id, NULLIF($4,'')), note = 'reparse ' || $5 || ': ' || $3 || ' entries read' WHERE message_id = $1`,
+			r.id, string(ej), len(entries), docket, time.Now().UTC().Format("2006-01-02"))
+		n, slug := clApplyMailEntries(db, r.id, docket, entries)
+		if n > 0 {
+			fmt.Printf("cl_mail reparse %s: %d new docket entries\n", slug, n)
+			clNoteChange(db, fmt.Sprintf("email: %d entries for %s", n, slug))
+		}
 	}
 }
 
