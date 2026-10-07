@@ -146,10 +146,10 @@ func twoaiCoverageAudit(db *sql.DB) error {
 			if outcome == "" {
 				if err := db.QueryRow(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, published_at, fetched_at, raw)
 					SELECT $1, md5($2), md5($2), $2, $3, $4::date, now(),
-					       jsonb_build_object('url', $2, 'date', $4 || 'T12:00:00Z', 'title', $3, 'domain', $5, 'intake', 'coverage_audit',
+					       jsonb_build_object('url', $2, 'date', $8 || 'T12:00:00Z', 'title', $3, 'domain', $5, 'intake', 'coverage_audit',
 					                          'query', $6, 'hand', 'twoai_coverage_audit ' || $7 || ': not in our stories or corpus of the last 72 hours')
 					WHERE NOT EXISTS (SELECT 1 FROM pipeline.documents WHERE url=$2) RETURNING id`,
-					sourceID, link, title, date, publisherFromURL(link), src.name, today).Scan(&docID); err == nil && docID.Valid {
+					sourceID, link, title, date, publisherFromURL(link), src.name, today, date).Scan(&docID); err == nil && docID.Valid {
 					outcome = "harvested"
 					harvested++
 					held[canon] = true
