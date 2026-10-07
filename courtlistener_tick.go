@@ -87,8 +87,10 @@ func clReparseAlertMail(db *sql.DB) {
 			continue
 		}
 		ej, _ := json.Marshal(entries)
-		db.Exec(`UPDATE cl_alert_emails SET entries = $2::jsonb, parsed = $3, docket_id = COALESCE(docket_id, NULLIF($4,'')), note = 'reparse ' || $5 || ': ' || $3 || ' entries read' WHERE message_id = $1`,
-			r.id, string(ej), len(entries), docket, time.Now().UTC().Format("2006-01-02"))
+		if _, err := db.Exec(`UPDATE cl_alert_emails SET entries = $2::jsonb, parsed = $3, docket_id = COALESCE(docket_id, NULLIF($4,'')), note = 'reparse ' || $5 || ': ' || $3::text || ' entries read' WHERE message_id = $1`,
+			r.id, string(ej), len(entries), docket, time.Now().UTC().Format("2006-01-02")); err != nil {
+			fmt.Fprintln(os.Stderr, "cl_mail reparse note:", err)
+		}
 		n, slug := clApplyMailEntries(db, r.id, docket, entries)
 		if n > 0 {
 			fmt.Printf("cl_mail reparse %s: %d new docket entries\n", slug, n)
