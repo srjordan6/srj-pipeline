@@ -1415,6 +1415,13 @@ func main() {
 			fmt.Fprintln(os.Stderr, "inkbox_tick: pull:", err)
 		}
 		clBuildIfPending(db)
+		// THE TICK'S HEARTBEAT IS A ROW, NOT A LOG LINE (row 573, 2026-10-07):
+		// a quiet tick writes nothing to pipeline.log by design, so the only
+		// evidence that the five-minute task still fires was a file on the
+		// PC. pipeline_stage_runs.inkbox_tick is stamped every tick and the
+		// daily freshness row reads it.
+		db.Exec(`INSERT INTO pipeline_stage_runs (stage, last_run_date, last_run_at) VALUES ('inkbox_tick', current_date, now())
+			ON CONFLICT (stage) DO UPDATE SET last_run_date = current_date, last_run_at = now()`)
 		if err := inkboxOutbox(db); err != nil {
 			fmt.Fprintln(os.Stderr, "inkbox_tick: outbox:", err)
 			os.Exit(1)
