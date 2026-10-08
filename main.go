@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/lib/pq"
@@ -8789,6 +8790,43 @@ var twoaiThemeRules = []struct {
 		regexp.MustCompile(`(?i)copyright|intellectual property|authorship|royalt|licens(e|ing) of works`)},
 }
 
+// twoaiBillDetail turns a LegiScan description into something a reader can
+// use. Ohio writes every description as "To amend sections 141.16, 1301.101,
+// ... of the Revised Code to make changes to ..." and can list a hundred
+// section numbers before the first word about the bill; Michigan appends
+// "Amends secs. ... (MCL ...)" and "TIE BAR WITH: HB 6390'26" to the title.
+// The section citations go, the first letter of what is left is capitalised,
+// and the text is capped at a sentence boundary. The words that remain are
+// still the legislature's own.
+var (
+	billAmendRe = regexp.MustCompile(`(?is)^to (?:amend|enact|repeal|create)\b.*\bof the revised code\b[,;.]?\s*(?:and\s+)?(?:to\s+)?`)
+	billSectRe  = regexp.MustCompile(`(?is)\s*(?:\b(?:amends?|adds?|repeals?)\s+(?:title\s+&\s+)?secs?\..*|\bTIE BAR WITH:.*)$`)
+)
+
+func twoaiBillDetail(s string) string {
+	s = strings.TrimSpace(s)
+	if m := billAmendRe.FindStringIndex(s); m != nil {
+		s = strings.TrimSpace(s[m[1]:])
+	}
+	s = strings.TrimSpace(billSectRe.ReplaceAllString(s, ""))
+	r := []rune(s)
+	if len(r) == 0 {
+		return ""
+	}
+	r[0] = unicode.ToUpper(r[0])
+	const max = 420
+	if len(r) > max {
+		cut := string(r[:max])
+		if i := strings.LastIndexAny(cut, ".;"); i > 120 {
+			cut = cut[:i+1]
+		} else if i := strings.LastIndex(cut, " "); i > 0 {
+			cut = cut[:i] + "\u2026"
+		}
+		return cut
+	}
+	return string(r)
+}
+
 func twoaiClassify(text string) []string {
 	var out []string
 	for _, r := range twoaiThemeRules {
@@ -10113,12 +10151,22 @@ func twoaiWeeks(db *sql.DB, today string, upsert func(path, kind string, v any) 
 			}
 			item := weekItem{State: name, Number: strings.Join(head[1:], " "), URL: url, Date: date}
 			if len(parts) == 2 {
-				item.Title = strings.TrimSpace(parts[1])
+				item.Title = strings.TrimSpace(billSectRe.ReplaceAllString(parts[1], ""))
+			}
+			// THE SAME GATE THE EVENTS USE. The corpus is keyword-matched at
+			// ingest, so a week's rows held the Budget Act, the Golden Gate
+			// Bridge district, a UCC revision and a gaming omnibus beside the
+			// AI bills (Stephen, 2026-10-08: "that looks terrible"). A bill
+			// is listed only when its title or description carries AI or
+			// privacy subject matter, the rule twoaiBillRelevant already
+			// applies before a bill becomes news.
+			if ok, _ := twoaiBillRelevant(item.Title, descr); !ok && !mentionsPrivacy(item.Title+" "+descr) {
+				continue
 			}
 			// LegiScan's description repeats the title on most bills. Carry it
 			// only when it actually adds something, so the page does not print
 			// the same sentence twice under a heading that promises more.
-			if d := strings.TrimSpace(descr); d != "" && !strings.EqualFold(d, item.Title) {
+			if d := twoaiBillDetail(descr); d != "" && !strings.EqualFold(d, item.Title) {
 				item.Detail = d
 			}
 			item.Themes = twoaiClassify(item.Title + " " + item.Detail)
