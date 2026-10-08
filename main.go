@@ -2939,8 +2939,17 @@ func publishNews(db *sql.DB) error {
 	// would have carried it.
 	if len(cls) > 10 {
 		rest := []*cluster{}
+		// AN EDITOR'S STORY IS NEVER CUT BY THE CAP. Hand documents grouped
+		// for one event (raw.hand_group) were added because the feeds missed
+		// it; on 2026-10-08 the Trahan CLAIM Act (3 newsrooms) and the
+		// National Compute Grid (5) clustered and then fell off the end of a
+		// briefing that already had ten wide-coverage stories. They publish
+		// beyond the twenty when they must.
+		hand := []*cluster{}
 		for _, c := range cls[10:] {
-			if newsrooms(c) >= 3 {
+			if handGroup(c) != "" {
+				hand = append(hand, c)
+			} else if newsrooms(c) >= 3 {
 				rest = append(rest, c)
 			}
 		}
@@ -2949,6 +2958,7 @@ func publishNews(db *sql.DB) error {
 			rest = rest[:10]
 		}
 		cls = append(cls[:10:10], rest...)
+		cls = append(cls, hand...)
 		if len(rest) > 0 {
 			fmt.Printf("publishNews: %d wide-coverage stories added below the top ten\n", len(rest))
 		}
@@ -5332,6 +5342,16 @@ func twoaiBuild(db *sql.DB) error {
 					// districts is not Utah AI policy.
 					if !pins[slug][s.uid] && !twoaiStateStory(nameRe, policy, s.head, text) {
 						continue
+					}
+					// A story that names the state only in a summary sentence
+					// ("a Utah law enacted in July also prohibits the devices")
+					// is a passing mention, and a passing mention is news for a
+					// month, not a year (Stephen, 2026-10-08: the school
+					// cellphone piece of 2026-09-15 still sat on Utah's page).
+					if !pins[slug][s.uid] && !nameRe.MatchString(s.head) && len(s.date) >= 10 {
+						if d, perr := time.Parse("2006-01-02", s.date[:10]); perr == nil && time.Since(d) > 30*24*time.Hour {
+							continue
+						}
 					}
 					var home *event
 					for _, e := range events {
