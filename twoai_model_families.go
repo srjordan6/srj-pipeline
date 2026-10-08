@@ -62,14 +62,27 @@ var famCats = []famCat{
 	// Multimodal: more than one input modality, the rule twoai_models uses
 	// for the section's own API table (len(InputMods) > 1).
 	{"multimodal-models", "Multimodal Models", "62d0f0ce", "models/multimodal-models.json", func(m famMember) bool { return len(m.In) > 1 }},
+	// Vision: the model takes images in. Opened by Stephen on 2026-10-08
+	// ("no family of models" on the Vision Models page). Families already
+	// paged under Multimodal appear here as "also in this category"; the
+	// ten counted here are the image-input lines not yet paged.
+	{"vision-models", "Vision Models", "4e095e6f", "models/vision-models.json", func(m famMember) bool {
+		for _, in := range m.In {
+			if in == "image" {
+				return true
+			}
+		}
+		return false
+	}},
 }
 
 // famOpen is how many of famCats are open. One category at a time, and the
 // next only when Stephen says so: he reviewed the Large Language Models ten
 // on 2026-10-03 ("look fine"), which opened Reasoning Models, and approved
 // the Reasoning Models ten the same evening (theworldofai row 422), which
-// opened Multimodal Models. Nothing beyond Multimodal until he has seen its ten.
-const famOpen = 3
+// opened Multimodal Models. Vision Models opened 2026-10-08 when he asked
+// why that page had no families. Nothing beyond Vision until he says so.
+const famOpen = 4
 
 func famCatBySlug(slug string) famCat {
 	for _, c := range famCats {
