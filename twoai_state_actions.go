@@ -229,11 +229,13 @@ func twoaiGovWatch(db *sql.DB) error {
 			} else if url != "" {
 				note = "feed answered with no items"
 			}
-			if declared != "" {
-				note += "; the page declares " + declared + ", add it to twoai_gov_feeds.feed_url if it is the newsroom feed"
-			}
 			deadNotes = append(deadNotes, fmt.Sprintf("%s (%s: %s)", f.code, url, note))
-			db.Exec(`UPDATE twoai_gov_feeds SET probed_at=now(), probe_status=$2, probe_note=$3, last_items=0 WHERE code=$1`, f.code, status, note)
+			// The declared feed, if any, is appended in SQL: a value composed in
+			// Go and passed as an argument reads to the scanner as a query built
+			// from strings (row 586), even where it is bound.
+			db.Exec(`UPDATE twoai_gov_feeds SET probed_at=now(), probe_status=$2, last_items=0,
+				probe_note = $3 || CASE WHEN $4 <> '' THEN '; the page declares ' || $4 || ', add it to twoai_gov_feeds.feed_url if it is the newsroom feed' ELSE '' END
+				WHERE code=$1`, f.code, status, note, declared)
 			continue
 		}
 		alive++

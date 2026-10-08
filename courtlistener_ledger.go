@@ -53,6 +53,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sort"
@@ -105,10 +106,16 @@ var clTiers = map[string]clMembership{
 	// 10/min, 75/hour, 300/day. Seven seconds apart is under 9 a minute.
 	// The alerts share subscribes about 150 dockets over three days, then
 	// sits nearly idle and rolls to the refresh each evening.
-	"1": {Day: 300, Hour: 75, Spacing: 7 * time.Second,
-		Shares: map[string]int{clBucketRefresh: 130, clBucketRecap: 50, clBucketDiscovery: 25, clBucketClassify: 25,
-			clBucketAlerts: 60, clBucketReserve: 10},
-		HourCaps: map[string]int{clBucketRefresh: 45, clBucketAlerts: 20}},
+	// TIER 1 LEAVES 30 OF ITS 300 TO THE CONNECTOR. theworldofai row 583
+	// (2026-10-08): Stephen's CourtListener MCP connector authenticates as
+	// the same account, so its reads count against the same 300 a day. The
+	// pipeline keeps 270 and splits them as asked: refresh 150, recap 50,
+	// discovery 30, classify 25, alerts 15. The ~150 dockets are subscribed,
+	// so the alerts share now only covers new cases and resubscriptions.
+	"1": {Day: 270, Hour: 75, Spacing: 7 * time.Second,
+		Shares: map[string]int{clBucketRefresh: 150, clBucketRecap: 50, clBucketDiscovery: 30, clBucketClassify: 25,
+			clBucketAlerts: 15, clBucketReserve: 0},
+		HourCaps: map[string]int{clBucketRefresh: 45, clBucketAlerts: 15}},
 	// 15/min, 150/hour, 600/day.
 	"2": {Day: 600, Hour: 150, Spacing: 5 * time.Second,
 		Shares: map[string]int{clBucketRefresh: 300, clBucketRecap: 120, clBucketDiscovery: 50, clBucketClassify: 50,
@@ -505,7 +512,80 @@ func clUsageToday(db *sql.DB, now time.Time) clDayUse {
 		rows.Close()
 	}
 	u.Latched = u.Status[http.StatusTooManyRequests] > 0
+	// THE CONNECTOR'S CALLS ARE NOT IN THE LEDGER (row 583). When CourtListener
+	// reports more use today than the ledger recorded, the difference is
+	// charged to an "external" share that no stage may spend, so the day's
+	// room shrinks by exactly what the connector took. The live figure comes
+	// from CL_USAGE_URL, the usage endpoint the connector reads (its answer
+	// carries limits with rate "300/day" and a used count); unset, or
+	// unreachable, the ledger counts only itself, as before.
+	if live, ok := clLiveUsedToday(); ok && live > u.Total {
+		u.By["external"] = live - u.Total
+		u.Total = live
+	}
 	return u
+}
+
+var (
+	clLiveOnce   sync.Once
+	clLiveUsed   int
+	clLiveOK     bool
+	clLiveClient = &http.Client{Timeout: 20 * time.Second}
+)
+
+// clLiveUsedToday reads today's used count for the account from the
+// CourtListener usage endpoint, once per process. It is not charged to the
+// ledger: the usage check has its own small limit and never spends the
+// account's quota.
+func clLiveUsedToday() (int, bool) {
+	clLiveOnce.Do(func() {
+		u := strings.TrimSpace(os.Getenv("CL_USAGE_URL"))
+		tok := os.Getenv("COURTLISTENER_TOKEN")
+		if u == "" || tok == "" {
+			return
+		}
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("Authorization", "Token "+tok)
+		req.Header.Set("User-Agent", "SRJ-Consulting-intel-sync/1.0 (srjconsultingservices.com)")
+		resp, err := clLiveClient.Do(req)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "courtlistener usage:", err)
+			return
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode != 200 {
+			fmt.Fprintf(os.Stderr, "courtlistener usage: http %d %s\n", resp.StatusCode, trunc(string(raw), 120))
+			return
+		}
+		var doc map[string]any
+		if json.Unmarshal(raw, &doc) != nil {
+			return
+		}
+		// Either the connector's shape ({current_usage: {user: {limits: [...]}}})
+		// or a bare list of limits; the "/day" entry is the one that matters.
+		var limits []any
+		if cu, ok := doc["current_usage"].(map[string]any); ok {
+			if user, ok := cu["user"].(map[string]any); ok {
+				limits, _ = user["limits"].([]any)
+			}
+		}
+		if limits == nil {
+			limits, _ = doc["limits"].([]any)
+		}
+		for _, l := range limits {
+			m, _ := l.(map[string]any)
+			if rate, _ := m["rate"].(string); strings.HasSuffix(rate, "/day") {
+				if used, ok := m["used"].(float64); ok {
+					clLiveUsed, clLiveOK = int(used), true
+				}
+			}
+		}
+	})
+	return clLiveUsed, clLiveOK
 }
 
 // clUsageLine is the one line every CourtListener stage ends on and the
