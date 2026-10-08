@@ -39,6 +39,15 @@ import (
 	"time"
 )
 
+// vendorBioRe recognises an author biography served as the page description.
+// Tom's Hardware puts the writer's bio in og:description on every post, so
+// 145 posts said "Etiido Uko is a mechanical engineer and senior technical
+// writer with over nine years of experience" in the box headed "In Tom's
+// Hardware's words" (Stephen, 2026-10-08). A bio is about the writer, not
+// the post; it is treated like a site-wide tagline and the body path writes
+// our sentence instead.
+var vendorBioRe = regexp.MustCompile(`(?i)^(?:[A-Z][\w'\x{2019}.-]*\s){1,4}(?:is|was|has been)\s(?:(?:a|an|the|currently|now)\s)?[^.]{0,80}?\b(?:writer|editor|journalist|reporter|contributor|correspondent|columnist|analyst|engineer|gamer|enthusiast|freelancer|blogger)\b|^(?:[A-Z][\w'\x{2019}.-]*\s){1,4}has been (?:playing|writing|covering|building|reporting|working)\b|\b(?:deeply passionate|deep-seated passion)\b`)
+
 var (
 	vendorMetaRe = regexp.MustCompile(`(?is)<meta[^>]+(?:property|name)\s*=\s*["'](og:description|twitter:description|description)["'][^>]*>`)
 	vendorContRe = regexp.MustCompile(`(?is)content\s*=\s*["']([^"']*)["']`)
@@ -290,6 +299,9 @@ func twoaiVendorEnrich(db *sql.DB) error {
 				WHERE vendor=(SELECT vendor FROM twoai_vendor_posts WHERE slug=$1) AND summary=$2 AND slug <> $1`,
 				p.slug, desc).Scan(&dupes)
 			boilerplate = dupes > 0
+		}
+		if vendorBioRe.MatchString(desc) {
+			boilerplate = true
 		}
 
 		// THE BODY IS THE FALLBACK, AND FOR SOME VENDORS IT IS THE ONLY PATH.
