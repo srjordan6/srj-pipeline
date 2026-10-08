@@ -101,6 +101,38 @@ func legiscanAdd(db *sql.DB, args []string) error {
 			fmt.Printf("legiscan_add: %s %s not in the current session; using bill_id %d from the corpus\n", state, bill, billID)
 		}
 	}
+	// getSearch is a text search and does not always index a bill number
+	// (CA AB1864, 2026-10-08: in the current session, not found by number).
+	// getMasterList lists every bill of the state's current session with its
+	// bill_id in one call, so the number is matched there before giving up.
+	if billID == 0 {
+		mu := fmt.Sprintf("https://api.legiscan.com/?key=%s&op=getMasterList&state=%s", key, state)
+		if mresp, merr := client.Get(mu); merr == nil {
+			mb, _ := io.ReadAll(mresp.Body)
+			mresp.Body.Close()
+			var ml struct {
+				Status     string                     `json:"status"`
+				MasterList map[string]json.RawMessage `json:"masterlist"`
+			}
+			if json.Unmarshal(mb, &ml) == nil && ml.Status == "OK" {
+				for k, raw := range ml.MasterList {
+					if k == "session" {
+						continue
+					}
+					var r struct {
+						BillID     int    `json:"bill_id"`
+						Number     string `json:"number"`
+						ChangeHash string `json:"change_hash"`
+					}
+					if json.Unmarshal(raw, &r) == nil && strings.EqualFold(strings.ReplaceAll(r.Number, " ", ""), bill) {
+						billID, changeHash = r.BillID, r.ChangeHash
+						fmt.Printf("legiscan_add: %s %s found in the session master list as bill_id %d\n", state, bill, billID)
+						break
+					}
+				}
+			}
+		}
+	}
 	if billID == 0 {
 		return fmt.Errorf("LegiScan has no %s %s in the current session; pass its LegiScan bill_id as a third argument", state, bill)
 	}

@@ -2412,7 +2412,7 @@ func publishNews(db *sql.DB) error {
 	// old story does not hold the lead by age alone.
 	asOf := newsAsOf()
 	rows, err := db.Query(`SELECT d.title, d.url, to_char(d.published_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), d.raw->>'domain', coalesce(d.raw->>'persons',''), coalesce(d.raw->>'orgs',''),
-			d.fetched_at > $1::timestamptz - interval '36 hours'
+			d.fetched_at > $1::timestamptz - interval '36 hours', coalesce(d.raw->>'hand_group','')
 		FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
 		WHERE s.key='gdelt' AND d.title <> '' AND d.fetched_at > $1::timestamptz - interval '72 hours' AND d.fetched_at <= $1::timestamptz
 		ORDER BY d.id DESC LIMIT 5000`, asOf)
@@ -2423,9 +2423,16 @@ func publishNews(db *sql.DB) error {
 	// cand marks a vendor-news candidate read as coverage (no text, so it
 	// never heads a story or supplies the summary); fresh marks an article
 	// from the last 36 hours, the only ones the top-ten score counts.
+	// group is raw.hand_group: an editor who adds documents by hand names the
+	// event they report, and documents sharing a name form one cluster
+	// whatever their headlines say (see the merge loop). Added 2026-10-08:
+	// five hand documents on the FTC probe of the AI labs, three on the
+	// Trahan CLAIM Act and six on the National Compute Grid never became
+	// stories, because hand documents carry no GDELT people or organisations
+	// and their headlines were worded too differently to pass the token test.
 	type art struct {
-		Title, URL, Date, Domain, persons, orgs string
-		cand, fresh                             bool
+		Title, URL, Date, Domain, persons, orgs, group string
+		cand, fresh                                    bool
 	}
 	var arts []art
 	// Per-URL summary and lead text, for the story summary at the top of each
@@ -2466,7 +2473,7 @@ func publishNews(db *sql.DB) error {
 	for rows.Next() {
 		var a art
 		var d sql.NullString
-		if rows.Scan(&a.Title, &a.URL, &d, &a.Domain, &a.persons, &a.orgs, &a.fresh) == nil {
+		if rows.Scan(&a.Title, &a.URL, &d, &a.Domain, &a.persons, &a.orgs, &a.fresh, &a.group) == nil {
 			if !twoaiTitleIsAI(a.Title) || twoaiIsIndexPage(a.Title, a.URL) {
 				skipped++
 				continue
@@ -2752,6 +2759,14 @@ func publishNews(db *sql.DB) error {
 		commonAt = 5
 	}
 	commonNames := newsCommon(seedNames, commonAt)
+	handGroup := func(c *cluster) string {
+		for _, a := range c.arts {
+			if a.group != "" {
+				return a.group
+			}
+		}
+		return ""
+	}
 	rareWords := map[string]bool{}
 	{
 		df := map[string]int{}
@@ -2791,6 +2806,10 @@ func publishNews(db *sql.DB) error {
 				if d := oneOutlet(cls[i], cls[j]); d != "" {
 					same = newsSameOutletStory(cls[i].seed, cls[j].seed, seedEnt[i], seedEnt[j], d)
 				}
+				// Hand documents named for the same event belong together.
+				if g := handGroup(cls[i]); g != "" && g == handGroup(cls[j]) {
+					same = true
+				}
 				if !same {
 					continue
 				}
@@ -2808,6 +2827,8 @@ func publishNews(db *sql.DB) error {
 			}
 		}
 	}
+	// handGroup is the event name an editor gave a cluster's hand documents.
+	_ = handGroup
 	// Independent coverage, measured in distinct headlines. A wire item
 	// mirrored across fifty domains contributes one, so breadth reflects how
 	// many newsrooms wrote about a story rather than how efficiently a feed
@@ -12140,13 +12161,19 @@ func twoaiStateStory(nameRe, policy *regexp.Regexp, head, text string) bool {
 	if nameRe.MatchString(head) {
 		return policy.MatchString(text)
 	}
+	// A summary sentence has to name the state beside a government actor or
+	// instrument, not any policy word: "districts in Utah expanded cellphone
+	// bans" matched on "ban" and put a school cellphone piece on the Utah AI
+	// laws page for three weeks (Stephen, 2026-10-08).
 	for _, sent := range regexp.MustCompile(`[.!?]\s+|\n+`).Split(text, -1) {
-		if nameRe.MatchString(sent) && policy.MatchString(sent) {
+		if nameRe.MatchString(sent) && twoaiStateSentenceRe.MatchString(sent) {
 			return true
 		}
 	}
 	return false
 }
+
+var twoaiStateSentenceRe = regexp.MustCompile(`(?i)\b(law|laws|bill|bills|legislat\w*|executive order|governor|gov\.|attorney general|regulat\w*|statute|lawmakers|general assembly|state senate|state house|legislature)\b`)
 
 // pipelineBuildStamp names the running binary by its modification time, so a
 // tick can record which build it is. The source is not stamped at compile
