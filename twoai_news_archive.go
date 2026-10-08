@@ -173,9 +173,15 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 					VALUES ($1,$2,$3::jsonb,$4::date,$5)
 					ON CONFLICT (slug) DO UPDATE SET
 						headline=EXCLUDED.headline,
-						story=CASE WHEN twoai_news_stories.story ? 'why_it_matters'
-							THEN EXCLUDED.story || jsonb_build_object('why_it_matters', twoai_news_stories.story->'why_it_matters')
-							ELSE EXCLUDED.story END,
+						-- An editor's summary (summary_by, Stephen 2026-10-08) survives
+						-- the refresh the same way why_it_matters does.
+						story=EXCLUDED.story
+							|| CASE WHEN twoai_news_stories.story ? 'why_it_matters'
+							   THEN jsonb_build_object('why_it_matters', twoai_news_stories.story->'why_it_matters') ELSE '{}'::jsonb END
+							|| CASE WHEN twoai_news_stories.story ? 'summary_by'
+							   THEN jsonb_build_object('Summary', twoai_news_stories.story->'Summary', 'SummaryURL', twoai_news_stories.story->'SummaryURL',
+							                           'SummaryDomain', twoai_news_stories.story->'SummaryDomain', 'summary_by', twoai_news_stories.story->'summary_by')
+							   ELSE '{}'::jsonb END,
 						last_seen=now(),
 						uid=COALESCE(twoai_news_stories.uid, EXCLUDED.uid)`,
 					slug, headline, string(raw), pub, twoaiUID("story:"+slug)); err != nil {
