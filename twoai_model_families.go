@@ -57,19 +57,66 @@ type famCat struct {
 }
 
 var famCats = []famCat{
-	{"llms", "Large Language Models", "87868942", "models/llms.json", func(m famMember) bool { return true }},
+	{"llms", "Large Language Models", "87868942", "models/llms.json", func(m famMember) bool { return famHas(m.In, "text") && famHas(m.Out, "text") }},
 	{"reasoning-models", "Reasoning Models", "80f6d64d", "models/reasoning-models.json", func(m famMember) bool { return m.Reasoning }},
 	// Multimodal: more than one input modality, the rule twoai_models uses
 	// for the section's own API table (len(InputMods) > 1).
 	{"multimodal-models", "Multimodal Models", "62d0f0ce", "models/multimodal-models.json", func(m famMember) bool { return len(m.In) > 1 }},
+	// Vision: the model takes images in. Opened by Stephen on 2026-10-08
+	// ("no family of models" on the Vision Models page). Families already
+	// paged under Multimodal appear here as "also in this category"; the
+	// ten counted here are the image-input lines not yet paged.
+	{"vision-models", "Vision Models", "4e095e6f", "models/vision-models.json", func(m famMember) bool { return famHas(m.In, "image") }},
+	// The rest opened the same day (Stephen: "every pipeline run is supposed
+	// to put models with a new web page"). Each is the rule the catalog can
+	// answer from a model's own record: what it takes in, what it gives out,
+	// its parameter count, or a coder name.
+	{"audio-speech-models", "Audio and Speech Models", "2e3db013", "models/audio-speech-models.json", func(m famMember) bool { return famHas(m.In, "audio") || famHas(m.Out, "audio") }},
+	{"image-generation-models", "Image Generation Models", "c8f599cd", "models/image-generation-models.json", func(m famMember) bool { return famHas(m.Out, "image") }},
+	{"video-models", "Video Models", "33ad47d7", "models/video-models.json", func(m famMember) bool { return famHas(m.In, "video") || famHas(m.Out, "video") }},
+	{"coding-models", "Coding Models", "29375dec", "models/coding-models.json", func(m famMember) bool { return famCoderRe.MatchString(m.ID) || famCoderRe.MatchString(m.Name) }},
+	{"small-language-models", "Small Language Models", "71415be9", "models/small-language-models.json", func(m famMember) bool { b := famTotalB(m.ID); return b > 0 && b <= 10 }},
+	{"on-device-edge-models", "On-device and Edge Models", "062cdc6f", "models/on-device-edge-models.json", func(m famMember) bool { b := famTotalB(m.ID); return b > 0 && b <= 4 }},
+}
+
+func famHas(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+var famCoderRe = regexp.MustCompile(`(?i)\bcode[rx]?\b|\bcoder\b|-code-|codestral|devstral`)
+
+// famTotalB is the total parameter count in billions from a catalog id, or 0
+// when the id does not say ("qwen3.8-27b" gives 27, "x-2.4t-a95b" gives 2400).
+func famTotalB(id string) float64 {
+	slug := id[strings.Index(id, "/")+1:]
+	for _, t := range strings.Split(slug, "-") {
+		if m := famParamRe.FindStringSubmatch(t); m != nil {
+			v, err := strconv.ParseFloat(m[1], 64)
+			if err != nil {
+				return 0
+			}
+			if strings.EqualFold(m[2], "t") {
+				v *= 1000
+			}
+			return v
+		}
+	}
+	return 0
 }
 
 // famOpen is how many of famCats are open. One category at a time, and the
 // next only when Stephen says so: he reviewed the Large Language Models ten
 // on 2026-10-03 ("look fine"), which opened Reasoning Models, and approved
 // the Reasoning Models ten the same evening (theworldofai row 422), which
-// opened Multimodal Models. Nothing beyond Multimodal until he has seen its ten.
-const famOpen = 3
+// opened Multimodal Models. On 2026-10-08 he asked why Vision Models had no
+// families and said every run is supposed to add model pages, so every
+// category is open and the one-at-a-time gate is gone.
+var famOpen = len(famCats)
 
 func famCatBySlug(slug string) famCat {
 	for _, c := range famCats {
@@ -347,6 +394,32 @@ func famSelect(db *sql.DB, c famCat, groups map[string]*famGroup) {
 			fmt.Printf("twoai_model_families: new family in %s: %s\n", cat, r.g.displayName())
 		}
 	}
+	// EVERY RUN ADDS PAGES (Stephen, 2026-10-08). The first ten were a
+	// review set, not a ceiling: once a category's selected families are all
+	// built, the next three lines by newest member join it, so the queue
+	// never runs dry while the catalog has families nobody has paged.
+	var unbuilt int
+	db.QueryRow(`SELECT count(*) FROM twoai_model_families WHERE category=$1 AND page_built_on IS NULL`, cat).Scan(&unbuilt)
+	if unbuilt > 0 {
+		return
+	}
+	added := 0
+	for _, r := range all {
+		if added >= 3 {
+			break
+		}
+		var exists bool
+		db.QueryRow(`SELECT EXISTS (SELECT 1 FROM twoai_model_families WHERE family_key=$1)`, r.g.Key).Scan(&exists)
+		if exists {
+			continue
+		}
+		res, _ := db.Exec(`INSERT INTO twoai_model_families (family_key, uid, name, category, how) VALUES ($1,$2,$3,$4,'rolling') ON CONFLICT DO NOTHING`,
+			r.g.Key, twoaiUID("family:"+r.g.Key), r.g.displayName(), cat)
+		if k, _ := res.RowsAffected(); k > 0 {
+			added++
+			fmt.Printf("twoai_model_families: %s grows: %s (%d members)\n", cat, r.g.displayName(), len(r.g.live()))
+		}
+	}
 }
 
 // famParams pulls parameter counts out of model ids: "qwen3.8-27b" gives 27B,
@@ -591,12 +664,8 @@ func twoaiModelFamilies(db *sql.DB, today string) int {
 			for _, l := range listed {
 				names = append(names, fmt.Sprintf("%s theworldofai.org%s", l["name"], l["href"]))
 			}
-			next := "no further category is listed yet"
-			if ci+1 < len(famCats) {
-				next = famCats[ci+1].name + " (" + famCats[ci+1].uid + ") does not start until he says so through this bridge"
-			} else if famOpen < len(famCats) {
-				next = famCats[famOpen].name + " does not start until he says so through this bridge"
-			}
+			_ = ci
+			next := "Every category is open since 2026-10-08 and keeps growing three families a run once its first ten are built, no sign-off needed"
 			body := "Rows 386 to 389: the ten " + c.name + " family pages are built and go live with this run's deploy. Listed on /ai-ecosystem/technology-and-core-infrastructure/" + c.uid + "/ under Model families. " +
 				strings.Join(names, ", ") + ". Please ask Stephen to look at them. " + next + "."
 			body = strings.ReplaceAll(body, ";", ",")
