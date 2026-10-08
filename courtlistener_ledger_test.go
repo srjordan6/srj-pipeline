@@ -46,21 +46,23 @@ func TestCLSharesAddUpToTheDay(t *testing.T) {
 	}
 }
 
-// Tier 1 is the default since 2026-10-07: 300 a day, 75 an hour.
+// Tier 1 is the default since 2026-10-07: 300 a day, 75 an hour; since row
+// 583 (2026-10-08) the pipeline keeps 270 of the 300 and leaves 30 to the
+// connector that shares the account.
 func TestCLTier1(t *testing.T) {
 	clTestTier(t, "1")
-	if clDayLimit != 300 || clHourLimit != 75 {
+	if clDayLimit != 270 || clHourLimit != 75 {
 		t.Fatalf("tier 1: got %d a day, %d an hour", clDayLimit, clHourLimit)
 	}
-	if _, left := clAllowance(clBucketRefresh, map[string]int{}, clTestMorning, false); left != 130 {
-		t.Errorf("tier 1 refresh share: got %d, want 130", left)
+	if _, left := clAllowance(clBucketRefresh, map[string]int{}, clTestMorning, false); left != 150 {
+		t.Errorf("tier 1 refresh share: got %d, want 150", left)
 	}
 	// After 18:00 an untouched alerts share rolls to the refresh too.
-	used := map[string]int{clBucketRefresh: 130, clBucketRecap: 50, clBucketDiscovery: 25, clBucketClassify: 25}
-	if _, left := clAllowance(clBucketRefresh, used, clTestEvening, false); left != 60 {
-		t.Errorf("tier 1 evening rollover of the alerts share: got %d, want 60", left)
+	used := map[string]int{clBucketRefresh: 150, clBucketRecap: 50, clBucketDiscovery: 30, clBucketClassify: 25}
+	if _, left := clAllowance(clBucketRefresh, used, clTestEvening, false); left != 15 {
+		t.Errorf("tier 1 evening rollover of the alerts share: got %d, want 15", left)
 	}
-	if _, left := clAllowance(clBucketAlerts, map[string]int{clBucketAlerts: 59}, clTestMorning, false); left != 1 {
+	if _, left := clAllowance(clBucketAlerts, map[string]int{clBucketAlerts: 14}, clTestMorning, false); left != 1 {
 		t.Errorf("tier 1 alerts share: got %d left, want 1", left)
 	}
 }
