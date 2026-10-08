@@ -3010,6 +3010,11 @@ func publishNews(db *sql.DB) error {
 		// and Title_lang the same way. The story page labels them.
 		HeadlineOriginal string `json:"Headline_original,omitempty"`
 		HeadlineLang     string `json:"Headline_lang,omitempty"`
+		// Stephen, 2026-10-08: three to four paragraphs, or a breaking story
+		// that says so. See news_summary.go.
+		SummaryThin     bool   `json:"summary_thin,omitempty"`
+		SummaryBreaking bool   `json:"summary_breaking,omitempty"`
+		SummaryBy       string `json:"summary_by,omitempty"`
 	}
 	var stories []story
 	big := []string{}
@@ -3084,7 +3089,24 @@ func publishNews(db *sql.DB) error {
 				order = append(order, a)
 			}
 		}
+		// THE WHOLE CLUSTER, THREE TO FOUR PARAGRAPHS (Stephen, 2026-10-08).
+		// The per-article path below stays as the fallback when no article
+		// has text the model can work from.
+		var narts []newsArt
 		for _, a := range order {
+			narts = append(narts, newsArt{Title: a.Title, URL: a.URL, Domain: a.Domain, Date: a.Date})
+		}
+		ss := newsSummarizeStory(db, sl, h, narts, asOf,
+			func(u string) (string, string, bool) { dt, okd := docs[u]; return dt.summary, dt.text, okd },
+			func(p string) (string, error) { s, _, err := twoaiGenerate("news_summary", "", p); return s, err })
+		sumThin, sumBreaking, sumBy := ss.Thin, ss.Breaking, ss.By
+		if ss.Summary != "" && (ss.By == "editorial" || newsSummaryFits(h, ss.Summary)) {
+			summary, sumURL, sumDomain = ss.Summary, ss.URL, ss.Domain
+		}
+		for _, a := range order {
+			if summary != "" {
+				break
+			}
 			dt, okd := docs[a.URL]
 			if !okd || (dt.summary == "" && dt.text == "") {
 				continue
@@ -3126,7 +3148,8 @@ func publishNews(db *sql.DB) error {
 			summary, sumURL, sumDomain = dt.summary, a.URL, a.Domain
 			break
 		}
-		stories = append(stories, story{Slug: sl, Headline: h, Summary: summary, SummaryURL: sumURL, SummaryDomain: sumDomain, ArticleCount: len(c.arts), DomainCount: len(dm), Domains: dl, Persons: topPersons(c), Orgs: topOrgs(c), Articles: as, HeadlineOriginal: hOrig, HeadlineLang: hLang})
+		stories = append(stories, story{Slug: sl, Headline: h, Summary: summary, SummaryURL: sumURL, SummaryDomain: sumDomain, ArticleCount: len(c.arts), DomainCount: len(dm), Domains: dl, Persons: topPersons(c), Orgs: topOrgs(c), Articles: as, HeadlineOriginal: hOrig, HeadlineLang: hLang,
+			SummaryThin: sumThin && summary != "", SummaryBreaking: sumBreaking, SummaryBy: sumBy})
 		if len(big) < 4 {
 			big = append(big, h)
 		}
