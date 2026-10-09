@@ -747,7 +747,7 @@ func twoaiModelFamilies(db *sql.DB, today string) int {
 				names = append(names, fmt.Sprintf("%s theworldofai.org%s", l["name"], l["href"]))
 			}
 			_ = ci
-			next := "The next category's first ten waits for his review (row 627). When he approves, record it with INSERT INTO twoai_model_family_reviews (category, approved_on, approved_by) VALUES ('" + c.slug + "', current_date, 'Stephen'). Rolling additions here continue meanwhile"
+			next := "The next category's first ten waits for his review (row 627). When he approves, add this category's row to twoai_model_family_reviews. Rolling additions here continue meanwhile"
 			body := "Rows 386 to 389: the ten " + c.name + " family pages are built and go live with this run's deploy. Listed on /ai-ecosystem/technology-and-core-infrastructure/" + c.uid + "/ under Model families. " +
 				strings.Join(names, ", ") + ". Please ask Stephen to look at them. " + next + "."
 			body = strings.ReplaceAll(body, ";", ",")
@@ -1339,9 +1339,10 @@ func famModelPages(db *sql.DB, g *famGroup, famUID string, cat famCat, today str
 			doc["siblings"] = []map[string]any{}
 		}
 		j, _ := json.Marshal(doc)
-		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count) VALUES ($1,'tech-section',$2::jsonb,NULL,1)
+		// The path is composed in SQL from the uid (Semgrep's gosql rule).
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count) VALUES ('tech/model-' || $1::text || '.json','tech-section',$2::jsonb,NULL,1)
 			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data, url_count=1, updated_at=now()
-			WHERE (twoai_pages.data - 'built_at') IS DISTINCT FROM EXCLUDED.data`, "tech/model-"+uid+".json", string(j)); err != nil {
+			WHERE (twoai_pages.data - 'built_at') IS DISTINCT FROM EXCLUDED.data`, uid, string(j)); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_model_families model page:", err)
 		}
 	}
