@@ -6165,15 +6165,19 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	// The policy digest's hub first: it creates the this-week-in-ai-laws
+	// taxonomy row that every week/*.json page now files under, and
+	// twoai_pages.taxonomy_slug is a foreign key. On 2026-10-09 the hub ran
+	// after the weeks, the first week upsert failed on the key, and the
+	// build stopped there with every later page unwritten.
+	if err := twoaiLawWeekHub(db, today, upsert); err != nil {
+		fmt.Println("twoai_law_week_hub:", err)
+	}
 	weeks, err := twoaiWeeks(db, today, upsert)
 	if err != nil {
 		return err
 	}
-	// The policy digest's hub, and the news week that took over
-	// /this-week-in-ai/ (Stephen, 2026-10-09).
-	if err := twoaiLawWeekHub(db, today, upsert); err != nil {
-		fmt.Println("twoai_law_week_hub:", err)
-	}
+	// The news week that took over /this-week-in-ai/ (Stephen, 2026-10-09).
 	if _, err := twoaiNewsWeeks(db, today, upsert); err != nil {
 		fmt.Println("twoai_news_weeks:", err)
 	}
