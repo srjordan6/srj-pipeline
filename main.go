@@ -2412,7 +2412,7 @@ func publishNews(db *sql.DB) error {
 	// old story does not hold the lead by age alone.
 	asOf := newsAsOf()
 	rows, err := db.Query(`SELECT d.title, d.url, to_char(d.published_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), d.raw->>'domain', coalesce(d.raw->>'persons',''), coalesce(d.raw->>'orgs',''),
-			d.fetched_at > $1::timestamptz - interval '36 hours', coalesce(d.raw->>'hand_group','')
+			d.fetched_at > $1::timestamptz - interval '36 hours', coalesce(d.raw->>'hand_group',''), coalesce(d.raw->>'hand_lead','')
 		FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
 		WHERE s.key='gdelt' AND d.title <> '' AND d.fetched_at > $1::timestamptz - interval '72 hours' AND d.fetched_at <= $1::timestamptz
 		ORDER BY d.id DESC LIMIT 5000`, asOf)
@@ -2430,9 +2430,12 @@ func publishNews(db *sql.DB) error {
 	// Trahan CLAIM Act and six on the National Compute Grid never became
 	// stories, because hand documents carry no GDELT people or organisations
 	// and their headlines were worded too differently to pass the token test.
+	// handLead is raw.hand_lead: the hand document an editor chose to head
+	// the story, so its headline and slug are known before the run (row 610,
+	// 2026-10-09: a story URL promised for a post at a fixed hour).
 	type art struct {
 		Title, URL, Date, Domain, persons, orgs, group string
-		cand, fresh                                    bool
+		cand, fresh, handLead                          bool
 	}
 	var arts []art
 	// Per-URL summary and lead text, for the story summary at the top of each
@@ -2473,8 +2476,13 @@ func publishNews(db *sql.DB) error {
 	for rows.Next() {
 		var a art
 		var d sql.NullString
-		if rows.Scan(&a.Title, &a.URL, &d, &a.Domain, &a.persons, &a.orgs, &a.fresh, &a.group) == nil {
-			if !twoaiTitleIsAI(a.Title) || twoaiIsIndexPage(a.Title, a.URL) {
+		var hl string
+		if rows.Scan(&a.Title, &a.URL, &d, &a.Domain, &a.persons, &a.orgs, &a.fresh, &a.group, &hl) == nil {
+			a.handLead = hl != ""
+			// An editor's grouped document is about AI because the editor
+			// said so: CrowdStrike's "Unknown Threat Actor Uses ARTEX to
+			// Target South Korean Finance" names no AI word in its title.
+			if (!twoaiTitleIsAI(a.Title) && a.group == "") || twoaiIsIndexPage(a.Title, a.URL) {
 				skipped++
 				continue
 			}
@@ -3066,6 +3074,12 @@ func publishNews(db *sql.DB) error {
 				break
 			}
 		}
+		for _, a := range c.arts {
+			if a.handLead {
+				lead = a
+				break
+			}
+		}
 		h := html.UnescapeString(lead.Title)
 		{
 			// The outlet is not part of the headline (news_headline.go,
@@ -3082,12 +3096,19 @@ func publishNews(db *sql.DB) error {
 			continue
 		}
 		seen[sl] = true
+		// AN EDITOR'S HEADLINE. The slug stays cut from the lead article, so
+		// the URL is stable; the headline shown is the one an editor wrote
+		// into the archive row (story.headline_editorial), when there is one.
+		var edHead string
+		db.QueryRow(`SELECT COALESCE(story->>'headline_editorial','') FROM twoai_news_stories WHERE slug=$1`, sl).Scan(&edHead)
 		// IN ENGLISH (bridge row 508). The slug above is cut from the
 		// headline as published, so a URL never changes; the headline shown
 		// and every outlet title under it are put into English here, with
 		// the original kept beside each.
 		hOrig, hLang := "", ""
-		if en, lang := twoaiEnglishLive(db, h); lang != "" {
+		if edHead != "" {
+			h = edHead
+		} else if en, lang := twoaiEnglishLive(db, h); lang != "" {
 			hOrig, hLang, h = h, lang, en
 		}
 		dm := map[string]bool{}

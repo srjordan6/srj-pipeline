@@ -181,6 +181,10 @@ func twoaiNewsArchive(db *sql.DB, upsert func(path, kind string, v any) error) (
 							|| CASE WHEN twoai_news_stories.story ? 'summary_by'
 							   THEN jsonb_build_object('Summary', twoai_news_stories.story->'Summary', 'SummaryURL', twoai_news_stories.story->'SummaryURL',
 							                           'SummaryDomain', twoai_news_stories.story->'SummaryDomain', 'summary_by', twoai_news_stories.story->'summary_by')
+							   ELSE '{}'::jsonb END
+							-- An editor's headline (row 610) survives the refresh too.
+							|| CASE WHEN twoai_news_stories.story ? 'headline_editorial'
+							   THEN jsonb_build_object('headline_editorial', twoai_news_stories.story->'headline_editorial')
 							   ELSE '{}'::jsonb END,
 						last_seen=now(),
 						uid=COALESCE(twoai_news_stories.uid, EXCLUDED.uid)`,

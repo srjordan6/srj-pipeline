@@ -290,10 +290,10 @@ func twoaiGovWatch(db *sql.DB) error {
 			// morning briefing clusters it with the outlets that report it.
 			if sourceID > 0 {
 				if r2, err := db.Exec(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, published_at, fetched_at, raw)
-					SELECT $1, md5($2), md5($2), $2, $3, $4::date, now(),
-					       jsonb_build_object('url', $2, 'date', $8 || 'T12:00:00Z', 'title', $3, 'domain', $5, 'intake', 'gov_watch',
-					                          'query', $6, 'hand', 'twoai_gov_watch ' || $7 || ', official release')
-					WHERE NOT EXISTS (SELECT 1 FROM pipeline.documents WHERE url=$2)`,
+					SELECT $1, md5($2::text), md5($2::text), $2::text, $3::text, $4::date, now(),
+					       jsonb_build_object('url', $2::text, 'date', $8::text || 'T12:00:00Z', 'title', $3::text, 'domain', $5::text, 'intake', 'gov_watch',
+					                          'query', $6::text, 'hand', 'twoai_gov_watch ' || $7::text || ', official release')
+					WHERE NOT EXISTS (SELECT 1 FROM pipeline.documents WHERE url=$2::text)`,
 					sourceID, link, title, date, publisherFromURL(link), f.name, f.code, date); err == nil {
 					if k, _ := r2.RowsAffected(); k > 0 {
 						docs++

@@ -36,16 +36,35 @@ import (
 // Post block the fetch, AP and Reuters publish no RSS), so they are reached
 // through site-restricted Google News queries, which is the aggregator's
 // own index of them.
-var twoaiCoverageSources = []struct{ name, url string }{
-	{"Google News: artificial intelligence", gnewsSearch(`artificial intelligence when:1d`)},
-	{"Google News: AI regulation and law", gnewsSearch(`AI (regulation OR law OR bill OR "executive order" OR lawsuit OR FTC OR governor OR senator) when:1d`)},
-	{"Google News: AI companies", gnewsSearch(`(OpenAI OR Anthropic OR Nvidia OR "Google DeepMind" OR Microsoft OR Meta) AI when:1d`)},
-	{"Google News: AP", gnewsSearch(`site:apnews.com artificial intelligence when:1d`)},
-	{"Google News: Reuters", gnewsSearch(`site:reuters.com artificial intelligence when:1d`)},
-	{"Google News: Politico", gnewsSearch(`site:politico.com artificial intelligence when:1d`)},
-	{"Google News: Washington Post", gnewsSearch(`site:washingtonpost.com artificial intelligence when:1d`)},
-	{"Google News: Axios", gnewsSearch(`site:axios.com AI when:1d`)},
-	{"Techmeme", "https://www.techmeme.com/feed.xml"},
+//
+// research marks a security research or advisory source: its titles name the
+// campaign, not the technology ("Unknown Threat Actor Uses ARTEX to Target
+// South Korean Finance"), so the AI-title filter that keeps the general
+// queries readable is not applied to it.
+//
+// The regional and research sources were added 2026-10-09 (theworldofai
+// rows 607 and 608): the South Korean bank breaches were reported by
+// Kyunghyang on 2026-10-02, AhnLab via Yonhap on 10-06 and CrowdStrike on
+// 10-07, and the corpus held nothing before a BankInfoSecurity article on
+// 10-07.
+var twoaiCoverageSources = []struct {
+	name, url string
+	research  bool
+}{
+	{"Google News: artificial intelligence", gnewsSearch(`artificial intelligence when:1d`), false},
+	{"Google News: AI regulation and law", gnewsSearch(`AI (regulation OR law OR bill OR "executive order" OR lawsuit OR FTC OR governor OR senator) when:1d`), false},
+	{"Google News: AI companies", gnewsSearch(`(OpenAI OR Anthropic OR Nvidia OR "Google DeepMind" OR Microsoft OR Meta) AI when:1d`), false},
+	{"Google News: AP", gnewsSearch(`site:apnews.com artificial intelligence when:1d`), false},
+	{"Google News: Reuters", gnewsSearch(`site:reuters.com artificial intelligence when:1d`), false},
+	{"Google News: Politico", gnewsSearch(`site:politico.com artificial intelligence when:1d`), false},
+	{"Google News: Washington Post", gnewsSearch(`site:washingtonpost.com artificial intelligence when:1d`), false},
+	{"Google News: Axios", gnewsSearch(`site:axios.com AI when:1d`), false},
+	{"Google News: Korean press in English", gnewsSearch(`(site:koreatimes.co.kr OR site:en.yna.co.kr OR site:koreaherald.com OR site:koreajoongangdaily.com OR site:khan.co.kr) AI when:2d`), false},
+	{"Google News: Asian press", gnewsSearch(`(site:japantimes.co.jp OR site:asia.nikkei.com OR site:scmp.com OR site:straitstimes.com) AI when:2d`), false},
+	{"Google News: Indian press", gnewsSearch(`(site:livemint.com OR site:thehindu.com) AI when:2d`), false},
+	{"Google News: security research", gnewsSearch(`(site:crowdstrike.com OR site:unit42.paloaltonetworks.com OR site:blog.talosintelligence.com OR site:research.checkpoint.com OR site:microsoft.com/en-us/security/blog OR site:cloud.google.com/blog/topics/threat-intelligence OR site:anthropic.com) (AI OR LLM OR agent OR "threat actor") when:3d`), true},
+	{"Google News: Asian security research and advisories", gnewsSearch(`(site:asec.ahnlab.com OR site:genians.co.kr OR site:kisa.or.kr OR site:fsec.or.kr OR site:jpcert.or.jp OR site:cert-in.org.in OR site:csa.gov.sg) when:3d`), true},
+	{"Techmeme", "https://www.techmeme.com/feed.xml", false},
 }
 
 func gnewsSearch(q string) string {
@@ -90,7 +109,8 @@ func twoaiCoverageAudit(db *sql.DB) error {
 	client := &http.Client{Timeout: 30 * time.Second}
 	today := time.Now().UTC().Format("2006-01-02")
 	read, asStory, asDoc, harvested, dupes := 0, 0, 0, 0, 0
-	var unreachable, finds []string
+	var unreachable, finds, missed []string
+	insertErr := ""
 	seen := map[string]bool{}
 	for _, src := range twoaiCoverageSources {
 		_, items, _, err := twoaiFetchFeed(client, src.url)
@@ -110,7 +130,10 @@ func twoaiCoverageAudit(db *sql.DB) error {
 					continue
 				}
 			}
-			if src.name == "Techmeme" && !twoaiGovAIRe.MatchString(title) {
+			// AI items only, so the morning row stays readable (row 607:
+			// the Korean energy plan, a POW dispute and an athletes'
+			// exemption came through the Reuters and AP site queries).
+			if !src.research && !twoaiTitleIsAI(title) && !twoaiGovAIRe.MatchString(title) {
 				continue
 			}
 			title = newsStripOutlet(title, publisherFromURL(link))
@@ -126,9 +149,16 @@ func twoaiCoverageAudit(db *sql.DB) error {
 				date = today
 			}
 			outcome, match := "", ""
+			// IN THE CORPUS IS NOT COVERED (row 607). An article we hold that
+			// no story carries is a miss: it reaches this run's clustering,
+			// but the morning row lists it so a subject that never formed a
+			// story is seen. Only a match to a published story is covered.
 			if held[canon] {
-				outcome = "in corpus"
+				outcome = "in corpus, no story"
 				asDoc++
+				if len(missed) < 25 {
+					missed = append(missed, fmt.Sprintf("%s (%s, %s)", title, publisherFromURL(link), src.name))
+				}
 			} else {
 				toks := newsTitleTokens(title)
 				best, bestUID := 0.0, ""
@@ -145,10 +175,10 @@ func twoaiCoverageAudit(db *sql.DB) error {
 			var docID sql.NullInt64
 			if outcome == "" {
 				if err := db.QueryRow(`INSERT INTO pipeline.documents (source_id, external_id, change_hash, url, title, published_at, fetched_at, raw)
-					SELECT $1, md5($2), md5($2), $2, $3, $4::date, now(),
-					       jsonb_build_object('url', $2, 'date', $8 || 'T12:00:00Z', 'title', $3, 'domain', $5, 'intake', 'coverage_audit',
-					                          'query', $6, 'hand', 'twoai_coverage_audit ' || $7 || ': not in our stories or corpus of the last 72 hours')
-					WHERE NOT EXISTS (SELECT 1 FROM pipeline.documents WHERE url=$2) RETURNING id`,
+					SELECT $1, md5($2::text), md5($2::text), $2::text, $3::text, $4::date, now(),
+					       jsonb_build_object('url', $2::text, 'date', $8::text || 'T12:00:00Z', 'title', $3::text, 'domain', $5::text, 'intake', 'coverage_audit',
+					                          'query', $6::text, 'hand', 'twoai_coverage_audit ' || $7::text || ': not in our stories or corpus of the last 72 hours')
+					WHERE NOT EXISTS (SELECT 1 FROM pipeline.documents WHERE url=$2::text) RETURNING id`,
 					sourceID, link, title, date, publisherFromURL(link), src.name, today, date).Scan(&docID); err == nil && docID.Valid {
 					outcome = "harvested"
 					harvested++
@@ -156,8 +186,18 @@ func twoaiCoverageAudit(db *sql.DB) error {
 					if len(finds) < 25 {
 						finds = append(finds, fmt.Sprintf("%s (%s, %s)", title, publisherFromURL(link), src.name))
 					}
+				} else if err != nil && err != sql.ErrNoRows {
+					// Every harvest from 2026-10-07 to 10-09 failed here: the
+					// parameters used only inside jsonb_build_object had no type
+					// Postgres could deduce, and the failure was recorded as "in
+					// corpus" (row 607). Now cast, and a failure says so.
+					outcome = "harvest failed"
+					if insertErr == "" {
+						insertErr = err.Error()
+						fmt.Fprintln(os.Stderr, "twoai_coverage_audit insert:", err)
+					}
 				} else {
-					outcome = "in corpus"
+					outcome = "in corpus, no story"
 					asDoc++
 				}
 			}
@@ -176,8 +216,18 @@ func twoaiCoverageAudit(db *sql.DB) error {
 	db.QueryRow(`SELECT EXISTS (SELECT 1 FROM project_bridge WHERE from_project='srj' AND topic = 'Coverage audit ' || $1)`, today).Scan(&already)
 	if !already && read > 0 {
 		var b strings.Builder
-		fmt.Fprintf(&b, "Coverage audit %s (twoai_coverage_audit, row 567). Read %d items from %d aggregator feeds: %d already in a story of the last 72 hours, %d already in the corpus, %d harvested as new documents for this run's publish_news to cluster (a story needs three domains, so a single-outlet find becomes a story only when others follow).\n",
+		fmt.Fprintf(&b, "Coverage audit %s (twoai_coverage_audit, row 567). Read %d items from %d aggregator feeds: %d in a story of the last 72 hours (covered), %d in the corpus but in no story (misses, listed below), %d harvested as new documents for this run's publish_news to cluster (a story needs three domains, so a single-outlet find becomes a story only when others follow).\n",
 			today, read, len(twoaiCoverageSources)-len(unreachable), asStory, asDoc, harvested)
+		if len(missed) > 0 {
+			b.WriteString("\nIN THE CORPUS BUT IN NO STORY (a miss until it clusters; title, publisher, which feed):\n")
+			sort.Strings(missed)
+			for _, m := range missed {
+				b.WriteString("- " + m + "\n")
+			}
+		}
+		if insertErr != "" {
+			b.WriteString("\nHARVEST FAILED: " + trunc(insertErr, 200) + "\n")
+		}
 		if len(finds) > 0 {
 			b.WriteString("\nHARVESTED (title, publisher, which feed):\n")
 			sort.Strings(finds)
