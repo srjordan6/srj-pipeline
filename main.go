@@ -109,7 +109,9 @@ var twoaiStageDeadline = map[string]time.Duration{
 	// Row 567: the audit reads nine feeds and resolves Google links; the
 	// governor watch probes twenty newsrooms. Neither may hold up the run.
 	"twoai_coverage_audit": 8 * time.Minute,
-	"twoai_gov_watch":      6 * time.Minute,
+	// Up to forty stories rewritten, a few live article fetches each.
+	"news_summary_backfill": 25 * time.Minute,
+	"twoai_gov_watch":       6 * time.Minute,
 }
 
 const twoaiStageDeadlineDefault = 20 * time.Minute
@@ -346,7 +348,7 @@ func main() {
 		// Twelve Data plan, six batches for 45 instruments, so about six
 		// minutes - and it is cheap the rest of the time because it asks for
 		// five days once an instrument is seeded.
-		seq := []string{"federal_register", "agency_watch", "twoai_gov_watch", "legiscan", "gdelt", "twoai_coverage_audit", "govinfo", "mcp_registry", "cl_webhooks", "cl_alerts", "intel", "archive_news", "publish_news", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_company_sitemap", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "twoai_gsc", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
+		seq := []string{"federal_register", "agency_watch", "twoai_gov_watch", "legiscan", "gdelt", "twoai_coverage_audit", "govinfo", "mcp_registry", "cl_webhooks", "cl_alerts", "intel", "archive_news", "publish_news", "news_summary_backfill", "publish_legislation", "publish_leaderboard", "publish_lawsuits", "publish_intel", "sync_people", "sync_content", "bench_results", "twoai_jobs", "twoai_stocks", "twoai_etf_holdings", "twoai_vendor_feeds", "twoai_company_sites", "twoai_company_sitemap", "twoai_internal_links", "twoai_vendor_enrich", "twoai_point_briefs", "twoai_learning_readings", "twoai_benchmark_readings", "twoai_dart", "twoai_ma_readings", "twoai_model_watch", "twoai_case_studies", "twoai_ext_library", "vendor_notes", "twoai_onet", "twoai_ga_top", "twoai_gsc", "talent_pull", "ask_pull", "twoai_openlibrary", "docwatch", "doi_queue", "appsec_research", "openalex_watch", "twoai_fred", "twoai_politics_lda", "twoai_politics_bills", "twoai_politics_fec", "twoai_politics_pages", "twoai_gaps", "twoai_health_watch", "twoai_cheri_watch", "twoai_health_research", "twoai_family_sources", "twoai_english_sweep", "twoai_build", "twoai_build_tail", "twoai_embed", "twoai_vectorize", "twoai_publish", "twoai_publish_r2", "url_registry", "twoai_indexnow", "audit_sync", "export_corpus", "deploy_site"}
 		// The corpus stages ride along with the daily build UNTIL a dedicated
 		// corpus cron exists, at which point setting CORPUS_CRON=1 here stops
 		// the duplication. Leaving them in by default matters: removing them
@@ -550,6 +552,12 @@ func main() {
 	if src == "twoai_gov_watch" {
 		if err := twoaiGovWatch(db); err != nil {
 			fmt.Fprintln(os.Stderr, "twoai_gov_watch:", err)
+		}
+		return
+	}
+	if src == "news_summary_backfill" {
+		if err := newsSummaryBackfill(db); err != nil {
+			fmt.Fprintln(os.Stderr, "news_summary_backfill:", err)
 		}
 		return
 	}
@@ -6161,6 +6169,14 @@ func twoaiBuild(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	// The policy digest's hub, and the news week that took over
+	// /this-week-in-ai/ (Stephen, 2026-10-09).
+	if err := twoaiLawWeekHub(db, today, upsert); err != nil {
+		fmt.Println("twoai_law_week_hub:", err)
+	}
+	if _, err := twoaiNewsWeeks(db, today, upsert); err != nil {
+		fmt.Println("twoai_news_weeks:", err)
+	}
 
 	vendorNews, err := twoaiVendorNews(db, upsert)
 	if err != nil {
@@ -8755,6 +8771,8 @@ func twoaiTaxonomyFor(kind string) any {
 	case "sources-hub":
 		return "research-library"
 	case "week", "week-hub":
+		return "this-week-in-ai-laws"
+	case "newsweek", "newsweek-hub":
 		return "this-week-in-ai"
 	case "vendor-news":
 		return "vendor-news"
@@ -9671,7 +9689,7 @@ func urlRegistryKind(u string) string {
 	if len(seg) == 1 {
 		switch seg[0] {
 		case "ai-laws", "ai-glossary", "ai-lawsuits", "ai-tools", "companies", "research",
-			"ai-compliance", "mcp", "benchmarks", "this-week-in-ai", "ai-ecosystem",
+			"ai-compliance", "mcp", "benchmarks", "this-week-in-ai", "this-week-in-ai-laws", "ai-ecosystem",
 			"ai-news", "ai-prompts", "calculators", "sources", "api":
 			return seg[0] + "-hub"
 		}
@@ -9693,6 +9711,8 @@ func urlRegistryKind(u string) string {
 	case "companies":
 		return "company"
 	case "this-week-in-ai":
+		return "newsweek"
+	case "this-week-in-ai-laws":
 		return "week"
 	case "calculators":
 		return "calculator"

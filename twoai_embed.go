@@ -602,6 +602,11 @@ func twoaiDocURL(path string, doc map[string]any, idx map[string]string) string 
 		return ""
 	case "week":
 		if name == "index" {
+			return base + "/ai-ecosystem/enterprise-applications-governance-and-tools/" + twoaiUID("section:this-week-in-ai-laws") + "/"
+		}
+		return base + "/this-week-in-ai-laws/" + name + "/"
+	case "newsweek":
+		if name == "index" {
 			return base + "/this-week-in-ai/"
 		}
 		return base + "/this-week-in-ai/" + name + "/"
