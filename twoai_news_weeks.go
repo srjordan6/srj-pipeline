@@ -267,12 +267,14 @@ func cleanSummaryText(s string) string {
 // twoaiWeeks; the site renders this hub from them.
 func twoaiLawWeekHub(db *sql.DB, today string, upsert func(path, kind string, v any) error) error {
 	uid := twoaiUID("section:this-week-in-ai-laws")
-	live := "/ai-ecosystem/enterprise-applications-governance-and-tools/" + uid + "/"
 	blurb := "The week in AI law and compliance: state bills that changed status, Federal Register documents, and AI lawsuits with new docket activity, grouped by subject and computed from the record every day."
+	// The path is composed in SQL from the uid, so no argument is built by
+	// string concatenation (Semgrep's gosql rule, row 585).
 	db.Exec(`INSERT INTO twoai_taxonomy (slug, name, parent_slug, level, sort, blurb, status, live_path, created_at, updated_at, line, line_auto)
-		VALUES ('this-week-in-ai-laws', 'This Week in AI Laws and Compliance', 'law-and-compliance', 3, 0, $1, 'live', $2, now(), now(), $3, false)
+		VALUES ('this-week-in-ai-laws', 'This Week in AI Laws and Compliance', 'law-and-compliance', 3, 0, $1, 'live',
+			'/ai-ecosystem/enterprise-applications-governance-and-tools/' || $2::text || '/', now(), now(), $3, false)
 		ON CONFLICT (slug) DO UPDATE SET live_path=EXCLUDED.live_path, status='live', updated_at=now()`,
-		blurb, live, "Each week of AI bills, federal rules and lawsuits, grouped by subject, with every subject linked to its bills.")
+		blurb, uid, "Each week of AI bills, federal rules and lawsuits, grouped by subject, with every subject linked to its bills.")
 	return upsert("industries/this-week-ai-laws.json", "law-week-hub", map[string]any{
 		"uid": uid, "page_uid": uid, "shape": "law-week-hub", "tax": "this-week-in-ai-laws",
 		"name": "This Week in AI Laws and Compliance", "blurb": blurb, "generated": today,
