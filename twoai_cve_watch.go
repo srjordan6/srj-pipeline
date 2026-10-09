@@ -744,13 +744,21 @@ func twoaiCVEPages(db *sql.DB) int {
 			"cvss_score": sc, "cvss_severity": sev, "kev": kev, "summary": head, "entities": entList, "headline": headline,
 		})
 	}
-	// A CVE moved back to proposed or rejected keeps no page. On 2026-10-02 a
-	// reclassification demoted 405 of them, their pages stayed in twoai_pages,
-	// 404 on the site but counted as overdue by the freshness report (row 477).
-	if res, err := db.Exec(`DELETE FROM twoai_pages p WHERE p.path LIKE 'news/cve-%'
-		AND NOT EXISTS (SELECT 1 FROM twoai_cves c WHERE 'news/cve-' || c.cve_id || '.json' = p.path AND c.status IN ('published','approved'))`); err == nil {
+	// A CVE moved back to proposed or rejected is ARCHIVED, NOT DELETED
+	// (Stephen, 2026-10-09: "remember to archive the CVEs, do not delete
+	// them"). Its page stays, marked retired with the date and reason, so the
+	// site renders it as an archive record out of search and the ask box can
+	// still answer about it; refresh_every_days is cleared so the freshness
+	// report no longer counts it as overdue (the row 477 problem the old
+	// DELETE solved). A CVE promoted again is rewritten above and loses the
+	// mark.
+	if res, err := db.Exec(`UPDATE twoai_pages p SET data = p.data - 'refresh_every_days'
+			|| jsonb_build_object('retired', true, 'retired_on', $1::text,
+			   'retired_reason', 'no longer classified as an AI CVE by the tracker'), updated_at = now()
+		WHERE p.path LIKE 'news/cve-%' AND NOT COALESCE((p.data->>'retired')::boolean, false)
+		AND NOT EXISTS (SELECT 1 FROM twoai_cves c WHERE 'news/cve-' || c.cve_id || '.json' = p.path AND c.status IN ('published','approved'))`, today); err == nil {
 		if n, _ := res.RowsAffected(); n > 0 {
-			fmt.Printf("twoai_cve_watch: removed %d pages of CVEs no longer published\n", n)
+			fmt.Printf("twoai_cve_watch: archived %d pages of CVEs no longer on the tracker\n", n)
 		}
 	}
 	fmt.Printf("twoai_cve_watch: pages with a written headline=%d of %d\n", headlined, len(list))
