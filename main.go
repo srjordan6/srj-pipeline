@@ -2420,7 +2420,7 @@ func publishNews(db *sql.DB) error {
 	// old story does not hold the lead by age alone.
 	asOf := newsAsOf()
 	rows, err := db.Query(`SELECT d.title, d.url, to_char(d.published_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), d.raw->>'domain', coalesce(d.raw->>'persons',''), coalesce(d.raw->>'orgs',''),
-			d.fetched_at > $1::timestamptz - interval '36 hours', coalesce(d.raw->>'hand_group',''), coalesce(d.raw->>'hand_lead','')
+			(d.fetched_at > $1::timestamptz - interval '36 hours' OR d.raw ? 'hand_group'), coalesce(d.raw->>'hand_group',''), coalesce(d.raw->>'hand_lead','')
 		FROM pipeline.documents d JOIN pipeline.sources s ON s.id=d.source_id
 		WHERE s.key='gdelt' AND d.title <> '' AND d.fetched_at > $1::timestamptz - interval '72 hours' AND d.fetched_at <= $1::timestamptz
 		ORDER BY d.id DESC LIMIT 5000`, asOf)
@@ -2438,6 +2438,10 @@ func publishNews(db *sql.DB) error {
 	// Trahan CLAIM Act and six on the National Compute Grid never became
 	// stories, because hand documents carry no GDELT people or organisations
 	// and their headlines were worded too differently to pass the token test.
+	// A hand document counts as fresh for the whole 72 hour window: the
+	// Trahan CLAIM Act documents went in on 2026-10-07 at 20:06, missed the
+	// next briefing, and were 38 hours old by the one after, so the story an
+	// editor asked for never published (row 553).
 	// handLead is raw.hand_lead: the hand document an editor chose to head
 	// the story, so its headline and slug are known before the run (row 610,
 	// 2026-10-09: a story URL promised for a post at a fixed hour).
@@ -6165,15 +6169,19 @@ func twoaiBuild(db *sql.DB) error {
 		return err
 	}
 
+	// The policy digest's hub first: it creates the this-week-in-ai-laws
+	// taxonomy row that every week/*.json page now files under, and
+	// twoai_pages.taxonomy_slug is a foreign key. On 2026-10-09 the hub ran
+	// after the weeks, the first week upsert failed on the key, and the
+	// build stopped there with every later page unwritten.
+	if err := twoaiLawWeekHub(db, today, upsert); err != nil {
+		fmt.Println("twoai_law_week_hub:", err)
+	}
 	weeks, err := twoaiWeeks(db, today, upsert)
 	if err != nil {
 		return err
 	}
-	// The policy digest's hub, and the news week that took over
-	// /this-week-in-ai/ (Stephen, 2026-10-09).
-	if err := twoaiLawWeekHub(db, today, upsert); err != nil {
-		fmt.Println("twoai_law_week_hub:", err)
-	}
+	// The news week that took over /this-week-in-ai/ (Stephen, 2026-10-09).
 	if _, err := twoaiNewsWeeks(db, today, upsert); err != nil {
 		fmt.Println("twoai_news_weeks:", err)
 	}
