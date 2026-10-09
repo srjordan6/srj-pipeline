@@ -328,6 +328,61 @@ func famEnsure(db *sql.DB) {
 		how text NOT NULL, selected_on date NOT NULL DEFAULT current_date, page_built_on date,
 		reading text, reading_model text, reading_on date, reading_hash text, reading_attempts int NOT NULL DEFAULT 0,
 		notified_on date)`)
+	// THE REVIEW GATE (theworldofai row 627, 2026-10-09). Stephen reviews each
+	// category's first ten before the next category's first ten is chosen;
+	// rolling additions in a category already under way do not wait. His
+	// sign-off is a row here, so recording it needs no code change.
+	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_model_family_reviews (
+		category text PRIMARY KEY, approved_on date NOT NULL, approved_by text NOT NULL, note text)`)
+	db.Exec(`INSERT INTO twoai_model_family_reviews (category, approved_on, approved_by, note) VALUES
+		('llms', '2026-10-03', 'Stephen', 'look fine'),
+		('reasoning-models', '2026-10-03', 'Stephen', 'theworldofai row 422')
+		ON CONFLICT DO NOTHING`)
+}
+
+// famGateOpen reports whether a category may choose its first ten: every
+// category before it that already has a first ten must be signed off. It
+// returns the category still waiting when the gate is shut.
+func famGateOpen(db *sql.DB, c famCat) (bool, string) {
+	for _, prev := range famCats {
+		if prev.slug == c.slug {
+			return true, ""
+		}
+		var firsts int
+		var approved bool
+		db.QueryRow(`SELECT (SELECT count(*) FROM twoai_model_families WHERE category=$1 AND how='first ten'),
+			EXISTS (SELECT 1 FROM twoai_model_family_reviews WHERE category=$1)`, prev.slug).Scan(&firsts, &approved)
+		if firsts > 0 && !approved {
+			return false, prev.name
+		}
+	}
+	return true, ""
+}
+
+// famFineTune reports whether a line is a third party's fine-tune of a line
+// that already has a family page under another developer (row 627: Sao10K
+// publishes fine-tunes of Meta Llama, which is not a family of its own). The
+// match is on the line's display name, kept with the family it matched.
+func famFineTune(db *sql.DB, g *famGroup, groups map[string]*famGroup) (bool, string) {
+	rows, err := db.Query(`SELECT family_key FROM twoai_model_families`)
+	if err != nil {
+		return false, ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k string
+		if rows.Scan(&k) != nil || k == g.Key {
+			continue
+		}
+		o := groups[k]
+		if o == nil || o.Dev == g.Dev {
+			continue
+		}
+		if strings.EqualFold(o.LineName, g.LineName) || strings.EqualFold(o.Line, g.Line) {
+			return true, k
+		}
+	}
+	return false, ""
 }
 
 // famSelect chooses the category's first ten once and freezes them, then
@@ -358,6 +413,10 @@ func famSelect(db *sql.DB, c famCat, groups map[string]*famGroup) {
 		return all[i].g.Key < all[j].g.Key
 	})
 	if n == 0 {
+		if ok, waiting := famGateOpen(db, c); !ok {
+			fmt.Printf("twoai_model_families: %s first ten waits for Stephen's review of %s\n", cat, waiting)
+			return
+		}
 		picked := []string{}
 		for _, r := range all {
 			if len(picked) >= 10 {
@@ -368,6 +427,10 @@ func famSelect(db *sql.DB, c famCat, groups map[string]*famGroup) {
 			var exists bool
 			db.QueryRow(`SELECT EXISTS (SELECT 1 FROM twoai_model_families WHERE family_key=$1)`, r.g.Key).Scan(&exists)
 			if exists {
+				continue
+			}
+			if ft, of := famFineTune(db, r.g, groups); ft {
+				fmt.Printf("twoai_model_families: %s skipped, a fine-tune line of %s\n", r.g.displayName(), of)
 				continue
 			}
 			db.Exec(`INSERT INTO twoai_model_families (family_key, uid, name, category, how) VALUES ($1,$2,$3,$4,'first ten') ON CONFLICT DO NOTHING`,
@@ -386,6 +449,9 @@ func famSelect(db *sql.DB, c famCat, groups map[string]*famGroup) {
 		// Oldest-but-one live member is the one that made it a family.
 		second := l[len(l)-2].Created
 		if second <= cut {
+			continue
+		}
+		if ft, _ := famFineTune(db, r.g, groups); ft {
 			continue
 		}
 		res, _ := db.Exec(`INSERT INTO twoai_model_families (family_key, uid, name, category, how) VALUES ($1,$2,$3,$4,'new arrival') ON CONFLICT DO NOTHING`,
@@ -411,6 +477,9 @@ func famSelect(db *sql.DB, c famCat, groups map[string]*famGroup) {
 		var exists bool
 		db.QueryRow(`SELECT EXISTS (SELECT 1 FROM twoai_model_families WHERE family_key=$1)`, r.g.Key).Scan(&exists)
 		if exists {
+			continue
+		}
+		if ft, _ := famFineTune(db, r.g, groups); ft {
 			continue
 		}
 		res, _ := db.Exec(`INSERT INTO twoai_model_families (family_key, uid, name, category, how) VALUES ($1,$2,$3,$4,'rolling') ON CONFLICT DO NOTHING`,
@@ -607,6 +676,19 @@ func twoaiModelFamilies(db *sql.DB, today string) int {
 		if f.reading != "" {
 			doc["family_reading"] = map[string]string{"text": f.reading, "model": f.readingModel, "written_on": f.readingOn}
 		}
+		// EVERY MODEL GETS ITS OWN PAGE (Stephen, 2026-10-09: on the Claude
+		// family page "each link goes to Anthropic, each model gets its own web
+		// page"). One page per member, listed or retired, so a page once
+		// published keeps serving; the family's tables link to them.
+		pages := famModelPages(db, g, f.uid, famCatBySlug(f.category), today)
+		if ms, ok := doc["members"].([]map[string]any); ok {
+			for _, r := range ms {
+				if id, _ := r["id"].(string); pages[id] != "" {
+					r["page"] = pages[id]
+				}
+			}
+		}
+		doc["member_pages"] = pages
 		j, _ := json.Marshal(doc)
 		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count) VALUES ($1,'tech-section',$2::jsonb,NULL,1)
 			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data, url_count=1, updated_at=now()`,
@@ -665,7 +747,7 @@ func twoaiModelFamilies(db *sql.DB, today string) int {
 				names = append(names, fmt.Sprintf("%s theworldofai.org%s", l["name"], l["href"]))
 			}
 			_ = ci
-			next := "Every category is open since 2026-10-08 and keeps growing three families a run once its first ten are built, no sign-off needed"
+			next := "The next category's first ten waits for his review (row 627). When he approves, record it with INSERT INTO twoai_model_family_reviews (category, approved_on, approved_by) VALUES ('" + c.slug + "', current_date, 'Stephen'). Rolling additions here continue meanwhile"
 			body := "Rows 386 to 389: the ten " + c.name + " family pages are built and go live with this run's deploy. Listed on /ai-ecosystem/technology-and-core-infrastructure/" + c.uid + "/ under Model families. " +
 				strings.Join(names, ", ") + ". Please ask Stephen to look at them. " + next + "."
 			body = strings.ReplaceAll(body, ";", ",")
@@ -676,7 +758,75 @@ func twoaiModelFamilies(db *sql.DB, today string) int {
 		}
 		fmt.Printf("twoai_model_families: %s families=%d also=%d ok=true\n", c.slug, len(listed), len(alsoHere))
 	}
-	fmt.Printf("twoai_model_families: rows=%d new_pages=%d refreshed=%d ok=true\n", len(fams), newPages, refreshed)
+	// THE FOUNDATION MODELS HUB LEADS TO THE FAMILIES (theworldofai row 628).
+	// Every built family grouped by the category it was paged under, and the
+	// ten newest releases across all of them, each linking its family page.
+	// Rewritten every run, so a model the catalog gains today is on the hub
+	// today. twoaiEcosystem writes the hub earlier in the build; these keys
+	// are set on top of it.
+	byCat := []map[string]any{}
+	type latest struct {
+		m   famMember
+		fam map[string]any
+	}
+	var newest []latest
+	for _, c := range open {
+		listed := listedBy[c.slug]
+		if len(listed) == 0 {
+			continue
+		}
+		fl := []map[string]any{}
+		for _, x := range listed {
+			fl = append(fl, map[string]any{"name": x["name"], "href": x["href"], "developer": x["developer"],
+				"latest": x["newest_model"], "latest_on": x["newest"], "versions": x["members"]})
+			if g := groups[x["key"].(string)]; g != nil {
+				for _, m := range g.live() {
+					newest = append(newest, latest{m, x})
+				}
+			}
+		}
+		byCat = append(byCat, map[string]any{"category": c.name, "href": famBase + c.uid + "/", "families": fl})
+	}
+	// SINGLE MODELS (Stephen, 2026-10-09, row 629): a current model that is
+	// the only version of its line gets a page too. Current means first
+	// listed in the last 90 days; no backfill. Once tracked it stays tracked,
+	// so its page keeps serving, and when a second version arrives the line
+	// becomes a family and the same page carries on as that member's page.
+	singles := famSingles(db, groups, today)
+	singleByCat := map[string][]map[string]any{}
+	for _, sm := range singles {
+		newest = append(newest, latest{sm.m, map[string]any{"name": "", "href": "", "developer": sm.g.DevName}})
+		singleByCat[sm.cat.slug] = append(singleByCat[sm.cat.slug], map[string]any{"name": famShortName(sm.m.Name), "developer": sm.g.DevName,
+			"href": famBase + famModelUID(sm.m.ID) + "/", "released": sm.m.Released})
+	}
+	sort.SliceStable(newest, func(i, j int) bool {
+		if newest[i].m.Created != newest[j].m.Created {
+			return newest[i].m.Created > newest[j].m.Created
+		}
+		return newest[i].m.ID < newest[j].m.ID
+	})
+	latestRows := []map[string]any{}
+	for _, l := range newest {
+		if len(latestRows) >= 10 {
+			break
+		}
+		latestRows = append(latestRows, map[string]any{"model": l.m.Name, "released": l.m.Released, "page": famBase + famModelUID(l.m.ID) + "/",
+			"family": l.fam["name"], "href": l.fam["href"], "developer": l.fam["developer"]})
+	}
+	for _, c := range open {
+		sj := []byte("[]")
+		if len(singleByCat[c.slug]) > 0 {
+			sj, _ = json.Marshal(singleByCat[c.slug])
+		}
+		db.Exec(`UPDATE twoai_pages SET data = jsonb_set(data, '{single_models}', $1::jsonb) WHERE path=$2`, string(sj), c.path)
+	}
+	bj, _ := json.Marshal(byCat)
+	lj, _ := json.Marshal(latestRows)
+	if _, err := db.Exec(`UPDATE twoai_pages SET data = jsonb_set(jsonb_set(data, '{model_families}', $1::jsonb), '{latest_models}', $2::jsonb), updated_at=now()
+		WHERE path='ecosystem/foundation-models.json'`, string(bj), string(lj)); err != nil {
+		fmt.Fprintln(os.Stderr, "twoai_model_families foundation hub:", err)
+	}
+	fmt.Printf("twoai_model_families: rows=%d new_pages=%d refreshed=%d hub_categories=%d ok=true\n", len(fams), newPages, refreshed, len(byCat))
 	return newPages
 }
 
@@ -1010,5 +1160,276 @@ func famHFReleases(g *famGroup, rows []map[string]any) []map[string]any {
 	}
 	dl := func(r map[string]any) float64 { v, _ := r["downloads"].(float64); return v }
 	sort.SliceStable(out, func(a, b int) bool { return dl(out[a]) > dl(out[b]) })
+	return out
+}
+
+// famModelUID is the uid of one model's page, from its catalog id.
+func famModelUID(id string) string { return twoaiUID("model:" + id) }
+
+func famModsText(list []string) string {
+	if len(list) == 0 {
+		return "text"
+	}
+	if len(list) == 1 {
+		return list[0]
+	}
+	return strings.Join(list[:len(list)-1], ", ") + " and " + list[len(list)-1]
+}
+
+func famTokText(n int64) string {
+	switch {
+	case n >= 1000000 && n%1000000 == 0:
+		return fmt.Sprintf("%d million", n/1000000)
+	case n >= 1000000:
+		return fmt.Sprintf("%.1f million", float64(n)/1e6)
+	case n >= 1000:
+		return fmt.Sprintf("%dK", n/1000)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+// famModelPages writes tech/model-<uid>.json for every member of a family and
+// returns catalog id -> page path. Every sentence is composed from the
+// catalog record and the family around it; nothing is generated.
+func famModelPages(db *sql.DB, g *famGroup, famUID string, cat famCat, today string) map[string]string {
+	out := map[string]string{}
+	live := g.live()
+	famName := g.displayName()
+	famHref := famBase + famUID + "/"
+	// famUID "" is a single model with no family yet (row 629).
+	var famRef any
+	if famUID != "" {
+		famRef = map[string]any{"name": famName, "href": famHref, "uid": famUID}
+	}
+	// Family medians, for the comparison lines.
+	var prices []float64
+	var ctxMax int64
+	for _, m := range live {
+		if m.PromptPM > 0 {
+			prices = append(prices, m.PromptPM)
+		}
+		if m.Context > ctxMax {
+			ctxMax = m.Context
+		}
+	}
+	sort.Float64s(prices)
+	median := 0.0
+	if len(prices) > 0 {
+		median = prices[len(prices)/2]
+	}
+	siblings := []map[string]any{}
+	for _, m := range g.Members {
+		siblings = append(siblings, map[string]any{"name": famShortName(m.Name), "id": m.ID, "href": famBase + famModelUID(m.ID) + "/",
+			"released": m.Released, "prompt_pm": m.PromptPM, "completion_pm": m.CompletionPM, "context": m.Context, "delisted": m.Delisted})
+	}
+	for i, m := range g.Members {
+		uid := famModelUID(m.ID)
+		href := famBase + uid + "/"
+		out[m.ID] = href
+		short := famShortName(m.Name)
+		sents := []string{}
+		if famUID == "" {
+			sents = append(sents, fmt.Sprintf("%s is a model from %s, first listed on %s. It is the only version of its line in the catalog so far.", short, g.DevName, m.Released))
+		} else {
+			sents = append(sents, fmt.Sprintf("%s is a model in %s's %s family, first listed on %s.", short, g.DevName, famName, m.Released))
+		}
+		io := fmt.Sprintf("It takes %s in and returns %s", famModsText(m.In), famModsText(m.Out))
+		if m.Context > 0 {
+			io += fmt.Sprintf(", with a context window of %s tokens", famTokText(m.Context))
+			if m.MaxOut > 0 {
+				io += fmt.Sprintf(" and up to %s tokens of output", famTokText(m.MaxOut))
+			}
+		}
+		sents = append(sents, io+".")
+		if m.PromptPM > 0 || m.CompletionPM > 0 {
+			sents = append(sents, fmt.Sprintf("On the lowest-cost route in the OpenRouter catalog it costs %s per million input tokens and %s per million output tokens.", famCost(m.PromptPM), famCost(m.CompletionPM)))
+		} else {
+			sents = append(sents, "The OpenRouter catalog lists it at no charge per token on at least one route.")
+		}
+		if m.Reasoning {
+			sents = append(sents, "It supports a reasoning mode, where the model works through a problem before it answers.")
+		}
+		if m.HFID != "" {
+			sents = append(sents, fmt.Sprintf("Its weights are published on Hugging Face as %s, so it can be run on your own hardware as well as through a provider.", m.HFID))
+		} else {
+			sents = append(sents, "Its weights are not published, so it is reached through an API.")
+		}
+		if m.Cutoff != "" {
+			sents = append(sents, fmt.Sprintf("Its training data runs to %s.", m.Cutoff))
+		}
+		answer := strings.Join(sents, " ")
+		// Where it sits in the family.
+		cmp := []string{}
+		if !m.Delisted && len(live) > 1 {
+			pos := 0
+			for _, x := range live {
+				if x.Created > m.Created {
+					pos++
+				}
+			}
+			switch pos {
+			case 0:
+				cmp = append(cmp, fmt.Sprintf("It is the newest of the %d versions of %s listed today.", len(live), famName))
+			case len(live) - 1:
+				cmp = append(cmp, fmt.Sprintf("It is the oldest of the %d versions of %s still listed.", len(live), famName))
+			default:
+				cmp = append(cmp, fmt.Sprintf("Of the %d versions of %s listed today, %d are newer.", len(live), famName, pos))
+			}
+			if median > 0 && m.PromptPM > 0 {
+				switch {
+				case m.PromptPM < median:
+					cmp = append(cmp, fmt.Sprintf("Its input price is below the family median of %s per million tokens.", famUSD(median)))
+				case m.PromptPM > median:
+					cmp = append(cmp, fmt.Sprintf("Its input price is above the family median of %s per million tokens.", famUSD(median)))
+				default:
+					cmp = append(cmp, fmt.Sprintf("Its input price is the family median, %s per million tokens.", famUSD(median)))
+				}
+			}
+			if m.Context > 0 && m.Context == ctxMax {
+				cmp = append(cmp, "No version in the family has a larger context window.")
+			}
+		}
+		if m.Delisted {
+			cmp = append(cmp, "It is no longer listed in the OpenRouter catalog. This page keeps its last recorded details.")
+		}
+		if m.Expires != "" {
+			cmp = append(cmp, fmt.Sprintf("Its developer has scheduled it for retirement on %s.", m.Expires))
+		}
+		providers := []map[string]any{}
+		for _, e := range m.Providers {
+			pn, _ := e["provider"].(string)
+			if pn == "" {
+				continue
+			}
+			providers = append(providers, map[string]any{"provider": pn, "prompt_pm": e["prompt_pm"], "completion_pm": e["completion_pm"], "context": e["context"]})
+		}
+		sort.SliceStable(providers, func(a, b int) bool {
+			pa, _ := providers[a]["prompt_pm"].(float64)
+			pb, _ := providers[b]["prompt_pm"].(float64)
+			return pa < pb
+		})
+		faq := []map[string]string{
+			{"q": "How much does " + short + " cost?", "a": sents[2]},
+			{"q": "How large is the context window of " + short + "?", "a": func() string {
+				if m.Context > 0 {
+					return fmt.Sprintf("%s tokens of input, per the OpenRouter catalog.", famTokText(m.Context))
+				}
+				return "The catalog does not state it."
+			}()},
+		}
+		if famUID != "" {
+			faq = append(faq, map[string]string{"q": "Which family does " + short + " belong to?", "a": fmt.Sprintf("%s, %s's model line, with %d versions listed today.", famName, g.DevName, len(live))})
+		} else {
+			faq = append(faq, map[string]string{"q": "Who makes " + short + "?", "a": g.DevName + ". It is the only version of its line in the catalog so far; when a second arrives, this page joins a family page."})
+		}
+		_ = i
+		doc := map[string]any{
+			"uid": uid, "page_uid": uid, "slug": "model-" + uid, "shape": "model", "name": short, "full_name": m.Name,
+			"title": short + ": price, context window and specs", "id": m.ID, "developer": g.DevName,
+			"family":      famRef,
+			"parent_name": cat.name, "parent_path": famBase + cat.uid + "/", "hub_name": "Foundation Models", "hub_path": famBase + "70d363c9/",
+			"answer": answer, "compare": cmp, "released": m.Released, "context": m.Context, "max_output": m.MaxOut,
+			"prompt_pm": m.PromptPM, "completion_pm": m.CompletionPM, "knowledge_cutoff": m.Cutoff, "reasoning": m.Reasoning,
+			"input": m.In, "output": m.Out, "open_weights": m.HFID != "", "hf_id": m.HFID, "expires": m.Expires,
+			"delisted": m.Delisted, "providers": providers, "siblings": siblings, "faq": faq,
+			"source":    map[string]string{"name": "OpenRouter model catalog", "url": "https://openrouter.ai/" + m.ID},
+			"generated": today, "refresh_every_days": 1,
+		}
+		if famUID == "" {
+			doc["siblings"] = []map[string]any{}
+		}
+		j, _ := json.Marshal(doc)
+		if _, err := db.Exec(`INSERT INTO twoai_pages (path, kind, data, taxonomy_slug, url_count) VALUES ($1,'tech-section',$2::jsonb,NULL,1)
+			ON CONFLICT (path) DO UPDATE SET kind=EXCLUDED.kind, data=EXCLUDED.data, url_count=1, updated_at=now()
+			WHERE (twoai_pages.data - 'built_at') IS DISTINCT FROM EXCLUDED.data`, "tech/model-"+uid+".json", string(j)); err != nil {
+			fmt.Fprintln(os.Stderr, "twoai_model_families model page:", err)
+		}
+	}
+	return out
+}
+
+// famCost is a per-token price for a sentence: "$0.25", or "nothing".
+func famCost(v float64) string {
+	if v == 0 {
+		return "nothing"
+	}
+	return famUSD(v)
+}
+
+type famSingle struct {
+	g   *famGroup
+	m   famMember
+	cat famCat
+}
+
+// famSingles finds current single models, records them, and writes their
+// pages. A line is single while it has one live member and no family row.
+func famSingles(db *sql.DB, groups map[string]*famGroup, today string) []famSingle {
+	db.Exec(`CREATE TABLE IF NOT EXISTS twoai_model_singles (
+		ext_id text PRIMARY KEY, uid text NOT NULL, family_key text NOT NULL, category text NOT NULL, added_on date NOT NULL DEFAULT current_date)`)
+	cut := time.Now().AddDate(0, 0, -90).Unix()
+	for _, g := range groups {
+		l := g.live()
+		if len(l) != 1 || l[0].Created < cut {
+			continue
+		}
+		var exists bool
+		db.QueryRow(`SELECT EXISTS (SELECT 1 FROM twoai_model_families WHERE family_key=$1)`, g.Key).Scan(&exists)
+		if exists {
+			continue
+		}
+		if ft, of := famFineTune(db, g, groups); ft {
+			fmt.Printf("twoai_model_families: single %s skipped, a fine-tune line of %s\n", l[0].Name, of)
+			continue
+		}
+		cat := ""
+		for _, c := range famCats {
+			if c.member(l[0]) {
+				cat = c.slug
+				break
+			}
+		}
+		if cat == "" {
+			continue
+		}
+		res, _ := db.Exec(`INSERT INTO twoai_model_singles (ext_id, uid, family_key, category) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
+			l[0].ID, famModelUID(l[0].ID), g.Key, cat)
+		if k, _ := res.RowsAffected(); k > 0 {
+			fmt.Printf("twoai_model_families: single model tracked: %s (%s)\n", l[0].Name, cat)
+		}
+	}
+	var out []famSingle
+	rows, err := db.Query(`SELECT ext_id, family_key, category FROM twoai_model_singles ORDER BY added_on, ext_id`)
+	if err != nil {
+		return out
+	}
+	type row struct{ id, key, cat string }
+	var rs []row
+	for rows.Next() {
+		var r row
+		if rows.Scan(&r.id, &r.key, &r.cat) == nil {
+			rs = append(rs, r)
+		}
+	}
+	rows.Close()
+	for _, r := range rs {
+		g := groups[r.key]
+		if g == nil || len(g.live()) > 1 {
+			// A family now: its member page, at the same uid, is written by
+			// the family step once the family is built.
+			continue
+		}
+		var exists bool
+		db.QueryRow(`SELECT EXISTS (SELECT 1 FROM twoai_model_families WHERE family_key=$1)`, r.key).Scan(&exists)
+		if exists {
+			continue
+		}
+		famModelPages(db, g, "", famCatBySlug(r.cat), today)
+		for _, m := range g.Members {
+			if m.ID == r.id && !m.Delisted {
+				out = append(out, famSingle{g, m, famCatBySlug(r.cat)})
+			}
+		}
+	}
 	return out
 }
