@@ -6161,6 +6161,14 @@ func twoaiBuild(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	// The policy digest's hub, and the news week that took over
+	// /this-week-in-ai/ (Stephen, 2026-10-09).
+	if err := twoaiLawWeekHub(db, today, upsert); err != nil {
+		fmt.Println("twoai_law_week_hub:", err)
+	}
+	if _, err := twoaiNewsWeeks(db, today, upsert); err != nil {
+		fmt.Println("twoai_news_weeks:", err)
+	}
 
 	vendorNews, err := twoaiVendorNews(db, upsert)
 	if err != nil {
@@ -8755,6 +8763,8 @@ func twoaiTaxonomyFor(kind string) any {
 	case "sources-hub":
 		return "research-library"
 	case "week", "week-hub":
+		return "this-week-in-ai-laws"
+	case "newsweek", "newsweek-hub":
 		return "this-week-in-ai"
 	case "vendor-news":
 		return "vendor-news"
@@ -9671,7 +9681,7 @@ func urlRegistryKind(u string) string {
 	if len(seg) == 1 {
 		switch seg[0] {
 		case "ai-laws", "ai-glossary", "ai-lawsuits", "ai-tools", "companies", "research",
-			"ai-compliance", "mcp", "benchmarks", "this-week-in-ai", "ai-ecosystem",
+			"ai-compliance", "mcp", "benchmarks", "this-week-in-ai", "this-week-in-ai-laws", "ai-ecosystem",
 			"ai-news", "ai-prompts", "calculators", "sources", "api":
 			return seg[0] + "-hub"
 		}
@@ -9693,6 +9703,8 @@ func urlRegistryKind(u string) string {
 	case "companies":
 		return "company"
 	case "this-week-in-ai":
+		return "newsweek"
+	case "this-week-in-ai-laws":
 		return "week"
 	case "calculators":
 		return "calculator"
