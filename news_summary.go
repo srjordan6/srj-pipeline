@@ -20,9 +20,11 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -37,6 +39,10 @@ const (
 	newsSummaryMaxArticles = 4
 	newsSummaryMaxChars    = 16000
 )
+
+// newsFetchBudget caps the live article fetches one process makes for
+// summaries, so a run with many textless clusters cannot outlast its stage.
+var newsFetchBudget = 60
 
 // newsArt is one article of a cluster as the summary needs it.
 type newsArt struct {
@@ -119,6 +125,37 @@ func newsSummarizeStory(db *sql.DB, slug, headline string, arts []newsArt, now t
 		}
 		pieces = append(pieces, piece{a, body})
 		_ = i
+	}
+	// NO TEXT IN THE CORPUS IS NOT NO TEXT (Stephen, 2026-10-08, on d809213e:
+	// 44 outlets, an empty summary, labelled breaking). GDELT gives a URL and
+	// a title; the text is fetched for only some articles. When the cluster
+	// holds fewer texts than the summary reads, the missing ones are fetched
+	// from the publisher now, a few per story within a budget per run, and
+	// kept on the article row so the next run does not fetch them again.
+	if db != nil && len(pieces) < newsSummaryMaxArticles {
+		have := map[string]bool{}
+		for _, p := range pieces {
+			have[p.a.URL] = true
+		}
+		tries := 0
+		for _, a := range arts {
+			if len(pieces) >= newsSummaryMaxArticles || tries >= 6 || newsFetchBudget <= 0 {
+				break
+			}
+			if have[a.URL] {
+				continue
+			}
+			tries++
+			newsFetchBudget--
+			text := newsArticleText(db, a.URL)
+			body := newsArticleBody(text)
+			if len(body) < 400 {
+				continue
+			}
+			db.Exec(`UPDATE pipeline.documents SET fulltext = $1 WHERE url = $2 AND COALESCE(fulltext,'') = ''`, text, a.URL)
+			pieces = append(pieces, piece{a, body})
+			have[a.URL] = true
+		}
 	}
 	leadURL := ""
 	if len(arts) > 0 {
@@ -222,4 +259,82 @@ func newsSummarizeStory(db *sql.DB, slug, headline string, arts []newsArt, now t
 			breaking=EXCLUDED.breaking, model=EXCLUDED.model, written_at=now()`,
 		slug, best, src.URL, src.Domain, used, bestWords, bestParas, thin, breaking, "news_summary")
 	return newsStorySummary{Summary: best, URL: src.URL, Domain: src.Domain, Thin: thin, Breaking: breaking, Used: used}
+}
+
+// newsSummaryBackfill rewrites the summaries of published stories that are
+// still short of the rule (Stephen, 2026-10-08, repeated 2026-10-09 on
+// d809213e: "all news stories are supposed to have 3 to 4 paragraphs of 4 to
+// 5 sentences"). A story leaves the 72-hour briefing window after three days
+// and is never summarised again, so the ones written before the rule, or
+// written with no text, stay thin forever without this. Newest first, a few
+// a run (TWOAI_SUMMARY_BACKFILL_PER_RUN, default 40; 1,123 stories were short on
+// 2026-10-09, so about two weeks at two runs a day), an editor's summary
+// never touched, and the archive row updated in place.
+func newsSummaryBackfill(db *sql.DB) error {
+	perRun := 40
+	newsFetchBudget = 240
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("TWOAI_SUMMARY_BACKFILL_PER_RUN"))); err == nil && v >= 0 {
+		perRun = v
+	}
+	newsEnsureSummaries(db)
+	rows, err := db.Query(`SELECT slug, headline, COALESCE(story->'Articles','[]'::jsonb)::text
+		FROM twoai_news_stories
+		WHERE retired_at IS NULL AND NOT (story ? 'summary_by') AND published_on >= current_date - 90
+		  AND (COALESCE(story->>'Summary','') = ''
+		       OR array_length(regexp_split_to_array(btrim(story->>'Summary'), E'\\n\\s*\\n'), 1) < 3
+		       OR array_length(regexp_split_to_array(btrim(story->>'Summary'), E'\\s+'), 1) < 300)
+		ORDER BY published_on DESC, (story->>'DomainCount')::int DESC NULLS LAST
+		LIMIT $1`, perRun*3)
+	if err != nil {
+		return err
+	}
+	type cand struct{ slug, head, arts string }
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		if rows.Scan(&c.slug, &c.head, &c.arts) == nil {
+			cands = append(cands, c)
+		}
+	}
+	rows.Close()
+	done, full, thin, none := 0, 0, 0, 0
+	for _, c := range cands {
+		if done >= perRun {
+			break
+		}
+		var raw []struct{ URL, Title, Domain, Date string }
+		if json.Unmarshal([]byte(c.arts), &raw) != nil || len(raw) == 0 {
+			continue
+		}
+		var arts []newsArt
+		for _, r := range raw {
+			arts = append(arts, newsArt{Title: r.Title, URL: r.URL, Domain: r.Domain, Date: r.Date})
+		}
+		// The cached summary for this slug is dropped first, so the writer
+		// does not hand back the short one it already has.
+		db.Exec(`DELETE FROM twoai_news_summaries WHERE slug = $1 AND (thin OR paragraphs < 3 OR words < 300)`, c.slug)
+		ss := newsSummarizeStory(db, c.slug, c.head, arts, time.Now().UTC(),
+			func(u string) (string, string, bool) {
+				var sm, tx string
+				err := db.QueryRow(`SELECT COALESCE(summary,''), COALESCE(substr(fulltext,1,12000),'') FROM pipeline.documents
+					WHERE url = $1 ORDER BY id DESC LIMIT 1`, u).Scan(&sm, &tx)
+				return sm, tx, err == nil
+			},
+			func(p string) (string, error) { s, _, err := twoaiGenerate("news_summary", "", p); return s, err })
+		done++
+		if ss.Summary == "" {
+			none++
+			continue
+		}
+		if ss.Thin {
+			thin++
+		} else {
+			full++
+		}
+		db.Exec(`UPDATE twoai_news_stories SET story = story || jsonb_build_object('Summary', $2::text, 'SummaryURL', $3::text,
+				'SummaryDomain', $4::text, 'summary_thin', $5::boolean, 'summary_breaking', $6::boolean)
+			WHERE slug = $1 AND NOT (story ? 'summary_by')`, c.slug, ss.Summary, ss.URL, ss.Domain, ss.Thin, ss.Breaking)
+	}
+	fmt.Printf("news_summary_backfill: candidates=%d tried=%d full=%d thin=%d no_text=%d ok=true\n", len(cands), done, full, thin, none)
+	return nil
 }
