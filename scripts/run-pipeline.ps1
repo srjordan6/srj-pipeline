@@ -87,20 +87,39 @@ if ((Test-Path $log) -and (Get-Item $log).Length -gt 25MB) {
   try { Move-Item $log "$log.1" -Force } catch {}
 }
 
-# TWO FULL RUNS A DAY UNTIL 2026-10-12. Stephen, 2026-10-03: slow things
-# down, one run at the start of off-peak and one two hours before off-peak
-# ends. Off-peak is outside 12:00 to 18:00 UTC on weekdays, so the runs are
-# 18:00 and 10:00 UTC, every day. The 3-hourly srj-pipeline task still fires
-# (its trigger cannot be changed without Stephen's password), and this gate
-# skips it. The runs come from srj-pipeline-offpeak-1000utc and
-# srj-pipeline-offpeak-1800utc. The gate lapses by itself on 2026-10-12.
-# -Now runs a full pipeline by hand regardless.
-if ($Stage -eq 'all' -and -not $Now -and (Get-Date) -lt [datetime]'2026-10-12') {
-  $utcHour = (Get-Date).ToUniversalTime().Hour
-  if ($utcHour -ne 10 -and $utcHour -ne 18) {
-    Set-Status "$(Stamp) skipped: off-peak schedule until 2026-10-12, full runs only at 10:00 and 18:00 UTC"
+# THE OFF-PEAK SCHEDULE, in UTC so daylight saving cannot move it.
+# Until 2026-10-12 (Stephen, 2026-10-03): two full runs a day, 10:00 and 18:00.
+# From 2026-10-12 (Stephen, 2026-10-10): every model call back on
+# deepseek-v4-pro, and full runs only in off-peak hours. Off-peak is outside
+# 12:00 to 18:00 UTC on weekdays and all day at weekends.
+#   Weekdays: 18:00 (off-peak starts), 03:00 (its middle) and 10:00 (the run
+#   that finishes in its last hour; a full run takes about two hours).
+#   Weekends: five runs, 01:00, 06:00, 11:00, 16:00 and 21:00.
+# The hourly srj-pipeline-hourly task calls this every hour and the gate
+# picks the slots; the older 3-hourly and 10:00/18:00 tasks are gated the
+# same way. A slot runs once even when two tasks fire in it. -Now runs a full
+# pipeline by hand regardless.
+$utcNow = (Get-Date).ToUniversalTime()
+$proFrom = [datetime]'2026-10-12'
+if ($Stage -eq 'all' -and -not $Now) {
+  if ($utcNow -lt $proFrom) {
+    $slots = @(10, 18)
+  } elseif ($utcNow.DayOfWeek -eq 'Saturday' -or $utcNow.DayOfWeek -eq 'Sunday') {
+    $slots = @(1, 6, 11, 16, 21)
+  } else {
+    $slots = @(3, 10, 18)
+  }
+  if ($slots -notcontains $utcNow.Hour) {
+    Set-Status "$(Stamp) skipped: off-peak schedule, full runs at $($slots -join ', ') UTC today"
     exit 0
   }
+  $slotFile = 'C:\srj-data\pipeline-last-slot.txt'
+  $slot = $utcNow.ToString('yyyy-MM-dd HH')
+  if ((Test-Path $slotFile) -and ((Get-Content $slotFile -ErrorAction SilentlyContinue | Select-Object -First 1) -eq $slot)) {
+    Set-Status "$(Stamp) skipped: the $slot UTC slot already ran"
+    exit 0
+  }
+  $slot | Set-Content $slotFile
 }
 
 # One at a time per stage. The lock holds the process id AND the process
@@ -145,6 +164,14 @@ if (Test-Path $lock) {
 try {
   Get-Content $envf | ForEach-Object {
     if ($_ -match '^([^=#][^=]*)=(.*)$') { Set-Item -Path "env:$($matches[1].Trim())" -Value $matches[2] }
+  }
+  # EVERYTHING ON PRO FROM 2026-10-12 (Stephen, 2026-10-10). The credits ran
+  # low in October, so pipeline.env was moved to Flash until the refill. From
+  # the refill every stage uses deepseek-v4-pro whatever pipeline.env says;
+  # the schedule above keeps the runs in off-peak hours.
+  if ($utcNow -ge $proFrom) {
+    $env:OLLAMA_MODEL = 'deepseek-v4-pro'
+    Get-ChildItem env: | Where-Object { $_.Name -like 'OLLAMA_MODEL_*' } | ForEach-Object { Set-Item -Path "env:$($_.Name)" -Value 'deepseek-v4-pro' }
   }
   Set-Location $repo
 
